@@ -23,6 +23,14 @@ step() {
   if "$@" > "$WORK/0b-step-$n.log" 2>&1; then echo "ok $n - $what"
   else echo "not ok $n - $what (see $WORK/0b-step-$n.log)"; sed 's/^/#   /' "$WORK/0b-step-$n.log" | tail -n 20; bad=1; fi
 }
+# platform: why fusermount3 refused a mount on this host (GitHub's runner refuses some that a local Docker allows): who
+#           we are, the mount point, /dev/fuse, fusermount3, our capabilities and AppArmor label, and the mounts involved
+fuse_diag() {
+  echo "fuse_diag: $(id); $(ls -ld "$1"); $(ls -l /dev/fuse); $(ls -l "$(command -v fusermount3)")"
+  grep -E '^(CapEff|CapBnd|NoNewPrivs)' /proc/self/status
+  echo "apparmor: $(cat /proc/self/attr/current 2>/dev/null)"
+  grep -E ' (/work|/tmp|/) ' /proc/mounts
+}
 fstype() { case $1 in ntfs) echo ntfs3 ;; *) echo "$1" ;; esac; }
 checker() { sh "$ROOT/tests/lib/check-fs.sh" "$@"; }
 # platform: the FUSE mount appears first, and a listing is answered only once lklfuse's loop runs, after LKL's
@@ -34,7 +42,7 @@ mount_fs() {
   i=0
   until grep -q " $MNT " /proc/mounts; do
     i=$((i + 1)); [ $i -le 300 ] || { echo "no FUSE mount after 30 s"; cat "$WORK/lklfuse-$1.log"; return 1; }
-    kill -0 "$pid" 2>/dev/null || { echo "lklfuse ended before mounting:"; cat "$WORK/lklfuse-$1.log"; return 1; }
+    kill -0 "$pid" 2>/dev/null || { echo "lklfuse ended before mounting:"; cat "$WORK/lklfuse-$1.log"; fuse_diag "$MNT"; return 1; }
     sleep 0.1
   done
   ls "$MNT" > /dev/null && kill -0 "$pid" || { cat "$WORK/lklfuse-$1.log"; return 1; }

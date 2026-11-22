@@ -151,6 +151,12 @@ jobs:
           LINUX_HOST_FUSE: 1
         run: sh build/linux-host.sh env MAVERICKS_TEST_JOBS=1 sh "$SHIPYARD_SCRIPTS/run-repo-tests.sh"
 
+      # platform: a FUSE mount the container is refused leaves its reason in the host's kernel log (an AppArmor denial,
+      #           say), which the container cannot read
+      - name: Kernel log, when the tests fail
+        if: failure()
+        run: sudo dmesg | grep -iE 'apparmor|fuse|denied' | tail -n 60 || true
+
       - name: Ingredient pins are well declared
         run: sh "$SHIPYARD_SCRIPTS/check-ingredient-pins.sh"
 

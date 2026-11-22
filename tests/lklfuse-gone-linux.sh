@@ -43,7 +43,23 @@ i=0; while kill -0 "$pid" 2>/dev/null && [ $i -lt 150 ]; do sleep 0.1; i=$((i + 
 if kill -0 "$pid" 2>/dev/null; then rc=running; else wait "$pid"; rc=$?; pid=; fi
 [ "$rc" = 1 ]; ok $? "and exits 1 ($rc)"
 grep -q "is gone" "$W/log"; r=$?; ok $r "saying the device is gone ($(grep 'gone' "$W/log" | head -n 1))"
-[ $r -eq 0 ] || sed 's/^/#   /' "$W/log" | tail -n 30
+if [ $r -ne 0 ]; then
+  sed 's/^/#   /' "$W/log" | tail -n 30
+  # platform: why fusermount3 refused a mount on this host (GitHub's runner refuses some that a local Docker allows): who
+  #           we are, the mount point, /dev/fuse, fusermount3, our capabilities and AppArmor label, and the mounts involved
+  fuse_diag() {
+    echo "fuse_diag: $(id); $(ls -ld "$1"); $(ls -l /dev/fuse); $(ls -l "$(command -v fusermount3)")"
+    grep -E '^(CapEff|CapBnd|NoNewPrivs)' /proc/self/status
+    echo "apparmor: $(cat /proc/self/attr/current 2>/dev/null)"
+    grep -E ' (/work|/tmp|/) ' /proc/mounts
+  }
+  fuse_diag "$MNT" | sed 's/^/#   /'
+  # platform: the same mount, from an image in the container's /tmp (apfs-fixtures-linux.sh's, which mounts)
+  cp "$W/disk.img" /tmp/lklfuse-gone-probe.img && m2=$(mktemp -d /tmp/lklfuse-gone-m2.XXXXXX) &&
+    { timeout 20 "$LKLFUSE" -f -o type=ext4 /tmp/lklfuse-gone-probe.img "$m2" > "$W/log2" 2>&1 & p2=$!; sleep 5
+      grep " $m2 " /proc/mounts | sed 's/^/#   from \/tmp: mounted: /'; fusermount3 -u "$m2" 2>/dev/null; wait $p2
+      sed 's/^/#   from \/tmp: /' "$W/log2"; rm -f /tmp/lklfuse-gone-probe.img; rmdir "$m2"; }
+fi
 ! grep -q "^lklfuse: I/O error on" "$W/log" || false; ok $? "and nothing more about it: no I/O error line for a device already gone (10.9's pull printed both)"
 ! grep -q " $MNT " /proc/mounts || false; ok $? "its FUSE mount is down, not left dead"
 [ -z "$pid" ] || { kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; pid=; }
