@@ -1,0 +1,78 @@
+--- a/tools/lkl/lib/fs.c
++++ b/tools/lkl/lib/fs.c
+@@ -272,7 +272,8 @@
+ 				mnt_str_len);
+ }
+ 
+-long lkl_umount_timeout(char *path, int flags, long timeout_ms)
++/* umount(), retried while busy; *timeout_ms is what is left of the budget afterwards */
++static long umount_within(char *path, int flags, long *timeout_ms)
+ {
+ 	long incr = 10000000; /* 10 ms */
+ 	struct __lkl__kernel_timespec ts = {
+@@ -285,31 +286,57 @@
+ 		err = lkl_sys_umount(path, flags);
+ 		if (err == -LKL_EBUSY) {
+ 			lkl_sys_nanosleep(&ts, NULL);
+-			timeout_ms -= incr / 1000000;
++			*timeout_ms -= incr / 1000000;
+ 		}
+-	} while (err == -LKL_EBUSY && timeout_ms > 0);
++	} while (err == -LKL_EBUSY && *timeout_ms > 0);
+ 
+ 	return err;
+ }
+ 
++long lkl_umount_timeout(char *path, int flags, long timeout_ms)
++{
++	return umount_within(path, flags, &timeout_ms);
++}
++
+ long lkl_umount_blkdev(unsigned int dev, int flags, long timeout_ms)
+ {
+ 	char dev_str[] = { "/dev/xxxxxxxx" };
+ 	char mnt_str[] = { "/mnt/xxxxxxxx" };
+-	int err;
++	struct __lkl__kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 };
++	long err, fd;
+ 
+ 	snprintf(dev_str, sizeof(dev_str), "/dev/%08x", dev);
+ 	snprintf(mnt_str, sizeof(mnt_str), "/mnt/%08x", dev);
+ 
+-	err = lkl_umount_timeout(mnt_str, flags, timeout_ms);
++	err = umount_within(mnt_str, flags, &timeout_ms);
+ 	if (err)
+ 		return err;
+ 
+-	err = lkl_sys_unlink(dev_str);
+-	if (err)
+-		return err;
++	/*
++	 * LKL runs system calls on kernel threads, so umount() leaves the
++	 * superblock teardown to delayed_mntput_work and returns before the
++	 * file system has written its final state. Wait, within what is left
++	 * of the caller's timeout, until the device can be claimed exclusively,
++	 * which happens only once the superblock has released it, so that a
++	 * halt right after this returns loses nothing.
++	 */
++	for (;;) {
++		fd = lkl_sys_open(dev_str, LKL_O_RDONLY | LKL_O_EXCL, 0);
++		if (fd != -LKL_EBUSY || timeout_ms <= 0)
++			break;
++		lkl_sys_nanosleep(&ts, NULL);
++		timeout_ms -= 10;
++	}
++	if (fd >= 0)
++		lkl_sys_close(fd);
+ 
+-	return lkl_sys_rmdir(mnt_str);
++	/* Unmounted either way: the nodes go, so nothing is left to retry. */
++	err = lkl_sys_unlink(dev_str);
++	if (!err)
++		err = lkl_sys_rmdir(mnt_str);
++	if (fd == -LKL_EBUSY)
++		return -LKL_ETIMEDOUT;	/* teardown still in progress */
++	return fd < 0 ? fd : err;
+ }
+ 
+ long lkl_umount_dev(unsigned int disk_id, unsigned int part, int flags,

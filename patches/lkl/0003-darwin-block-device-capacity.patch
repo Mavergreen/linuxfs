@@ -1,0 +1,39 @@
+--- a/tools/lkl/lib/posix-host.c
++++ b/tools/lkl/lib/posix-host.c
+@@ -22,6 +22,9 @@
+ #include <poll.h>
+ #include <limits.h>
+ #ifdef __APPLE__
++#include <sys/disk.h>
++#include <sys/ioctl.h>
++#include <sys/stat.h>
+ #include <dispatch/dispatch.h>
+ #include <mach/mach_time.h>
+ #endif
+@@ -780,6 +783,26 @@
+ static int fd_get_capacity(struct lkl_disk disk, unsigned long long *res)
+ {
+ 	off_t off;
++#ifdef __APPLE__
++	struct stat st;
++	uint32_t block_size;
++	uint64_t blocks;
++
++	/* Darwin's lseek() and fstat() report 0 for a disk; ask its driver. */
++	if (fstat(disk.fd, &st) == 0 && (S_ISBLK(st.st_mode) || S_ISCHR(st.st_mode))) {
++		if (ioctl(disk.fd, DKIOCGETBLOCKSIZE, &block_size) < 0 ||
++		    ioctl(disk.fd, DKIOCGETBLOCKCOUNT, &blocks) < 0)
++			return -1;
++		/* The block layer here issues 512-byte I/O, which a raw 4Kn disk refuses. */
++		if (block_size != 512) {
++			lkl_printf("lkl: disk has %u-byte blocks; only 512-byte blocks are supported\n",
++				   block_size);
++			return -1;
++		}
++		*res = blocks * block_size;
++		return 0;
++	}
++#endif
+ 
+ 	off = lseek(disk.fd, 0, SEEK_END);
+ 	if (off < 0)

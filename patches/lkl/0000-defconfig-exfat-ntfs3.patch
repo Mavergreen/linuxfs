@@ -1,0 +1,11 @@
+--- a/arch/lkl/configs/defconfig
++++ b/arch/lkl/configs/defconfig
+@@ -49,6 +49,8 @@
+ # CONFIG_DNOTIFY is not set
+ # CONFIG_INOTIFY_USER is not set
+ CONFIG_VFAT_FS=y
++CONFIG_EXFAT_FS=y
++CONFIG_NTFS3_FS=y
+ CONFIG_NLS_CODEPAGE_437=y
+ CONFIG_NLS_CODEPAGE_737=y
+ CONFIG_NLS_CODEPAGE_775=y

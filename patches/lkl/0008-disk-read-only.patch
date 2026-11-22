@@ -1,0 +1,62 @@
+lkl: a disk added read-only says so (VIRTIO_BLK_F_RO), and lklfuse adds -o ro disks that way
+
+LKL's virtio-blk advertised no features, so a disk lklfuse opened read-only looked writable to the kernel.
+XFS, mounting read-only, still clears stale log blocks unless the device itself is read-only, and those
+writes failed against the read-only descriptor: "log recovery write I/O error ... log mount failed" on a
+clean log (P3-1 on 10.9; tests/fixtures/xfs). With the flag the block layer marks the disk read-only and no
+filesystem writes to it. The Fusion second device is always added read-only.
+
+diff -ru a/tools/lkl/include/lkl.h b/tools/lkl/include/lkl.h
+--- a/tools/lkl/include/lkl.h
++++ b/tools/lkl/include/lkl.h
+@@ -365,6 +365,8 @@
+ 		void *handle;
+ 	};
+ 	struct lkl_dev_blk_ops *ops;
++	/* read-only: the device says so (VIRTIO_BLK_F_RO), so the kernel never writes to it, not even to replay a log */
++	int ro;
+ };
+ 
+ /**
+diff -ru a/tools/lkl/lib/virtio_blk.c b/tools/lkl/lib/virtio_blk.c
+--- a/tools/lkl/lib/virtio_blk.c
++++ b/tools/lkl/lib/virtio_blk.c
+@@ -2,6 +2,10 @@
+ #include "virtio.h"
+ #include "endian.h"
+ 
++#ifndef LKL_VIRTIO_BLK_F_RO
++#define LKL_VIRTIO_BLK_F_RO 5
++#endif
++
+ struct virtio_blk_dev {
+ 	struct virtio_dev dev;
+ 	struct lkl_virtio_blk_config config;
+@@ -82,7 +86,7 @@
+ 
+ 	dev->dev.device_id = LKL_VIRTIO_ID_BLOCK;
+ 	dev->dev.vendor_id = 0;
+-	dev->dev.device_features = 0;
++	dev->dev.device_features = disk->ro ? 1ULL << LKL_VIRTIO_BLK_F_RO : 0;
+ 	dev->dev.config_gen = 0;
+ 	dev->dev.config_data = &dev->config;
+ 	dev->dev.config_len = sizeof(dev->config);
+diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
+--- a/tools/lkl/lklfuse.c
++++ b/tools/lkl/lklfuse.c
+@@ -1171,6 +1171,7 @@
+ 	}
+ 
+ 	lklfuse.disk.fd = ret;
++	lklfuse.disk.ro = lklfuse.ro;
+ 
+ 	ret = lkl_init(&lkl_host_ops);
+ 	if (ret < 0) {
+@@ -1189,6 +1190,7 @@
+ 	if (lklfuse.tier2file) {
+ 		/* read-only: the driver never writes a Fusion container */
+ 		lklfuse.tier2.fd = lklfuse_open_path(lklfuse.tier2file, 1);
++		lklfuse.tier2.ro = 1;
+ 		if (lklfuse.tier2.fd < 0) {
+ 			perror(lklfuse.tier2file);
+ 			ret = -1;

@@ -1,0 +1,284 @@
+--- a/tools/lkl/lib/endian.h
++++ b/tools/lkl/lib/endian.h
+@@ -5,6 +5,18 @@
+ #include <sys/endian.h>
+ #elif defined(__ANDROID__)
+ #include <sys/endian.h>
++#elif defined(__APPLE__)
++#include <libkern/OSByteOrder.h>
++#define le16toh(x) OSSwapLittleToHostInt16(x)
++#define le32toh(x) OSSwapLittleToHostInt32(x)
++#define le64toh(x) OSSwapLittleToHostInt64(x)
++#define htole16(x) OSSwapHostToLittleInt16(x)
++#define htole32(x) OSSwapHostToLittleInt32(x)
++#define htole64(x) OSSwapHostToLittleInt64(x)
++#define be16toh(x) OSSwapBigToHostInt16(x)
++#define be32toh(x) OSSwapBigToHostInt32(x)
++#define htobe16(x) OSSwapHostToBigInt16(x)
++#define htobe32(x) OSSwapHostToBigInt32(x)
+ #elif defined(__MINGW32__)
+ #include <winsock.h>
+ #define le32toh(x) (x)
+--- a/tools/lkl/lib/posix-host.c
++++ b/tools/lkl/lib/posix-host.c
+@@ -21,6 +21,10 @@
+ #include <sys/mman.h>
+ #include <poll.h>
+ #include <limits.h>
++#ifdef __APPLE__
++#include <dispatch/dispatch.h>
++#include <mach/mach_time.h>
++#endif
+ #ifdef __FreeBSD__
+ #include <pthread_np.h>
+ #endif
+@@ -31,6 +35,11 @@
+ /* Let's see if the host has semaphore.h */
+ #include <unistd.h>
+ 
++#ifdef __APPLE__
++/* Darwin declares POSIX semaphores, but sem_init() always fails. */
++#undef _POSIX_SEMAPHORES
++#endif
++
+ #ifdef _POSIX_SEMAPHORES
+ #include <semaphore.h>
+ /* TODO(pscollins): We don't support fork() for now, but maybe one day
+@@ -210,6 +219,30 @@
+ 	return NULL;
+ }
+ 
++#ifdef __APPLE__
++static pthread_attr_t big_stack_attr;
++
++static void big_stack_attr_init(void)
++{
++	pthread_attr_init(&big_stack_attr);
++	/* Darwin gives secondary threads 512 KiB; kernel code expects 8 MiB. */
++	pthread_attr_setstacksize(&big_stack_attr, 8 << 20);
++}
++
++static pthread_attr_t *thread_attr(void)
++{
++	static pthread_once_t once = PTHREAD_ONCE_INIT;
++
++	pthread_once(&once, big_stack_attr_init);
++	return &big_stack_attr;
++}
++#else
++static pthread_attr_t *thread_attr(void)
++{
++	return NULL;
++}
++#endif
++
+ static lkl_thread_t thread_create(void (*fn)(void *), void *arg)
+ {
+ 	pthread_t thread;
+@@ -221,7 +254,7 @@
+ 	wrapper_arg->fn = fn;
+ 	wrapper_arg->arg = arg;
+ 
+-	if (WARN_PTHREAD(pthread_create(&thread, NULL, lkl_thread_wrapper,
++	if (WARN_PTHREAD(pthread_create(&thread, thread_attr(), lkl_thread_wrapper,
+ 					wrapper_arg)))
+ 		return 0;
+ 	else
+@@ -256,6 +289,20 @@
+ 	return pthread_equal((pthread_t)a, (pthread_t)b);
+ }
+ 
++#ifdef __APPLE__
++void *thread_stack(unsigned long *size)
++{
++	pthread_t self = pthread_self();
++	size_t stack_size = pthread_get_stacksize_np(self);
++	char *top = pthread_get_stackaddr_np(self);
++
++	if (size)
++		*size = stack_size;
++
++	return top - stack_size;
++}
++#else
++
+ #ifdef	__FreeBSD__
+ #define pthread_getattr_np pthread_attr_get_np
+ #endif
+@@ -279,6 +326,7 @@
+ 
+ 	return thread_stack;
+ }
++#endif /* __APPLE__ */
+ 
+ static struct lkl_tls_key *tsd_alloc(void (*destructor)(void *))
+ {
+@@ -393,13 +441,116 @@
+ 
+ static unsigned long long time_ns(void)
+ {
++#ifdef __APPLE__
++	static mach_timebase_info_data_t tb;
++	unsigned long long t = mach_absolute_time();
++
++	if (!tb.denom)
++		mach_timebase_info(&tb);
++
++	return t / tb.denom * tb.numer + t % tb.denom * tb.numer / tb.denom;
++#else
+ 	struct timespec ts;
+ 
+ 	clock_gettime(CLOCK_MONOTONIC, &ts);
+ 
+ 	return 1e9*ts.tv_sec + ts.tv_nsec;
++#endif
++}
++
++#ifdef __APPLE__
++/* Darwin has no timer_create(); a one-shot dispatch timer source stands in. */
++struct darwin_timer {
++	dispatch_source_t source;
++	dispatch_semaphore_t cancelled;
++	void (*fn)(void);
++	int free_on_cancel;
++};
++
++static __thread struct darwin_timer *timer_firing;
++
++static void darwin_timer_fire(void *arg)
++{
++	struct darwin_timer *t = arg;
++
++	timer_firing = t;
++	t->fn();
++	timer_firing = NULL;
+ }
+ 
++static void darwin_timer_release(struct darwin_timer *t)
++{
++	dispatch_release(t->source);
++	dispatch_release(t->cancelled);
++	free(t);
++}
++
++static void darwin_timer_cancelled(void *arg)
++{
++	struct darwin_timer *t = arg;
++
++	if (t->free_on_cancel)
++		darwin_timer_release(t);
++	else
++		dispatch_semaphore_signal(t->cancelled);
++}
++
++static void *timer_alloc(void (*fn)(void))
++{
++	struct darwin_timer *t = calloc(1, sizeof(*t));
++
++	if (!t)
++		return NULL;
++	t->fn = fn;
++	t->cancelled = dispatch_semaphore_create(0);
++	t->source = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
++		dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0));
++	if (!t->cancelled || !t->source) {
++		if (t->cancelled)
++			dispatch_release(t->cancelled);
++		free(t);
++		return NULL;
++	}
++	dispatch_set_context(t->source, t);
++	dispatch_source_set_event_handler_f(t->source, darwin_timer_fire);
++	dispatch_source_set_cancel_handler_f(t->source, darwin_timer_cancelled);
++	dispatch_source_set_timer(t->source, DISPATCH_TIME_FOREVER,
++				  DISPATCH_TIME_FOREVER, 0);
++	dispatch_resume(t->source);
++	return t;
++}
++
++static int timer_set_oneshot(void *_timer, unsigned long ns)
++{
++	struct darwin_timer *t = _timer;
++
++	dispatch_source_set_timer(t->source,
++				  dispatch_time(DISPATCH_TIME_NOW, ns),
++				  DISPATCH_TIME_FOREVER, 0);
++	return 0;
++}
++
++/*
++ * Returns only once the callback can no longer run, except when called from
++ * the timer's own callback, where waiting would deadlock: then the cancel
++ * handler, which runs after the callback returns, frees the timer.
++ */
++static void timer_free(void *_timer)
++{
++	struct darwin_timer *t = _timer;
++
++	if (timer_firing == t) {
++		t->free_on_cancel = 1;
++		dispatch_source_cancel(t->source);
++		return;
++	}
++	dispatch_source_cancel(t->source);
++	dispatch_semaphore_wait(t->cancelled, DISPATCH_TIME_FOREVER);
++	darwin_timer_release(t);
++}
++
++#else /* !__APPLE__ */
++
+ static void lkl_timer_callback(union sigval sv)
+ {
+ 	void (*fn)(void) = sv.sival_ptr;
+@@ -445,6 +596,7 @@
+ 
+ 	timer_delete(timer);
+ }
++#endif /* __APPLE__ */
+ 
+ static void panic(void)
+ {
+@@ -489,7 +641,7 @@
+ #ifndef MAP_NORESERVE
+ #define MAP_NORESERVE 0
+ #endif
+-#elif defined(__linux__)
++#elif defined(__linux__) || defined(__APPLE__)
+ #ifndef MAP_FIXED_NOREPLACE
+ #define MAP_FIXED_NOREPLACE 0
+ #endif
+@@ -685,6 +837,11 @@
+ 
+ 	switch (req->type) {
+ 	case LKL_DEV_BLK_TYPE_READ:
++#ifdef __APPLE__
++		/* no preadv() before 10.15 */
++		err = do_rw(pread, disk.fd, req);
++		break;
++#endif
+ 		len = preadv(disk.fd, req->buf, req->count, req->sector * 512);
+ 		if (len < 0) {
+ 			err = -1;
+@@ -695,6 +852,10 @@
+ 			err = do_rw(pread, disk.fd, req);
+ 		break;
+ 	case LKL_DEV_BLK_TYPE_WRITE:
++#ifdef __APPLE__
++		err = do_rw(pwrite_fn, disk.fd, req);
++		break;
++#endif
+ 		len = pwritev(disk.fd, req->buf, req->count, req->sector * 512);
+ 		if (len < 0) {
+ 			err = -1;
+@@ -707,6 +868,11 @@
+ 	case LKL_DEV_BLK_TYPE_FLUSH_OUT:
+ #ifdef __linux__
+ 		err = fdatasync(disk.fd);
++#elif defined(__APPLE__)
++		/* fsync() leaves data in the drive's cache on Darwin */
++		err = fcntl(disk.fd, F_FULLFSYNC);
++		if (err < 0)
++			err = fsync(disk.fd);
+ #else
+ 		err = fsync(disk.fd);
+ #endif
