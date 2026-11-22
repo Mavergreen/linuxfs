@@ -1,0 +1,84 @@
+lklfuse: a disk pulled out ends lklfuse, taking its mount down, rather than leaving a dead mount
+
+A pulled disk's reads and writes fail with ENXIO (macOS, once IOKit terminates the media under an open raw
+node; P3-2 found the disk never disappears while lklfuse holds it, so the agent's unmount never runs). lklfuse
+gives the disk its own block ops, which wrap LKL's and, on ENXIO or ENODEV, log that the device is gone and stop
+the FUSE loop with SIGTERM to its thread, then exit 1; once it is gone, its later errors are not logged. Any other
+first I/O error is logged, naming its errno. A real USB pull on 10.9 mid-copy (2026-11-21) gave ENXIO, and ended
+lklfuse with no hang or panic; tests/lklfuse-gone-linux.sh stands one in with tests/lib/gone-shim.c.
+
+diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
+--- a/tools/lkl/lklfuse.c	2026-11-21 17:10:22.000000000 -0500
++++ b/tools/lkl/lklfuse.c	2026-11-21 17:10:22.000000000 -0500
+@@ -11,6 +11,8 @@
+ #include <string.h>
+ #include <errno.h>
+ #include <unistd.h>
++#include <pthread.h>
++#include <signal.h>
+ #define FUSE_USE_VERSION 35
+ #ifdef __APPLE__
+ /* macFUSE: keep libfuse's portable callback signatures (no position argument, struct stat) */
+@@ -981,6 +983,44 @@
+ 	return ret;
+ }
+ 
++/*
++ * A disk pulled out from under lklfuse: its reads and writes fail with ENXIO (or ENODEV) from then on. Rather than
++ * serve I/O errors from a dead mount forever, say so, stop the FUSE loop (SIGTERM to the thread running it, so its
++ * blocking read is interrupted; libfuse's handler ends the loop) and exit 1; the mount is taken down on the way out.
++ * Other I/O errors are reported once, so the error a real pull gives on this host is in the log.
++ */
++static pthread_t lklfuse_loop_thread;
++static volatile sig_atomic_t lklfuse_gone, lklfuse_io_errors;
++
++static int lklfuse_blk_get_capacity(struct lkl_disk disk, unsigned long long *res)
++{
++	return lkl_dev_blk_ops.get_capacity(disk, res);
++}
++
++static int lklfuse_blk_request(struct lkl_disk disk, struct lkl_blk_req *req)
++{
++	int ret, err;
++
++	errno = 0;
++	ret = lkl_dev_blk_ops.request(disk, req);
++	if (ret != LKL_DEV_BLK_STATUS_IOERR)
++		return ret;
++	err = errno;
++	if ((err == ENXIO || err == ENODEV) && !lklfuse_gone) {
++		lklfuse_gone = 1;
++		fprintf(stderr, "lklfuse: %s is gone (%s); unmounting\n", lklfuse.file, strerror(err));
++		pthread_kill(lklfuse_loop_thread, SIGTERM);
++	} else if (!lklfuse_gone && !lklfuse_io_errors++) {
++		fprintf(stderr, "lklfuse: I/O error on %s: %s\n", lklfuse.file, err ? strerror(err) : "short transfer");
++	}
++	return ret;
++}
++
++static struct lkl_dev_blk_ops lklfuse_blk_ops = {
++	.get_capacity = lklfuse_blk_get_capacity,
++	.request = lklfuse_blk_request,
++};
++
+ static int start_lkl(void)
+ {
+ 	long ret;
+@@ -1172,6 +1212,8 @@
+ 
+ 	lklfuse.disk.fd = ret;
+ 	lklfuse.disk.ro = lklfuse.ro;
++	lklfuse.disk.ops = &lklfuse_blk_ops;
++	lklfuse_loop_thread = pthread_self();
+ 
+ 	ret = lkl_init(&lkl_host_ops);
+ 	if (ret < 0) {
+@@ -1234,6 +1276,8 @@
+ 		fprintf(stderr, "warning: multithreaded mode not supported\n");
+ 
+ 	ret = fuse_loop(fuse);
++	if (lklfuse_gone)
++		ret = -1;
+ 
+ 	stop_lkl();
+ 

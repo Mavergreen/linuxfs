@@ -1,0 +1,201 @@
+lklfuse: owner= for new files, and the image opened close-on-exec
+
+linuxfs shows every file as the Mac user's (libfuse's uid=/gid=), so files it creates need on-disk ids
+of their own: owner=root gives new files, directories, symlinks and device nodes the filesystem root's
+uid and gid; owner=UID:GID gives those ids. create() takes O_EXCL first so that only a file it makes is
+chowned, retrying when the name vanishes in between. A filesystem that cannot store the ids keeps its own, without error.
+
+The image and lock files are opened O_CLOEXEC, so libfuse's mount helper (macFUSE's mount_macfuse)
+does not inherit a descriptor for the device. The lock file is opened O_NOFOLLOW. A file named /dev/fd/N (linuxfs-open passes the
+helper's descriptor as fd 3) is used as that descriptor, made close-on-exec too.
+
+--- a/tools/lkl/lklfuse.c	2026-11-20 20:46:01.000000000 -0500
++++ b/tools/lkl/lklfuse.c	2026-11-21 05:11:44.000000000 -0500
+@@ -30,6 +30,10 @@
+ 	const char *type;
+ 	const char *opts;
+ 	const char *lock;
++	const char *owner;
++	int set_owner;
++	unsigned int owner_uid;
++	unsigned int owner_gid;
+ 	struct lkl_disk disk;
+ 	int disk_id;
+ 	int part;
+@@ -53,6 +57,7 @@
+ 	LKLFUSE_OPT("opts=%s", opts, 0),
+ 	LKLFUSE_OPT("part=%d", part, 0),
+ 	LKLFUSE_OPT("lock=%s", lock, 0),
++	LKLFUSE_OPT("owner=%s", owner, 0),
+ 	FUSE_OPT_KEY("-h", KEY_HELP),
+ 	FUSE_OPT_KEY("--help", KEY_HELP),
+ 	FUSE_OPT_KEY("-V",             KEY_VERSION),
+@@ -79,6 +84,7 @@
+ "    -o part=parition       partition to mount\n"
+ "    -o ro                  open block-device read-only\n"
+ "    -o lock=FILE           only mount after taking an exclusive lock on FILE\n"
++"    -o owner=root|UID:GID  owner of new files: the filesystem root's, or these ids\n"
+ "    -o opts=options        mount options (use \\ to escape , and =)\n"
+ );
+ }
+@@ -312,14 +318,52 @@
+ 	return 0;
+ }
+ 
++/*
++ * owner=: new files take the filesystem root's ids (owner=root) or given ones (owner=UID:GID), not
++ * LKL's own (0:0). A filesystem that cannot hold the ids (vfat) keeps its own; that is not an error.
++ */
++static int lklfuse_set_owner(void)
++{
++	struct lkl_stat st;
++	unsigned int uid, gid;
++	char extra;
++	long ret;
++
++	lklfuse.set_owner = 0;
++	if (!lklfuse.owner)
++		return 0;
++	if (strcmp(lklfuse.owner, "root") == 0) {
++		ret = lkl_sys_newfstatat(LKL_AT_FDCWD, "/", &st, 0);
++		if (ret < 0)
++			return lklfuse_err(ret);
++		uid = st.st_uid;
++		gid = st.st_gid;
++	} else if (sscanf(lklfuse.owner, "%u:%u%c", &uid, &gid, &extra) != 2) {
++		fprintf(stderr, "owner=%s: not root or UID:GID\n", lklfuse.owner);
++		return -EINVAL;
++	}
++	lklfuse.owner_uid = uid;
++	lklfuse.owner_gid = gid;
++	lklfuse.set_owner = 1;
++	return 0;
++}
++
++static int lklfuse_own(const char *path, long ret)
++{
++	if (ret == 0 && lklfuse.set_owner)
++		lkl_sys_fchownat(LKL_AT_FDCWD, path, lklfuse.owner_uid,
++				 lklfuse.owner_gid, LKL_AT_SYMLINK_NOFOLLOW);
++	return lklfuse_err(ret);
++}
++
+ static int lklfuse_mknod(const char *path, mode_t mode, dev_t dev)
+ {
+-	return lklfuse_err(lkl_sys_mknod(path, mode, dev));
++	return lklfuse_own(path, lkl_sys_mknod(path, mode, dev));
+ }
+ 
+ static int lklfuse_mkdir(const char *path, mode_t mode)
+ {
+-	return lklfuse_err(lkl_sys_mkdir(path, mode));
++	return lklfuse_own(path, lkl_sys_mkdir(path, mode));
+ }
+ 
+ static int lklfuse_unlink(const char *path)
+@@ -334,7 +378,7 @@
+ 
+ static int lklfuse_symlink(const char *oldname, const char *newname)
+ {
+-	return lklfuse_err(lkl_sys_symlink(oldname, newname));
++	return lklfuse_own(newname, lkl_sys_symlink(oldname, newname));
+ }
+ 
+ 
+@@ -418,6 +462,8 @@
+ 	 */
+ 	if (create)
+ 		flags |= LKL_O_CREAT;
++	if (create && (fi->flags & O_EXCL))
++		flags |= LKL_O_EXCL;
+ 	if (fi->flags & O_TRUNC)
+ 		flags |= LKL_O_TRUNC;
+ 	if (fi->flags & O_APPEND)
+@@ -467,7 +513,33 @@
+ static int lklfuse_create(const char *path, mode_t mode,
+ 	                  struct fuse_file_info *fi)
+ {
+-	return lklfuse_open3(path, true, mode, fi);
++	int flags = fi->flags;
++	int ret, tries;
++
++	if (!lklfuse.set_owner)
++		return lklfuse_open3(path, true, mode, fi);
++	/*
++	 * Only a file this call creates takes owner=; O_EXCL tells the two apart. When the name exists, it is
++	 * opened as it is. When it then is gone again (unlinked meanwhile), creating is tried again, so a file
++	 * made in that gap is still chowned. A name O_EXCL finds and a plain open does not, every time, is a
++	 * dangling symlink: create makes its target, which this call has just seen absent, so chown that too.
++	 */
++	for (tries = 0; tries < 4; tries++) {
++		fi->flags = flags | O_EXCL;
++		ret = lklfuse_open3(path, true, mode, fi);
++		fi->flags = flags;
++		if (ret == 0)
++			break;
++		if (ret != -EEXIST || (flags & O_EXCL))
++			return ret;
++		ret = lklfuse_open3(path, false, mode, fi);
++		if (ret != -ENOENT)
++			return ret;
++	}
++	if (tries == 4 && (ret = lklfuse_open3(path, true, mode, fi)) != 0)
++		return ret;
++	lkl_sys_fchown(fi->fh, lklfuse.owner_uid, lklfuse.owner_gid);
++	return 0;
+ }
+ 
+ static int lklfuse_open(const char *path, struct fuse_file_info *fi)
+@@ -920,6 +992,10 @@
+ 		goto out_umount;
+ 	}
+ 
++	ret = lklfuse_set_owner();
++	if (ret)
++		goto out_umount;
++
+ 	return 0;
+ 
+ out_umount:
+@@ -946,6 +1022,23 @@
+ 	lkl_sys_halt();
+ }
+ 
++/*
++ * close-on-exec, so the mount helper that libfuse runs does not inherit the image. /dev/fd/N is a descriptor
++ * this process was started with (linuxfs-open passes the helper's on fd 3): used as it is, and made
++ * close-on-exec too.
++ */
++static int lklfuse_open_disk(void)
++{
++	int fd;
++	char extra;
++
++	if (sscanf(lklfuse.file, "/dev/fd/%d%c", &fd, &extra) == 1 && fd >= 0 && fcntl(fd, F_GETFD) >= 0) {
++		fcntl(fd, F_SETFD, FD_CLOEXEC);
++		return fd;
++	}
++	return open(lklfuse.file, (lklfuse.ro ? O_RDONLY : O_RDWR) | O_CLOEXEC);
++}
++
+ int main(int argc, char **argv)
+ {
+ 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+@@ -963,7 +1056,7 @@
+ 	}
+ 
+ 	if (lklfuse.lock) {
+-		lockfd = open(lklfuse.lock, O_RDWR | O_CREAT, 0644);
++		lockfd = open(lklfuse.lock, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
+ 		if (lockfd < 0) {
+ 			fprintf(stderr, "failed to open %s: %s\n",
+ 				lklfuse.lock, strerror(errno));
+@@ -996,7 +1089,7 @@
+ 		goto out_free;
+ 	}
+ 
+-	ret = open(lklfuse.file, lklfuse.ro ? O_RDONLY : O_RDWR);
++	ret = lklfuse_open_disk();
+ 	if (ret < 0) {
+ 		perror(lklfuse.file);
+ 		goto out_free;

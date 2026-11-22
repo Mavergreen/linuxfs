@@ -1,0 +1,459 @@
+--- a/tools/lkl/lklfuse.c
++++ b/tools/lkl/lklfuse.c
+@@ -12,6 +12,10 @@
+ #include <errno.h>
+ #include <unistd.h>
+ #define FUSE_USE_VERSION 35
++#ifdef __APPLE__
++/* macFUSE: keep libfuse's portable callback signatures (no position argument, struct stat) */
++#define FUSE_DARWIN_ENABLE_EXTENSIONS 0
++#endif
+ #include <fuse3/fuse.h>
+ #include <fuse3/fuse_opt.h>
+ #include <fuse3/fuse_lowlevel.h>
+@@ -115,6 +119,143 @@
+ 	}
+ }
+ 
++#ifdef __APPLE__
++#include <sys/xattr.h>
++
++#define st_atim st_atimespec
++#define st_mtim st_mtimespec
++#define st_ctim st_ctimespec
++
++/*
++ * LKL returns Linux errno values, and macFUSE hands a callback's result to Darwin as it is, so
++ * translate: same name, Darwin's number. Two need a different name: a missing xattr is
++ * ENOATTR on Darwin, and macFUSE falls back to AppleDouble files only on ENOTSUP.
++ */
++static long lklfuse_err(long ret)
++{
++	if (ret >= 0)
++		return ret;
++	switch (-ret) {
++	case LKL_ENODATA: return -ENOATTR;
++	case LKL_EOPNOTSUPP: return -ENOTSUP;
++#define E(name) case LKL_##name: return -name;
++	E(E2BIG)
++	E(EACCES)
++	E(EADDRINUSE)
++	E(EADDRNOTAVAIL)
++	E(EAFNOSUPPORT)
++	E(EAGAIN)
++	E(EALREADY)
++	E(EBADF)
++	E(EBADMSG)
++	E(EBUSY)
++	E(ECANCELED)
++	E(ECHILD)
++	E(ECONNABORTED)
++	E(ECONNREFUSED)
++	E(ECONNRESET)
++	E(EDEADLK)
++	E(EDESTADDRREQ)
++	E(EDOM)
++	E(EDQUOT)
++	E(EEXIST)
++	E(EFAULT)
++	E(EFBIG)
++	E(EHOSTDOWN)
++	E(EHOSTUNREACH)
++	E(EIDRM)
++	E(EILSEQ)
++	E(EINPROGRESS)
++	E(EINTR)
++	E(EINVAL)
++	E(EIO)
++	E(EISCONN)
++	E(EISDIR)
++	E(ELOOP)
++	E(EMFILE)
++	E(EMLINK)
++	E(EMSGSIZE)
++	E(EMULTIHOP)
++	E(ENAMETOOLONG)
++	E(ENETDOWN)
++	E(ENETRESET)
++	E(ENETUNREACH)
++	E(ENFILE)
++	E(ENOBUFS)
++	E(ENODEV)
++	E(ENOENT)
++	E(ENOEXEC)
++	E(ENOLCK)
++	E(ENOLINK)
++	E(ENOMEM)
++	E(ENOMSG)
++	E(ENOPROTOOPT)
++	E(ENOSPC)
++	E(ENOSR)
++	E(ENOSTR)
++	E(ENOSYS)
++	E(ENOTBLK)
++	E(ENOTCONN)
++	E(ENOTDIR)
++	E(ENOTEMPTY)
++	E(ENOTRECOVERABLE)
++	E(ENOTSOCK)
++	E(ENOTTY)
++	E(ENXIO)
++	E(EOVERFLOW)
++	E(EOWNERDEAD)
++	E(EPERM)
++	E(EPFNOSUPPORT)
++	E(EPIPE)
++	E(EPROTO)
++	E(EPROTONOSUPPORT)
++	E(EPROTOTYPE)
++	E(ERANGE)
++	E(EREMOTE)
++	E(EROFS)
++	E(ESHUTDOWN)
++	E(ESOCKTNOSUPPORT)
++	E(ESPIPE)
++	E(ESRCH)
++	E(ESTALE)
++	E(ETIME)
++	E(ETIMEDOUT)
++	E(ETOOMANYREFS)
++	E(ETXTBSY)
++	E(EUSERS)
++	E(EXDEV)
++#undef E
++	default: return -EIO;
++	}
++}
++
++/* Darwin's XATTR_CREATE and XATTR_REPLACE are 2 and 4; Linux's are 1 and 2. */
++static int lklfuse_xattr_flags(int flags)
++{
++	return ((flags & XATTR_CREATE) ? 1 : 0) | ((flags & XATTR_REPLACE) ? 2 : 0);
++}
++
++/* macFUSE passes Darwin's RENAME_EXCL and RENAME_SWAP. */
++static unsigned int lklfuse_rename_flags(unsigned int flags)
++{
++	unsigned int f = 0;
++
++#ifdef RENAME_EXCL
++	if (flags & RENAME_EXCL)
++		f |= LKL_RENAME_NOREPLACE;
++#endif
++#ifdef RENAME_SWAP
++	if (flags & RENAME_SWAP)
++		f |= LKL_RENAME_EXCHANGE;
++#endif
++	return f;
++}
++#else
++#define lklfuse_err(ret) (ret)
++#define lklfuse_xattr_flags(flags) (flags)
++#define lklfuse_rename_flags(flags) (flags)
++#endif
++
+ static void lklfuse_xlat_stat(const struct lkl_stat *in, struct stat *st)
+ {
+ 	st->st_dev = in->st_dev;
+@@ -152,7 +293,7 @@
+ 	if (!ret)
+ 		lklfuse_xlat_stat(&lkl_stat, st);
+ 
+-	return ret;
++	return lklfuse_err(ret);
+ }
+ 
+ static int lklfuse_readlink(const char *path, char *buf, size_t len)
+@@ -161,7 +302,7 @@
+ 
+ 	ret = lkl_sys_readlink(path, buf, len);
+ 	if (ret < 0)
+-		return ret;
++		return lklfuse_err(ret);
+ 
+ 	if ((size_t)ret == len)
+ 		ret = len - 1;
+@@ -173,27 +314,27 @@
+ 
+ static int lklfuse_mknod(const char *path, mode_t mode, dev_t dev)
+ {
+-	return lkl_sys_mknod(path, mode, dev);
++	return lklfuse_err(lkl_sys_mknod(path, mode, dev));
+ }
+ 
+ static int lklfuse_mkdir(const char *path, mode_t mode)
+ {
+-	return lkl_sys_mkdir(path, mode);
++	return lklfuse_err(lkl_sys_mkdir(path, mode));
+ }
+ 
+ static int lklfuse_unlink(const char *path)
+ {
+-	return lkl_sys_unlink(path);
++	return lklfuse_err(lkl_sys_unlink(path));
+ }
+ 
+ static int lklfuse_rmdir(const char *path)
+ {
+-	return lkl_sys_rmdir(path);
++	return lklfuse_err(lkl_sys_rmdir(path));
+ }
+ 
+ static int lklfuse_symlink(const char *oldname, const char *newname)
+ {
+-	return lkl_sys_symlink(oldname, newname);
++	return lklfuse_err(lkl_sys_symlink(oldname, newname));
+ }
+ 
+ 
+@@ -201,13 +342,13 @@
+ 			  unsigned int flags)
+ {
+ 	/* libfuse: *flags* may be `RENAME_EXCHANGE` or `RENAME_NOREPLACE` */
+-	return lkl_sys_renameat2(LKL_AT_FDCWD, oldname, LKL_AT_FDCWD, newname,
+-				 flags);
++	return lklfuse_err(lkl_sys_renameat2(LKL_AT_FDCWD, oldname, LKL_AT_FDCWD, newname,
++				 lklfuse_rename_flags(flags)));
+ }
+ 
+ static int lklfuse_link(const char *oldname, const char *newname)
+ {
+-	return lkl_sys_link(oldname, newname);
++	return lklfuse_err(lkl_sys_link(oldname, newname));
+ }
+ 
+ static int lklfuse_chmod(const char *path, mode_t mode,
+@@ -220,7 +361,7 @@
+ 	else
+ 		ret = lkl_sys_fchmodat(LKL_AT_FDCWD, path, mode);
+ 
+-	return ret;
++	return lklfuse_err(ret);
+ }
+ 
+ static int lklfuse_chown(const char *path, uid_t uid, gid_t gid,
+@@ -233,7 +374,7 @@
+ 	else
+ 		ret = lkl_sys_fchownat(LKL_AT_FDCWD, path, uid, gid,
+ 				LKL_AT_SYMLINK_NOFOLLOW);
+-	return ret;
++	return lklfuse_err(ret);
+ }
+ 
+ static int lklfuse_truncate(const char *path, off_t off,
+@@ -246,7 +387,7 @@
+ 	else
+ 		ret = lkl_sys_truncate(path, off);
+ 
+-	return ret;
++	return lklfuse_err(ret);
+ }
+ 
+ #ifdef __FreeBSD__
+@@ -285,28 +426,38 @@
+ 		flags |= LKL_O_NONBLOCK;
+ 	if (fi->flags & O_DSYNC)
+ 		flags |= LKL_O_DSYNC;
++#ifdef O_DIRECT
+ 	if (fi->flags & O_DIRECT)
+ 		flags |= LKL_O_DIRECT;
++#endif
++#ifdef O_LARGEFILE
+ 	if (fi->flags & O_LARGEFILE)
+ 		flags |= LKL_O_LARGEFILE;
++#endif
+ 	if (fi->flags & O_DIRECTORY)
+ 		flags |= LKL_O_DIRECTORY;
+ 	if (fi->flags & O_NOFOLLOW)
+ 		flags |= LKL_O_NOFOLLOW;
++#ifdef O_NOATIME
+ 	if (fi->flags & O_NOATIME)
+ 		flags |= LKL_O_NOATIME;
++#endif
+ 	if (fi->flags & O_CLOEXEC)
+ 		flags |= LKL_O_CLOEXEC;
+ 	if (fi->flags & O_SYNC)
+ 		flags |= LKL_O_SYNC;
++#ifdef O_PATH
+ 	if (fi->flags & O_PATH)
+ 		flags |= LKL_O_PATH;
++#endif
++#ifdef O_TMPFILE
+ 	if (fi->flags & O_TMPFILE)
+ 		flags |= LKL_O_TMPFILE;
++#endif
+ 
+ 	ret = lkl_sys_open(path, flags, mode);
+ 	if (ret < 0)
+-		return ret;
++		return lklfuse_err(ret);
+ 
+ 	fi->fh = ret;
+ 
+@@ -339,7 +490,7 @@
+ 		buf += ret;
+ 	} while (size > 0);
+ 
+-	return ret < 0 ? ret : orig_size - (ssize_t)size;
++	return lklfuse_err(ret < 0 ? ret : orig_size - (ssize_t)size);
+ 
+ }
+ 
+@@ -358,7 +509,7 @@
+ 		buf += ret;
+ 	} while (size > 0);
+ 
+-	return ret < 0 ? ret : orig_size - (ssize_t)size;
++	return lklfuse_err(ret < 0 ? ret : orig_size - (ssize_t)size);
+ }
+ 
+ 
+@@ -369,7 +520,7 @@
+ 
+ 	ret = lkl_sys_statfs(path, &lkl_statfs);
+ 	if (ret < 0)
+-		return ret;
++		return lklfuse_err(ret);
+ 
+ 	stat->f_bsize = lkl_statfs.f_bsize;
+ 	stat->f_frsize = lkl_statfs.f_frsize;
+@@ -393,38 +544,38 @@
+ 
+ static int lklfuse_release(const char *path, struct fuse_file_info *fi)
+ {
+-	return lkl_sys_close(fi->fh);
++	return lklfuse_err(lkl_sys_close(fi->fh));
+ }
+ 
+ static int lklfuse_fsync(const char *path, int datasync,
+ 		       struct fuse_file_info *fi)
+ {
+ 	if (datasync)
+-		return lkl_sys_fdatasync(fi->fh);
++		return lklfuse_err(lkl_sys_fdatasync(fi->fh));
+ 	else
+-		return lkl_sys_fsync(fi->fh);
++		return lklfuse_err(lkl_sys_fsync(fi->fh));
+ }
+ 
+ static int lklfuse_setxattr(const char *path, const char *name, const char *val,
+ 		   size_t size, int flags)
+ {
+-	return lkl_sys_setxattr(path, name, val, size, flags);
++	return lklfuse_err(lkl_sys_setxattr(path, name, val, size, lklfuse_xattr_flags(flags)));
+ }
+ 
+ static int lklfuse_getxattr(const char *path, const char *name, char *val,
+ 			  size_t size)
+ {
+-	return lkl_sys_getxattr(path, name, val, size);
++	return lklfuse_err(lkl_sys_getxattr(path, name, val, size));
+ }
+ 
+ static int lklfuse_listxattr(const char *path, char *list, size_t size)
+ {
+-	return lkl_sys_listxattr(path, list, size);
++	return lklfuse_err(lkl_sys_listxattr(path, list, size));
+ }
+ 
+ static int lklfuse_removexattr(const char *path, const char *name)
+ {
+-	return lkl_sys_removexattr(path, name);
++	return lklfuse_err(lkl_sys_removexattr(path, name));
+ }
+ 
+ static int lklfuse_opendir(const char *path, struct fuse_file_info *fi)
+@@ -434,7 +585,7 @@
+ 
+ 	dir = lkl_opendir(path, &err);
+ 	if (!dir)
+-		return err;
++		return lklfuse_err(err);
+ 
+ 	fi->fh = (uintptr_t)dir;
+ 
+@@ -480,7 +631,7 @@
+ 	}
+ 
+ 	if (!de)
+-		return lkl_errdir(dir);
++		return lklfuse_err(lkl_errdir(dir));
+ 
+ 	return 0;
+ }
+@@ -489,7 +640,7 @@
+ {
+ 	struct lkl_dir *dir = (struct lkl_dir *)(uintptr_t)fi->fh;
+ 
+-	return lkl_closedir(dir);
++	return lklfuse_err(lkl_closedir(dir));
+ }
+ 
+ static int lklfuse_fsyncdir(const char *path, int datasync,
+@@ -499,14 +650,14 @@
+ 	int fd = lkl_dirfd(dir);
+ 
+ 	if (datasync)
+-		return lkl_sys_fdatasync(fd);
++		return lklfuse_err(lkl_sys_fdatasync(fd));
+ 	else
+-		return lkl_sys_fsync(fd);
++		return lklfuse_err(lkl_sys_fsync(fd));
+ }
+ 
+ static int lklfuse_access(const char *path, int mode)
+ {
+-	return lkl_sys_access(path, mode);
++	return lklfuse_err(lkl_sys_access(path, mode));
+ }
+ 
+ static int lklfuse_utimens(const char *path, const struct timespec tv[2],
+@@ -523,13 +674,13 @@
+ 	else
+ 		ret = lkl_sys_utimensat(-1, path, ts, LKL_AT_SYMLINK_NOFOLLOW);
+ 
+-	return ret;
++	return lklfuse_err(ret);
+ }
+ 
+ static int lklfuse_fallocate(const char *path, int mode, off_t offset,
+ 			     off_t len, struct fuse_file_info *fi)
+ {
+-	return lkl_sys_fallocate(fi->fh, mode, offset, len);
++	return lklfuse_err(lkl_sys_fallocate(fi->fh, mode, offset, len));
+ }
+ 
+ static ssize_t lklfuse_copy_file_range(const char *path_in,
+@@ -540,14 +691,14 @@
+ {
+ 	lkl_loff_t loff_in = off_in, loff_out = off_out;
+ 
+-	return lkl_sys_copy_file_range(fi_in->fh, &loff_in, fi_out->fh,
+-				       &loff_out, len, flags);
++	return lklfuse_err(lkl_sys_copy_file_range(fi_in->fh, &loff_in, fi_out->fh,
++				       &loff_out, len, flags));
+ }
+ 
+ static off_t lklfuse_lseek(const char *path, off_t off, int whence,
+ 			   struct fuse_file_info *fi)
+ {
+-	return lkl_sys_lseek(fi->fh, off, whence);
++	return lklfuse_err(lkl_sys_lseek(fi->fh, off, whence));
+ }
+ 
+ static void *lklfuse_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
+@@ -831,6 +982,14 @@
+ 	if (fuse_parse_cmdline(&args, &cli_opts))
+ 		return 1;
+ 
++#ifdef __APPLE__
++	/* macFUSE's libfuse cannot fork once mounted, and lklfuse daemonizes after mounting. */
++	if (!cli_opts.foreground && !cli_opts.show_help && !cli_opts.show_version) {
++		fprintf(stderr, "lklfuse: on macOS, run in the foreground (-f)\n");
++		return 1;
++	}
++#endif
++
+ 	ret = stat(cli_opts.mountpoint, &st);
+ 	if (ret) {
+ 		perror(cli_opts.mountpoint);
