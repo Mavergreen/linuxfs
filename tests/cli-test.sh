@@ -76,6 +76,23 @@ cat > "$T/bin/lsof" <<EOF
 echo "Finder 187 me cwd DIR 1,5 0 1 \$(tail -n 1 "$T/mtab" | sed 's/^.* on \(.*\) (.*/\1/')/d"
 EOF
 chmod 755 "$T/bin"/*
+# platform: cli/linuxfs is macOS-only and leans on two BSD behaviours GNU coreutils lacks: stat -f FORMAT, and cut -c
+#           counting characters, not bytes, in a UTF-8 locale. Off macOS these stand-ins supply both (stat's two formats
+#           as GNU's -c; cut -c 1-N through perl), so the suite also runs on the Linux CI host
+if [ "$(uname)" != Darwin ]; then
+  cat > "$T/bin/stat" <<'EOF2'
+#!/bin/sh
+[ "$1" = -f ] || exec /usr/bin/stat "$@"
+case $2 in %d) f=%d ;; %Lp) f=%a ;; *) echo "stat stand-in: no GNU form for -f $2" >&2; exit 2 ;; esac
+shift 2; exec /usr/bin/stat -c "$f" "$@"
+EOF2
+  cat > "$T/bin/cut" <<'EOF2'
+#!/bin/sh
+case $#:$1:$2 in 2:-c:1-*) N=${2#1-} LC_ALL=C exec perl -CS -ne 'chomp; print substr($_, 0, $ENV{N}), "\n"' ;; esac
+exec /usr/bin/cut "$@"
+EOF2
+  chmod +x "$T/bin/stat" "$T/bin/cut"
+fi
 export PATH="$T/bin:$PATH" LINUXFS_LKLFUSE="$T/bin/lklfuse" LINUXFS_PROBE="$T/bin/probe" LINUXFS_OPEN="$T/none"
 export LINUXFS_DOMAIN=test.linuxfs LINUXFS_STATE="$T/state" LINUXFS_LOGS="$T/logs" LINUXFS_VOLUMES="$T/Volumes" LINUXFS_LOCKS="$T/locks" LINUXFS_WAIT=50
 L=$ROOT/cli/linuxfs

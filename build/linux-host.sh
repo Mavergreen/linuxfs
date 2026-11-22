@@ -27,12 +27,14 @@ if [ "${LINUX_HOST_FUSE:-0}" = 1 ]; then
   pw=$HOME/Library/Caches/mm-build/linux-host-passwd
   mkdir -p "${pw%/*}"
   printf "root:x:0:0::/root:/bin/sh\n%s:x:%s:%s::%s:/bin/sh\n" "$(id -un)" "$(id -u)" "$(id -g)" "$HOME" > "$pw"
-  fuse="--device /dev/fuse --cap-add SYS_ADMIN -v $pw:/etc/passwd:ro"
+  # platform: Docker's default AppArmor profile (Ubuntu hosts: GitHub's runners) denies mount(2) even with SYS_ADMIN,
+  #           so lklfuse's FUSE mount fails "Permission denied"; hosts without AppArmor ignore the option
+  fuse="--device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined -v $pw:/etc/passwd:ro"
 fi
 # shellcheck disable=SC2086  # $fuse is deliberately split into options
 exec docker run --rm $fuse -u "$(id -u):$(id -g)" -v "$SHARE:$SHARE" -v linuxfs-gate0-work:/work -w "$PWD" \
   -e HOME="$HOME" -e TMPDIR=/work/tmp \
   -e MAVERICKS_BUILD_ROOT="$HOME/Library/Caches/mm-build" \
-  -e SHIPYARD_SCRIPTS="$sy" \
+  -e SHIPYARD_SCRIPTS="$sy" -e SHIPYARD_VERSION \
   -e MAVERICKS_SOURCE_CACHE="$HOME/Library/Caches/mavericks-sources" \
   "$img" "$@"

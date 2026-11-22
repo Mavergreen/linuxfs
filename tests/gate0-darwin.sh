@@ -64,6 +64,10 @@ killed() {
   [ $rc -eq 137 ] && grep -q "^# churn [1-9]" "$log"
 }
 case "${1:-}" in
+'')
+  # spec: tests/gate0-darwin.sh usage line -- run-repo-tests.sh runs every top-level test with no arguments; this is a
+  #       two-host round driven by hand on the 10.9 box (`round`), so a bare run has nothing to check here and skips
+  echo "gate0-darwin.sh: a by-hand round (gate0-darwin.sh round, on the 10.9 box); nothing to run bare" >&2; exit 77 ;;
 mkimages)
   on linux mkimages
   sh "$ROOT/tests/lib/mkimages.sh" "$IMG" ;;
