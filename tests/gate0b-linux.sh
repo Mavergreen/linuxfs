@@ -12,10 +12,10 @@ set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${GATE0_WORK:-/work/gate0-linux}
 OUT=$WORK/out IMG=$WORK/images0b
-# platform: the FUSE mount point is in the container's own /tmp, not on the /work volume: on GitHub's runner
-#           fusermount3 refuses a mount point on that volume ("mount failed: Permission denied"), as
-#           apfs-fixtures-linux.sh's /tmp one is not
-MNT=$(mktemp -d /tmp/gate0b-mnt.XXXXXX)
+# platform: Ubuntu's AppArmor profile for fusermount3 confines a container's fusermount3 too (it attaches by path) and
+#           denies it dac_override, so fusermount3 cannot enter a mount point only its owner may (mktemp -d makes it
+#           0700): "mount failed: Permission denied" on GitHub's runner. The mount point is made searchable by all
+MNT=$(mktemp -d /tmp/gate0b-mnt.XXXXXX); chmod 755 "$MNT"
 LKLFUSE=${LKLFUSE:-$OUT/lklfuse}
 n=0 bad=0 pid=
 step() {
