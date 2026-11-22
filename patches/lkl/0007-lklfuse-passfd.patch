@@ -1,0 +1,108 @@
+lklfuse: passfd=N, an encrypted volume's password from a descriptor
+
+lklfuse reads the password from descriptor N and gives it to the filesystem as pass=HEX in the mount data
+(linux-apfs-rw, with linuxfs's encryption patch, unlocks the volume with it), so it is never on a command
+line; the buffers that held it are cleared once the mount is done.
+
+--- a/tools/lkl/lklfuse.c	2026-11-21 05:48:06.000000000 -0500
++++ b/tools/lkl/lklfuse.c	2026-11-21 05:48:33.000000000 -0500
+@@ -37,6 +37,7 @@
+ 	struct lkl_disk disk;
+ 	int disk_id;
+ 	const char *tier2file;
++	int passfd;
+ 	struct lkl_disk tier2;
+ 	int tier2_id;
+ 	int part;
+@@ -44,6 +45,7 @@
+ 	int mb;
+ } lklfuse = {
+ 	.mb = 64,
++	.passfd = -1,
+ };
+ 
+ #define LKLFUSE_OPT(t, p, v) { t, offsetof(struct lklfuse, p), v }
+@@ -62,6 +64,7 @@
+ 	LKLFUSE_OPT("lock=%s", lock, 0),
+ 	LKLFUSE_OPT("owner=%s", owner, 0),
+ 	LKLFUSE_OPT("tier2file=%s", tier2file, 0),
++	LKLFUSE_OPT("passfd=%d", passfd, 0),
+ 	FUSE_OPT_KEY("-h", KEY_HELP),
+ 	FUSE_OPT_KEY("--help", KEY_HELP),
+ 	FUSE_OPT_KEY("-V",             KEY_VERSION),
+@@ -88,6 +91,7 @@
+ "    -o part=parition       partition to mount\n"
+ "    -o ro                  open block-device read-only\n"
+ "    -o tier2file=PATH      second device of an APFS Fusion container (/dev/fd/N: that descriptor)\n"
++"    -o passfd=N            read an encrypted volume's password from descriptor N\n"
+ "    -o lock=FILE           only mount after taking an exclusive lock on FILE\n"
+ "    -o owner=root|UID:GID  owner of new files: the filesystem root's, or these ids\n"
+ "    -o opts=options        mount options (use \\ to escape , and =)\n"
+@@ -936,6 +940,47 @@
+ 	return 0;
+ }
+ 
++/*
++ * An encrypted volume's password: read from passfd (to its end; one trailing newline dropped) and given to the
++ * filesystem as pass=HEX in the mount data, so that it is never on a command line.
++ */
++static int lklfuse_add_pass(char *mopts, size_t size)
++{
++	char pw[1024];
++	size_t n = 0, i, len = strlen(mopts);
++	ssize_t r;
++	int ret = -1;
++
++	while (n < sizeof(pw) && (r = read(lklfuse.passfd, pw + n, sizeof(pw) - n)) != 0) {
++		if (r < 0) {
++			if (errno == EINTR)
++				continue;
++			perror("passfd");
++			goto out;
++		}
++		n += r;
++	}
++	if (n == sizeof(pw)) {
++		fprintf(stderr, "passfd: the password is too long\n");
++		goto out;
++	}
++	if (n && pw[n - 1] == '\n')
++		n--;
++	if (len + sizeof(",pass=") + 2 * n > size) {
++		fprintf(stderr, "passfd: no room for the password in the mount options\n");
++		goto out;
++	}
++	strcat(mopts, len ? ",pass=" : "pass=");
++	len = strlen(mopts);
++	for (i = 0; i < n; i++)
++		snprintf(mopts + len + 2 * i, 3, "%02x", (unsigned char)pw[i]);
++	ret = 0;
++out:
++	memset(pw, 0, sizeof(pw));
++	close(lklfuse.passfd);
++	return ret;
++}
++
+ static int start_lkl(void)
+ {
+ 	long ret;
+@@ -987,6 +1032,11 @@
+ 		strcat(remaining_mopts, *remaining_mopts ? ",tier2=/tier2" : "tier2=/tier2");
+ 	}
+ 
++	if (lklfuse.passfd >= 0 && lklfuse_add_pass(remaining_mopts, sizeof(remaining_mopts))) {
++		ret = -1;
++		goto out_halt;
++	}
++
+ 	ret = lkl_mount_dev(lklfuse.disk_id, lklfuse.part, lklfuse.type,
+ 			    mount_flags, remaining_mopts,
+ 			    mpoint, sizeof(mpoint));
+@@ -999,6 +1049,7 @@
+ 				"device write-protected, mounted read-only\n");
+ 	}
+ 
++	memset(remaining_mopts, 0, sizeof(remaining_mopts));	/* it may hold the password */
+ 	if (ret) {
+ 		fprintf(stderr, "can't mount disk: %s\n", lkl_strerror(ret));
+ 		goto out_halt;

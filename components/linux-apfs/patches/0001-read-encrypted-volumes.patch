@@ -1,0 +1,260 @@
+linux-apfs-rw: read software-encrypted volumes, read-only (linuxfs)
+
+Hooks crypt.c and unlock.c (components/linux-apfs/src) into the driver: a pass= mount option (the password,
+in hex) unlocks the volume at mount, in place of the warning that it may not read correctly; object blocks are
+decrypted as read when their checksum says so; file data is read through apfs_read_folio_encrypted(); and
+whole-dstream reads (xattrs, compressed resource forks) decrypt each block by its extent's crypto_id.
+
+diff -ruN a/apfs.h b/apfs.h
+--- a/apfs.h
++++ b/apfs.h
+@@ -382,6 +382,8 @@
+ /*
+  * Volume superblock data in memory
+  */
++struct apfs_xts;
++
+ struct apfs_sb_info {
+ 	struct apfs_nxsb_info *s_nxi; /* In-memory container sb for volume */
+ 	struct list_head list;		/* List of mounted volumes in container */
+@@ -391,6 +393,9 @@
+ 
+ 	char *s_tier2_path; /* Path to the tier 2 device */
+ 
++	char *s_pass;		/* linuxfs: an encrypted volume's password (hex), until the mount unlocks it */
++	struct apfs_xts *s_xts;	/* linuxfs: its keys once unlocked; NULL if the volume is not encrypted */
++
+ 	char *s_snap_name; /* Label for the mounted snapshot */
+ 	u64 s_snap_xid; /* Transaction id for mounted snapshot */
+ 
+@@ -1033,6 +1038,13 @@
+ #endif
+ extern int apfs_clone_extents(struct apfs_dstream_info *dstream, u64 new_id);
+ extern int apfs_nonsparse_dstream_read(struct apfs_dstream_info *dstream, void *buf, size_t count, u64 offset);
++extern int apfs_logic_to_phys_crypto(struct apfs_dstream_info *dstream, sector_t dsblock, u64 *bno, u64 *tweak);
++
++/* crypt.c (linuxfs: reading software-encrypted volumes) */
++extern int apfs_unlock_volume(struct super_block *sb);
++extern void apfs_decrypt_object(struct super_block *sb, struct buffer_head *bh);
++extern void apfs_decrypt_block(struct super_block *sb, void *buf, u64 tweak);
++extern int apfs_read_folio_encrypted(struct folio *folio);
+ extern void apfs_nonsparse_dstream_preread(struct apfs_dstream_info *dstream);
+ 
+ /* file.c */
+diff -ruN a/extents.c b/extents.c
+--- a/extents.c
++++ b/extents.c
+@@ -206,6 +206,31 @@
+ 	return 0;
+ }
+ 
++/*
++ * linuxfs: as apfs_logic_to_phys_bno(), and *TWEAK is the block's XTS tweak (the extent's crypto_id plus the
++ * block's offset in it), or 0 when it is stored in the clear.
++ */
++int apfs_logic_to_phys_crypto(struct apfs_dstream_info *dstream, sector_t dsblock, u64 *bno, u64 *tweak)
++{
++	struct super_block *sb = dstream->ds_sb;
++	struct apfs_file_extent ext;
++	u64 blk_off;
++	int ret;
++
++	ret = apfs_extent_read(dstream, dsblock, &ext);
++	if (ret)
++		return ret;
++	*bno = 0;
++	*tweak = 0;
++	if (apfs_ext_is_hole(&ext))
++		return 0;
++	blk_off = dsblock - (ext.logical_addr >> sb->s_blocksize_bits);
++	*bno = ext.phys_block_num + blk_off;
++	if (ext.crypto_id)
++		*tweak = ext.crypto_id + blk_off;
++	return 0;
++}
++
+ /* This does the same as apfs_get_block(), but without taking any locks */
+ int __apfs_get_block(struct apfs_dstream_info *dstream, sector_t dsblock,
+ 		     struct buffer_head *bh_result, int create)
+@@ -2248,6 +2273,7 @@
+  */
+ int apfs_nonsparse_dstream_read(struct apfs_dstream_info *dstream, void *buf, size_t count, u64 offset)
+ {
++	char *clear = NULL;	/* linuxfs: one block, decrypted */
+ 	struct super_block *sb = dstream->ds_sb;
+ 	u64 logical_start_block, logical_end_block, log_bno, blkcnt, idx;
+ 	struct buffer_head **bhs = NULL;
+@@ -2323,11 +2349,32 @@
+ 		else
+ 			left_in_block = sb->s_blocksize - off_in_block;
+ 
++		if (APFS_SB(sb)->s_xts) {
++			u64 pbno, tweak;
++
++			ret = apfs_logic_to_phys_crypto(dstream, log_bno, &pbno, &tweak);
++			if (ret)
++				goto out;
++			if (tweak) {
++				if (!clear)
++					clear = kmalloc(sb->s_blocksize, GFP_KERNEL);
++				if (!clear) {
++					ret = -ENOMEM;
++					goto out;
++				}
++				memcpy(clear, bhs[idx]->b_data, sb->s_blocksize);
++				apfs_decrypt_block(sb, clear, tweak);
++				memcpy(buf, clear + off_in_block, left_in_block);
++				buf += left_in_block;
++				continue;
++			}
++		}
+ 		memcpy(buf, bhs[idx]->b_data + off_in_block, left_in_block);
+ 		buf += left_in_block;
+ 	}
+ 
+ out:
++	kfree_sensitive(clear);
+ 	if (bhs) {
+ 		for (idx = 0; idx < blkcnt; idx++)
+ 			brelse(bhs[idx]);
+diff -ruN a/inode.c b/inode.c
+--- a/inode.c
++++ b/inode.c
+@@ -31,6 +31,8 @@
+ 
+ static int apfs_read_folio(struct file *file, struct folio *folio)
+ {
++	if (APFS_SB(folio->mapping->host->i_sb)->s_xts)
++		return apfs_read_folio_encrypted(folio);
+ 	return mpage_read_folio(folio, apfs_get_block);
+ }
+ 
+@@ -47,6 +49,9 @@
+ 
+ static void apfs_readahead(struct readahead_control *rac)
+ {
++	/* encrypted: each folio is read, and decrypted, by apfs_read_folio() */
++	if (APFS_SB(rac->mapping->host->i_sb)->s_xts)
++		return;
+ 	mpage_readahead(rac, apfs_get_block);
+ }
+ 
+diff -ruN a/object.c b/object.c
+--- a/object.c
++++ b/object.c
+@@ -245,6 +245,8 @@
+ 		apfs_err(sb, "failed to read object block 0x%llx", bno);
+ 		return ERR_PTR(-EIO);
+ 	}
++	if (APFS_SB(sb)->s_xts)
++		apfs_decrypt_object(sb, bh);
+ 
+ 	obj = (struct apfs_obj_phys *)bh->b_data;
+ 	type = le32_to_cpu(obj->o_type);
+diff -ruN a/super.c b/super.c
+--- a/super.c
++++ b/super.c
+@@ -1207,7 +1207,7 @@
+ };
+ 
+ enum {
+-	Opt_readwrite, Opt_cknodes, Opt_uid, Opt_gid, Opt_vol, Opt_snap, Opt_tier2, Opt_err,
++	Opt_readwrite, Opt_cknodes, Opt_uid, Opt_gid, Opt_vol, Opt_snap, Opt_tier2, Opt_pass, Opt_err,
+ };
+ 
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+@@ -1219,6 +1219,7 @@
+ 	{Opt_vol, "vol=%u"},
+ 	{Opt_snap, "snap=%s"},
+ 	{Opt_tier2, "tier2=%s"},
++	{Opt_pass, "pass=%s"},
+ 	{Opt_err, NULL}
+ };
+ #else
+@@ -1230,6 +1231,7 @@
+ 	fsparam_u32	("vol",		Opt_vol),
+ 	fsparam_string	("snap",	Opt_snap),
+ 	fsparam_string	("tier2",	Opt_tier2),
++	fsparam_string	("pass",	Opt_pass),
+ 	{}
+ };
+ #endif
+@@ -1371,6 +1373,12 @@
+ 			if (!sbi->s_tier2_path)
+ 				return -ENOMEM;
+ 			break;
++		case Opt_pass:
++			kfree_sensitive(sbi->s_pass);
++			sbi->s_pass = match_strdup(&args[0]);
++			if (!sbi->s_pass)
++				return -ENOMEM;
++			break;
+ 		default:
+ 			apfs_warn(NULL, "invalid mount option %s", p);
+ 			return -EINVAL;
+@@ -1427,6 +1435,12 @@
+ 		if (!sbi->s_tier2_path)
+ 			return -ENOMEM;
+ 		break;
++	case Opt_pass:
++		kfree_sensitive(sbi->s_pass);
++		sbi->s_pass = kstrdup(param->string, GFP_KERNEL);
++		if (!sbi->s_pass)
++			return -ENOMEM;
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -1556,9 +1570,13 @@
+ 		apfs_warn(sb, "extent prealloc flag is set");
+ 
+ 	features = le64_to_cpu(vsb_raw->apfs_fs_flags);
+-	/* Some encrypted volumes are readable anyway */
+-	if (!(features & APFS_FS_UNENCRYPTED))
+-		apfs_warn(sb, "volume is encrypted, may not be read correctly");
++	/* linuxfs: a software-encrypted volume is unlocked with its password (crypt.c) */
++	if (!(features & APFS_FS_UNENCRYPTED)) {
++		int uerr = apfs_unlock_volume(sb);
++
++		if (uerr)
++			return uerr;
++	}
+ 
+ 	features = le64_to_cpu(vsb_raw->apfs_readonly_compatible_features);
+ 	if (features & ~APFS_SUPPORTED_ROCOMPAT_MASK) {
+@@ -2075,6 +2093,8 @@
+ 		/* Only one superblock per volume */
+ 		apfs_free_main_super(sbi);
+ 		kfree(sbi->s_snap_name);
++		kfree_sensitive(sbi->s_pass);
++		kfree_sensitive(sbi->s_xts);
+ 		sbi->s_snap_name = NULL;
+ 		kfree(sbi->s_tier2_path);
+ 		sbi->s_tier2_path = NULL;
+@@ -2130,6 +2150,8 @@
+ out_free_sbi:
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
+ 	kfree(sbi->s_snap_name);
++	kfree_sensitive(sbi->s_pass);
++	kfree_sensitive(sbi->s_xts);
+ 	kfree(sbi->s_tier2_path);
+ 	kfree(sbi);
+ #endif
+@@ -2158,6 +2180,8 @@
+ 	sb->s_fs_info = NULL;
+ 
+ 	kfree(sbi->s_snap_name);
++	kfree_sensitive(sbi->s_pass);
++	kfree_sensitive(sbi->s_xts);
+ 	sbi->s_snap_name = NULL;
+ 	kfree(sbi->s_tier2_path);
+ 	sbi->s_tier2_path = NULL;
+@@ -2212,6 +2236,8 @@
+ 	if (sbi) {
+ 		apfs_free_main_super(sbi);
+ 		kfree(sbi->s_snap_name);
++		kfree_sensitive(sbi->s_pass);
++		kfree_sensitive(sbi->s_xts);
+ 		kfree(sbi->s_tier2_path);
+ 		kfree(sbi);
+ 	}

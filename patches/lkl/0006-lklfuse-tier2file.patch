@@ -1,0 +1,102 @@
+lklfuse: tier2file=, the second device of an APFS Fusion container
+
+lklfuse adds the file (or /dev/fd/N descriptor) as a second disk, read-only, makes a node for it in LKL's root,
+and passes it to the filesystem as tier2=, the option linux-apfs-rw reads a Fusion container's second device by.
+
+--- a/tools/lkl/lklfuse.c	2026-11-21 05:32:13.000000000 -0500
++++ b/tools/lkl/lklfuse.c	2026-11-21 05:32:13.000000000 -0500
+@@ -36,6 +36,9 @@
+ 	unsigned int owner_gid;
+ 	struct lkl_disk disk;
+ 	int disk_id;
++	const char *tier2file;
++	struct lkl_disk tier2;
++	int tier2_id;
+ 	int part;
+ 	int ro;
+ 	int mb;
+@@ -58,6 +61,7 @@
+ 	LKLFUSE_OPT("part=%d", part, 0),
+ 	LKLFUSE_OPT("lock=%s", lock, 0),
+ 	LKLFUSE_OPT("owner=%s", owner, 0),
++	LKLFUSE_OPT("tier2file=%s", tier2file, 0),
+ 	FUSE_OPT_KEY("-h", KEY_HELP),
+ 	FUSE_OPT_KEY("--help", KEY_HELP),
+ 	FUSE_OPT_KEY("-V",             KEY_VERSION),
+@@ -83,6 +87,7 @@
+ "    -o mb=memory           amount of memory to allocate in MB (default: 64)\n"
+ "    -o part=parition       partition to mount\n"
+ "    -o ro                  open block-device read-only\n"
++"    -o tier2file=PATH      second device of an APFS Fusion container (/dev/fd/N: that descriptor)\n"
+ "    -o lock=FILE           only mount after taking an exclusive lock on FILE\n"
+ "    -o owner=root|UID:GID  owner of new files: the filesystem root's, or these ids\n"
+ "    -o opts=options        mount options (use \\ to escape , and =)\n"
+@@ -968,6 +973,20 @@
+ 		goto out_halt;
+ 	}
+ 
++	if (lklfuse.tier2file) {
++		/* the second device of an APFS Fusion container, as the driver's tier2= */
++		uint32_t dev;
++
++		ret = lkl_get_virtio_blkdev(lklfuse.tier2_id, 0, &dev);
++		if (!ret)
++			ret = lkl_sys_mknod("/tier2", LKL_S_IFBLK | 0600, dev);
++		if (ret || strlen(remaining_mopts) + sizeof(",tier2=/tier2") > sizeof(remaining_mopts)) {
++			fprintf(stderr, "can't attach %s: %s\n", lklfuse.tier2file, lkl_strerror(ret));
++			goto out_halt;
++		}
++		strcat(remaining_mopts, *remaining_mopts ? ",tier2=/tier2" : "tier2=/tier2");
++	}
++
+ 	ret = lkl_mount_dev(lklfuse.disk_id, lklfuse.part, lklfuse.type,
+ 			    mount_flags, remaining_mopts,
+ 			    mpoint, sizeof(mpoint));
+@@ -1027,16 +1046,21 @@
+  * this process was started with (linuxfs-open passes the helper's on fd 3): used as it is, and made
+  * close-on-exec too.
+  */
+-static int lklfuse_open_disk(void)
++static int lklfuse_open_path(const char *path, int ro)
+ {
+ 	int fd;
+ 	char extra;
+ 
+-	if (sscanf(lklfuse.file, "/dev/fd/%d%c", &fd, &extra) == 1 && fd >= 0 && fcntl(fd, F_GETFD) >= 0) {
++	if (sscanf(path, "/dev/fd/%d%c", &fd, &extra) == 1 && fd >= 0 && fcntl(fd, F_GETFD) >= 0) {
+ 		fcntl(fd, F_SETFD, FD_CLOEXEC);
+ 		return fd;
+ 	}
+-	return open(lklfuse.file, (lklfuse.ro ? O_RDONLY : O_RDWR) | O_CLOEXEC);
++	return open(path, (ro ? O_RDONLY : O_RDWR) | O_CLOEXEC);
++}
++
++static int lklfuse_open_disk(void)
++{
++	return lklfuse_open_path(lklfuse.file, lklfuse.ro);
+ }
+ 
+ int main(int argc, char **argv)
+@@ -1111,6 +1135,22 @@
+ 
+ 	lklfuse.disk_id = ret;
+ 
++	if (lklfuse.tier2file) {
++		/* read-only: the driver never writes a Fusion container */
++		lklfuse.tier2.fd = lklfuse_open_path(lklfuse.tier2file, 1);
++		if (lklfuse.tier2.fd < 0) {
++			perror(lklfuse.tier2file);
++			ret = -1;
++			goto out_close_disk;
++		}
++		ret = lkl_disk_add(&lklfuse.tier2);
++		if (ret < 0) {
++			fprintf(stderr, "can't add disk %s: %s\n", lklfuse.tier2file, lkl_strerror(ret));
++			goto out_close_disk;
++		}
++		lklfuse.tier2_id = ret;
++	}
++
+ 	fuse = fuse_new(&args, &lklfuse_ops, sizeof(lklfuse_ops), NULL);
+ 	if (!fuse) {
+ 		ret = -1;

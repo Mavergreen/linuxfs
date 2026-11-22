@@ -1,0 +1,4 @@
+REPO=https://github.com/linux-apfs/linux-apfs-rw
+TAG=v0.3.22
+DIGEST=80f5db04ecd3b240fee4c67829a5b5465f11f63f
+TARBALL_SHA256=3dc61144b6ad5564ed8bf8c4911c01bf24cbaa31d832ea7d78371e87998c43b4
