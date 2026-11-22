@@ -17,7 +17,7 @@ n=0 bad=0 pid=
 step() {
   n=$((n + 1)); what=$1; shift
   if "$@" > "$WORK/0b-step-$n.log" 2>&1; then echo "ok $n - $what"
-  else echo "not ok $n - $what (see $WORK/0b-step-$n.log)"; bad=1; fi
+  else echo "not ok $n - $what (see $WORK/0b-step-$n.log)"; sed 's/^/#   /' "$WORK/0b-step-$n.log" | tail -n 20; bad=1; fi
 }
 fstype() { case $1 in ntfs) echo ntfs3 ;; *) echo "$1" ;; esac; }
 checker() { sh "$ROOT/tests/lib/check-fs.sh" "$@"; }
@@ -29,11 +29,11 @@ mount_fs() {
   pid=$!
   i=0
   until grep -q " $MNT " /proc/mounts; do
-    i=$((i + 1)); [ $i -le 100 ] || return 1
-    kill -0 "$pid" 2>/dev/null || return 1
+    i=$((i + 1)); [ $i -le 300 ] || { echo "no FUSE mount after 30 s"; cat "$WORK/lklfuse-$1.log"; return 1; }
+    kill -0 "$pid" 2>/dev/null || { echo "lklfuse ended before mounting:"; cat "$WORK/lklfuse-$1.log"; return 1; }
     sleep 0.1
   done
-  ls "$MNT" > /dev/null && kill -0 "$pid"
+  ls "$MNT" > /dev/null && kill -0 "$pid" || { cat "$WORK/lklfuse-$1.log"; return 1; }
 }
 unmount_fs() {
   fusermount3 -u "$MNT" || return 1

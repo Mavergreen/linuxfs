@@ -38,7 +38,8 @@ i=0; while kill -0 "$pid" 2>/dev/null && [ $i -lt 150 ]; do sleep 0.1; i=$((i + 
 ! kill -0 "$pid" 2>/dev/null || false; ok $? "lklfuse ends within 15 s of the disk going"
 if kill -0 "$pid" 2>/dev/null; then rc=running; else wait "$pid"; rc=$?; pid=; fi
 [ "$rc" = 1 ]; ok $? "and exits 1 ($rc)"
-grep -q "is gone" "$W/log"; ok $? "saying the device is gone ($(grep 'gone' "$W/log" | head -n 1))"
+grep -q "is gone" "$W/log"; r=$?; ok $r "saying the device is gone ($(grep 'gone' "$W/log" | head -n 1))"
+[ $r -eq 0 ] || sed 's/^/#   /' "$W/log" | tail -n 30
 ! grep -q "^lklfuse: I/O error on" "$W/log" || false; ok $? "and nothing more about it: no I/O error line for a device already gone (10.9's pull printed both)"
 ! grep -q " $MNT " /proc/mounts || false; ok $? "its FUSE mount is down, not left dead"
 [ -z "$pid" ] || { kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; pid=; }
