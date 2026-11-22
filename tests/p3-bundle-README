@@ -1,0 +1,26 @@
+linuxfs P3 bundle: the product's CLI, root helper and automount agent on Mac OS X 10.9.
+
+Needs: Mavergreen macFUSE installed (lklfuse loads /usr/local/lib/libfuse3.4.dylib). No network, python or root
+login. Copy this directory to the guest's local disk and, as the user logged in at the console:
+
+    cd ~/linuxfs-p3-N && sh run.sh
+
+Part A (CLI on images) runs as that user. Part B installs and loads the root helper with `sudo -n`; without
+passwordless sudo it is skipped. The helper stays loaded through Part C, as an installed agent probes disks
+through it, and is unloaded and removed at the end. Part C (the automount agent) needs the user logged in at the
+console (Finder running) and the helper; without them it is skipped. Its images are attached -nomount, so
+DiskArbitration peeks at them (the agent claims and mounts) but mounts nothing itself; whether the Mac's "not
+readable" dialog would appear needs a real disk, so it is not asked. Last, Part C attaches an encrypted APFS
+image: a dialog "Unlock an encrypted volume" appears on the console. Enter linuxfs-test, tick "Remember this
+password in my keychain", and press Mount (there are three minutes; unanswered, that step is skipped). It is
+ejected (the disk must go, and the agent log that it kept the password), then attached once more and should mount from the keychain with no second dialog: please say whether one appeared.
+With no one at the screen (over ssh), run `P3_ASKPASS=1 sh run.sh`: a script answers in place of the dialog, and
+the second attach is checked to ask nothing; the dialog itself is then left untested.
+
+The guest is left as it was found, on any exit, a failed one included: the helper (loaded without -w, so
+launchd's overrides are untouched), its log (copied to out/), any linuxfs mount this run made still up, any of
+the run's images still attached, new empty mount points in /Volumes, the keychain items filed under the test
+image's partition, the dev.mavergreen.linuxfs preferences (restored as they were, or removed when there were
+none), and work/ (its raw images; its small files, errors and logs, are kept in out/work/).
+
+Send back: results.txt and the out/ directory (images and logs).

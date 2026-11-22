@@ -1,0 +1,136 @@
+name: on-mavericks
+
+# spec: mavergreen-conventions SKILL.md "Acceptance on real 10.9" -- the 10.9 acceptance job: Linux makes ext4, btrfs, xfs,
+#       NTFS, exFAT and APFS images (tests/lib/probe-images.sh); a fresh Mac OS X 10.9.5 guest (Mavergreen/mavericks-vm), logged in
+#       to its console so the automount agent runs, installs the pinned Mavergreen macFUSE (and the Recaulk that release was
+#       tested with) and the run's pkg, and runs tests/smoke-mavericks.sh, which mounts, writes, unmounts and reads back each
+#       image through `linuxfs mount` and checks the agent automounts an attached ext4 disk; then Linux checks every image
+#       the guest wrote with its own fsck (tests/lib/check-fs.sh). Any panic, hang, skip (77) or failed fsck fails.
+#       release.yml calls it, and its publish job needs it.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: The run's version, <UPSTREAM_VERSION>-mavericks.N
+        type: string
+        required: true
+      artifact:
+        description: The run's dist artifact, holding linuxfs-<version>.pkg
+        type: string
+        required: true
+    secrets:
+      MAVERICKS_VM_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  images:
+    name: Linux makes the test images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: Mavergreen/shipyard/.github/actions/install@v1
+      - name: ext4, btrfs, xfs, NTFS, exFAT and APFS images, labelled, in the build container
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/images"
+          mkdir -p "$d"
+          LINUX_HOST_SHARE="$HOME" sh build/linux-host.sh sh tests/lib/probe-images.sh "$d"
+          mkdir -p "$RUNNER_TEMP/up"
+          for fs in ext4 btrfs xfs ntfs exfat apfs; do gzip -c "$d/$fs.img" > "$RUNNER_TEMP/up/$fs.img.gz"; done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linuxfs-images-before
+          if-no-files-found: error
+          path: ${{ runner.temp }}/up/*.img.gz
+
+  guest:
+    name: Mount, write, read back and automount on Mac OS X 10.9 (mavericks-vm)
+    needs: [images]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # platform: review M11: GitHub withholds organization secrets from a fork's pull request, so its run cannot reach the VM.
+      #           That cannot verify the change, which is a failure (never a pass), but it fails first and says why.
+      - name: The 10.9 VM key
+        env:
+          HAS_KEY: ${{ secrets.MAVERICKS_VM_KEY != '' }}
+        run: |
+          if [ "$HAS_KEY" != true ]; then
+            echo "::error::No MAVERICKS_VM_KEY: GitHub gives a fork's pull request no organization secrets, so this run cannot reach the 10.9 VM and cannot verify the change. A maintainer pushes the branch to this repository to run it here."
+            exit 1
+          fi
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: Mavergreen/shipyard/.github/actions/install@v1
+      - uses: actions/download-artifact@v8
+        with: { name: "${{ inputs.artifact }}", path: dist }
+      - uses: actions/download-artifact@v8
+        with: { name: linuxfs-images-before, path: images }
+      # spec: components/macfuse/version -- the macfuse lklfuse was built against; Recaulk is the one that macfuse release pins at its own tag, so
+      #       the guest runs macfuse exactly as macfuse's own 10.9 job did
+      - name: The pinned Mavergreen macFUSE and its Recaulk
+        run: |
+          set -eu
+          mf="$(tr -d '[:space:]' < components/macfuse/version)"
+          sh "$SHIPYARD_SCRIPTS/fetch-release-pkg.sh" macfuse "$mf" "macfuse-$mf.pkg" deps
+          . "$SHIPYARD_SCRIPTS/mavericks_fetch.sh"
+          shipyard_curl "https://raw.githubusercontent.com/Mavergreen/macfuse/$mf/components/recaulk/version" "$RUNNER_TEMP/recaulk-version"
+          rc="$(tr -d '[:space:]' < "$RUNNER_TEMP/recaulk-version")"
+          sh "$SHIPYARD_SCRIPTS/fetch-release-pkg.sh" recaulk "$rc" "recaulk-$rc.pkg" deps
+      - uses: Mavergreen/mavericks-vm@v1
+        env:
+          LINUXFS_VERSION: ${{ inputs.version }}
+        with:
+          image-key: ${{ secrets.MAVERICKS_VM_KEY }}
+          aqua-session: 'true'
+          copyback: 'true'
+          debug-on-error: true
+          envs: 'LINUXFS_VERSION'
+          run: |
+            sw_vers
+            sudo -n true || { echo "the guest's user cannot sudo without a password, and installer needs root"; exit 1; }
+            sudo installer -pkg deps/recaulk-*.pkg -target /
+            sudo installer -pkg deps/macfuse-*.pkg -target /
+            sudo installer -pkg "dist/linuxfs-$LINUXFS_VERSION.pkg" -target /
+            status=0; sh tests/smoke-mavericks.sh "$LINUXFS_VERSION" images images-after || status=$?
+            [ "$status" -eq 0 ] || { echo "tests/smoke-mavericks.sh exited $status (77 is a skip, a failure here)"; exit 1; }
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: linuxfs-images-after
+          if-no-files-found: warn
+          path: images-after/*.img.gz
+
+  fsck:
+    name: Linux's own fsck on every image the guest wrote
+    needs: [guest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with: { persist-credentials: false }
+      - uses: Mavergreen/shipyard/.github/actions/install@v1
+      - uses: actions/download-artifact@v8
+        with: { name: linuxfs-images-after, path: "${{ runner.temp }}/after" }
+      - name: e2fsck -fn, btrfs check, xfs_repair -n, ntfsfix -n and fsck.exfat -n, in the build container
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/after"
+          for z in "$d"/*.img.gz; do gunzip "$z"; done
+          LINUX_HOST_SHARE="$HOME" sh build/linux-host.sh sh -c '
+            rc=0
+            for c in ext4:ext4 btrfs:btrfs xfs:xfs ntfs:ntfs exfat:exfat ext4:ext4-auto; do
+              fs=${c%%:*} img=$1/${c#*:}.img
+              if [ ! -f "$img" ]; then echo "not ok - $img: the guest returned no such image"; rc=1
+              elif sh tests/lib/check-fs.sh "$fs" "$img"; then echo "ok - $img is clean ($fs)"
+              else echo "not ok - $img is not clean ($fs)"; rc=1; fi
+            done
+            exit $rc' _ "$d"

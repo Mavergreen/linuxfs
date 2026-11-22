@@ -1,0 +1,21 @@
+name: repackage-on-ingredient-bump
+
+# spec: mavergreen-conventions SKILL.md "Consuming a Mavergreen toolchain" -- an ingredient pin that moves on main (clang22,
+#       which brings Recaulk; macFUSE, whose libfuse 3 headers and dylib lklfuse builds against) dispatches release.yml with local_release=true, which cuts and
+#       publishes .N+1. components/lkl/version and the UPSTREAM_VERSION derived from it are this port's own upstream (a new
+#       upstream cuts .1 by itself).
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'components/**'
+
+permissions: {}
+
+jobs:
+  repackage:
+    permissions:
+      actions: write
+    uses: Mavergreen/shipyard/.github/workflows/repackage-on-ingredient-bump.yml@v1
+    with:
+      own-upstream-paths: UPSTREAM_VERSION components/lkl/version

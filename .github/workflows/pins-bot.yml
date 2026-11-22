@@ -1,0 +1,112 @@
+name: pins-bot
+
+# spec: build/pin-lkl.sh -- Renovate moves two pins it cannot finish. An LKL bump moves components/lkl/version's DIGEST, and
+#       the build fetches that commit as GitHub's tarball verified by TARBALL_SHA256, and reads UPSTREAM_VERSION, which is
+#       derived from the commit's tree; a clang22 bump moves components/clang22/version, and a Linux build verifies the
+#       clang22 archive against components/clang22/linux-sha256. Until those follow, CI fails at the first fetch or at the
+#       stale-UPSTREAM_VERSION check. This fills them on Renovate's own branch, in two jobs:
+#       - pins (contents: read) runs build/pin-lkl.sh, which downloads the tarball, checks with git that it holds exactly
+#         the commit's tree, and derives the version; and reads the clang22 release's SHA256SUMS for its Linux archive.
+#         Upstream's bytes are read there, never run, and never beside a token that can write. It outputs KEY=VALUE
+#         words, or nothing when the pins already hold them.
+#       - push touches no upstream byte: it validates the words, writes them, commits, and pushes to the branch with a
+#         token of the Mavergreen pins-bot GitHub App (org variable PINS_BOT_CLIENT_ID, org secret PINS_BOT_PRIVATE_KEY;
+#         minted for this repository with contents: write alone). A push made with GITHUB_TOKEN starts no workflow; the
+#         App's push starts release.yml's pull_request run (its push trigger ignores renovate/**), and that run's
+#         `required (release)` is the PR's required check on the new head. The job's own GITHUB_TOKEN reads only.
+#       renovate.json's gitIgnoredAuthors keeps this bot's commit from marking the branch as edited by someone else.
+
+on:
+  push:
+    branches: ['renovate/**']
+    paths: [components/lkl/version, components/linux-apfs/version, components/clang22/version]
+
+permissions: {}
+
+# platform: the run the bot's own push starts gets a group of its own, and its jobs are skipped: that push is the
+#           checked pins, and it must not cancel the run that made it.
+concurrency:
+  group: pins-bot-${{ github.ref }}${{ github.actor == 'mavergreen-pins-bot[bot]' && format('-{0}', github.run_id) || '' }}
+  cancel-in-progress: true
+
+jobs:
+  pins:
+    if: github.actor != 'mavergreen-pins-bot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      pins: ${{ steps.pin.outputs.pins }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install mavericks-shipyard
+        uses: Mavergreen/shipyard/.github/actions/install@v1
+
+      - name: The LKL tarball's SHA-256, UPSTREAM_VERSION, and clang22's Linux archive digest, if they are stale
+        id: pin
+        run: |
+          set -eu
+          sh build/pin-lkl.sh >&2
+          sh build/pin-lkl.sh components/linux-apfs/version >&2
+          cv="$(tr -d '[:space:]' < components/clang22/version)"
+          . "$SHIPYARD_SCRIPTS/mavericks_fetch.sh"
+          shipyard_curl "https://github.com/Mavergreen/clang-22/releases/download/$cv/SHA256SUMS" "$RUNNER_TEMP/clang22-sums"
+          line="$(grep -F "  clang22-$cv-linux-x86_64.tar.gz" "$RUNNER_TEMP/clang22-sums" || true)"
+          [ "$(printf '%s\n' "$line" | grep -c .)" -eq 1 ] || { echo "::error::clang22 $cv's SHA256SUMS does not list clang22-$cv-linux-x86_64.tar.gz exactly once"; exit 1; }
+          printf '%s\n' "$line" > components/clang22/linux-sha256
+          pins=""
+          if ! git diff --quiet -- components/lkl/version components/linux-apfs/version UPSTREAM_VERSION components/clang22/linux-sha256; then
+            pins="LKL_TARBALL_SHA256=$(sed -n 's/^TARBALL_SHA256=//p' components/lkl/version)"
+            pins="$pins APFS_TARBALL_SHA256=$(sed -n 's/^TARBALL_SHA256=//p' components/linux-apfs/version)"
+            pins="$pins UPSTREAM_VERSION=$(tr -d '[:space:]' < UPSTREAM_VERSION)"
+            pins="$pins CLANG22_LINUX_SHA256=$(printf '%s\n' "$line" | cut -c1-64)"
+          fi
+          echo "pins=$pins" >> "$GITHUB_OUTPUT"
+
+  push:
+    needs: pins
+    if: needs.pins.outputs.pins != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: A pins-bot App token, contents write on this repository alone
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.PINS_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.PINS_BOT_PRIVATE_KEY }}
+          permission-contents: write
+
+      - uses: actions/checkout@v7
+        with:
+          token: ${{ steps.app.outputs.token }}
+
+      - name: Commit the pins to the branch, as the App, which starts release.yml on its new head
+        env:
+          PINS: ${{ needs.pins.outputs.pins }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -eu
+          word() { v=""; for w in $PINS; do case "$w" in "$1="*) v="${w#*=}" ;; esac; done; printf '%s' "$v"; }
+          lkl="$(word LKL_TARBALL_SHA256)"; up="$(word UPSTREAM_VERSION)"; cl="$(word CLANG22_LINUX_SHA256)"; ap="$(word APFS_TARBALL_SHA256)"
+          for h in "$lkl" "$cl" "$ap"; do
+            case "$h" in *[!0-9a-f]*|'') echo "bad digest: '$h'" >&2; exit 1 ;; esac
+            [ "${#h}" -eq 64 ] || { echo "bad digest: '$h'" >&2; exit 1; }
+          done
+          case "$up" in [0-9]*.[0-9]*.[0-9]*.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;; *) echo "bad UPSTREAM_VERSION: '$up'" >&2; exit 1 ;; esac
+          case "$up" in *[!0-9.]*) echo "bad UPSTREAM_VERSION: '$up'" >&2; exit 1 ;; esac
+          sed -i "s/^TARBALL_SHA256=.*/TARBALL_SHA256=$lkl/" components/lkl/version
+          sed -i "s/^TARBALL_SHA256=.*/TARBALL_SHA256=$ap/" components/linux-apfs/version
+          printf '%s\n' "$up" > UPSTREAM_VERSION
+          cv="$(tr -d '[:space:]' < components/clang22/version)"
+          printf '%s  clang22-%s-linux-x86_64.tar.gz\n' "$cl" "$cv" > components/clang22/linux-sha256
+          git diff --quiet -- components/lkl/version components/linux-apfs/version UPSTREAM_VERSION components/clang22/linux-sha256 && { echo "pins already hold them"; exit 0; }
+          git -c user.name='mavergreen-pins-bot[bot]' -c user.email='342268518+mavergreen-pins-bot[bot]@users.noreply.github.com' \
+            commit -q -m 'chore(pins): the LKL and linux-apfs-rw tarball digests, UPSTREAM_VERSION and clang22 Linux digest of the moved pins' \
+            -m 'Written by .github/workflows/pins-bot.yml: its pins job checked, with git, that the LKL tarball is its commit'"'"'s tree, and read clang22'"'"'s digest from its release'"'"'s SHA256SUMS.' \
+            components/lkl/version components/linux-apfs/version UPSTREAM_VERSION components/clang22/linux-sha256
+          git push origin "HEAD:refs/heads/$BRANCH"

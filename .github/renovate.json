@@ -1,0 +1,61 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "github>Mavergreen/shipyard"
+  ],
+  "gitIgnoredAuthors": [
+    "342268518+mavergreen-pins-bot[bot]@users.noreply.github.com"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The LKL pin: a commit on lkl/linux master (LKL publishes no releases). The pins bot writes TARBALL_SHA256 and the derived UPSTREAM_VERSION on Renovate's branch.",
+      "managerFilePatterns": [
+        "/^components/lkl/version$/"
+      ],
+      "matchStrings": [
+        "REPO=(?<packageName>\\S+)\\s+REF=(?<currentValue>\\S+)\\s+DIGEST=(?<currentDigest>[0-9a-f]{40})"
+      ],
+      "depNameTemplate": "lkl/linux",
+      "datasourceTemplate": "git-refs"
+    },
+    {
+      "customType": "regex",
+      "description": "The linux-apfs-rw pin (the APFS driver grafted into LKL): a tag and its commit. The pins bot writes TARBALL_SHA256 on Renovate's branch.",
+      "managerFilePatterns": [
+        "/^components/linux-apfs/version$/"
+      ],
+      "matchStrings": [
+        "REPO=https://github.com/(?<packageName>\\S+)\\s+TAG=(?<currentValue>\\S+)\\s+DIGEST=(?<currentDigest>[0-9a-f]{40})"
+      ],
+      "depNameTemplate": "linux-apfs/linux-apfs-rw",
+      "datasourceTemplate": "github-tags"
+    },
+    {
+      "customType": "regex",
+      "description": "The clang22 pin: a Mavergreen/clang-22 release tag. The pins bot writes components/clang22/linux-sha256 from that release's SHA256SUMS on Renovate's branch.",
+      "managerFilePatterns": [
+        "/^components/clang22/version$/"
+      ],
+      "matchStrings": [
+        "^(?<currentValue>\\S+)\\s*$"
+      ],
+      "depNameTemplate": "Mavergreen/clang-22",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-mavericks\\.(?<build>\\d+)$"
+    },
+    {
+      "customType": "regex",
+      "description": "The Mavergreen macFUSE release lklfuse builds against (libfuse 3 headers and dylib, from its pkg) and the 10.9 acceptance job installs.",
+      "managerFilePatterns": [
+        "/^components/macfuse/version$/"
+      ],
+      "matchStrings": [
+        "^(?<currentValue>\\S+)\\s*$"
+      ],
+      "depNameTemplate": "Mavergreen/macfuse",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-mavericks\\.(?<build>\\d+)$"
+    }
+  ]
+}
