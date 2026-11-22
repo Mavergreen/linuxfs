@@ -14,9 +14,13 @@ if [ ! -x "$LKLFUSE" ]; then
   sh "$ROOT/build/build-lkl-linux.sh" "$(dirname "$LKLFUSE")" > "${TMPDIR:-/tmp}/lklfuse-gone-build.log" 2>&1 &&
     [ -x "$LKLFUSE" ] || { echo "lklfuse-gone-linux.sh: building lklfuse failed:" >&2; tail -20 "${TMPDIR:-/tmp}/lklfuse-gone-build.log" >&2; exit 1; }
 fi
-W=$(mktemp -d "${TMPDIR:-/tmp}/lklfuse-gone.XXXXXX"); MNT=$W/mnt; mkdir "$MNT"
+W=$(mktemp -d "${TMPDIR:-/tmp}/lklfuse-gone.XXXXXX")
+# platform: the FUSE mount point is in the container's own /tmp, not on the /work volume: on GitHub's runner
+#           fusermount3 refuses a mount point on that volume ("mount failed: Permission denied"), as
+#           apfs-fixtures-linux.sh's /tmp one is not
+MNT=$(mktemp -d /tmp/lklfuse-gone-mnt.XXXXXX)
 pid=
-trap 'fusermount3 -uz "$MNT" 2>/dev/null; [ -z "$pid" ] || kill -9 "$pid" 2>/dev/null; rm -rf "$W"' EXIT
+trap 'fusermount3 -uz "$MNT" 2>/dev/null; [ -z "$pid" ] || kill -9 "$pid" 2>/dev/null; rm -rf "$W"; rmdir "$MNT" 2>/dev/null' EXIT
 n=0 bad=0
 ok() { n=$((n + 1)); if [ "$1" = 0 ]; then echo "ok $n - $2"; else echo "not ok $n - $2"; bad=1; fi; }
 

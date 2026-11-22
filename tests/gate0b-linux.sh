@@ -11,7 +11,11 @@ set -u
 [ -c /dev/fuse ] || { echo "gate0b-linux.sh: no /dev/fuse (LINUX_HOST_FUSE=1?)" >&2; exit 77; }
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${GATE0_WORK:-/work/gate0-linux}
-OUT=$WORK/out IMG=$WORK/images0b MNT=$WORK/mnt
+OUT=$WORK/out IMG=$WORK/images0b
+# platform: the FUSE mount point is in the container's own /tmp, not on the /work volume: on GitHub's runner
+#           fusermount3 refuses a mount point on that volume ("mount failed: Permission denied"), as
+#           apfs-fixtures-linux.sh's /tmp one is not
+MNT=$(mktemp -d /tmp/gate0b-mnt.XXXXXX)
 LKLFUSE=${LKLFUSE:-$OUT/lklfuse}
 n=0 bad=0 pid=
 step() {
@@ -83,7 +87,8 @@ dirty_refused() {
   cat "$WORK/lklfuse-dirty.log"
   [ $rc -ne 0 ] && grep -q 'volume is dirty' "$WORK/lklfuse-dirty.log" && ! grep -q " $MNT " /proc/mounts
 }
-mkdir -p "$WORK" "$MNT"
+mkdir -p "$WORK"
+trap 'fusermount3 -uz "$MNT" 2>/dev/null; rmdir "$MNT" 2>/dev/null' EXIT
 [ -x "$LKLFUSE" ] || { echo "gate0b-linux.sh: no $LKLFUSE (run build/build-lkl-linux.sh)" >&2; exit 1; }
 head -c 4194304 /dev/urandom > "$WORK/payload"
 truncate -s 64M "$WORK/ops.img" && mkfs.ext4 -q -F "$WORK/ops.img"
