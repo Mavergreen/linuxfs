@@ -14,7 +14,6 @@ fails=0
 fail() { printf 'FAIL: %s\n' "$*" >&2; fails=$((fails + 1)); }
 T="$(mktemp -d "${TMPDIR:-/tmp}/package-test.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
-. "$REPO_ROOT/tests/lib/shipyard-registry.sh" "$T"
 SOURCE_DATE_EPOCH=1763600000; export SOURCE_DATE_EPOCH
 CL="$(sh "$SHIPYARD_SCRIPTS/fetch_clang22.sh" "$REPO_ROOT/components/clang22")" || { echo "FAIL: no clang22" >&2; exit 1; }
 LIPO="$CL/bin/llvm-lipo"; OTOOL="$CL/bin/llvm-otool"; NM="$CL/bin/llvm-nm"; STRINGS="$CL/bin/llvm-strings"
