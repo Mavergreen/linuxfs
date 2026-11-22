@@ -1,0 +1,14 @@
+# linuxfs: (re)load the root helper that opens disks for the user at the console. Only on the running system.
+if [ "${3:-/}" = / ]; then
+  launchctl unload /Library/LaunchDaemons/dev.mavergreen.linuxfs.helper.plist 2>/dev/null || :
+  launchctl load -w /Library/LaunchDaemons/dev.mavergreen.linuxfs.helper.plist
+fi
+# linuxfs: (re)load the automount agent in the console user's session; otherwise it starts at the next login.
+if [ "${3:-/}" = / ]; then
+  user=$(stat -f %Su /dev/console 2>/dev/null)
+  lw=$(pgrep -x -u "$user" loginwindow 2>/dev/null | head -n 1)
+  if [ -n "$user" ] && [ "$user" != root ] && [ -n "$lw" ]; then
+    launchctl bsexec "$lw" sudo -u "$user" launchctl unload -S Aqua /Library/LaunchAgents/dev.mavergreen.linuxfs.agent.plist 2>/dev/null || :
+    launchctl bsexec "$lw" sudo -u "$user" launchctl load -S Aqua /Library/LaunchAgents/dev.mavergreen.linuxfs.agent.plist || :
+  fi
+fi
