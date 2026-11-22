@@ -1,0 +1,385 @@
+#!/bin/sh
+# platform: macOS-only -- drives lklfuse through Mavergreen macFUSE; diskutil, mount and lsof
+#   usage: linuxfs list
+#          linuxfs mount DEVICE|IMAGE [MOUNTPOINT] [--ro] [--linux-ids] [--tier2 DEVICE|IMAGE] [--password-stdin] [-o LKLFUSE-OPTIONS]
+#          linuxfs unmount [--force] MOUNTPOINT|DEVICE|IMAGE
+#          linuxfs status
+#          linuxfs prefs [Automount|ReadOnly|NTFSTakeover|APFSWrite on|off]
+#          linuxfs ignore|unignore LABEL
+#          linuxfs automount DISK
+#          Mounts a Linux filesystem (ext4, btrfs, xfs, NTFS, exFAT, FAT, f2fs) with Linux's own driver, running in
+#          lklfuse. Every file appears owned by you and only you can open the volume; new files are written with
+#          the filesystem root's owner. --linux-ids shows Linux's owners instead. A dirty NTFS volume mounts
+#          read-only. A device the Mac has mounted is refused. APFS mounts read-only (APFSWrite on: read-write, but
+#          never an encrypted or Fusion volume); an encrypted volume's password is asked for at the terminal, or
+#          read from stdin (--password-stdin). Exit 0 on success, 1 on failure, 2 on misuse, 4 when an encrypted
+#          volume's password is missing or wrong.
+set -u
+PREFIX=${LINUXFS_PREFIX:-/usr/local/mavergreen/linuxfs}
+LKLFUSE=${LINUXFS_LKLFUSE:-$PREFIX/libexec/lklfuse}
+PROBE=${LINUXFS_PROBE:-$PREFIX/libexec/linuxfs-probe}
+OPENER=${LINUXFS_OPEN:-$PREFIX/libexec/linuxfs-open}
+STATE=${LINUXFS_STATE:-$HOME/Library/Caches/dev.mavergreen.linuxfs/mounts}
+LOGS=${LINUXFS_LOGS:-$HOME/Library/Logs/linuxfs}
+VOLUMES=${LINUXFS_VOLUMES:-/Volumes}
+LOCKS=${LINUXFS_LOCKS:-$HOME/Library/Caches/dev.mavergreen.linuxfs/locks}   # the user's own, never /tmp (review I2)
+WAIT=${LINUXFS_WAIT:-100}
+DOMAIN=${LINUXFS_DOMAIN:-dev.mavergreen.linuxfs}
+
+die() { echo "linuxfs: $*" >&2; exit 1; }
+usage() { sed -n 's/^#   usage: /usage: /p; s/^#          linuxfs /       linuxfs /p' "$0" >&2; exit 2; }
+tab=$(printf '\t')
+
+# The mount table's mount points, one per line (a dead FUSE mount hangs anything that touches its directory).
+mounted_points() {
+  mount | awk '{ o = index($0, " on "); if (!o) next; r = substr($0, o + 4)
+    for (i = length(r); i > 0; i--) if (substr(r, i, 2) == " (") { print substr(r, 1, i - 1); next } }'
+}
+is_mounted() { mounted_points | grep -qxF "$1"; }
+# The Mac's own mount of a device node, if any: its mount point.
+mac_mount_of() {
+  mount | awk -v d="$1" '{ o = index($0, " on "); if (!o) next; if (substr($0, 1, o - 1) != d) next
+    r = substr($0, o + 4); for (i = length(r); i > 0; i--) if (substr(r, i, 2) == " (") { print substr(r, 1, i - 1); exit } }'
+}
+
+# STATE holds one file per running lklfuse, named by its pid: source, mount point, type, mode (rw|ro).
+# A record counts only while its pid is still that lklfuse, running on that mount point: after a reboot, or
+# a crash, the pid may be some other process's (review M7).
+records() {
+  [ -d "$STATE" ] || return 0
+  for f in "$STATE"/*; do
+    [ -f "$f" ] || continue
+    pid=${f##*/} r=$(cat "$f")
+    m=$(printf '%s\n' "$r" | cut -f 2)
+    case $(ps -o command= -p "$pid" 2>/dev/null) in
+      *lklfuse*" $m") printf '%s\t%s\n' "$pid" "$r" ;;
+      # gone (a pulled disk: lklfuse took its mount down and exited): the folder linuxfs made in VOLUMES goes too,
+      # if nothing is mounted there and it is empty (rmdir); never a mount point the user named
+      *) rm -f "$f"
+         [ "$(dirname "$m")" != "$VOLUMES" ] || is_mounted "$m" || rmdir "$m" 2>/dev/null || : ;;
+    esac
+  done
+}
+
+# A device argument as its block node (/dev/diskNsM) and raw node (/dev/rdiskNsM).
+# The lock name of an image file: its inode and filesystem, so every path to it agrees.
+image_lock() { printf 'image-%s-%s\n' "$(ls -i "$1" | awk '{ print $1 }')" "$(stat -f %d "$1")"; }
+
+# The image file hdiutil attached as whole disk /dev/diskN, if it did.
+image_of() {
+  hdiutil info 2>/dev/null | awk -v d="$1" '
+    /^image-path/ { sub(/^image-path[ \t]*:[ \t]*/, ""); img = $0 }
+    /^=+$/ { img = "" }
+    { split($0, f, "\t"); sub(/[ \t]+$/, "", f[1]) } f[1] == d && img != "" { print img; exit }'
+}
+
+device_nodes() {
+  d=${1#/dev/}; d=${d#r}
+  case $d in disk[0-9]*) blk=/dev/$d raw=/dev/r$d ;; *) return 1 ;; esac
+}
+
+# A name a volume can carry, a directory can be called and an lklfuse -o value can hold: no / or : (paths),
+# no , = or \ (they would end the option and start another: review I1), no leading ., not empty.
+# Empty unless it is UTF-8 (the Mac names folders in it); at most 200 characters, cut at a character
+# whatever the caller's locale (review M5).
+safe_name() {
+  printf '%s' "$1" | iconv -f UTF-8 -t UTF-8 > /dev/null 2>&1 || return 0
+  printf '%s' "$1" | LC_ALL=C tr '/:,=\\' '-----' | LC_ALL=C sed 's/^\.*//' | LC_ALL=en_US.UTF-8 cut -c 1-200
+}
+free_mountpoint() {
+  base=$VOLUMES/$1; p=$base; i=1
+  while [ -e "$p" ] || is_mounted "$p"; do p="$base $i"; i=$((i + 1)); done
+  printf '%s\n' "$p"
+}
+
+cmd_list() {
+  printf 'DEVICE\tTYPE\tLABEL\tMOUNTED\n'
+  diskutil list | awk '{ print $NF }' | grep -E '^disk[0-9]+(s[0-9]+)?$' | while read -r d; do
+    out=$("$PROBE" "/dev/r$d" 2>/dev/null); rc=$?
+    if [ $rc -eq 2 ] && [ -x "$OPENER" ]; then out=$("$OPENER" --probe "/dev/$d" 2>/dev/null); rc=$?; fi
+    case $rc in
+      0) ;;
+      1) continue ;;
+      *) out="?${tab}(needs the linuxfs helper, or sudo, to read)" ;;
+    esac
+    at=$(mac_mount_of "/dev/$d")
+    [ -n "$at" ] || at=$(records | awk -F"$tab" -v s="/dev/r$d" '$2 == s { print $3 }')
+    printf '/dev/%s\t%s\t%s\n' "$d" "$out" "${at:--}"
+  done
+}
+
+# lklfuse in the foreground of a background job, until the volume appears or lklfuse exits.
+# Sets $pid; returns lklfuse's status when it exits early (output in $log).
+# Starts a command in the background, logging to $log, and sets pid. With $password set, the command gets it on fd 5,
+# through a pipe from the shell's own printf, so it is on no command line.
+launch() {
+  if [ -n "${password+x}" ]; then printf '%s\n' "$password" | "$@" 5<&0 < /dev/null > "$log" 2>&1 &
+  else "$@" > "$log" 2>&1 &
+  fi
+  pid=$!
+}
+
+run_lklfuse() { # SOURCE MOUNTPOINT OPTIONS [OPENER-DEVICE [SECOND-OPENER-DEVICE]]   (the password: $password, if set)
+  [ -z "${password+x}" ] || set -- "$1" "$2" "$3,passfd=5" "${4:-}" "${5:-}"
+  if [ -n "${4:-}" ]; then
+    rof=; case ,$3, in *,ro,*) rof=--ro ;; esac
+    if [ -n "${5:-}" ]; then launch "$OPENER" $rof "$4" --also "$5" "$LKLFUSE" -f -o "$3" /dev/fd/3 "$2"
+    else launch "$OPENER" $rof "$4" "$LKLFUSE" -f -o "$3" /dev/fd/3 "$2"
+    fi
+  else
+    launch "$LKLFUSE" -f -o "$3" "$1" "$2"
+  fi
+  i=0
+  while ! is_mounted "$2"; do
+    if ! kill -0 "$pid" 2>/dev/null; then wait "$pid"; return $?; fi
+    i=$((i + 1)); [ $i -le "$WAIT" ] || { kill "$pid" 2>/dev/null; wait "$pid"; echo "lklfuse did not mount within $((WAIT / 10)) s" >> "$log"; return 1; }
+    sleep 0.1
+  done
+  return 0
+}
+
+# A disk's "TYPE<TAB>LABEL[<TAB>EXTRA]": from the probe when the raw node is readable, else through the helper.
+probe_dev() { if [ -r "$1" ]; then "$PROBE" "$1" 2>/dev/null; else "$OPENER" --probe "$1" 2>/dev/null; fi; }
+
+# The attached disk (/dev/rdiskN...) whose probe names it ROLE (main|tier2) of APFS Fusion container UUID.
+fusion_partner() { # ROLE UUID
+  diskutil list | awk '{ print $NF }' | grep -E '^disk[0-9]+(s[0-9]+)?$' | while read -r d; do
+    case $(probe_dev "/dev/r$d" | cut -f 3) in "fusion-$1 $2") echo "/dev/r$d"; break ;; esac
+  done
+}
+
+# Asks at the terminal for an encrypted volume's password, without echo; sets password.
+ask_password() { # NAME REJECTED HINT
+  [ -z "$2" ] || echo "linuxfs: wrong password${3:+ (hint: $3)}" > /dev/tty
+  printf 'Password for %s: ' "$1" > /dev/tty
+  tty_was=$(stty -g < /dev/tty); stty -echo < /dev/tty
+  IFS= read -r password < /dev/tty; r=$?
+  stty "$tty_was" < /dev/tty; echo > /dev/tty
+  return $r
+}
+
+cmd_mount() {
+  target= mnt= ro= ids= extra= tier2= pwstdin=
+  unset password
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --ro) ro=1 ;;
+      --tier2) [ $# -ge 2 ] || usage; tier2=$2; shift ;;
+      --password-stdin) pwstdin=1 ;;
+      --linux-ids) ids=1 ;;
+      -o) [ $# -ge 2 ] || usage; extra=${extra:+$extra,}$2; shift ;;
+      -*) usage ;;
+      *) if [ -z "$target" ]; then target=$1; elif [ -z "$mnt" ]; then mnt=$1; else usage; fi ;;
+    esac
+    shift
+  done
+  [ -n "$target" ] || usage
+  open_dev=
+  if device_nodes "$target"; then
+    at=$(mac_mount_of "$blk")
+    [ -z "$at" ] || die "$blk is mounted by the Mac at $at; eject it first (diskutil unmount $blk)"
+    src=$raw lockname=${raw#/dev/}
+    # review M6: a disk hdiutil attached from an image is that image, so it takes the image file's lock
+    # (with the partition's number), and mounting the file and the device at once is refused
+    whole=${blk%s[0-9]*}; img=$(image_of "$whole")
+    if [ -n "$img" ] && [ -f "$img" ]; then
+      lockname=$(image_lock "$img"); [ "$whole" = "$blk" ] || lockname=$lockname-s${blk##*s}
+    fi
+    [ -r "$raw" ] && [ -w "$raw" ] || { [ -x "$OPENER" ] && open_dev=$raw; } ||
+      die "cannot open $raw: the linuxfs helper is not installed, so mount it with sudo"
+  else
+    [ -f "$target" ] || die "$target: no such image or device"
+    src=$(cd "$(dirname "$target")" && pwd)/$(basename "$target")
+    lockname=$(image_lock "$src")
+  fi
+  if [ -n "$open_dev" ]; then probed=$("$OPENER" --probe "$open_dev"); rc=$?
+  else probed=$("$PROBE" "$src"); rc=$?; fi
+  case $rc in
+    0) ;;
+    1) die "$target: no filesystem linuxfs knows (ext4, btrfs, xfs, NTFS, exFAT, FAT, f2fs)" ;;
+    *) die "$target: cannot read it" ;;
+  esac
+  type=${probed%%"$tab"*} rest=${probed#*"$tab"}; label=${rest%%"$tab"*} fusion=
+  case $rest in *"$tab"*) fusion=${rest#*"$tab"} ;; esac
+  # APFS Fusion: read-only, from both devices; the second is found among the attached disks, or given (--tier2)
+  also= tier2opt=
+  case $fusion in
+    "fusion-tier2 "*)
+      m=$(fusion_partner main "${fusion#* }")
+      die "$target is the second device of an APFS Fusion container; mount its main device${m:+ (${m#/dev/r})} instead" ;;
+    "fusion-main "*)
+      ro=1
+      if [ -z "$tier2" ] && [ -n "${raw:-}" ] && [ "$src" = "$raw" ]; then tier2=$(fusion_partner tier2 "${fusion#* }"); fi
+      [ -n "$tier2" ] || die "$target is the main device of an APFS Fusion container, and its second device is not attached (give an image's with --tier2 PATH)"
+      if device_nodes "$tier2"; then
+        t2raw=$raw; device_nodes "$target"
+        if [ -n "$open_dev" ] || ! [ -r "$t2raw" ]; then open_dev=$src also=$t2raw tier2opt=tier2file=/dev/fd/4
+        else tier2opt=tier2file=$t2raw; fi
+      else
+        [ -f "$tier2" ] || die "$tier2: no such image"
+        tier2opt=tier2file=$(cd "$(dirname "$tier2")" && pwd)/$(basename "$tier2")
+      fi ;;
+  esac
+  if [ -n "$pwstdin" ]; then
+    [ "$type" = apfs ] || die "--password-stdin is for encrypted APFS volumes, and $target is $type"
+    IFS= read -r password || [ -n "${password:-}" ] || die "no password on stdin"
+  fi
+  case $extra in *type=*) type=$(printf '%s\n' "$extra" | tr ',' '\n' | sed -n 's/^type=//p' | tail -n 1) ;; esac
+  # APFS: read-only unless the user opted in (APFSWrite), since linux-apfs-rw's write support is experimental;
+  # then read-write through its readwrite option, with a warning
+  apfs_rw=
+  if [ "$type" = apfs ]; then
+    if [ "$(pref APFSWrite off)" = on ] && [ -z "$ro" ] && [ -z "$fusion" ]; then
+      apfs_rw=1
+      echo "linuxfs: writing APFS is experimental (linux-apfs-rw); it may damage the volume, so keep a backup" >&2
+    else ro=1; fi
+  fi
+  name=$(safe_name "$label"); [ -n "$name" ] || name=$(safe_name "$(basename "$target")")
+  [ -n "$name" ] || name=Linux
+  if [ -z "$mnt" ]; then
+    mnt=$(free_mountpoint "$name")
+    if ! mkdir "$mnt" 2>/dev/null; then   # a name the Mac's filesystem refuses: the image's or device's instead
+      name=$(safe_name "$(basename "$target")"); [ -n "$name" ] || name=Linux
+      mnt=$(free_mountpoint "$name"); mkdir "$mnt" || die "cannot make $mnt"
+    fi
+    made=1
+  else made=; [ -d "$mnt" ] || die "$mnt: no such directory"; ! is_mounted "$mnt" || die "$mnt already has a volume mounted"; fi
+  opts="type=$type,lock=$LOCKS/linuxfs-$lockname.lock,local,volname=$name,fsname=linuxfs@$(safe_name "$(basename "$src")"),noappledouble"
+  [ -n "$ids" ] || opts="$opts,uid=$(id -u),gid=$(id -g),owner=root"
+  [ -z "$ro" ] || opts="$opts,ro"
+  [ -z "$apfs_rw" ] || opts="$opts,opts=readwrite"
+  [ -z "$tier2opt" ] || opts="$opts,$tier2opt"
+  [ -z "$extra" ] || opts="$opts,$extra"
+  mkdir -p "$STATE" "$LOGS" "$LOCKS" && chmod 700 "$LOCKS"
+  log=$LOGS/$(basename "$src").log
+  mode=rw; [ -z "$ro" ] || mode=ro
+  tries=0
+  while ! run_lklfuse "$src" "$mnt" "$opts" "$open_dev" "$also"; do
+    if [ "$type" = ntfs3 ] && [ -z "$ro" ] && grep -q 'volume is dirty' "$log"; then
+      echo "linuxfs: $target is a dirty NTFS volume (Windows hibernated or was not shut down); mounting it read-only" >&2
+      ro=1 mode=ro opts="$opts,ro"; continue
+    fi
+    # an encrypted APFS volume: read-only, whatever APFSWrite says; and its password, asked for at the terminal
+    # (three tries) or taken from stdin; with neither, exit 4 (the agent asks, and mounts with --password-stdin)
+    if [ -n "$apfs_rw" ] && grep -q 'can only be mounted read-only' "$log"; then
+      echo "linuxfs: $target is an encrypted APFS volume, which linuxfs mounts read-only" >&2
+      apfs_rw= ro=1 mode=ro opts="$(printf '%s\n' "$opts" | sed 's/,opts=readwrite//'),ro"; continue
+    fi
+    if [ "$type" = apfs ] && grep -q 'Required key not available\|Key was rejected' "$log"; then
+      hint=$(sed -n 's/.*(hint: \(.*\))$/\1/p' "$log" | tail -n 1) rejected=
+      grep -q 'Key was rejected' "$log" && rejected=1
+      if [ -z "$pwstdin" ] && [ $tries -lt 3 ] && [ -t 0 ] && ask_password "$name" "$rejected" "$hint"; then
+        tries=$((tries + 1)); continue
+      fi
+      [ -z "$made" ] || rmdir "$mnt" 2>/dev/null
+      if [ -n "$rejected" ]; then echo "linuxfs: wrong password for $target${hint:+ (hint: $hint)}" >&2
+      else echo "linuxfs: $target is an encrypted volume; give its password at a terminal, or on stdin with --password-stdin" >&2; fi
+      exit 4
+    fi
+    [ -z "$made" ] || rmdir "$mnt" 2>/dev/null
+    cat "$log" >&2
+    grep -q 'unable to exclusively lock\|failed to open .*linuxfs-.*\.lock' "$log" && die "$target is already mounted by linuxfs"
+    die "cannot mount $target"
+  done
+  printf '%s\t%s\t%s\t%s\n' "$src" "$mnt" "$type" "$mode" > "$STATE/$pid"
+  echo "$mnt"
+}
+
+cmd_unmount() {
+  force=
+  [ "${1:-}" != --force ] || { force=force; shift; }
+  [ $# -eq 1 ] || usage
+  t=$1
+  if device_nodes "$t"; then t=$raw
+  elif [ -f "$t" ]; then t=$(cd "$(dirname "$t")" && pwd)/$(basename "$t"); fi
+  rec=$(records | awk -F"$tab" -v t="$t" '$2 == t || $3 == t { print; exit }')
+  case $rec,$t in
+    ,/dev/rdisk*)   # a whole disk (being ejected): the volumes linuxfs mounted from its partitions
+      parts=$(records | awk -F"$tab" -v p="${t}s" 'index($2, p) == 1 && substr($2, length(p) + 1) ~ /^[0-9]+$/ { print $3 }')
+      if [ -n "$parts" ]; then
+        r=0
+        while IFS= read -r m; do ( cmd_unmount ${force:+--force} "$m" ) || r=1; done <<EOF
+$parts
+EOF
+        exit $r
+      fi ;;
+  esac
+  if [ -n "$rec" ]; then pid=${rec%%"$tab"*}; mnt=$(printf '%s\n' "$rec" | cut -f 3)
+  else pid=; mnt=$t; is_mounted "$mnt" || die "$1 is not mounted by linuxfs"; fi
+  # forced (a yank or an eject, from the agent): umount -f, not diskutil, which DiskArbitration holds up while
+  # an eject waits on the agent (P3-3: 9 s, past what DiskArbitration waits, for a 0.7 s unmount)
+  if [ -n "$force" ]; then unmount_it() { umount -f "$1"; }; else unmount_it() { diskutil unmount "$1"; }; fi
+  if ! unmount_it "$mnt" > /dev/null 2>&1; then
+    echo "linuxfs: $mnt is busy; these programs have files open on it:" >&2
+    lsof -n 2>/dev/null | grep -F " $mnt" | awk '{ print "  " $1 " (pid " $2 ")" }' | sort -u >&2
+    exit 1
+  fi
+  if [ -n "$pid" ]; then
+    i=0; while kill -0 "$pid" 2>/dev/null && [ $i -lt "$WAIT" ]; do sleep 0.1; i=$((i + 1)); done
+    rm -f "$STATE/$pid"
+  fi
+  [ "$(dirname "$mnt")" != "$VOLUMES" ] || rmdir "$mnt" 2>/dev/null || :
+}
+
+# Preferences, in the defaults domain dev.mavergreen.linuxfs: on/off keys, and Ignore:LABEL for each opted-out volume.
+pref() { # KEY DEFAULT(on|off) -> prints on|off
+  case $(defaults read "$DOMAIN" "$1" 2>/dev/null) in 1|true|YES|yes) echo on ;; 0|false|NO|no) echo off ;; *) echo "$2" ;; esac
+}
+pref_default() { case $1 in Automount) echo on ;; ReadOnly|NTFSTakeover|APFSWrite) echo off ;; *) return 1 ;; esac; }
+ignored() { [ "$(defaults read "$DOMAIN" "Ignore:$1" 2>/dev/null)" = 1 ]; }
+
+cmd_prefs() {
+  case $# in
+    0) for k in Automount ReadOnly NTFSTakeover APFSWrite; do printf '%s\t%s\n' "$k" "$(pref "$k" "$(pref_default "$k")")"; done
+       defaults read "$DOMAIN" 2>/dev/null | sed -n 's/^ *"Ignore:\(.*\)" = 1;$/Ignore	\1/p; s/^ *Ignore:\([^ "]*\) = 1;$/Ignore	\1/p' ;;
+    2) pref_default "$1" > /dev/null || usage
+       case $2 in on) v=true ;; off) v=false ;; *) usage ;; esac
+       defaults write "$DOMAIN" "$1" -bool "$v" ;;
+    *) usage ;;
+  esac
+}
+
+# For the automount agent: mounts DISK when the preferences say to. Exit 3 when they say not to (or the
+# filesystem is one the Mac mounts itself), so the agent leaves the disk alone.
+cmd_automount() {
+  [ $# -eq 1 ] || usage
+  device_nodes "$1" || usage
+  [ "$(pref Automount on)" = on ] || exit 3
+  probed=$(probe_dev "$raw") || exit 3
+  type=${probed%%"$tab"*} rest=${probed#*"$tab"}; label=${rest%%"$tab"*}
+  case $rest in
+    *"${tab}fusion-tier2 "*)   # the second device: mount the container from its main device, once both are here
+      main=$(fusion_partner main "${rest##*fusion-tier2 }"); [ -n "$main" ] || exit 3
+      records | awk -F"$tab" -v s="$main" '$2 == s { f = 1 } END { exit !f }' && exit 3
+      set -- "${main#/dev/r}" ;;
+    *"${tab}fusion-main "*)
+      [ -n "$(fusion_partner tier2 "${rest##*fusion-main }")" ] || exit 3 ;;
+  esac
+  case $type in
+    exfat|vfat) exit 3 ;;
+    ntfs3) [ "$(pref NTFSTakeover off)" = on ] || exit 3 ;;
+  esac
+  [ -z "$label" ] || ! ignored "$label" || exit 3
+  if [ "$(pref ReadOnly off)" = on ]; then cmd_mount "$1" --ro; else cmd_mount "$1"; fi
+}
+
+cmd_status() {
+  [ $# -eq 0 ] || usage
+  printf 'PID\tSOURCE\tMOUNTPOINT\tTYPE\tMODE\n'
+  records
+}
+
+[ $# -ge 1 ] || usage
+c=$1; shift
+case $c in
+  list) [ $# -eq 0 ] || usage; cmd_list ;;
+  mount) cmd_mount "$@" ;;
+  unmount|umount|eject) cmd_unmount "$@" ;;
+  status) cmd_status "$@" ;;
+  prefs) cmd_prefs "$@" ;;
+  ignore) [ $# -eq 1 ] || usage; defaults write "$DOMAIN" "Ignore:$1" -bool true ;;
+  unignore) [ $# -eq 1 ] || usage; defaults delete "$DOMAIN" "Ignore:$1" 2>/dev/null || : ;;
+  automount) cmd_automount "$@" ;;
+  -h|--help|help) usage ;;
+  *) usage ;;
+esac
