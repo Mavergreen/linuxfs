@@ -1,0 +1,28 @@
+Gate 0b bundle: lklfuse (LKL's FUSE front end, Linux 6.12 in-process) on 10.9 through
+Mavergreen macFUSE's libfuse 3.
+
+Needs: 10.9 x86_64 with Mavergreen macFUSE (/usr/local/mavergreen/macfuse, /usr/local/lib/libfuse3.4.dylib).
+No root, no python, no `timeout`. Copy the whole directory to a local disk (not NFS) first.
+Disk: about 3 GB free while it runs (four 512 MiB images, unpacked once per mode, plus snapshots).
+Time: a few minutes per mode; give a watchdog 30 minutes for the whole run.
+
+Run:      cd THIS-DIR && sh run.sh
+Mounts:   only THIS-DIR/run-file/mnt and THIS-DIR/run-rdisk/mnt (one at a time). rdisk mode attaches
+          each image with `hdiutil attach -nomount` and detaches it again.
+Success:  run.sh exits 0 and results.txt ends "# ok: N, not ok: 0". Every TAP line is "ok".
+Failure:  a "not ok N - what (see .../step-N.log)" line; that log says why. A line starting
+          "gate0b-darwin.sh:" means the run could not start (e.g. macFUSE missing: exit 77).
+Send back: results.txt, sha.log, run-file/ and run-rdisk/ minus their images/ and mnt/ directories
+           (snapshots/ and the logs are what's needed), plus system.log and any panic reports.
+
+What each check means (per mode; the numbers vary):
+- lklfuse callbacks report Darwin errno values and flags: no FUSE involved; LKL's errors and xattr/
+  rename flags translated for macOS (15 sub-checks in ops.log).
+- lklfuse mounts FS: the volume appears, and a listing through it works.
+- write through the FS mount: cp 4 MiB, mkdir, 200 small files, mv, `xattr -w user.k v`, touch -t.
+- umount / diskutil unmount FS; lklfuse exits 0: unmounting ends lklfuse cleanly.
+- Linux: FS is clean...: here, a snapshot of the image is saved; Linux checks it later.
+- everything reads back on FS: contents, rename, xattr and mtime survive an unmount and remount.
+- kill -9 lklfuse mid-write on ext4 / ntfs: a writer is copying when lklfuse is killed.
+- lklfuse mounts ext4 after the kill: the journal replays; what was written before reads back.
+- lklfuse refuses the dirty NTFS volume, and says why: lklfuse exits non-zero with "volume is dirty".
