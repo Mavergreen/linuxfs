@@ -10,4 +10,7 @@
 const char *linuxfs_probe_fd(int fd, char *label, size_t labellen, int *err);
 /* After linuxfs_probe_fd: a third field, or "": "fusion-main UUID" or "fusion-tier2 UUID" for an APFS Fusion device. */
 const char *linuxfs_probe_extra(void);
+/* After linuxfs_probe_fd: writes the filesystem's UUID, uppercase 8-4-4-4-12, to out (outlen at least 37) and returns 0;
+ * -1 when it has none (ntfs3, f2fs, vfat, exfat) or out is too small. APFS's is the container's. */
+int linuxfs_probe_uuid(char *out, size_t outlen);
 #endif

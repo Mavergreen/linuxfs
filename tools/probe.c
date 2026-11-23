@@ -18,6 +18,7 @@
 static unsigned char buf[SPAN];
 static size_t have;
 static int probe_fd = -1;	/* for the reads beyond SPAN that an APFS volume's name needs */
+static size_t uuid_off;		/* where the 16 UUID bytes sit in buf, or 0 when the filesystem has none */
 static char extra[64];		/* a third field: an APFS Fusion device's role and container */
 
 const char *linuxfs_probe_extra(void)
@@ -328,6 +329,7 @@ done:
 static const char *probe(char *lab, size_t lablen)
 {
 	lab[0] = '\0';
+	uuid_off = 0;
 	/* APFS: a container (10.9 has no driver for it; linux-apfs-rw reads it), named by its first volume */
 	if (has(0, 4096) && is(32, "NXSB", 4)) {
 		/* nx_fusion_uuid (0x500): zero unless Fusion; the second device's has its lowest bit set */
@@ -342,6 +344,7 @@ static const char *probe(char *lab, size_t lablen)
 			if (tier2)
 				return "apfs";	/* its blocks are the main device's container's: no volume to name here */
 		}
+		uuid_off = 72;		/* nx_uuid */
 		apfs_label(lab, lablen);
 		return "apfs";
 	}
@@ -352,14 +355,17 @@ static const char *probe(char *lab, size_t lablen)
 	 * revision 0 or 1), so a stray 0xEF53 is not enough */
 	if (has(1024, 1024) && le16(1024 + 56) == 0xEF53 && le32(1024 + 24) <= 6 && le32(1024 + 40) != 0 &&
 	    le32(1024 + 76) <= 1) {
+		uuid_off = 1024 + 0x68;	/* s_uuid */
 		label(1024 + 120, 16, lab, lablen);
 		return "ext4";
 	}
 	if (has(0x10000, 4096) && is(0x10040, "_BHRfS_M", 8)) {
+		uuid_off = 0x10020;	/* fsid */
 		label(0x1012b, 256, lab, lablen);
 		return "btrfs";
 	}
 	if (has(0, 512) && is(0, "XFSB", 4)) {
+		uuid_off = 32;		/* sb_uuid */
 		label(108, 12, lab, lablen);
 		return "xfs";
 	}
@@ -395,6 +401,7 @@ const char *linuxfs_probe_fd(int fd, char *lab, size_t lablen, int *err)
 	ssize_t r;
 
 	have = 0;
+	uuid_off = 0;
 	*err = 0;
 	extra[0] = '\0';
 	while (have < SPAN) {
@@ -415,6 +422,23 @@ const char *linuxfs_probe_fd(int fd, char *lab, size_t lablen, int *err)
 	if (type && strcmp(lab, "NO NAME") == 0)
 		lab[0] = '\0';
 	return type;
+}
+
+int linuxfs_probe_uuid(char *out, size_t outlen)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	size_t i, n = 0;
+
+	if (!uuid_off || !has(uuid_off, 16) || outlen < 37)
+		return -1;
+	for (i = 0; i < 16; i++) {
+		if (i == 4 || i == 6 || i == 8 || i == 10)
+			out[n++] = '-';
+		out[n++] = hex[buf[uuid_off + i] >> 4];
+		out[n++] = hex[buf[uuid_off + i] & 15];
+	}
+	out[n] = '\0';
+	return 0;
 }
 
 #ifndef LINUXFS_PROBE_NO_MAIN

@@ -10,6 +10,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 if [ "$(uname -s)" = Linux ]; then
   D=${PROBE_TEST_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/probe-test.XXXXXX")}
   cc -O2 -Wall -Werror -o "$D/probe" "$ROOT/tools/probe.c" || exit 1
+  cc -O2 -Wall -Werror -DLINUXFS_PROBE_NO_MAIN -o "$D/probe-uuid" "$ROOT/tests/probe-uuid.c" "$ROOT/tools/probe.c" || exit 1
 else
   . "$ROOT/build/msc.sh"
   D=$HOME/Library/Caches/mm-build/linuxfs-probe-test; rm -rf "$D"; mkdir -p "$D"
@@ -17,6 +18,8 @@ else
   SDK=$(sh "$SHIPYARD_SCRIPTS/fetch_sdk.sh" 2>/dev/null) || exit 1
   "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld \
     -o "$D/probe" "$ROOT/tools/probe.c" || exit 1
+  "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN \
+    -o "$D/probe-uuid" "$ROOT/tests/probe-uuid.c" "$ROOT/tools/probe.c" || exit 1
 fi
 if [ "$(uname -s)" = Linux ]; then sh "$ROOT/tests/lib/probe-images.sh" "$D" || exit 1
 else sh "$ROOT/build/linux-host.sh" sh "$ROOT/tests/lib/probe-images.sh" "$D" || exit 1; fi
@@ -50,4 +53,18 @@ want apfs-magic.img "apfs${T}" 0
 want ext-bogus.img unknown 1
 n=$((n + 1)); "$D/probe" "$D/missing" > /dev/null 2>&1; rc=$?
 if [ $rc -eq 2 ]; then echo "ok $n - an unreadable path exits 2"; else echo "not ok $n - missing file exit $rc, want 2"; bad=1; fi
+# filesystem UUIDs (-k): equal to blkid's, case-insensitively; none for ntfs, f2fs, vfat, exfat
+uuid() { # IMAGE: the expected UUID, from blkid on Linux
+  if [ "$(uname -s)" = Linux ]; then blkid -s UUID -o value "$D/$1"; else sh "$ROOT/build/linux-host.sh" blkid -s UUID -o value "$D/$1"; fi
+}
+for i in ext4 btrfs xfs apfs; do
+  n=$((n + 1)); want_u=$(uuid $i.img | tr a-f A-F); got=$("$D/probe-uuid" "$D/$i.img"); rc=$?
+  if [ -n "$want_u" ] && [ "$got" = "$want_u" ] && [ $rc -eq 0 ]; then echo "ok $n - $i.img: UUID $got"
+  else echo "not ok $n - $i.img: UUID got '$got' ($rc), want '$want_u'"; bad=1; fi
+done
+for i in ntfs f2fs vfat exfat fat32; do
+  n=$((n + 1)); got=$("$D/probe-uuid" "$D/$i.img"); rc=$?
+  if [ -z "$got" ] && [ $rc -eq 1 ]; then echo "ok $n - $i.img: no UUID"
+  else echo "not ok $n - $i.img: UUID got '$got' ($rc), want none (1)"; bad=1; fi
+done
 echo "1..$n"; exit $bad

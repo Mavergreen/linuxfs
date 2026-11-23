@@ -21,7 +21,7 @@ struct fsprefs { int automount, readonly, ntfs_takeover, apfs_write; };
 void fsrules_default_prefs(struct fsprefs *p);
 
 /* Whether the bundle for <fs> claims a disk the probe named <probed_type>. NTFS is the Mac's unless
- * NTFSTakeover and Automount are on and the disk is removable. */
+ * NTFSTakeover and Automount are on and the disk is removable. A NULL fs, probed_type or prefs declines (returns 0). */
 int fsrules_claims(const char *fs, const char *probed_type, int removable, const struct fsprefs *p);
 
 struct mountreq { int asked, ro; const char *dev, *mnt; };
