@@ -13,7 +13,7 @@ CL=$(sh "$SHIPYARD_SCRIPTS/fetch_clang22.sh" "$ROOT/components/clang22" 2>/dev/n
 SDK=$(sh "$SHIPYARD_SCRIPTS/fetch_sdk.sh" 2>/dev/null) || exit 1
 cc() { "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld "$@"; }
 cc -DLINUXFS_PROBE_NO_MAIN -o "$D/helper" "$ROOT/tools/helper.c" "$ROOT/tools/probe.c" -framework IOKit -framework CoreFoundation || exit 1
-cc -o "$D/open" "$ROOT/tools/open.c" || exit 1
+cc -DLINUXFS_PROBE_NO_MAIN -o "$D/open" "$ROOT/tools/open.c" "$ROOT/tools/probe.c" || exit 1
 cc -o "$D/probe" "$ROOT/tools/probe.c" || exit 1
 cc -DLINUXFS_PROBE_NO_MAIN -o "$D/policy" "$ROOT/tests/helper-policy-test.c" "$ROOT/tools/probe.c" -framework IOKit -framework CoreFoundation || exit 1
 "$D/policy" > "$D/policy.tap"; bad=$?
@@ -24,7 +24,9 @@ sh "$ROOT/build/linux-host.sh" sh -c 'truncate -s 32M "$1/ext4.img" && mkfs.ext4
 head -c 1048576 /dev/zero > "$D/zero.img"
 S=$D/sock; export LINUXFS_HELPER_SOCKET=$S
 "$D/helper" --socket "$S" --test-files --timeout 3 & hp=$!
-trap 'kill $hp 2>/dev/null' EXIT
+att() { hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$D/$1" | awk 'NR == 1 { print $1 }'; }
+e=$(att ext4.img); devs=$e
+trap 'kill $hp 2>/dev/null; for d in $devs; do hdiutil detach -quiet -force "$d" 2>/dev/null; done' EXIT
 i=0; while [ ! -S "$S" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
 ok() { n=$((n + 1)); if [ "$1" = 0 ]; then echo "ok $n - $2"; else echo "not ok $n - $2"; bad=1; fi; }
 T=$(printf '\t')
@@ -54,6 +56,27 @@ took=$(($(date +%s) - start)); kill $mp 2>/dev/null; wait $mp 2>/dev/null
 [ "$("$D/open" --ro "$D/ssd.img" --also "$D/hdd.img" "$D/probe" /dev/fd/4 | cut -f 3 | cut -d' ' -f 1)" = fusion-tier2 ]; ok $? "--also: the second device on fd 4"
 "$D/open" --ro "$D/ssd.img" --also "$D/hdd.img" /bin/sh -c 'printf x >&4' 2>/dev/null; [ $? -ne 0 ]; ok $? "and read-only"
 "$D/open" --ro "$D/ssd.img" --also "$D/zero.img" /bin/echo > /dev/null 2>&1; [ $? -ne 0 ]; ok $? "a second device the helper refuses stops the program from running"
+# spec: tools/open.c --
+#       inherited mode (LINUXFS_OPEN_INHERITED=1): fd 3 is the device already, opened by the mount program as root before
+#       it dropped privileges; the helper is never contacted (its socket here is a path nothing listens on)
+NS=$D/nobody.sock; I="env LINUXFS_OPEN_INHERITED=1 LINUXFS_HELPER_SOCKET=$NS"
+[ "$($I "$D/open" --probe "$e" 3<"/dev/r${e#/dev/}")" = "ext4${T}helped" ]; ok $? "inherited --probe reads the label from fd 3 (the attached ext4 disk)"
+[ "$($I "$D/open" "$e" "$D/probe" /dev/fd/3 3<"/dev/r${e#/dev/}")" = "ext4${T}helped" ]; ok $? "inherited exec form: the program gets fd 3 as it is"
+[ "$($I "$D/open" --ro "$e" "$D/probe" /dev/fd/3 3<"/dev/r${e#/dev/}")" = "ext4${T}helped" ]; ok $? "inherited --ro is accepted"
+cp "$D/ext4.img" "$D/patched.img"; printf WXYZ | dd of="$D/patched.img" conv=notrunc 2>/dev/null
+[ "$($I "$D/open" --probe "$e" 3<"$D/patched.img" | cut -f 1)" = ext4 ]; ok $? "inherited --probe works on a patched copy too"
+[ "$( { $I "$D/open" --probe "$e" > /dev/null; dd bs=4 count=1 <&3 2>/dev/null; } 3<"$D/patched.img" )" = WXYZ ]; ok $? "inherited --probe does not move fd 3's offset"
+[ "$($I "$D/open" "$e" /bin/sh -c 'dd bs=4 count=1 <&3 2>/dev/null' 3<"$D/patched.img")" = WXYZ ]; ok $? "the exec form leaves fd 3's offset alone too"
+$I "$D/open" "$e" --also "$e" /bin/echo ran 3<"/dev/r${e#/dev/}" > "$D/also.out" 2>&1; rc=$?
+[ $rc -eq 1 ] && ! grep -q ran "$D/also.out"; ok $? "inherited --also exits 1 and does not run the program (rc $rc)"
+$I "$D/open" "$e" /bin/echo ran 3<&- > "$D/nofd.out" 2>&1; rc=$?
+[ $rc -eq 1 ] && ! grep -q '^ran' "$D/nofd.out" && grep -qi 'fd 3\|descriptor 3' "$D/nofd.out"; ok $? "inherited with fd 3 closed exits 1 and says so (rc $rc: $(head -1 "$D/nofd.out"))"
+$I "$D/open" --probe "$e" 3<&- > "$D/nofd.out" 2>&1; rc=$?
+[ $rc -eq 1 ]; ok $? "inherited --probe with fd 3 closed exits 1 (rc $rc)"
+env LINUXFS_OPEN_INHERITED=0 LINUXFS_HELPER_SOCKET=$NS "$D/open" --probe "$e" 3<"/dev/r${e#/dev/}" > /dev/null 2>&1; [ $? -eq 3 ]; ok $? "LINUXFS_OPEN_INHERITED other than 1 is the helper's way (no helper: exit 3)"
+$I "$D/open" "$e" /bin/echo 3<"/dev/r${e#/dev/}" > /dev/null 2>&1; rc=$?
+[ $rc -eq 0 ]; ok $? "inherited exec form never touches the helper socket (rc $rc)"
+$I "$D/open" 3<"/dev/r${e#/dev/}" > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "inherited misuse still exits 2"
 kill $hp; wait $hp 2>/dev/null
 "$D/open" --probe "$D/ext4.img" > /dev/null 2>&1; [ $? -eq 3 ]; ok $? "with no helper listening, exit 3"
 echo "1..$n"; exit $bad

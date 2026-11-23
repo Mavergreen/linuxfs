@@ -264,4 +264,59 @@ for bad_args in "" "/dev/disk9" "-o /dev/disk9 /tmp/m" "/dev/disk9 /tmp/m extra"
   mt "$MD" $bad_args >/dev/null 2>&1; rc=$?
   [ $rc = 1 ] && [ ! -e "$M/log" ]; ok $? "misuse '$bad_args' exits 1 without running the CLI (rc $rc)"
 done
+# --- the mount role as root: it cannot run as root here, so a -DLINUXFS_FS_TEST_DROP build (the same code up to the
+#     drop; it prints the plan instead of dropping and exec'ing) stands in. The shipped build has no such code.
+mkdir -p "$D/drop"
+"$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN \
+  -DLINUXFS_FS_TEST_DROP -o "$D/drop/mount_linuxfs_ext4" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/probe.c" \
+  -framework CoreFoundation -framework DiskArbitration || exit 1
+DM=$D/drop/mount_linuxfs_ext4
+V=$D/vols; rm -rf "$V"; mkdir -p "$V/NAME" "$V/other"; : > "$V/file"; ln -s "$V/NAME" "$V/link"
+H=/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d
+UID_D=$(id -u daemon)
+plan() { # ARGS...: the drop build's plan for user daemon, volumes under $V
+  env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" "$DM" "$@"; }
+want() { # RW [ARGV-FLAGS] DEV MNT: the plan the brief prescribes
+  rw=$1; dv=$2; mn=$3; shift 3
+  printf 'user daemon\nuid %s\ngid %s\nfd3 /dev/r%s %s\nmnt %s\n' "$UID_D" "$(id -g daemon)" "$dv" "$rw" "$mn"
+  printf 'env HOME=/private/var/db/linuxfs\nenv PATH=/usr/bin:/bin:/usr/sbin:/sbin\nenv LINUXFS_DA=1\nenv LINUXFS_ALL_USERS=1\nenv LINUXFS_OPEN_INHERITED=1\n'
+  printf 'env LINUXFS_LKLFUSE=%s/lklfuse\nenv LINUXFS_PROBE=%s/linuxfs-probe\nenv LINUXFS_OPEN=%s/linuxfs-open\n' "$H" "$H" "$H"
+  printf 'argv %s/linuxfs\nargv da-mount\n' "$H"
+  for a in "$@"; do printf 'argv %s\n' "$a"; done
+  printf 'argv /dev/%s\nargv %s\nfds 3\n' "$dv" "$mn"
+}
+plan -o nodev -o noowners -o nosuid "/dev/$E" "$V/NAME" > "$M/plan" 2>"$M/plan.err"; rc=$?
+want rw "$E" "$V/NAME" > "$M/want"
+[ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root plan: _linuxfs ids, the device on fd 3, the exact env and argv (rc $rc: $(diff "$M/plan" "$M/want" | head -3 | tr '\n' ';'))"
+plan -o owners,rdonly "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
+want rw "$E" "$V/NAME" --asked --ro > "$M/want"
+[ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root plan: owners and rdonly become --asked --ro (rc $rc)"
+plan "$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
+want rw "$E" "$V/NAME" > "$M/want"
+[ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root plan: a device named without /dev/ is accepted and passed as /dev/DEV (rc $rc)"
+env -i LINUXFS_FS_TEST_USER=no_such_user_xyz LINUXFS_FS_TEST_VOLUMES="$V" "$DM" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
+[ $rc = 1 ] && [ ! -s "$M/plan" ] || { [ $rc = 1 ] && ! grep -q '^env' "$M/plan"; }; ok $? "root plan: no _linuxfs user: exit 1, nothing planned (rc $rc)"
+for bad_dev in "/dev/disk" "/dev/disk9s" "/dev/../etc/passwd" "/dev/disk9;ls" "/dev/rdisk9" "disk9/../disk8" "/dev/disk9 " "/dev/disk9s1s2" "/dev/tty" "" "/dev/disk$(printf '9%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34)"; do
+  plan "$bad_dev" "$V/NAME" > "$M/plan" 2>&1; rc=$?
+  [ $rc = 1 ] && ! grep -q '^fd3' "$M/plan"; ok $? "root plan: device '$(echo "$bad_dev" | cut -c1-24)' is refused (rc $rc)"
+done
+for bad_mnt in "/tmp/NAME" "$V" "$V/" "$V/NAME/" "$V/NAME/sub" "$V/." "$V/.." "$V/link" "$V/file" "$V/missing" "relative" "$V/../vols/NAME" "/private/var/empty" "/Volumes/../private/var/empty"; do
+  plan "/dev/$E" "$bad_mnt" > "$M/plan" 2>&1; rc=$?
+  [ $rc = 1 ] && ! grep -q '^mnt' "$M/plan"; ok $? "root plan: mount point '$bad_mnt' is refused (rc $rc)"
+done
+# a directory under the volumes directory that root does not own (here: that this user does not own)
+mkdir -p "$D/vols2"
+env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES=/private/var "$DM" "/dev/$E" /private/var/empty > "$M/plan" 2>&1; rc=$?
+[ $rc = 1 ] && ! grep -q '^mnt' "$M/plan"; ok $? "root plan: a mount point not owned by the expected owner is refused (rc $rc)"
+# every other descriptor is closed; the device is on 3 and stays open across exec
+plan "/dev/$E" "$V/NAME" 4</dev/null 5</dev/null 9</dev/null 3</dev/null > "$M/plan" 2>&1; rc=$?
+[ $rc = 0 ] && grep -qx 'fds 3' "$M/plan" && grep -qx "fd3 /dev/r$E rw" "$M/plan"; ok $? "root plan: inherited descriptors 3, 4, 5, 9 are gone; only the device is open, on 3 (rc $rc: $(grep fds "$M/plan"))"
+# closed standard descriptors do not let the device land on 0-2
+plan "/dev/$E" "$V/NAME" <&- >"$M/plan" 2>&1; rc=$?
+[ $rc = 0 ] && grep -qx 'fds 3' "$M/plan"; ok $? "root plan: with stdin closed the device still lands on fd 3 (rc $rc)"
+# test environment overrides are not honoured by the mount role's environment; the shipped build has no test code at all
+env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_CLI=/bin/false LINUXFS_OPEN=/bin/false LINUXFS_LKLFUSE=/bin/false "$DM" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1
+grep -qx "env LINUXFS_OPEN=$H/linuxfs-open" "$M/plan" && grep -qx "env LINUXFS_LKLFUSE=$H/lklfuse" "$M/plan"; ok $? "root plan: a caller's LINUXFS_OPEN and LINUXFS_LKLFUSE are not passed on"
+! strings "$D/linuxfs-fs" | grep -q 'LINUXFS_FS_TEST'; ok $? "the shipped build carries no LINUXFS_FS_TEST_* code"
+! grep -q 'LINUXFS_FS_TEST' "$ROOT"/build/*.sh; ok $? "no build script defines LINUXFS_FS_TEST_DROP"
 echo "1..$n"; exit $bad

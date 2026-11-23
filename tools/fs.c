@@ -9,7 +9,11 @@
  * fsck -q DEV                                     exit 0 (a quick check has nothing to do); -n or -y exit 8
  * mount [-o OPT]... DEV MNT                       as the console user: runs the CLI's da-mount and, for an encrypted volume,
  *                                                  asks for the password (the keychain keeper first, then Apple's dialog);
- *                                                  as root: not yet (exit 1)
+ *                                                  as root (nobody logged in): opens /dev/rDEV as fd 3, hands MNT to _linuxfs, drops
+ *                                                  to _linuxfs and execs the bundled CLI's da-mount with LINUXFS_OPEN_INHERITED=1
+ *
+ * -DLINUXFS_FS_TEST_DROP (tests only, never in the shipped binary) takes the root path as whatever user runs it, up to the
+ * drop: the privileged calls (fchown, initgroups, setgid, setuid, execve) are replaced by printing the plan.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <ctype.h>
@@ -23,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/un.h>
@@ -739,6 +744,183 @@ static int run_cli(const char *cli, const struct mountreq *req, const char *pw, 
 	return rc;
 }
 
+
+#define PRIV_DIR "/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d"
+#define RUN_USER "_linuxfs"
+
+/* A refusal as root: syslog and stderr, with a fixed reason and never the caller's text */
+static int refuse(const char *what, const char *reason)
+{
+	syslog(LOG_NOTICE, "mount_%s: refused: %s", what, reason);
+	fprintf(stderr, "linuxfs-mount: refused: %s\n", reason);
+	return 1;
+}
+
+#ifdef LINUXFS_FS_TEST_DROP
+#define ROOT_ONLY_UID geteuid()	/* the tests' stand-in for root: whoever runs the test build owns the mount point */
+static const char *volumes_dir(void) { const char *v = getenv("LINUXFS_FS_TEST_VOLUMES"); return v && *v ? v : "/Volumes"; }
+static const char *run_user(void) { const char *u = getenv("LINUXFS_FS_TEST_USER"); return u && *u ? u : RUN_USER; }
+#else
+#define ROOT_ONLY_UID 0
+static const char *volumes_dir(void) { return "/Volumes"; }
+static const char *run_user(void) { return RUN_USER; }
+#endif
+
+/* MNT is exactly <volumes>/<name>: one component, not . or .. */
+static int valid_mnt_path(const char *mnt)
+{
+	const char *v = volumes_dir(), *name;
+	size_t n = strlen(v);
+
+	if (strncmp(mnt, v, n) != 0 || mnt[n] != '/')
+		return 0;
+	name = mnt + n + 1;
+	return *name && strchr(name, '/') == NULL && strcmp(name, ".") != 0 && strcmp(name, "..") != 0;
+}
+
+/* descriptors 0-2 open (on /dev/null when closed), so nothing we open lands on them */
+static void fill_std_fds(void)
+{
+	int fd;
+
+	for (fd = 0; fd <= 2; fd++)
+		if (fcntl(fd, F_GETFD) < 0 && open("/dev/null", O_RDWR) < 0)
+			_exit(1);
+}
+
+/* Everything the mount program does as root, before login: _linuxfs's lookup, the device on fd 3, MNT handed to _linuxfs,
+ * the drop, the bundled CLI. Returns only to refuse (1). Test builds print the plan and return 0 instead of the privileged
+ * calls. */
+static int mount_as_root(const char *fs, const struct mountreq *req)
+{
+	static const char *const vars[] = { "HOME=/private/var/db/linuxfs", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LINUXFS_DA=1",
+		"LINUXFS_ALL_USERS=1", "LINUXFS_OPEN_INHERITED=1", "LINUXFS_LKLFUSE=" PRIV_DIR "/lklfuse",
+		"LINUXFS_PROBE=" PRIV_DIR "/linuxfs-probe", "LINUXFS_OPEN=" PRIV_DIR "/linuxfs-open", NULL };
+	struct passwd *pw;
+	struct stat st;
+	char node[64], devarg[64], name[64];
+	char *args[8];
+	const char *bsd;
+	int fd, mfd, i, n = 0, ro_fallback = 0;
+	uid_t uid;
+	gid_t gid;
+
+	bsd = strncmp(req->dev, "/dev/", 5) == 0 ? req->dev + 5 : req->dev;
+	if (!valid_bsd(bsd))
+		return refuse(fs, "the device is not diskN or diskNsM");
+	if (!valid_mnt_path(req->mnt))
+		return refuse(fs, "the mount point is not directly under /Volumes");
+	pw = getpwnam(run_user());
+	if (!pw || pw->pw_uid == 0 || pw->pw_gid == 0)
+		return refuse(fs, "no usable _linuxfs user");
+	uid = pw->pw_uid;
+	gid = pw->pw_gid;
+	snprintf(name, sizeof name, "%s", pw->pw_name);
+	fill_std_fds();
+	snprintf(node, sizeof node, "/dev/r%s", bsd);
+	snprintf(devarg, sizeof devarg, "/dev/%s", bsd);
+
+	fd = open(node, O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
+	if (fd < 0) {
+		fd = open(node, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
+		ro_fallback = 1;
+	}
+	if (fd < 0) {
+		syslog(LOG_NOTICE, "mount_%s: %s: cannot open: %s", fs, bsd, strerror(errno));
+		return 1;
+	}
+	if (fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode)) {
+		close(fd);
+		return refuse(fs, "the device node is not a character device");
+	}
+	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
+	if (fd != 3) {
+		if (dup2(fd, 3) < 0) {
+			close(fd);
+			return refuse(fs, "cannot place the device on fd 3");
+		}
+		close(fd);
+	}
+	fcntl(3, F_SETFD, 0);
+	{
+		int max = getdtablesize();
+
+		for (i = 4; i < max; i++)
+			close(i);
+	}
+
+	/* the mount point: the directory we open is the one we chown, so a swapped path cannot redirect it */
+	mfd = open(req->mnt, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
+	if (mfd < 0)
+		return refuse(fs, "the mount point cannot be opened (missing, or a symlink)");
+	if (fstat(mfd, &st) != 0 || !S_ISDIR(st.st_mode)) {
+		close(mfd);
+		return refuse(fs, "the mount point is not a directory");
+	}
+	if (st.st_uid != ROOT_ONLY_UID) {
+		close(mfd);
+		return refuse(fs, "the mount point is not owned by root");
+	}
+#ifdef LINUXFS_FS_TEST_DROP
+	printf("user %s\nuid %d\ngid %d\nfd3 %s %s\nmnt %s\n", name, (int)uid, (int)gid, node, ro_fallback ? "ro" : "rw", req->mnt);
+#else
+	if (fchown(mfd, uid, gid) != 0) {
+		syslog(LOG_NOTICE, "mount_%s: %s: cannot hand the mount point over: %s", fs, bsd, strerror(errno));
+		close(mfd);
+		return 1;
+	}
+#endif
+	close(mfd);
+
+	args[n++] = PRIV_DIR "/linuxfs";
+	args[n++] = "da-mount";
+	if (req->asked)
+		args[n++] = "--asked";
+	if (req->ro || ro_fallback)
+		args[n++] = "--ro";
+	args[n++] = devarg;
+	args[n++] = (char *)req->mnt;
+	args[n] = NULL;
+
+#ifdef LINUXFS_FS_TEST_DROP
+	for (i = 0; vars[i]; i++)
+		printf("env %s\n", vars[i]);
+	for (i = 0; args[i]; i++)
+		printf("argv %s\n", args[i]);
+	{
+		int max = getdtablesize();
+
+		printf("fds");
+		for (i = 3; i < max; i++)
+			if (fcntl(i, F_GETFD) >= 0 && !(fcntl(i, F_GETFD) & FD_CLOEXEC))
+				printf(" %d", i);
+		printf("\n");
+	}
+	fflush(stdout);
+	return 0;
+#else
+	if (initgroups(name, (int)gid) != 0 || setgid(gid) != 0 || setuid(uid) != 0 || getuid() != uid || geteuid() != uid ||
+	    getgid() != gid || getegid() != gid || setuid(0) != -1) {
+		syslog(LOG_NOTICE, "mount_%s: %s: could not drop to %s", fs, bsd, RUN_USER);
+		return 1;
+	}
+	signal(SIGPIPE, SIG_DFL);
+	{
+		sigset_t none;
+
+		sigemptyset(&none);
+		sigprocmask(SIG_SETMASK, &none, NULL);
+	}
+	umask(022);
+	if (chdir("/") != 0)
+		_exit(1);
+	syslog(LOG_NOTICE, "mount_%s: %s on %s as %s%s", fs, bsd, req->mnt, RUN_USER, ro_fallback ? " (read-only device)" : "");
+	execve(args[0], args, (char *const *)vars);
+	syslog(LOG_NOTICE, "mount_%s: %s: cannot run the CLI: %s", fs, bsd, strerror(errno));
+	return 1;
+#endif
+}
+
 static int mount_role(const char *fs, int argc, char **argv)
 {
 	struct mountreq req;
@@ -753,10 +935,12 @@ static int mount_role(const char *fs, int argc, char **argv)
 		syslog(LOG_NOTICE, "mount_%s: bad arguments", fs);
 		return 1;
 	}
-	if (getuid() == 0) {
-		syslog(LOG_NOTICE, "mount_%s: %s as root: not yet", fs, req.dev);
-		return 1;
-	}
+#ifdef LINUXFS_FS_TEST_DROP
+	if (1)
+#else
+	if (getuid() == 0)
+#endif
+		return mount_as_root(fs, &req);
 	pw = getpwuid(getuid());
 	if (!pw || !pw->pw_dir || pw->pw_dir[0] != '/') {
 		syslog(LOG_NOTICE, "mount_%s: no home directory for uid %d", fs, (int)getuid());

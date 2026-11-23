@@ -7,6 +7,10 @@
  *        linuxfs-open --probe DEVICE                     prints "TYPE<TAB>LABEL", as linuxfs-probe does
  * DEVICE is /dev/rdiskNsM (or /dev/diskNsM, diskNsM). The helper's refusal is printed and exits 1; no helper
  * listening exits 3; misuse exits 2. LINUXFS_HELPER_SOCKET names another socket (tests).
+ *
+ * With LINUXFS_OPEN_INHERITED=1 (the bundles' mount program, which opened the disk as root before dropping to _linuxfs)
+ * fd 3 already is the device and the helper is never contacted: --probe probes fd 3 (pread from offset 0), and
+ * [--ro] DEVICE PROGRAM [ARG...] runs PROGRAM with fd 3 as it is. --also exits 1: the partner cannot be probed there.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -17,6 +21,8 @@
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+#include "probe.h"
 
 #define DEFAULT_SOCKET "/var/run/dev.mavergreen.linuxfs.helper.sock"
 
@@ -111,11 +117,55 @@ static int open_one(const char *device, int ro)
 	return fd;
 }
 
+/* Inherited mode: fd 3 is the device. Returns main's exit status, or never returns (the exec). */
+static int inherited(int argc, char **argv)
+{
+	int i = 1;
+
+	if (fcntl(3, F_GETFD) < 0) {
+		fprintf(stderr, "linuxfs-open: LINUXFS_OPEN_INHERITED=1 but fd 3 is not open\n");
+		return 1;
+	}
+	if (argc == 3 && strcmp(argv[1], "--probe") == 0) {
+		char label[256];
+		const char *type, *extra;
+		int err = 0;
+
+		type = linuxfs_probe_fd(3, label, sizeof(label), &err);
+		if (!type) {
+			fprintf(stderr, "linuxfs-open: fd 3: %s\n", err ? strerror(err) : "no filesystem linuxfs knows");
+			printf("unknown\n");
+			return 1;
+		}
+		extra = linuxfs_probe_extra();
+		if (extra && *extra)
+			printf("%s\t%s\t%s\n", type, label, extra);
+		else
+			printf("%s\t%s\n", type, label);
+		return 0;
+	}
+	if (i < argc && strcmp(argv[i], "--ro") == 0)
+		i++;
+	if (argc - i < 2)
+		return usage();
+	i++;	/* DEVICE: fd 3 is it already */
+	if (strcmp(argv[i], "--also") == 0) {
+		fprintf(stderr, "linuxfs-open: --also is not available before login (the partner cannot be probed)\n");
+		return 1;
+	}
+	execv(argv[i], argv + i);
+	fprintf(stderr, "linuxfs-open: %s: %s\n", argv[i], strerror(errno));
+	return 127;
+}
+
 int main(int argc, char **argv)
 {
 	char dev[256], req[320], answer[1024];
-	const char *main_dev, *also_dev = NULL;
+	const char *main_dev, *also_dev = NULL, *inh = getenv("LINUXFS_OPEN_INHERITED");
 	int i = 1, ro = 0, fd, fd2;
+
+	if (inh && strcmp(inh, "1") == 0)
+		return inherited(argc, argv);
 
 	if (argc == 3 && strcmp(argv[1], "--probe") == 0) {
 		raw_path(argv[2], dev, sizeof(dev));
