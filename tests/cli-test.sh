@@ -36,6 +36,7 @@ exit 0
 EOF
 cat > "$T/bin/probe" <<EOF
 #!/bin/sh
+echo "\$1" >> "$T/probecalls"
 case "\$1" in */rdisk3) echo unknown; exit 1 ;; esac
 if [ -n "\${FAKE_FUSION:-}" ]; then
   case "\$1" in
@@ -55,9 +56,11 @@ case "\$1" in
   unmount) if [ "\$2" = force ]; then echo "diskutil unmount force \$3" >> "$T/calls"; shift; else [ -z "\${FAKE_BUSY:-}" ] || exit 1; fi
            grep -vF " on \$2 (" "$T/mtab" > "$T/mtab.new"; mv "$T/mtab.new" "$T/mtab"; echo "Unmount successful for \$2" ;;
   mount) shift; echo "diskutil mount \$*" >> "$T/dcalls"
+         if [ "\${FAKE_DISKUTIL:-}" = busy ]; then echo "Volume on disk5 failed to mount: resource busy" >&2; exit 1; fi
          if [ "\${FAKE_DISKUTIL:-}" = already ]; then echo "Volume on disk5 failed to mount; it is already mounted" >&2; exit 1; fi
          echo "Volume NAME on \${2:-\$1} mounted" ;;
-  info) printf '%s\n' "   Device Identifier:         \$2" "   Mount Point:               /Volumes/Fresh" ;;
+  info) printf '%s\n' "   Device Identifier:         \$2"
+        case "\${FAKE_INFO:-}" in none) echo "   Mount Point:" ;; space) echo "   Mount Point:               /Volumes/My Disk" ;; *) echo "   Mount Point:               /Volumes/Fresh" ;; esac ;;
   list) printf '%s\n' "/dev/disk3" "   #:  TYPE NAME  SIZE  IDENTIFIER" "   0:  GUID_partition_scheme  *16 GB  disk3" "   1:  Linux  data  8.0 GB  disk3s1" "   2:  Microsoft Basic Data  win  8.0 GB  disk3s2" "/dev/disk4" "   #:  TYPE NAME  SIZE  IDENTIFIER" "   0:  stick  *4.0 GB  disk4" ;;
 esac
 EOF
@@ -189,6 +192,8 @@ out=$(LINUXFS_DA=1 sh "$L" mount /dev/disk3s1 2>&1); rc=$?
 cat > "$T/bin/open" <<EOF
 #!/bin/sh
 echo "open \$*" >> "$T/calls"
+echo "\${LINUXFS_OPEN_INHERITED:-0}" >> "$T/openenv"
+[ "\$1" != --probe ] || [ -z "\${FAKE_OPEN_SLEEP:-}" ] || sleep "\$FAKE_OPEN_SLEEP"
 if [ "\$1" = --probe ] && [ -n "\${FAKE_FUSION:-}" ]; then
   case "\$2" in
     */rdisk3s1) printf 'apfs\tFused\tfusion-main 00112233445566778899aabbccddeeff\n'; exit 0 ;;
@@ -414,7 +419,6 @@ wait; sh "$L" unmount disk3s1 > /dev/null 2>&1; rm -f "$T/tier2here"
 case $(last) in *allow_other,uid=99,gid=99*) r=0 ;; *) r=1 ;; esac; case $(last) in *owner=root*) r=1 ;; esac
 ok $r "LINUXFS_ALL_USERS=1 mounts allow_other,uid=99,gid=99, without owner=root"
 sh "$L" unmount disk3s1 > /dev/null 2>&1
-(LINUXFS_OPEN_INHERITED=1; export LINUXFS_OPEN_INHERITED; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); ok $? "LINUXFS_OPEN_INHERITED=1 still mounts through the opener"
 sh "$L" unmount disk3s1 > /dev/null 2>&1
 for t in exfat vfat; do
   (FAKE_PROBE=$t; export FAKE_PROBE; DA --asked /dev/disk3s1 "$T/dam" > /dev/null 2>&1); [ $? -eq 3 ]; ok $? "da-mount leaves $t to the Mac, even asked"
@@ -426,5 +430,35 @@ sh "$L" unmount disk3s1 > /dev/null 2>&1
 sh "$L" prefs NTFSTakeover on
 (FAKE_PROBE=ntfs3; export FAKE_PROBE; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); ok $? "with NTFSTakeover on, da-mount takes NTFS"
 sh "$L" unmount disk3s1 > /dev/null 2>&1; sh "$L" prefs NTFSTakeover off
+(FAKE_DISKUTIL=busy; export FAKE_DISKUTIL; sh "$L" mount /dev/disk5 > "$T/out" 2>&1); rc=$?
+[ $rc -ne 0 ] && grep -q "resource busy" "$T/out"; ok $? "a diskutil failure other than 'already mounted' passes its message through with a failure"
+out=$(FAKE_INFO=space sh "$L" mount /dev/disk5 2>&1)
+[ "$out" = "/Volumes/My Disk" ]; ok $? "a mount point with a space is printed whole (got '$out')"
+out=$(FAKE_INFO=none sh "$L" mount /dev/disk5 2>&1); rc=$?
+[ $rc -ne 0 ] && [ -n "$out" ] && ! echo "$out" | grep -q '^/Volumes'; ok $? "a mount with no Mount Point afterwards fails, saying so (got $rc: '$out')"
+: > "$DU"
+out=$(printf 'pw\n' | FAKE_AGENT_RC=127 sh "$L" mount --password-stdin /dev/disk5 2>&1); rc=$?
+[ $rc -eq 1 ] && ! grep -q diskutil "$DU" && ! echo "$out" | grep -q "no one is logged in"; ok $? "an agent that cannot be run is exit 1, not 4 (got $rc: '$out')"
+sh "$L" prefs Automount on
+defaults write test.machine Automount -bool true; sh "$L" prefs Automount off
+DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1; [ $? -eq 3 ]; ok $? "a user-domain off overrides a machine-domain on"
+defaults delete test.machine Automount; sh "$L" prefs Automount on
+defaults write test.machine "Ignore:helped" -bool true
+DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1; [ $? -eq 3 ]; ok $? "an Ignore:LABEL in the machine domain only is honoured"
+defaults delete test.machine "Ignore:helped"
+: > "$T/probecalls"; : > "$T/openenv"
+(LINUXFS_OPEN_INHERITED=1; export LINUXFS_OPEN_INHERITED; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); ok $? "LINUXFS_OPEN_INHERITED=1 still mounts through the opener"
+[ ! -s "$T/probecalls" ] && [ -s "$T/openenv" ] && ! grep -qv '^1$' "$T/openenv"; ok $? "and only through it: no direct probe, every opener call inherited"
+sh "$L" unmount disk3s1 > /dev/null 2>&1
+for f in 1 notier2; do
+  s0=$(date +%s)
+  (FAKE_FUSION=$f LINUXFS_OPEN_INHERITED=1; export FAKE_FUSION LINUXFS_OPEN_INHERITED; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); rc=$?
+  (FAKE_FUSION=$f LINUXFS_OPEN_INHERITED=1; export FAKE_FUSION LINUXFS_OPEN_INHERITED; DA /dev/disk4 "$T/dam" > /dev/null 2>&1); rc2=$?
+  [ $rc -eq 3 ] && [ $rc2 -eq 3 ] && [ $(( $(date +%s) - s0 )) -lt 5 ]; ok $? "inherited, da-mount of a Fusion main or tier2 device exits 3 at once ($f)"
+done
+s0=$(date +%s)
+(FAKE_FUSION=notier2 LINUXFS_FUSION_WAIT=5 FAKE_OPEN_SLEEP=1; export FAKE_FUSION LINUXFS_FUSION_WAIT FAKE_OPEN_SLEEP; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); rc=$?
+[ $rc -eq 3 ] && [ $(( $(date +%s) - s0 )) -lt 12 ]; ok $? "the Fusion wait is wall-clock time, not iterations (took $(( $(date +%s) - s0 )) s)"
+! sh "$L" help 2>&1 | grep -q da-mount; ok $? "usage does not list the internal da-mount"
 sh "$L" frobnicate > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "an unknown command is misuse (exit 2)"
 echo "1..$n"; exit $bad

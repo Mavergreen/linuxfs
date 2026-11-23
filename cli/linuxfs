@@ -8,7 +8,7 @@
 #          linuxfs prefs [Automount|ReadOnly|NTFSTakeover|APFSWrite on|off]
 #          linuxfs ignore|unignore LABEL
 #          linuxfs automount DISK
-#          linuxfs da-mount [--asked] [--ro] DEVICE MOUNTPOINT      (only with LINUXFS_DA=1: the bundle's mount program)
+#   internal: linuxfs da-mount [--asked] [--ro] DEVICE MOUNTPOINT   (only with LINUXFS_DA=1: the bundle's mount program)
 #          Mounts a Linux filesystem (ext4, btrfs, xfs, NTFS, exFAT, FAT, f2fs) with Linux's own driver, running in
 #          lklfuse. An image file is mounted directly: every file appears owned by you and only you can open the
 #          volume; new files are written with the filesystem root's owner. --linux-ids shows Linux's owners instead.
@@ -32,7 +32,7 @@ WAIT=${LINUXFS_WAIT:-100}
 AGENT=${LINUXFS_AGENT:-$PREFIX/libexec/linuxfs-agent}
 DOMAIN=${LINUXFS_DOMAIN:-dev.mavergreen.linuxfs}
 MACHINE=${LINUXFS_MACHINE_DOMAIN:-/Library/Preferences/dev.mavergreen.linuxfs}
-FUSION_WAIT=${LINUXFS_FUSION_WAIT:-300}   # tenths of a second
+FUSION_WAIT=${LINUXFS_FUSION_WAIT:-300}   # tenths of a second, as wall-clock time
 
 die() { echo "linuxfs: $*" >&2; exit 1; }
 usage() { sed -n 's/^#   usage: /usage: /p; s/^#          linuxfs /       linuxfs /p' "$0" >&2; exit 2; }
@@ -171,14 +171,19 @@ mount_device() { # BLOCKNODE PASSWORD-STDIN RO
   d=${1#/dev/}
   if [ -n "$2" ]; then
     IFS= read -r pw || [ -n "${pw:-}" ] || die "no password on stdin"
-    if ! printf '%s\n' "$pw" | "$AGENT" --offer "$d" > /dev/null 2>&1; then
-      echo "linuxfs: no one is logged in at the console to unlock $1" >&2; exit 4
-    fi
+    printf '%s\n' "$pw" | "$AGENT" --offer "$d" > /dev/null 2>&1; rc=$?
+    case $rc in
+      0) ;;
+      1) echo "linuxfs: no one is logged in at the console to unlock $1" >&2; exit 4 ;;
+      *) die "cannot run $AGENT to unlock $1 (status $rc)" ;;
+    esac
     unset pw
   fi
   if [ -n "$3" ]; then out=$(diskutil mount readOnly "$d" 2>&1); else out=$(diskutil mount "$d" 2>&1); fi ||
     { printf '%s\n' "$out" >&2; exit 1; }
-  diskutil info "$d" 2>/dev/null | sed -n 's/^ *Mount Point: *//p' | head -n 1
+  at=$(diskutil info "$d" 2>/dev/null | sed -n 's/^ *Mount Point: *//p' | head -n 1)
+  [ -n "$at" ] || die "diskutil mounted $1 but reports no mount point for it"
+  printf '%s\n' "$at"
 }
 
 cmd_mount() {
@@ -422,9 +427,11 @@ cmd_da_mount() {
   case $rest in
     *"${tab}fusion-tier2 "*) exit 3 ;;
     *"${tab}fusion-main "*)
-      uuid=${rest##*fusion-main } i=0
+      # with the device inherited on fd 3 only it can be probed, so its partner can never be found
+      [ "${LINUXFS_OPEN_INHERITED:-}" != 1 ] || exit 3
+      uuid=${rest##*fusion-main } deadline=$(( $(date +%s) + (FUSION_WAIT + 9) / 10 ))
       while [ -z "$(fusion_partner tier2 "$uuid")" ]; do
-        i=$((i + 1)); [ $i -le "$FUSION_WAIT" ] || exit 3
+        [ "$(date +%s)" -lt "$deadline" ] || exit 3
         sleep 0.1
       done ;;
   esac
