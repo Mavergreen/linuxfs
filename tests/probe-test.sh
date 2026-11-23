@@ -75,7 +75,7 @@ none() { # NAME WHY ARGS...: the driver prints nothing and exits 1
   if [ -z "$got" ] && [ $rc -eq 1 ]; then echo "ok $n - $w"; else echo "not ok $n - $w: got '$got' ($rc), want none (1)"; bad=1; fi
 }
 none "ext4-nouuid.img: an all-zero UUID is none" "$D/ext4-nouuid.img"
-none "btrfs-cut.img: a truncated image has no UUID" "$D/btrfs-cut.img"
+none "btrfs-cut.img: a truncated btrfs image is not recognised, so no UUID" "$D/btrfs-cut.img"
 none "a 36-byte buffer is too small" --small "$D/ext4.img"
 none "no stale UUID after a failed probe (unknown)" --stale "$D/ext4.img" "$D/zero.img"
 none "no stale UUID after a failed probe (short)" --stale "$D/ext4.img" "$D/short.img"
