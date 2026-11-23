@@ -221,7 +221,7 @@ cat > "$M/clibg" <<'EOS'
 #!/bin/sh
 /usr/bin/python -c 'import os
 o = []
-for f in range(3, 255):
+for f in range(3, 256):
     try:
         os.fstat(f); o.append(str(f))
     except OSError:

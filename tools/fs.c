@@ -420,13 +420,15 @@ static int run_capture(char *const argv[], const char *pw, char *out, size_t out
 			in = fcntl(in, F_DUPFD_CLOEXEC, 10);
 		if (o < 10)
 			o = fcntl(o, F_DUPFD_CLOEXEC, 10);
+		if (o < 0 || (pw || nul >= 0 ? in < 0 : 0))
+			_exit(127);
 		if (in >= 0)
 			dup2(in, 0);
 		else
 			close(0);
 		dup2(o, 1);
 		dup2(o, 2);
-		for (fd = 3; fd < 1024; fd++)
+		for (fd = 3; fd < getdtablesize(); fd++)
 			close(fd);
 		signal(SIGPIPE, SIG_DFL);
 		execv(argv[0], argv);
@@ -583,7 +585,9 @@ static int kc_find(const char *bsd, char *pw, size_t pwlen, int *saved)
 		goto out;
 	}
 	e = strchr(p, '\n');
-	if (e && e > p && (size_t)(e - p) < pwlen) {
+	if (!e || e == p || (size_t)(e - p) >= pwlen)
+		syslog(LOG_NOTICE, "%s: the keychain keeper's reply has no usable password line", bsd);
+	else {
 		memcpy(pw, p, (size_t)(e - p));
 		pw[e - p] = '\0';
 		rc = 0;
@@ -613,7 +617,7 @@ static void kc_tell(const char *verb, const char *bsd, const char *pw)
 }
 
 /* The password dialog. 0 with the password in pw (PW_MAX bytes) and *remember; 1 when Mount was pressed with the
- * field empty; -1 for Cancel, timeout or any failure. */
+ * field empty; 2 when the field's text could not be read (too long); -1 for Cancel, timeout or any failure. */
 static int ask_dialog(const char *header, const char *message, char *pw, size_t pwlen, int *remember)
 {
 	const char *prog = test_env("LINUXFS_DIALOG");
@@ -689,7 +693,7 @@ static int ask_dialog(const char *header, const char *message, char *pw, size_t 
 					ok = 1;
 				} else {
 					memset(pw, 0, pwlen);
-					empty = 1;
+					empty = v && CFStringGetLength(v) > 0 ? 2 : 1;
 				}
 			} else if (n && rc != 0) {
 				syslog(LOG_NOTICE, "the dialog timed out or failed (%d)", (int)rc);
@@ -708,7 +712,7 @@ static int ask_dialog(const char *header, const char *message, char *pw, size_t 
 			CFRelease(h);
 		if (m)
 			CFRelease(m);
-		return ok ? 0 : (empty ? 1 : -1);
+		return ok ? 0 : (empty ? empty : -1);
 	}
 }
 
@@ -802,7 +806,8 @@ static int mount_role(const char *fs, int argc, char **argv)
 			snprintf(message + strlen(message), sizeof message - strlen(message), "%s", hintp);
 		rc = ask_dialog(header, message, pass, sizeof pass, &remember);
 		if (rc > 0) {
-			syslog(LOG_NOTICE, "mount_%s: %s: an empty password: asking again", fs, req.dev);
+			syslog(LOG_NOTICE, "mount_%s: %s: %s: asking again", fs, req.dev,
+			       rc == 2 ? "a password too long or unreadable" : "an empty password");
 			continue;
 		}
 		if (rc != 0) {
