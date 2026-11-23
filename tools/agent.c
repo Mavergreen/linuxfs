@@ -17,12 +17,14 @@
  * Login sweep: once, 15 s after it starts (LINUXFS_SWEEP_DELAY seconds instead, unless root), for every disk whose
  * DiskArbitration volume kind starts with linuxfs_ and that has no volume path (DiskArbitration did not mount it, say
  * because the keychain was not ready), it runs `linuxfs automount DISK`.
- * LINUXFS_CLI names another linuxfs, and LINUXFS_KEYCHAIN=off swaps the keychain for a store in memory (tests).
+ * LINUXFS_CLI names another linuxfs, and LINUXFS_KEYCHAIN=off swaps the keychain for a store in memory (tests); like
+ * LINUXFS_SWEEP_DELAY, they are honoured only when not root.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <DiskArbitration/DiskArbitration.h>
 #include <Security/Security.h>
 #include <ctype.h>
+#include <mach/mach_time.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -46,8 +48,10 @@ extern char **environ;
 #define SOCKNAME "keychain.sock"
 #define OFFER_TTL 60
 #define CLIENT_TIMEOUT 5
-#define SERVER_TIMEOUT 2
+#define SERVER_TIMEOUT 5
 #define SWEEP_DELAY 15
+#define SWEEP_WINDOW 10
+#define REQUEST_DEADLINE 5
 #define PW_MAX 1024
 
 /*
@@ -90,9 +94,10 @@ static const char *cli;
 static DASessionRef session;
 static int use_keychain;
 
+/* A test hook's value: honoured only when not root (an agent running as root takes nothing from its environment). */
 static const char *env_or(const char *name, const char *dflt)
 {
-	const char *v = getenv(name);
+	const char *v = geteuid() == 0 ? NULL : getenv(name);
 
 	return v && *v ? v : dflt;
 }
@@ -115,10 +120,20 @@ static int paths(char *dir, size_t dlen, char *sock, size_t slen)
 #define KC_SERVICE "dev.mavergreen.linuxfs"
 #define SLOTS 16
 
+/* a monotonic clock, in milliseconds (the wall clock may be set; TTLs and deadlines must not care) */
+static uint64_t now_ms(void)
+{
+	static mach_timebase_info_data_t tb;
+
+	if (!tb.denom)
+		mach_timebase_info(&tb);
+	return mach_absolute_time() * tb.numer / tb.denom / 1000000;
+}
+
 struct slot {
 	char bsd[64];
 	char pw[PW_MAX];
-	time_t at;
+	uint64_t at;
 };
 static struct slot memstore[SLOTS];	/* LINUXFS_KEYCHAIN=off */
 static struct slot offers[SLOTS];	/* --offer, kept in memory in either case */
@@ -143,12 +158,16 @@ static void slot_put(struct slot *t, const char *bsd, const char *pw)
 	for (int i = 0; !s && i < SLOTS; i++)
 		if (!t[i].bsd[0])
 			s = &t[i];
-	if (!s)
-		s = &t[0];	/* full: the oldest-written slot is as good as any */
+	if (!s) {	/* full: the oldest-written slot goes */
+		s = &t[0];
+		for (int i = 1; i < SLOTS; i++)
+			if (t[i].at < s->at)
+				s = &t[i];
+	}
 	slot_clear(s);
 	snprintf(s->bsd, sizeof(s->bsd), "%s", bsd);
 	snprintf(s->pw, sizeof(s->pw), "%s", pw);
-	s->at = time(NULL);
+	s->at = now_ms();
 }
 
 /* The keychain account for disk BSD: its partition's UUID; 0 when it has none (then nothing is kept). */
@@ -235,15 +254,18 @@ static void keychain_forget(const char *bsd)
 			slot_clear(s);
 		return;
 	}
-	if (keychain_account(bsd, acct, sizeof(acct)) &&
-	    SecKeychainFindGenericPassword(NULL, strlen(KC_SERVICE), KC_SERVICE, strlen(acct), acct, NULL, NULL, &item) == errSecSuccess) {
+	if (!keychain_account(bsd, acct, sizeof(acct)))
+		return;
+	/* every matching item, not just the first */
+	while (SecKeychainFindGenericPassword(NULL, strlen(KC_SERVICE), KC_SERVICE, strlen(acct), acct, NULL, NULL, &item) == errSecSuccess) {
 		OSStatus st = SecKeychainItemDelete(item);
 
 		CFRelease(item);
-		if (st == errSecSuccess)
-			syslog(LOG_NOTICE, "forgot %s's password in the keychain", bsd);
-		else
+		if (st != errSecSuccess) {
 			syslog(LOG_ERR, "cannot forget %s's password in the keychain (%d)", bsd, (int)st);
+			return;
+		}
+		syslog(LOG_NOTICE, "forgot %s's password in the keychain", bsd);
 	}
 }
 
@@ -255,11 +277,19 @@ static int offer_take(const char *bsd, char *pw, size_t len)
 
 	if (!s)
 		return 0;
-	ok = time(NULL) - s->at <= OFFER_TTL && strlen(s->pw) < len;
+	ok = now_ms() - s->at <= OFFER_TTL * 1000 && strlen(s->pw) < len;
 	if (ok)
 		snprintf(pw, len, "%s", s->pw);
 	slot_clear(s);
 	return ok;
+}
+
+/* Offers older than OFFER_TTL are forgotten, their passwords zeroed. */
+static void offers_purge(void)
+{
+	for (int i = 0; i < SLOTS; i++)
+		if (offers[i].bsd[0] && now_ms() - offers[i].at > OFFER_TTL * 1000)
+			slot_clear(&offers[i]);
 }
 
 /* ---- the socket ---- */
@@ -280,14 +310,28 @@ static void put(int fd, const char *s)
 	}
 }
 
-/* Reads from FD until LINES newlines have come (or EOF, the timeout, or BUF's CAP is full); the length, NUL-terminated. */
-static size_t read_lines(int fd, char *buf, size_t cap, int lines)
+/*
+ * Reads from FD until LINES newlines have come (or EOF, the DEADLINE (now_ms) or BUF's CAP is full); the length,
+ * NUL-terminated. It polls with what is left of the deadline before each read, so a client that drips bytes is dropped.
+ */
+static size_t read_lines(int fd, char *buf, size_t cap, int lines, uint64_t deadline)
 {
 	size_t n = 0;
 
 	while (n < cap - 1) {
-		ssize_t r = read(fd, buf + n, cap - 1 - n);
+		uint64_t now = now_ms();
+		struct pollfd p = { fd, POLLIN, 0 };
+		int pr;
+		ssize_t r;
 
+		if (now >= deadline)
+			break;
+		pr = poll(&p, 1, (int)(deadline - now));
+		if (pr < 0 && errno == EINTR)
+			continue;
+		if (pr <= 0)
+			break;
+		r = read(fd, buf + n, cap - 1 - n);
 		if (r < 0 && errno == EINTR)
 			continue;
 		if (r <= 0)
@@ -310,6 +354,7 @@ static void serve(int fd)
 	uid_t uid;
 	gid_t gid;
 	struct timeval tv = { SERVER_TIMEOUT, 0 };
+	uint64_t deadline = now_ms() + REQUEST_DEADLINE * 1000;
 	int one = 1, fl = fcntl(fd, F_GETFL);
 	int want_pw;
 
@@ -322,7 +367,7 @@ static void serve(int fd)
 	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 	setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
-	read_lines(fd, buf, sizeof(buf), 1);
+	read_lines(fd, buf, sizeof(buf), 1, deadline);
 	nl = strchr(buf, '\n');
 	if (!nl)
 		goto done;
@@ -339,7 +384,7 @@ static void serve(int fd)
 			goto done;
 		want_pw = strcmp(verb, "save") == 0 || strcmp(verb, "offer") == 0;
 		if (want_pw && !strchr(nl + 1, '\n'))
-			read_lines(fd, buf + (nl + 1 - buf) + strlen(nl + 1), sizeof(buf) - (size_t)(nl + 1 - buf) - strlen(nl + 1), 1);
+			read_lines(fd, buf + (nl + 1 - buf) + strlen(nl + 1), sizeof(buf) - (size_t)(nl + 1 - buf) - strlen(nl + 1), 1, deadline);
 		pwline = nl + 1;
 		if (want_pw) {
 			char *e = strchr(pwline, '\n');
@@ -394,9 +439,29 @@ static void accepted(CFSocketRef s, CFSocketCallBackType type, CFDataRef addr, c
 	close(fd);
 }
 
+/* 1 when an agent already answers at PATH */
+static int answers(const char *path)
+{
+	struct sockaddr_un sa;
+	int fd = socket(AF_UNIX, SOCK_STREAM, 0), ok;
+	struct timeval tv = { 1, 0 };
+
+	if (fd < 0)
+		return 0;
+	memset(&sa, 0, sizeof(sa));
+	sa.sun_family = AF_UNIX;
+	snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", path);
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	ok = connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0;
+	close(fd);
+	return ok;
+}
+
+/* -1 on failure, -2 when another agent already answers */
 static int listen_on(const char *dir, const char *path)
 {
 	struct sockaddr_un sa;
+	struct stat st;
 	int fd;
 	char parent[1024];
 	const char *sub[] = { "Library", "Library/Caches", NULL };
@@ -408,8 +473,15 @@ static int listen_on(const char *dir, const char *path)
 	}
 	if (mkdir(dir, 0700) < 0 && errno != EEXIST)
 		return -1;
+	/* a real directory of ours, not a symlink or someone else's */
+	if (lstat(dir, &st) < 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid()) {
+		syslog(LOG_ERR, "%s is not a directory of this user's own; not listening", dir);
+		return -1;
+	}
 	if (chmod(dir, 0700) < 0)
 		return -1;
+	if (answers(path))
+		return -2;
 	unlink(path);	/* a stale socket from an agent that died */
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0)
@@ -433,7 +505,6 @@ static int offer_main(const char *bsd)
 	struct sockaddr_un sa;
 	struct timeval tv = { CLIENT_TIMEOUT, 0 };
 	struct pollfd p;
-	size_t n = 0;
 	int fd, one = 1, fl;
 
 	snprintf(line, sizeof(line), "offer\t%s", bsd);
@@ -441,16 +512,7 @@ static int offer_main(const char *bsd)
 		fprintf(stderr, "linuxfs-agent: no such disk or no HOME\n");
 		return 2;
 	}
-	while (n < sizeof(pw) - 1) {
-		ssize_t r = read(0, pw + n, sizeof(pw) - 1 - n);
-
-		if (r < 0 && errno == EINTR)
-			continue;
-		if (r <= 0)
-			break;
-		n += (size_t)r;
-	}
-	pw[n] = '\0';
+	read_lines(0, pw, sizeof(pw), 1, now_ms() + CLIENT_TIMEOUT * 1000);
 	pw[strcspn(pw, "\n")] = '\0';
 	if (!pw[0]) {
 		fprintf(stderr, "linuxfs-agent: no password on stdin\n");
@@ -480,7 +542,7 @@ static int offer_main(const char *bsd)
 	put(fd, req);
 	memset(req, 0, sizeof(req));
 	memset(pw, 0, sizeof(pw));
-	read_lines(fd, reply, sizeof(reply), 1);
+	read_lines(fd, reply, sizeof(reply), 1, now_ms() + CLIENT_TIMEOUT * 1000);
 	close(fd);
 	return strcmp(reply, "ok\n") == 0 ? 0 : 1;
 }
@@ -495,16 +557,26 @@ static void reap(CFRunLoopTimerRef t, void *ctx)
 	(void)ctx;
 	while (waitpid(-1, &status, WNOHANG) > 0)
 		;
+	offers_purge();
 }
 
 static void automount(const char *bsd)
 {
 	const char *argv[] = { cli, "automount", bsd, NULL };
 	pid_t pid;
+	posix_spawnattr_t attr;
+	sigset_t def;
 
 	syslog(LOG_NOTICE, "%s automount %s", cli, bsd);
-	if (posix_spawn(&pid, cli, NULL, NULL, (char **)argv, environ) != 0)
+	/* the agent ignores SIGPIPE (a client may go away mid-answer); its child must not inherit that */
+	sigemptyset(&def);
+	sigaddset(&def, SIGPIPE);
+	posix_spawnattr_init(&attr);
+	posix_spawnattr_setsigdefault(&attr, &def);
+	posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGDEF);
+	if (posix_spawn(&pid, cli, NULL, &attr, (char **)argv, environ) != 0)
 		syslog(LOG_ERR, "cannot run %s: %s", cli, strerror(errno));
+	posix_spawnattr_destroy(&attr);
 }
 
 static int swept;
@@ -554,9 +626,10 @@ static void sweep(CFRunLoopTimerRef t, void *ctx)
 	{
 		CFRunLoopTimerContext tc = { 0, s, NULL, NULL, NULL };
 
-		CFRunLoopAddTimer(CFRunLoopGetCurrent(),
-				  CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 3, 0, 0, 0, sweep_end, &tc),
-				  kCFRunLoopDefaultMode);
+		CFRunLoopTimerRef et = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + SWEEP_WINDOW, 0, 0, 0, sweep_end, &tc);
+
+		CFRunLoopAddTimer(CFRunLoopGetCurrent(), et, kCFRunLoopDefaultMode);
+		CFRelease(et);	/* the run loop keeps it until it fires */
 	}
 }
 
@@ -566,6 +639,7 @@ int main(int argc, char **argv)
 	const char *delay;
 	CFSocketRef cs;
 	CFRunLoopSourceRef src;
+	CFRunLoopTimerRef timer;
 	int fd;
 
 	if (argc == 3 && strcmp(argv[1], "--offer") == 0)
@@ -575,6 +649,7 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	openlog("linuxfs-agent", LOG_PERROR | LOG_PID, LOG_USER);
+	signal(SIGPIPE, SIG_IGN);
 	cli = env_or("LINUXFS_CLI", PREFIX "/bin/linuxfs");
 	use_keychain = strcmp(env_or("LINUXFS_KEYCHAIN", "on"), "off") != 0;
 	session = DASessionCreate(NULL);
@@ -582,8 +657,17 @@ int main(int argc, char **argv)
 		syslog(LOG_ERR, "no DiskArbitration session");
 		return 1;
 	}
-	if (!paths(dir, sizeof(dir), path, sizeof(path)) || (fd = listen_on(dir, path)) < 0) {
-		syslog(LOG_ERR, "cannot listen on the keychain socket under %s", getenv("HOME") ? getenv("HOME") : "(no HOME)");
+	if (!paths(dir, sizeof(dir), path, sizeof(path))) {
+		syslog(LOG_ERR, "no usable HOME for the keychain socket");
+		return 1;
+	}
+	fd = listen_on(dir, path);
+	if (fd == -2) {
+		syslog(LOG_NOTICE, "already running (an agent answers at %s)", path);
+		return 0;
+	}
+	if (fd < 0) {
+		syslog(LOG_ERR, "cannot listen on the keychain socket %s", path);
 		return 1;
 	}
 	cs = CFSocketCreateWithNative(NULL, fd, kCFSocketAcceptCallBack, accepted, NULL);
@@ -593,14 +677,13 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	CFRunLoopAddSource(CFRunLoopGetCurrent(), src, kCFRunLoopDefaultMode);
-	delay = geteuid() == 0 ? NULL : getenv("LINUXFS_SWEEP_DELAY");
-	CFRunLoopAddTimer(CFRunLoopGetCurrent(),
-			  CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + (delay && *delay ? atof(delay) : SWEEP_DELAY),
-					       0, 0, 0, sweep, NULL),
-			  kCFRunLoopDefaultMode);
-	CFRunLoopAddTimer(CFRunLoopGetCurrent(),
-			  CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 1, 1, 0, 0, reap, NULL),
-			  kCFRunLoopDefaultMode);
+	delay = env_or("LINUXFS_SWEEP_DELAY", NULL);
+	timer = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + (delay ? atof(delay) : SWEEP_DELAY), 0, 0, 0, sweep, NULL);
+	CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopDefaultMode);
+	CFRelease(timer);	/* the run loop keeps it until it has fired */
+	timer = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 1, 1, 0, 0, reap, NULL);
+	CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopDefaultMode);
+	CFRelease(timer);
 	syslog(LOG_NOTICE, "keeping the keychain at %s", path);
 	CFRunLoopRun();
 	return 0;

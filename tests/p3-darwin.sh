@@ -48,7 +48,7 @@ cleanup() {
     sudo cp /var/log/$H.log "$O/helper.log" 2>/dev/null && sudo chown "$(id -u)" "$O/helper.log"
     sudo rm -f /Library/LaunchDaemons/$H.plist /Library/PrivilegedHelperTools/$H /var/run/$H.sock /var/log/$H.log
   fi
-  # spec: work/: the raw images (gigabytes) go; the small files (errors, logs, askpass's count) are kept in out/work
+  # spec: work/: the raw images (gigabytes) go; the small files (errors, logs) are kept in out/work
   mkdir -p "$O/work" && find "$W" -type f -size -1024k ! -name '*.img' -exec cp {} "$O/work/" \; 2>/dev/null
   cp -R "$W/logs" "$O/" 2>/dev/null
   rm -rf "$W"

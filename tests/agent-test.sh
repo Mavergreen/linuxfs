@@ -55,6 +55,22 @@ printf 'pw3\n' | HOME=$H "$D/agent" --offer disk9
 [ "$(stat -f %Lp "$H/Library/Caches/dev.mavergreen.linuxfs")" = 700 ]; ok $? "the socket's directory is mode 700"
 [ "$(stat -f %Lp "$SOCK")" = 600 ]; ok $? "and the socket is mode 600"
 ! grep -q 'secret\|pw2\|pw3\|saved1' "$D/agent.log"; ok $? "no password is in the agent's log"
+HOME=$H "$D/agent" 2> "$D/second.log"; rc=$?
+[ $rc = 0 ] && grep -q 'already running' "$D/second.log" && [ "$(find_ disk9)" = "saved saved1 " ]; ok $? "a second agent finds the first answering, says so and exits 0 (rc $rc), leaving its socket be"
+# a client must never hang: an agent that is stopped (accepts into its backlog, never answers)
+kill -STOP $ap
+s=$(date +%s)
+printf 'pw\n' | HOME=$H "$D/agent" --offer disk9 2> /dev/null; rc=$?
+e=$(( $(date +%s) - s ))
+[ $rc = 1 ] && [ $e -le 6 ]; ok $? "--offer to a stopped agent exits 1 within about 6 s (rc $rc, $e s)"
+kill -CONT $ap
+# a client that drips bytes is dropped at the 5 s deadline (the agent serves one at a time, so others wait that long at most)
+( printf 'sav'; sleep 2; printf 'e\tdisk6\n'; sleep 6; printf 'x\n' ) | nc -w 10 -U "$SOCK" > "$D/drip.out" 2>/dev/null & dp=$!
+sleep 1
+s=$(date +%s); r=$(printf 'find\tdisk6\n' | nc -w 9 -U "$SOCK" | tr '\n' ' '); e=$(( $(date +%s) - s ))
+[ "$r" = "none " ] && [ $e -le 6 ]; ok $? "the agent answers the next client once the drip is dropped at the deadline (answer '$r' after $e s)"
+wait $dp
+[ ! -s "$D/drip.out" ] && [ "$(find_ disk6)" = "none " ]; ok $? "and the dripped request kept nothing"
 kill -9 $ap; wait $ap 2>/dev/null
 [ -S "$SOCK" ]; ok $? "killing the agent leaves its socket file behind"
 s=$(date +%s)
