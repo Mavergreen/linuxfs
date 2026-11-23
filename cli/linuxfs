@@ -87,12 +87,13 @@ device_nodes() {
 }
 
 # A name a volume can carry, a directory can be called and an lklfuse -o value can hold: no / or : (paths),
-# no , = or \ (they would end the option and start another: review I1), no leading ., not empty.
+# no , = or \ (they would end the option and start another: review I1), no control characters (they
+# would reach DiskArbitration's stdout), no leading ., not empty.
 # Empty unless it is UTF-8 (the Mac names folders in it); at most 200 characters, cut at a character
 # whatever the caller's locale (review M5).
 safe_name() {
   printf '%s' "$1" | iconv -f UTF-8 -t UTF-8 > /dev/null 2>&1 || return 0
-  printf '%s' "$1" | LC_ALL=C tr '/:,=\\' '-----' | LC_ALL=C sed 's/^\.*//' | LC_ALL=en_US.UTF-8 cut -c 1-200
+  printf '%s' "$1" | LC_ALL=C tr '/:,=\\' '-----' | LC_ALL=C tr '\001-\037\177' '[-*]' | LC_ALL=C sed 's/^\.*//' | LC_ALL=en_US.UTF-8 cut -c 1-200
 }
 free_mountpoint() {
   base=$VOLUMES/$1; p=$base; i=1

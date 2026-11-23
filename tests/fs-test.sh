@@ -76,6 +76,11 @@ USERP=$D/link.plist u linuxfs_ntfs.util -p "$T" removable writable >/dev/null; r
 plist "$D/ign.plist" "<key>Ignore:my data</key><true/>"
 USERP=$D/ign.plist u linuxfs_ext4.util -p "$E" removable writable >/dev/null; rc=$?
 [ $rc = 254 ]; ok $? "Ignore:<LABEL> true makes the util decline that disk (rc $rc)"
+plist "$D/unign.plist" "<key>Ignore:my data</key><false/>"
+USERP=$D/unign.plist MACHP=$D/ign.plist u linuxfs_ext4.util -p "$E" removable writable >/dev/null; rc=$?
+[ $rc = 255 ]; ok $? "a user Ignore false overrides a machine Ignore true (rc $rc)"
+USERP=$D/empty.plist MACHP=$D/ign.plist u linuxfs_ext4.util -p "$E" removable writable >/dev/null; rc=$?
+[ $rc = 254 ]; ok $? "the machine's Ignore holds when the user's plist lacks the key (rc $rc)"
 for bad_args in "-p diskX removable writable" "-p ../disk2 removable writable" "-p ${E}s removable writable" "-p $E sometimes writable" "-p $E" "-z" ""; do
   # shellcheck disable=SC2086
   u linuxfs_ext4.util $bad_args >/dev/null 2>&1; rc=$?
@@ -91,6 +96,12 @@ out=$(u fsck_linuxfs_ext4 -n "/dev/r$E" 2>&1); rc=$?
 [ $rc = 8 ] && [ "$out" = "Verify and Repair for ext4 come with its tools" ]; ok $? "fsck -n exits 8 and says why (rc $rc, '$out')"
 u fsck_linuxfs_ext4 -y "/dev/r$E" >/dev/null 2>&1; rc=$?
 [ $rc = 8 ]; ok $? "fsck -y exits 8 (rc $rc)"
+u fsck_linuxfs_ext4 >/dev/null 2>&1; rc=$?
+[ $rc = 8 ]; ok $? "fsck with no flag exits 8 (rc $rc)"
+out=$(u fsck_linuxfs_ext4 -z "/dev/r$E" 2>&1 >/dev/null); rc=$?
+[ $rc = 8 ] && case $out in usage:*) true ;; *) false ;; esac; ok $? "fsck with an unknown flag exits 8 with a usage line on stderr (rc $rc, '$out')"
+u fsck_linuxfs_ext4 -qn "/dev/r$E" >/dev/null 2>&1; rc=$?
+[ $rc = 8 ]; ok $? "fsck flags are parsed exactly: -qn is not -q (rc $rc)"
 u mount_linuxfs_ext4 -o owners "/dev/$E" /tmp/nowhere >/dev/null 2>&1; rc=$?
 [ $rc = 1 ]; ok $? "the mount role is not yet implemented: exits 1 (rc $rc)"
 echo "1..$n"; exit $bad

@@ -30,16 +30,26 @@
 
 /* the plist at path, owned by uid (or by root too when also_root), a regular file that is not a symlink and at most
  * 1 MiB; NULL for anything else, including unparseable */
-static CFDictionaryRef load_plist(const char *path, uid_t uid, int also_root)
+static CFDictionaryRef load_plist(const char *path, uid_t uid, int also_root, int drop)
 {
 	struct stat st;
-	int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+	int fd, dropped = 0;
 	char *buf = NULL;
 	size_t got = 0;
 	CFDictionaryRef dict = NULL;
 
-	if (fd < 0)
+	/* a user's file is opened and read as that user, so root's reach never extends into what they can name */
+	if (drop && uid != 0 && geteuid() == 0) {
+		if (seteuid(uid) != 0)
+			return NULL;
+		dropped = 1;
+	}
+	fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
+	if (fd < 0) {
+		if (dropped && seteuid(0) != 0)
+			_exit(FSUR_UNRECOGNIZED);
 		return NULL;
+	}
 	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size > PREFS_MAX ||
 	    (st.st_uid != uid && !(also_root && st.st_uid == 0)))
 		goto done;
@@ -67,6 +77,8 @@ static CFDictionaryRef load_plist(const char *path, uid_t uid, int also_root)
 done:
 	free(buf);
 	close(fd);
+	if (dropped && seteuid(0) != 0)
+		_exit(FSUR_UNRECOGNIZED);	/* cannot get root back: stop rather than go on as the user */
 	return dict;
 }
 
@@ -94,7 +106,7 @@ static int pref_bool(CFDictionaryRef d, CFStringRef key)
 	return -1;
 }
 
-static void pref_apply(CFDictionaryRef d, const char *label, struct fsprefs *p, int *have, int *ignored)
+static void pref_apply(CFDictionaryRef d, const char *label, struct fsprefs *p, int *have, int *ignored, int *ign_set)
 {
 	static const struct { const char *name; size_t off; } keys[] = {
 		{ "Automount", offsetof(struct fsprefs, automount) },
@@ -122,8 +134,12 @@ static void pref_apply(CFDictionaryRef d, const char *label, struct fsprefs *p, 
 		snprintf(key, sizeof key, "Ignore:%s", label);
 		k = CFStringCreateWithCString(NULL, key, kCFStringEncodingUTF8);
 		if (k) {
-			if (pref_bool(d, k) == 1)
-				*ignored = 1;
+			int v = *ign_set ? -1 : pref_bool(d, k);
+
+			if (v >= 0) {
+				*ignored = v;
+				*ign_set = 1;
+			}
 			CFRelease(k);
 		}
 	}
@@ -137,7 +153,7 @@ int fs_read_prefs(struct fsprefs *p, const char *label, int *ignored)
 	char userpath[1024], machpath[1024];
 	const char *up = NULL, *mp = "/Library/Preferences/" PREFS_NAME;
 	uid_t uowner, mowner = 0;
-	int also_root = 1, have[4] = { 0, 0, 0, 0 };
+	int also_root = 1, have[4] = { 0, 0, 0, 0 }, ign_set = 0;
 	CFDictionaryRef ud, md;
 
 	fsrules_default_prefs(p);
@@ -163,12 +179,12 @@ int fs_read_prefs(struct fsprefs *p, const char *label, int *ignored)
 		}
 	}
 	snprintf(machpath, sizeof machpath, "%s", mp);
-	ud = up ? load_plist(up, uowner, 0) : NULL;
-	md = load_plist(machpath, mowner, also_root);
+	ud = up ? load_plist(up, uowner, 0, 1) : NULL;
+	md = load_plist(machpath, mowner, also_root, 0);
 	if (ud)
-		pref_apply(ud, label, p, have, ignored);
+		pref_apply(ud, label, p, have, ignored, &ign_set);
 	if (md)
-		pref_apply(md, label, p, have, ignored);
+		pref_apply(md, label, p, have, ignored, &ign_set);
 	if (ud)
 		CFRelease(ud);
 	if (md)
@@ -236,6 +252,10 @@ static int util(const char *fs, int argc, char **argv)
 		type = probe_bsd(argv[2], label, sizeof label);
 		if (!type)
 			return FSUR_UNRECOGNIZED;
+		if (strcmp(type, fsrules_probe_type(fs)) != 0) {
+			syslog(LOG_NOTICE, "%s: %s is not for the %s bundle", argv[2], type, fs);
+			return FSUR_UNRECOGNIZED;
+		}
 		fs_read_prefs(&p, label, &ignored);
 		if (ignored) {
 			syslog(LOG_NOTICE, "%s: %s found, ignored by the user's choice", argv[2], type);
@@ -251,7 +271,7 @@ static int util(const char *fs, int argc, char **argv)
 		return FSUR_RECOGNIZED;
 	}
 	if (argc == 3 && strcmp(argv[1], "-k") == 0) {
-		struct fsprefs all = { 1, 0, 1, 1 };
+		struct fsprefs all = { .automount = 1, .readonly = 0, .ntfs_takeover = 1, .apfs_write = 1 };
 
 		if (!valid_bsd(argv[2])) {
 			syslog(LOG_NOTICE, "%s util: bad -k argument", fs);
@@ -271,23 +291,14 @@ static int util(const char *fs, int argc, char **argv)
 
 static int fsck(const char *fs, int argc, char **argv)
 {
-	int i, quick = 0, repair = 0;
-
-	for (i = 1; i < argc; i++) {
-		if (argv[i][0] != '-')
-			continue;
-		if (strchr(argv[i], 'n') || strchr(argv[i], 'y'))
-			repair = 1;
-		if (strchr(argv[i], 'q'))
-			quick = 1;
-	}
-	if (repair) {
+	if (argc >= 2 && argc <= 3 && strcmp(argv[1], "-q") == 0)
+		return 0;
+	if (argc >= 2 && argc <= 3 && (strcmp(argv[1], "-n") == 0 || strcmp(argv[1], "-y") == 0)) {
 		printf("Verify and Repair for %s come with its tools\n", fs);
 		syslog(LOG_NOTICE, "fsck_%s: verify/repair refused (phase 1)", fs);
 		return 8;
 	}
-	if (quick)
-		return 0;
+	fprintf(stderr, "usage: fsck_linuxfs_%s -q|-n|-y device\n", fs);
 	syslog(LOG_NOTICE, "fsck_%s: unknown arguments", fs);
 	return 8;
 }

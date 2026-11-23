@@ -163,6 +163,10 @@ case $c in *allow_other,*|*,allow_other\ *|*'\'*) r=1 ;; *) r=0 ;; esac; ok $r "
 case $c in *"volname=x-allow_other-,"*) r=0 ;; *) r=1 ;; esac; ok $r "commas, equals signs and backslashes in the label become -"
 case $c in *"fsname=linuxfs@a-b-c.img,"*) r=0 ;; *) r=1 ;; esac; ok $r "and in the image's name"
 sh "$L" unmount "$T/a,b=c.img" > /dev/null 2>&1
+out=$(FAKE_LABEL="$(printf 'a\033b\177c\rd')" sh "$L" mount "$T/img" 2>&1)
+c=$(last)
+case $c in *"volname=a-b-c-d,"*) r=0 ;; *) r=1 ;; esac; ok $r "control characters in the label become - (got: $c)"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
 mkdir -p "$T/home"
 (unset LINUXFS_LOCKS; HOME=$T/home sh "$L" mount "$T/img" > /dev/null 2>&1)
 case $(last) in *"lock=$T/home/Library/Caches/dev.mavergreen.linuxfs/locks/linuxfs-image-"*) r=0 ;; *) r=1 ;; esac

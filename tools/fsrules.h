@@ -30,7 +30,7 @@ struct mountreq { int asked, ro; const char *dev, *mnt; };
  * 0, or -1 on misuse. */
 int fsrules_parse_mount(int argc, char **argv, struct mountreq *m);
 
-/* A volume's name from its label, by cli/linuxfs's safe_name: / : , = \ become -, leading dots go, at most
+/* A volume's name from its label, by cli/linuxfs's safe_name: / : , = \ and control characters become -, leading dots go, at most
  * 200 characters cut on a character boundary; "Linux" when that leaves nothing or the label is not UTF-8. */
 void fsrules_volname(const char *label, char *out, size_t outlen);
 

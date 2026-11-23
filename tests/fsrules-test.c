@@ -160,6 +160,16 @@ int main(void)
 	iss(out, "a-b-c", "/ and : become -");
 	fsrules_volname("a,b=c\\d", out, sizeof out);
 	iss(out, "a-b-c-d", ", = and backslash become -");
+	fsrules_volname("a\nb", out, sizeof out);
+	iss(out, "a-b", "a newline becomes -");
+	fsrules_volname("a\rb", out, sizeof out);
+	iss(out, "a-b", "a carriage return becomes -");
+	fsrules_volname("a\tb", out, sizeof out);
+	iss(out, "a-b", "a tab becomes -");
+	fsrules_volname("a\x1b" "b", out, sizeof out);
+	iss(out, "a-b", "an escape becomes -");
+	fsrules_volname("a\x7f" "b", out, sizeof out);
+	iss(out, "a-b", "DEL becomes -");
 	fsrules_volname("..x", out, sizeof out);
 	iss(out, "x", "leading dots are stripped");
 	fsrules_volname("...", out, sizeof out);

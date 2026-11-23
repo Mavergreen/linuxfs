@@ -161,7 +161,7 @@ void fsrules_volname(const char *label, char *out, size_t outlen)
 			n = u8len(s);
 			if (o + n + 1 > outlen)
 				break;
-			if (n == 1 && strchr("/:,=\\", *s))
+			if (n == 1 && (*s < 0x20 || *s == 0x7f || strchr("/:,=\\", *s)))
 				out[o++] = '-';
 			else
 				memcpy(out + o, s, n), o += n;
