@@ -311,7 +311,7 @@ cmd_mount() {
       fi
       [ -z "$made" ] || rmdir "$mnt" 2>/dev/null
       if [ -n "$rejected" ]; then echo "linuxfs: wrong password for $target${hint:+ (hint: $hint)}" >&2
-      else echo "linuxfs: $target is an encrypted volume; give its password at a terminal, or on stdin with --password-stdin" >&2; fi
+      else echo "linuxfs: $target is an encrypted volume; give its password at a terminal, or on stdin with --password-stdin${hint:+ (hint: $hint)}" >&2; fi
       exit 4
     fi
     [ -z "$made" ] || rmdir "$mnt" 2>/dev/null

@@ -452,6 +452,8 @@ static int reply_whole(const char *rep)
 	return nl >= ((strncmp(rep, "offered\n", 8) == 0 || strncmp(rep, "saved\n", 6) == 0) ? 2 : 1);
 }
 
+static int kc_hung; /* the keeper took its whole deadline without answering: no more requests to it */
+
 /* One request to the keychain keeper (one per connection), its reply into rep (replen bytes, NUL-ended); the whole
  * conversation within KC_DEADLINE_MS. 0 on a reply, -1 on any failure. */
 static int kc_ask(const char *req, size_t reqlen, char *rep, size_t replen)
@@ -464,6 +466,8 @@ static int kc_ask(const char *req, size_t reqlen, char *rep, size_t replen)
 	size_t got = 0, sent = 0;
 
 	rep[0] = '\0';
+	if (kc_hung)
+		return -1;
 	if (over)
 		snprintf(path, sizeof path, "%s", over);
 	else if ((home = getenv("HOME")) != NULL)
@@ -493,8 +497,10 @@ static int kc_ask(const char *req, size_t reqlen, char *rep, size_t replen)
 		pf.revents = 0;
 		gettimeofday(&now, NULL);
 		left = KC_DEADLINE_MS - ((long)(now.tv_sec - t0.tv_sec) * 1000 + (long)(now.tv_usec - t0.tv_usec) / 1000);
-		if (left <= 0)
+		if (left <= 0) {
+			kc_hung = 1;
 			goto done;
+		}
 		if (poll(&pf, 1, (int)left) < 0) {
 			if (errno == EINTR)
 				continue;
@@ -565,6 +571,11 @@ static void kc_tell(const char *verb, const char *bsd, const char *pw)
 	char req[PW_MAX + 80], rep[64];
 	int n = pw ? snprintf(req, sizeof req, "%s\t%s\n%s\n", verb, bsd, pw) : snprintf(req, sizeof req, "%s\t%s\n", verb, bsd);
 
+	if (kc_hung) {
+		syslog(LOG_NOTICE, "%s: the keychain keeper did not answer in time: not asking it to %s", bsd, verb);
+		memset(req, 0, sizeof req);
+		return;
+	}
 	if (n < 0 || (size_t)n >= sizeof req || kc_ask(req, (size_t)n, rep, sizeof rep) != 0)
 		syslog(LOG_NOTICE, "%s: the keychain keeper did not take the %s", bsd, verb);
 	else

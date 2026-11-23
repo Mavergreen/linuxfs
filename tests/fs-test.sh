@@ -211,6 +211,10 @@ kc hang; t0=$(date +%s)
 mt env STUB_PW=pw DLG_PWS=pw DLG_MODE=once "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
 t1=$(date +%s); kcstop
 [ $rc = 0 ] && grep -q '^dialog' "$M/log" && [ $((t1 - t0)) -lt 8 ]; ok $? "a keeper that never answers: the dialog runs after the 5 s deadline, in $((t1 - t0)) s (rc $rc)"
+kc hang; t0=$(date +%s)
+mt env STUB_PW=pw DLG_PWS=pw DLG_MODE=remember "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
+t1=$(date +%s); kcstop
+[ $rc = 0 ] && [ $((t1 - t0)) -lt 8 ]; ok $? "a hung keeper and 'remember' ticked: the save is skipped, not a second 5 s wait: $((t1 - t0)) s (rc $rc)"
 # misuse
 for bad_args in "" "/dev/disk9" "-o /dev/disk9 /tmp/m" "/dev/disk9 /tmp/m extra" "-x /dev/disk9 /tmp/m"; do
   # shellcheck disable=SC2086

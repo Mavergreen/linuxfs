@@ -23,7 +23,7 @@ if [ -n "\${FAKE_ENCRYPTED:-}" ]; then
   case "\$*" in
     *passfd=5*) IFS= read -r got <&5 || got=; printf '%s\n' "\$got" > "$T/pwgot"
       [ "\$got" = "\$FAKE_ENCRYPTED" ] || { echo "APFS: wrong password for the encrypted volume (hint: test)"; echo "can't mount disk: Key was rejected by service"; exit 1; } ;;
-    *) echo "APFS: volume is encrypted: mount it with its password"; echo "can't mount disk: Required key not available"; exit 1 ;;
+    *) echo "APFS: volume is encrypted: mount it with its password (hint: test)"; echo "can't mount disk: Required key not available"; exit 1 ;;
   esac
   case "\$*" in *opts=readwrite*) echo "APFS: an encrypted volume can only be mounted read-only"; echo "can't mount disk: Read-only file system"; exit 1 ;; esac
 fi
@@ -335,6 +335,7 @@ FAKE_FUSION=notier2 LINUXFS_OPEN="$T/bin/open" sh "$L" automount disk3s1 > /dev/
 : > "$T/enc.img"; : > "$T/calls"
 out=$(FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret sh "$L" mount "$T/enc.img" < /dev/null 2>&1); rc=$?
 [ $rc -eq 4 ] && echo "$out" | grep -q -- "--password-stdin"; ok $? "an encrypted volume with no terminal to ask at exits 4, saying how to give the password (got $rc: '$out')"
+echo "$out" | grep -q "(hint: test)\$"; ok $? "and the first exit 4 carries the volume's hint, as the wrong-password message does ('$out')"
 out=$(printf 's3cret\n' | FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret sh "$L" mount "$T/enc.img" --password-stdin 2>&1); rc=$?
 [ $rc -eq 0 ] && [ "$(cat "$T/pwgot")" = s3cret ] && last | grep -q 'passfd=5'; ok $? "--password-stdin: the password reaches lklfuse on fd 5 (got $rc: '$out')"
 ! grep -q s3cret "$T/calls" || false; ok $? "and is on no command line"
