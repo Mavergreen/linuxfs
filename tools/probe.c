@@ -429,7 +429,9 @@ int linuxfs_probe_uuid(char *out, size_t outlen)
 	static const char hex[] = "0123456789ABCDEF";
 	size_t i, n = 0;
 
-	if (!uuid_off || !has(uuid_off, 16) || outlen < 37)
+	static const unsigned char zero[16];
+
+	if (!uuid_off || !has(uuid_off, 16) || outlen < 37 || memcmp(buf + uuid_off, zero, 16) == 0)
 		return -1;
 	for (i = 0; i < 16; i++) {
 		if (i == 4 || i == 6 || i == 8 || i == 10)

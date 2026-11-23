@@ -67,4 +67,20 @@ for i in ntfs f2fs vfat exfat fat32; do
   if [ -z "$got" ] && [ $rc -eq 1 ]; then echo "ok $n - $i.img: no UUID"
   else echo "not ok $n - $i.img: UUID got '$got' ($rc), want none (1)"; bad=1; fi
 done
+# a zeroed UUID is none (as blkid); the Fusion main device has the container's, its tier2 none; edge cases in one process
+cp "$D/ext4.img" "$D/ext4-nouuid.img"; dd if=/dev/zero of="$D/ext4-nouuid.img" bs=1 seek=$((1024 + 0x68)) count=16 conv=notrunc 2>/dev/null
+head -c 2048 "$D/btrfs.img" > "$D/btrfs-cut.img"
+none() { # NAME WHY ARGS...: the driver prints nothing and exits 1
+  n=$((n + 1)); w=$1; shift; got=$("$D/probe-uuid" "$@"); rc=$?
+  if [ -z "$got" ] && [ $rc -eq 1 ]; then echo "ok $n - $w"; else echo "not ok $n - $w: got '$got' ($rc), want none (1)"; bad=1; fi
+}
+none "ext4-nouuid.img: an all-zero UUID is none" "$D/ext4-nouuid.img"
+none "btrfs-cut.img: a truncated image has no UUID" "$D/btrfs-cut.img"
+none "a 36-byte buffer is too small" --small "$D/ext4.img"
+none "no stale UUID after a failed probe (unknown)" --stale "$D/ext4.img" "$D/zero.img"
+none "no stale UUID after a failed probe (short)" --stale "$D/ext4.img" "$D/short.img"
+none "Fusion tier2 device: no UUID" "$D/fusion-hdd.img"
+n=$((n + 1)); want_u=$(uuid fusion-ssd.img | tr a-f A-F); got=$("$D/probe-uuid" "$D/fusion-ssd.img"); rc=$?
+if [ -n "$want_u" ] && [ "$got" = "$want_u" ] && [ $rc -eq 0 ]; then echo "ok $n - Fusion main device: the container's UUID $got"
+else echo "not ok $n - Fusion main: got '$got' ($rc), want '$want_u'"; bad=1; fi
 echo "1..$n"; exit $bad
