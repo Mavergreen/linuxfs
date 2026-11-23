@@ -29,6 +29,8 @@ sh "$REPO_ROOT/build/stage.sh" --built "$T/built" --out "$T/stage" --version "$V
   { cat "$T/log" >&2; echo "FAIL: stage.sh refused the fixtures" >&2; exit 1; }
 sh "$REPO_ROOT/build/package.sh" --stage "$T/stage" --version "$V" --out "$T/dist" > "$T/log" 2>&1 ||
   { cat "$T/log" >&2; echo "FAIL: package.sh refused the stage" >&2; exit 1; }
+if sh "$REPO_ROOT/build/stage.sh" --built "$T/built" --out "$T/stage-nover" > "$T/log" 2>&1; then fail "stage.sh stages linuxfs-fs without --version"
+else [ $? -eq 2 ] || fail "stage.sh without --version does not exit 2"; fi
 pkg="$T/dist/linuxfs-$V.pkg"
 [ -f "$pkg" ] || { echo "FAIL: no $pkg" >&2; exit 1; }
 
@@ -103,7 +105,7 @@ for prog in lklfuse linuxfs linuxfs-probe linuxfs-open; do
 done
 n="$(grep -c "^$D/" "$T/list" || :)"
 [ "$n" -eq 4 ] || fail "$D holds $n entries, not four programs"
-mkdir -p "$T/bundles"; (cd "$T/bundles" && gzip -dc < "$comp/Payload" | cpio -id --quiet "$S" 2>/dev/null)
+mkdir -p "$T/bundles"; (cd "$T/bundles" && gzip -dc < "$comp/Payload" | cpio -id --quiet "$S/*")
 for fs in ext4 ntfs btrfs xfs f2fs apfs; do
   ip="$T/bundles/System/Library/Filesystems/linuxfs_$fs.fs/Contents/Info.plist"
   case $fs in ntfs) pers=NTFS-linuxfs ;; xfs) pers=XFS ;; f2fs) pers=F2FS ;; apfs) pers=APFS ;; *) pers=$fs ;; esac
@@ -137,11 +139,61 @@ facts="$(sh "$SHIPYARD_SCRIPTS/artifact-facts.sh" "$T/dist" "$V" "$REPO_ROOT")" 
 printf '%s\n' "$facts" | sh "$SHIPYARD_SCRIPTS/check-artifact-conformance.sh" > "$T/conformance" 2>&1 ||
   { grep -v "^conformance: [a-z-]*: \(checked\|no \)" "$T/conformance" >&2; fail "the pkg does not conform"; }
 
+# spec: packaging/postinstall-hook -- _linuxfs is made with dscl from the first ID of 200-400 free as a user and a group; every command
+#       is a stub that logs, so this never touches the machine it runs on
+mkdir -p "$T/pbin" "$T/ds"
+cat > "$T/pbin/dscl" <<'STUB'
+#!/bin/sh
+ds="$PH_DIR/ds"
+case "$*" in
+  ". -read /Users/_linuxfs"*) [ -f "$ds/user" ] ;;
+  ". -read /Groups/_linuxfs"*) [ -f "$ds/gid" ] && echo "PrimaryGroupID: $(cat "$ds/gid")" ;;
+  ". -list /Users"*) cat "$ds/users" ;;
+  ". -list /Groups"*) cat "$ds/groups" ;;
+  ". -create"*) [ "$*" != ". -create /Users/_linuxfs" ] || : > "$ds/user"; echo "dscl $*" >> "$PH_DIR/calls" ;;
+esac
+STUB
+for c in mkdir chown chmod touch killall launchctl stat pgrep; do
+  printf '#!/bin/sh\necho "%s $*" >> "$PH_DIR/calls"\n' "$c" > "$T/pbin/$c"
+done
+chmod 755 "$T/pbin"/*
+run_post() {  # users groups-file-lines gid-or-empty user-exists(1/0)
+  rm -f "$T/ds"/* "$T/calls"; : > "$T/calls"
+  printf '%s\n' "$1" > "$T/ds/users"; printf '%s\n' "$2" > "$T/ds/groups"
+  [ -z "$3" ] || echo "$3" > "$T/ds/gid"
+  [ "$4" != 1 ] || : > "$T/ds/user"
+  PH_DIR="$T" PATH="$T/pbin:$PATH" sh "$REPO_ROOT/packaging/postinstall-hook" > "$T/post.out" 2>&1
+}
+want() { grep -qxF "$1" "$T/calls" || fail "postinstall: $2 (no '$1')"; }
+run_post "root 0
+_x 5" "wheel 0
+staff 200" "" 0 || fail "postinstall failed with 200 taken as a group ID"
+want "dscl . -create /Users/_linuxfs UniqueID 201" "200 taken as a GID gives 201"
+want "dscl . -create /Groups/_linuxfs PrimaryGroupID 201" "the new group gets 201"
+want "dscl . -create /Users/_linuxfs PrimaryGroupID 201" "the user's group is 201"
+want "dscl . -create /Users/_linuxfs UserShell /usr/bin/false" "UserShell"
+want "dscl . -create /Users/_linuxfs NFSHomeDirectory /var/empty" "NFSHomeDirectory"
+want "dscl . -create /Users/_linuxfs IsHidden 1" "IsHidden"
+want "touch /private/var/db/linuxfs/.created-group" "the made group is marked"
+[ "$(tail -n 1 "$T/calls")" = "killall diskarbitrationd" ] || fail "postinstall does not restart diskarbitrationd last: $(tail -n 1 "$T/calls")"
+grep -n 'launchctl load' "$T/calls" > /dev/null || fail "postinstall did not load the helper"
+run_post "root 0" "wheel 0" 250 0 || fail "postinstall failed with the group already there"
+grep -q 'create /Groups/_linuxfs' "$T/calls" && fail "postinstall remade an existing _linuxfs group"
+want "dscl . -create /Users/_linuxfs PrimaryGroupID 250" "the existing group is reused"
+grep -q 'touch ' "$T/calls" && fail "postinstall marked a group it did not make"
+run_post "$(seq 200 400 | sed 's/^/u /')" "wheel 0" "" 0 || fail "postinstall failed with the range full"
+grep -q 'no free user ID' "$T/post.out" || fail "postinstall does not warn when 200-400 is full"
+grep -q 'create /Users' "$T/calls" && fail "postinstall made a user with the range full"
+want "killall diskarbitrationd" "the install continues when the range is full"
+run_post "root 0" "wheel 0" 250 1 || fail "postinstall failed with _linuxfs there"
+grep -q 'dscl . -create' "$T/calls" && fail "postinstall changed an existing _linuxfs"
+
 mkdir -p "$T/bin"
 # pre-uninstall deletes _linuxfs and its home: dscl and rm are stubs that only log, so this never touches the machine it runs on
 printf '#!/bin/sh\necho "dscl $*" >> "%s/acct.calls"\n' "$T" > "$T/bin/dscl"
 printf '#!/bin/sh\necho "rm $*" >> "%s/acct.calls"\n' "$T" > "$T/bin/rm"
-chmod 755 "$T/bin/dscl" "$T/bin/rm"; : > "$T/acct.calls"
+printf '#!/bin/sh\n[ -f "%s/created-group" ]\n' "$T" > "$T/bin/ls"
+chmod 755 "$T/bin/dscl" "$T/bin/rm" "$T/bin/ls"; : > "$T/acct.calls"
 printf '#!/bin/sh\nprintf "%%s\\n" "  PID COMMAND" "  412 %s/libexec/lklfuse -f -o type=ext4 /dev/fd/3 /Volumes/data"\n' "$LINUXFS_PREFIX" > "$T/bin/ps"
 chmod 755 "$T/bin/ps"
 h="$REPO_ROOT/packaging/pre-uninstall"
@@ -157,13 +209,19 @@ printf '#!/bin/sh\necho "launchctl $*" >> "%s/launchctl.calls"\n' "$T" > "$T/bin
 PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > /dev/null 2>&1 || fail "pre-uninstall refuses with nothing mounted"
 grep -q "launchctl unload.*/Library/LaunchDaemons/$H.plist" "$T/launchctl.calls" 2>/dev/null || fail "pre-uninstall does not unload the helper"
 printf '#!/bin/sh\ncase "$*" in "-u _linuxfs") exit 0 ;; esac\necho 77\n' > "$T/bin/pgrep"; chmod 755 "$T/bin/pgrep"; : > "$T/launchctl.calls"; : > "$T/acct.calls"
-PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > /dev/null 2>&1 || fail "pre-uninstall refuses with only _linuxfs processes"
+PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > "$T/u.out" 2>&1 || fail "pre-uninstall refuses with only _linuxfs processes"
+grep -q '_linuxfs' "$T/u.out" || fail "pre-uninstall says nothing when a _linuxfs process keeps the account"
 [ ! -s "$T/acct.calls" ] || fail "pre-uninstall deleted _linuxfs while a process runs as it: $(cat "$T/acct.calls")"
 printf '#!/bin/sh\ncase "$*" in "-u _linuxfs") exit 1 ;; esac\necho 77\n' > "$T/bin/pgrep"; : > "$T/acct.calls"
 PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > /dev/null 2>&1 || fail "pre-uninstall refuses with nothing running as _linuxfs"
-for c in "dscl . -delete /Users/_linuxfs" "dscl . -delete /Groups/_linuxfs" "rm -rf /private/var/db/linuxfs"; do
+for c in "dscl . -delete /Users/_linuxfs" "rm -rf /private/var/db/linuxfs"; do
   grep -qxF "$c" "$T/acct.calls" 2>/dev/null || fail "pre-uninstall did not run: $c"
 done
+! grep -q 'Groups/_linuxfs' "$T/acct.calls" || fail "pre-uninstall deleted a _linuxfs group the postinstall did not make"
+: > "$T/created-group"; : > "$T/acct.calls"
+PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > /dev/null 2>&1 || fail "pre-uninstall refuses with the group marker"
+grep -qxF "dscl . -delete /Groups/_linuxfs" "$T/acct.calls" || fail "pre-uninstall kept the group the postinstall made"
+rm -f "$T/created-group"
 : > "$T/launchctl.calls"
 PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > /dev/null 2>&1
 grep -q "launchctl bsexec 77 .*launchctl unload .*/Library/LaunchAgents/dev.mavergreen.linuxfs.agent.plist" "$T/launchctl.calls" ||

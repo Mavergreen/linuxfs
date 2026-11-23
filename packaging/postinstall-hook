@@ -9,6 +9,7 @@ if [ "${3:-/}" = / ]; then
       echo "linuxfs: no free user ID from 200 to 400 for _linuxfs; volumes cannot mount until it exists" >&2
     else
       dscl . -read /Groups/_linuxfs PrimaryGroupID > /dev/null 2>&1 || {
+        made_group=1
         dscl . -create /Groups/_linuxfs
         dscl . -create /Groups/_linuxfs PrimaryGroupID "$lid"
         dscl . -create /Groups/_linuxfs RealName "linuxfs filesystem mounts"
@@ -27,9 +28,9 @@ if [ "${3:-/}" = / ]; then
     mkdir -p /private/var/db/linuxfs
     chown _linuxfs /private/var/db/linuxfs
     chmod 0700 /private/var/db/linuxfs
+    # pre-uninstall deletes the group only if this install made it
+    [ -z "$made_group" ] || touch /private/var/db/linuxfs/.created-group
   fi
-  # DiskArbitration reads the bundles when it starts; launchd restarts it
-  killall diskarbitrationd 2>/dev/null || :
 fi
 # linuxfs: (re)load the root helper that opens disks for the user at the console. Only on the running system.
 if [ "${3:-/}" = / ]; then
@@ -44,4 +45,8 @@ if [ "${3:-/}" = / ]; then
     launchctl bsexec "$lw" sudo -u "$user" launchctl unload -S Aqua /Library/LaunchAgents/dev.mavergreen.linuxfs.agent.plist 2>/dev/null || :
     launchctl bsexec "$lw" sudo -u "$user" launchctl load -S Aqua /Library/LaunchAgents/dev.mavergreen.linuxfs.agent.plist || :
   fi
+fi
+# linuxfs: DiskArbitration reads the bundles when it starts, so restart it last, once the helper and agent are loaded; launchd brings it back.
+if [ "${3:-/}" = / ]; then
+  killall diskarbitrationd 2>/dev/null || :
 fi

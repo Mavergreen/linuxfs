@@ -4,7 +4,10 @@
 #          Lays out linuxfs's install tree under STAGE (replaced): DIR/lklfuse as libexec/lklfuse, the CLI, prober and
 #          linuxfs-open when DIR has them, DIR/linuxfs-helper as /Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper
 #          with its LaunchDaemon, DIR/linuxfs-agent with its LaunchAgent, and packaging/pre-uninstall as libexec/mavergreen/pre-uninstall, all under
-#          LINUXFS_PREFIX (build/lib.sh), files 0644 and programs 0755. Ownership (0/0) is the packager's.
+#          LINUXFS_PREFIX (build/lib.sh), files 0644 and programs 0755. When DIR has linuxfs-fs it also lays out the six DiskArbitration
+#          bundles, version V, under System/Library/Filesystems (linuxfs-fs copied to each bundle's linuxfs_<fs>.util, mount_linuxfs_<fs>
+#          and fsck_linuxfs_<fs>), and Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d with copies of lklfuse, the CLI, the prober
+#          and linuxfs-open for the before-login root path; --version V is then required (exit 2 without it). Ownership (0/0) is the packager's.
 set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="${REPO_ROOT:-$(cd "$HERE/.." && pwd)}"
@@ -21,6 +24,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$built" ] && [ -n "$out" ] || usage
+[ ! -f "$built/linuxfs-fs" ] || [ -n "$ver" ] || usage
 [ -f "$built/lklfuse" ] || { echo "stage.sh: no lklfuse in $built" >&2; exit 1; }
 rm -rf "$out"
 t="$out$LINUXFS_PREFIX"
@@ -44,7 +48,7 @@ fi
 # spec: tests/package-test.sh -- DiskArbitration's bundles: one linuxfs-fs binary, copied to each role name (it picks its role
 #       from argv[0], tools/fsrules.c). Root runs them, so they are in /System/Library/Filesystems, root:wheel (the packager's).
 if [ -f "$built/linuxfs-fs" ]; then
-  sh "$REPO_ROOT/build/fs-bundles.sh" --version "${ver:-$(upstream_version)-mavericks.1}" --out "$out/System/Library/Filesystems"
+  sh "$REPO_ROOT/build/fs-bundles.sh" --version "$ver" --out "$out/System/Library/Filesystems"
   for fs in ext4 ntfs btrfs xfs f2fs apfs; do
     r="$out/System/Library/Filesystems/linuxfs_$fs.fs/Contents/Resources"
     mkdir -p "$r"

@@ -16,9 +16,12 @@ if [ -z "$running" ]; then
   [ -z "$lw" ] || launchctl bsexec "$lw" sudo -u "$user" launchctl unload -S Aqua /Library/LaunchAgents/dev.mavergreen.linuxfs.agent.plist 2>/dev/null || :
   # _linuxfs and its home go once nothing runs as it. DiskArbitration is not restarted: there is no post-uninstall hook, so its
   # list of bundles stays stale, and the missing probes fail, which reads as "not recognised", until the next reboot.
-  if ! pgrep -u _linuxfs > /dev/null 2>&1; then
+  if pgrep -u _linuxfs > /dev/null 2>&1; then
+    echo "linuxfs: keeping the _linuxfs account and /private/var/db/linuxfs: a process still runs as _linuxfs" >&2
+  else
+    # the group goes only if the postinstall made it (it left a marker in the home, which goes next)
+    if ls /private/var/db/linuxfs/.created-group > /dev/null 2>&1; then dscl . -delete /Groups/_linuxfs 2>/dev/null || :; fi
     dscl . -delete /Users/_linuxfs 2>/dev/null || :
-    dscl . -delete /Groups/_linuxfs 2>/dev/null || :
     rm -rf /private/var/db/linuxfs
   fi
   exit 0
