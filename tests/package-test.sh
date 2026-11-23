@@ -24,8 +24,8 @@ V="$UP-mavericks.1"
 P=".$LINUXFS_PREFIX"
 
 mkdir -p "$T/built"
-for f in lklfuse linuxfs-probe linuxfs-open linuxfs-helper linuxfs-agent; do printf '#!/bin/sh\n' > "$T/built/$f"; chmod 775 "$T/built/$f"; done
-sh "$REPO_ROOT/build/stage.sh" --built "$T/built" --out "$T/stage" > "$T/log" 2>&1 ||
+for f in lklfuse linuxfs-probe linuxfs-open linuxfs-fs linuxfs-helper linuxfs-agent; do printf '#!/bin/sh\n' > "$T/built/$f"; chmod 775 "$T/built/$f"; done
+sh "$REPO_ROOT/build/stage.sh" --built "$T/built" --out "$T/stage" --version "$V" > "$T/log" 2>&1 ||
   { cat "$T/log" >&2; echo "FAIL: stage.sh refused the fixtures" >&2; exit 1; }
 sh "$REPO_ROOT/build/package.sh" --stage "$T/stage" --version "$V" --out "$T/dist" > "$T/log" 2>&1 ||
   { cat "$T/log" >&2; echo "FAIL: package.sh refused the stage" >&2; exit 1; }
@@ -87,23 +87,84 @@ else
   grep -q macfuse "$T/pre.out" || fail "the preinstall's refusal does not name macfuse: $(cat "$T/pre.out")"
 fi
 
+# spec: build/fs-bundles.sh, build/stage.sh -- six filesystem bundles DiskArbitration runs, and the .d directory the
+#       before-login root path execs; all root:wheel, nothing group- or world-writable (the awk check above)
+S=./System/Library/Filesystems
+D=./Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d
+for fs in ext4 ntfs btrfs xfs f2fs apfs; do
+  b=$S/linuxfs_$fs.fs/Contents
+  grep -qxF "$b/Info.plist	100644	0/0" "$T/list" || fail "the payload lacks $b/Info.plist (0644)"
+  for prog in linuxfs_$fs.util mount_linuxfs_$fs fsck_linuxfs_$fs; do
+    grep -qxF "$b/Resources/$prog	100755	0/0" "$T/list" || fail "the payload lacks $b/Resources/$prog (0755)"
+  done
+done
+for prog in lklfuse linuxfs linuxfs-probe linuxfs-open; do
+  grep -qxF "$D/$prog	100755	0/0" "$T/list" || fail "the payload lacks $D/$prog (0755)"
+done
+n="$(grep -c "^$D/" "$T/list" || :)"
+[ "$n" -eq 4 ] || fail "$D holds $n entries, not four programs"
+mkdir -p "$T/bundles"; (cd "$T/bundles" && gzip -dc < "$comp/Payload" | cpio -id --quiet "$S" 2>/dev/null)
+for fs in ext4 ntfs btrfs xfs f2fs apfs; do
+  ip="$T/bundles/System/Library/Filesystems/linuxfs_$fs.fs/Contents/Info.plist"
+  case $fs in ntfs) pers=NTFS-linuxfs ;; xfs) pers=XFS ;; f2fs) pers=F2FS ;; apfs) pers=APFS ;; *) pers=$fs ;; esac
+  python3 -I - "$ip" "$fs" "$pers" "$V" <<'PY' || fail "linuxfs_$fs.fs/Contents/Info.plist is wrong"
+import plistlib, sys
+ip, fs, pers, v = sys.argv[1:5]
+d = plistlib.load(open(ip, "rb"))
+def need(c, m):
+    if not c: print(m, file=sys.stderr); sys.exit(1)
+need(d["CFBundleIdentifier"] == "dev.mavergreen.linuxfs." + fs, "CFBundleIdentifier")
+need(d["CFBundleShortVersionString"] == v and d["CFBundleVersion"] == v, "version")
+need(list(d["FSPersonalities"]) == [pers], "personality is %r, want %s" % (list(d["FSPersonalities"]), pers))
+p = d["FSPersonalities"][pers]
+need(p["FSMountExecutable"] == "mount_linuxfs_" + fs, "FSMountExecutable")
+for k in p: need(not k.startswith(("FSFormat", "FSVerification", "FSRepair")), "unexpected key " + k)
+mt = d["FSMediaTypes"]
+want = {"ntfs": ["EBD0A0A2-B9E5-4433-87C0-68B6B72699C7", "Windows_NTFS", "Partitionless"],
+        "apfs": ["7C3457EF-0000-11AA-AA11-00306543ECAC", "Partitionless"]}.get(fs,
+        ["0FC63DAF-8483-4772-8E79-3D69D8477DE4", "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7", "Linux", "Partitionless"])
+need(sorted(mt) == sorted(want), "FSMediaTypes %r" % sorted(mt))
+for m in mt.values():
+    need(m["FSProbeExecutable"] == "linuxfs_%s.util" % fs and m["FSProbeOrder"] == 900 and m["FSProbeArguments"] == "-p", "probe keys")
+PY
+  if command -v plutil > /dev/null 2>&1; then plutil -lint "$ip" > /dev/null || fail "plutil -lint refuses linuxfs_$fs.fs's Info.plist"; fi
+done
+grep -q 'killall diskarbitrationd' "$comp/Scripts/postinstall" || fail "the postinstall does not restart diskarbitrationd"
+grep -q 'dscl \. -create /Users/_linuxfs' "$comp/Scripts/postinstall" || fail "the postinstall does not create _linuxfs with dscl"
+
 printf '## Linux Filesystems %s for Mavericks (%s)\n\n### What changed\n\n- Test.\n' "$UP" "$V" > "$T/dist/RELEASE_NOTES.md"
 facts="$(sh "$SHIPYARD_SCRIPTS/artifact-facts.sh" "$T/dist" "$V" "$REPO_ROOT")" || fail "artifact-facts could not read the dist"
 printf '%s\n' "$facts" | sh "$SHIPYARD_SCRIPTS/check-artifact-conformance.sh" > "$T/conformance" 2>&1 ||
   { grep -v "^conformance: [a-z-]*: \(checked\|no \)" "$T/conformance" >&2; fail "the pkg does not conform"; }
 
 mkdir -p "$T/bin"
+# pre-uninstall deletes _linuxfs and its home: dscl and rm are stubs that only log, so this never touches the machine it runs on
+printf '#!/bin/sh\necho "dscl $*" >> "%s/acct.calls"\n' "$T" > "$T/bin/dscl"
+printf '#!/bin/sh\necho "rm $*" >> "%s/acct.calls"\n' "$T" > "$T/bin/rm"
+chmod 755 "$T/bin/dscl" "$T/bin/rm"; : > "$T/acct.calls"
 printf '#!/bin/sh\nprintf "%%s\\n" "  PID COMMAND" "  412 %s/libexec/lklfuse -f -o type=ext4 /dev/fd/3 /Volumes/data"\n' "$LINUXFS_PREFIX" > "$T/bin/ps"
 chmod 755 "$T/bin/ps"
 h="$REPO_ROOT/packaging/pre-uninstall"
 if PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > "$T/u.out" 2>&1; then fail "pre-uninstall allows uninstall while lklfuse runs"
 else grep -q /Volumes/data "$T/u.out" || fail "pre-uninstall's refusal does not name the volume: $(cat "$T/u.out")"; fi
+printf '#!/bin/sh\nprintf "%%s\\n" "  PID COMMAND" "  412 /Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d/lklfuse -f -o type=ext4 /dev/fd/3 /Volumes/dd"\n' > "$T/bin/ps"
+if PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > "$T/u.out" 2>&1; then fail "pre-uninstall allows uninstall while the .d lklfuse runs"
+else grep -q /Volumes/dd "$T/u.out" || fail "pre-uninstall's refusal does not name the .d volume: $(cat "$T/u.out")"; fi
+[ ! -s "$T/acct.calls" ] || fail "pre-uninstall touched _linuxfs while a volume was mounted: $(cat "$T/acct.calls")"
 PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/Volumes/Other sh "$h" > /dev/null 2>&1 || fail "pre-uninstall refuses for another volume"
 printf '#!/bin/sh\necho "  PID COMMAND"\necho "    1 /sbin/launchd"\n' > "$T/bin/ps"
 printf '#!/bin/sh\necho "launchctl $*" >> "%s/launchctl.calls"\n' "$T" > "$T/bin/launchctl"; chmod 755 "$T/bin/launchctl"
 PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > /dev/null 2>&1 || fail "pre-uninstall refuses with nothing mounted"
 grep -q "launchctl unload.*/Library/LaunchDaemons/$H.plist" "$T/launchctl.calls" 2>/dev/null || fail "pre-uninstall does not unload the helper"
-printf '#!/bin/sh\necho 77\n' > "$T/bin/pgrep"; chmod 755 "$T/bin/pgrep"; : > "$T/launchctl.calls"
+printf '#!/bin/sh\ncase "$*" in "-u _linuxfs") exit 0 ;; esac\necho 77\n' > "$T/bin/pgrep"; chmod 755 "$T/bin/pgrep"; : > "$T/launchctl.calls"; : > "$T/acct.calls"
+PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > /dev/null 2>&1 || fail "pre-uninstall refuses with only _linuxfs processes"
+[ ! -s "$T/acct.calls" ] || fail "pre-uninstall deleted _linuxfs while a process runs as it: $(cat "$T/acct.calls")"
+printf '#!/bin/sh\ncase "$*" in "-u _linuxfs") exit 1 ;; esac\necho 77\n' > "$T/bin/pgrep"; : > "$T/acct.calls"
+PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > /dev/null 2>&1 || fail "pre-uninstall refuses with nothing running as _linuxfs"
+for c in "dscl . -delete /Users/_linuxfs" "dscl . -delete /Groups/_linuxfs" "rm -rf /private/var/db/linuxfs"; do
+  grep -qxF "$c" "$T/acct.calls" 2>/dev/null || fail "pre-uninstall did not run: $c"
+done
+: > "$T/launchctl.calls"
 PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > /dev/null 2>&1
 grep -q "launchctl bsexec 77 .*launchctl unload .*/Library/LaunchAgents/dev.mavergreen.linuxfs.agent.plist" "$T/launchctl.calls" ||
   fail "pre-uninstall does not unload the agent in the console session"

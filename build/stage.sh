@@ -1,6 +1,6 @@
 #!/bin/sh
 # platform: host-agnostic
-#   usage: stage.sh --built DIR --out STAGE
+#   usage: stage.sh --built DIR --out STAGE [--version V]
 #          Lays out linuxfs's install tree under STAGE (replaced): DIR/lklfuse as libexec/lklfuse, the CLI, prober and
 #          linuxfs-open when DIR has them, DIR/linuxfs-helper as /Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper
 #          with its LaunchDaemon, DIR/linuxfs-agent with its LaunchAgent, and packaging/pre-uninstall as libexec/mavergreen/pre-uninstall, all under
@@ -10,12 +10,13 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="${REPO_ROOT:-$(cd "$HERE/.." && pwd)}"
 export REPO_ROOT
 . "$REPO_ROOT/build/lib.sh"
-usage() { echo "usage: stage.sh --built DIR --out STAGE" >&2; exit 2; }
-built=; out=
+usage() { echo "usage: stage.sh --built DIR --out STAGE [--version V]" >&2; exit 2; }
+built=; out=; ver=
 while [ $# -gt 0 ]; do
   case "$1" in
     --built) [ $# -ge 2 ] || usage; built=$2; shift 2 ;;
     --out) [ $# -ge 2 ] || usage; out=$2; shift 2 ;;
+    --version) [ $# -ge 2 ] || usage; ver=$2; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -40,5 +41,21 @@ if [ -f "$built/linuxfs-agent" ]; then
   mkdir -p "$out/Library/LaunchAgents"
   put "$REPO_ROOT/packaging/dev.mavergreen.linuxfs.agent.plist" "$out/Library/LaunchAgents/dev.mavergreen.linuxfs.agent.plist" 644
 fi
+# spec: tests/package-test.sh -- DiskArbitration's bundles: one linuxfs-fs binary, copied to each role name (it picks its role
+#       from argv[0], tools/fsrules.c). Root runs them, so they are in /System/Library/Filesystems, root:wheel (the packager's).
+if [ -f "$built/linuxfs-fs" ]; then
+  sh "$REPO_ROOT/build/fs-bundles.sh" --version "${ver:-$(upstream_version)-mavericks.1}" --out "$out/System/Library/Filesystems"
+  for fs in ext4 ntfs btrfs xfs f2fs apfs; do
+    r="$out/System/Library/Filesystems/linuxfs_$fs.fs/Contents/Resources"
+    mkdir -p "$r"
+    for n in "linuxfs_$fs.util" "mount_linuxfs_$fs" "fsck_linuxfs_$fs"; do put "$built/linuxfs-fs" "$r/$n" 755; done
+  done
+fi
+# spec: tools/fs.c mount_as_root -- the before-login root path execs these (names and directory as it spells them), as _linuxfs
+pd="$out/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d"
+mkdir -p "$pd"
+put "$built/lklfuse" "$pd/lklfuse" 755
+[ ! -f "$REPO_ROOT/cli/linuxfs" ] || put "$REPO_ROOT/cli/linuxfs" "$pd/linuxfs" 755
+for p in linuxfs-probe linuxfs-open; do [ ! -f "$built/$p" ] || put "$built/$p" "$pd/$p" 755; done
 rmdir "$t/bin" 2>/dev/null || :
 find "$out" -type d -exec chmod 755 {} +

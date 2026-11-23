@@ -130,7 +130,7 @@ jobs:
           set -eu
           b="$MAVERICKS_BUILD_ROOT/built"
           sh "$SHIPYARD_SCRIPTS/assert_binary_compatible.sh" \
-            "$b/lklfuse" "$b/linuxfs-probe" "$b/linuxfs-open" "$b/linuxfs-helper" "$b/linuxfs-agent"
+            "$b/lklfuse" "$b/linuxfs-probe" "$b/linuxfs-open" "$b/linuxfs-fs" "$b/linuxfs-helper" "$b/linuxfs-agent"
 
       - name: Stage the product, build the updater, package
         env:
@@ -138,7 +138,7 @@ jobs:
         run: |
           set -eu
           b="$MAVERICKS_BUILD_ROOT"
-          sh build/stage.sh --built "$b/built" --out "$b/stage"
+          sh build/stage.sh --built "$b/built" --out "$b/stage" --version "$VER"
           mkdir -p "$b/updater"
           sh build/build-updater.sh "$VER" "$b/updater/linuxfs-updater.app"
           sh build/package.sh --stage "$b/stage" --updater-app "$b/updater/linuxfs-updater.app" --version "$VER" --out "$DIST"

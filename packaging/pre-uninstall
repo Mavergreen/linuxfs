@@ -3,15 +3,24 @@
 #   usage: pre-uninstall        (MAVERGREEN_ROOT set by the helper)
 #          Refuses while any linuxfs volume is mounted (an lklfuse from this tree is running), naming each, since
 #          removing lklfuse under a mounted volume leaves it unwritable until unmounted. Another volume's uninstall
-#          has nothing to check here. Otherwise it unloads the root helper and the console user's automount agent before their files go.
+#          has nothing to check here. Otherwise it unloads the root helper and the console user's automount agent before their files go,
+#          and removes the _linuxfs account and its home when nothing runs as it. An lklfuse under the .d directory counts as mounted too.
 [ "${MAVERGREEN_ROOT:-/}" = / ] || exit 0
 prefix=/usr/local/mavergreen/linuxfs
-running="$(ps -axww -o command= 2>/dev/null | awk -v p="$prefix/libexec/lklfuse" 'index($0, p " ") == 1 { print }')" || running=
-[ -n "$running" ] || running="$(ps -axww -o pid,command 2>/dev/null | awk -v p="$prefix/libexec/lklfuse" '{ sub(/^ *[0-9]+ /, "") } index($0, p " ") == 1 { print }')"
+priv=/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d
+running="$(ps -axww -o command= 2>/dev/null | awk -v p="$prefix/libexec/lklfuse" -v q="$priv/lklfuse" 'index($0, p " ") == 1 || index($0, q " ") == 1 { print }')" || running=
+[ -n "$running" ] || running="$(ps -axww -o pid,command 2>/dev/null | awk -v p="$prefix/libexec/lklfuse" -v q="$priv/lklfuse" '{ sub(/^ *[0-9]+ /, "") } index($0, p " ") == 1 || index($0, q " ") == 1 { print }')"
 if [ -z "$running" ]; then
   launchctl unload /Library/LaunchDaemons/dev.mavergreen.linuxfs.helper.plist 2>/dev/null || :
   user=$(stat -f %Su /dev/console 2>/dev/null); lw=$(pgrep -x -u "$user" loginwindow 2>/dev/null | head -n 1)
   [ -z "$lw" ] || launchctl bsexec "$lw" sudo -u "$user" launchctl unload -S Aqua /Library/LaunchAgents/dev.mavergreen.linuxfs.agent.plist 2>/dev/null || :
+  # _linuxfs and its home go once nothing runs as it. DiskArbitration is not restarted: there is no post-uninstall hook, so its
+  # list of bundles stays stale, and the missing probes fail, which reads as "not recognised", until the next reboot.
+  if ! pgrep -u _linuxfs > /dev/null 2>&1; then
+    dscl . -delete /Users/_linuxfs 2>/dev/null || :
+    dscl . -delete /Groups/_linuxfs 2>/dev/null || :
+    rm -rf /private/var/db/linuxfs
+  fi
   exit 0
 fi
 echo "linuxfs is in use; unmount these volumes first (linuxfs unmount MOUNTPOINT), then run: sudo mavergreen uninstall linuxfs" >&2

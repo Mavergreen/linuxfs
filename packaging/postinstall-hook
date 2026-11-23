@@ -1,3 +1,36 @@
+# linuxfs: DiskArbitration mounts through the bundles in /System/Library/Filesystems, as the unprivileged _linuxfs. Only on the
+# running system. An existing _linuxfs is kept as it is; a new one gets the first ID from 200 to 400 free as a user and a group.
+if [ "${3:-/}" = / ]; then
+  if ! dscl . -read /Users/_linuxfs UniqueID > /dev/null 2>&1; then
+    used="$({ dscl . -list /Users UniqueID; dscl . -list /Groups PrimaryGroupID; } 2>/dev/null | awk '{ print $NF }')"
+    lid=200
+    while [ "$lid" -le 400 ] && printf '%s\n' "$used" | grep -qx "$lid"; do lid=$((lid + 1)); done
+    if [ "$lid" -gt 400 ]; then
+      echo "linuxfs: no free user ID from 200 to 400 for _linuxfs; volumes cannot mount until it exists" >&2
+    else
+      dscl . -read /Groups/_linuxfs PrimaryGroupID > /dev/null 2>&1 || {
+        dscl . -create /Groups/_linuxfs
+        dscl . -create /Groups/_linuxfs PrimaryGroupID "$lid"
+        dscl . -create /Groups/_linuxfs RealName "linuxfs filesystem mounts"
+      }
+      lgid="$(dscl . -read /Groups/_linuxfs PrimaryGroupID | awk '{ print $NF }')"
+      dscl . -create /Users/_linuxfs
+      dscl . -create /Users/_linuxfs UniqueID "$lid"
+      dscl . -create /Users/_linuxfs PrimaryGroupID "${lgid:-$lid}"
+      dscl . -create /Users/_linuxfs RealName "linuxfs filesystem mounts"
+      dscl . -create /Users/_linuxfs UserShell /usr/bin/false
+      dscl . -create /Users/_linuxfs NFSHomeDirectory /var/empty
+      dscl . -create /Users/_linuxfs IsHidden 1
+    fi
+  fi
+  if dscl . -read /Users/_linuxfs UniqueID > /dev/null 2>&1; then
+    mkdir -p /private/var/db/linuxfs
+    chown _linuxfs /private/var/db/linuxfs
+    chmod 0700 /private/var/db/linuxfs
+  fi
+  # DiskArbitration reads the bundles when it starts; launchd restarts it
+  killall diskarbitrationd 2>/dev/null || :
+fi
 # linuxfs: (re)load the root helper that opens disks for the user at the console. Only on the running system.
 if [ "${3:-/}" = / ]; then
   launchctl unload /Library/LaunchDaemons/dev.mavergreen.linuxfs.helper.plist 2>/dev/null || :
