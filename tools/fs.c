@@ -13,6 +13,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,42 +29,66 @@
 #define PREFS_NAME "dev.mavergreen.linuxfs.plist"
 #define PREFS_MAX (1024 * 1024)
 
+struct ids { gid_t groups[128], egid; int ngroups; };
+
+/* Becomes uid (egid gid, no supplementary groups) from root, saving root's in *save. 0 when done; -1 when not, with
+ * root's ids back. No syslog while dropped. */
+static int drop_to(uid_t uid, gid_t gid, struct ids *save)
+{
+	save->egid = getegid();
+	save->ngroups = getgroups(128, save->groups);
+	if (save->ngroups < 0)
+		return -1;
+	if (setgroups(0, NULL) == 0 && setegid(gid) == 0 && seteuid(uid) == 0)
+		return 0;
+	if (seteuid(0) != 0 || setegid(save->egid) != 0 || setgroups(save->ngroups, save->groups) != 0)
+		_exit(FSUR_UNRECOGNIZED);
+	return -1;
+}
+
+/* root again, in reverse order; failing to is fatal: never go on as the user */
+static void restore_root(const struct ids *save)
+{
+	if (seteuid(0) != 0 || setegid(save->egid) != 0 || setgroups(save->ngroups, save->groups) != 0)
+		_exit(FSUR_UNRECOGNIZED);
+}
+
 /* the plist at path, owned by uid (or by root too when also_root), a regular file that is not a symlink and at most
- * 1 MiB; NULL for anything else, including unparseable */
-static CFDictionaryRef load_plist(const char *path, uid_t uid, int also_root, int drop)
+ * 1 MiB; NULL for anything else, including unparseable. With drop, from root, it is opened and read as uid/gid (no
+ * other groups), so root's reach never extends into what the user can name; root is back before it is parsed. */
+static CFDictionaryRef load_plist(const char *path, uid_t uid, gid_t gid, int also_root, int drop)
 {
 	struct stat st;
+	struct ids saved;
 	int fd, dropped = 0;
 	char *buf = NULL;
 	size_t got = 0;
 	CFDictionaryRef dict = NULL;
 
-	/* a user's file is opened and read as that user, so root's reach never extends into what they can name */
 	if (drop && uid != 0 && geteuid() == 0) {
-		if (seteuid(uid) != 0)
+		if (drop_to(uid, gid, &saved) != 0)
 			return NULL;
 		dropped = 1;
 	}
 	fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
-	if (fd < 0) {
-		if (dropped && seteuid(0) != 0)
-			_exit(FSUR_UNRECOGNIZED);
-		return NULL;
-	}
-	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size > PREFS_MAX ||
-	    (st.st_uid != uid && !(also_root && st.st_uid == 0)))
-		goto done;
-	buf = malloc((size_t)st.st_size + 1);
-	if (!buf)
-		goto done;
-	while (got < (size_t)st.st_size) {
-		ssize_t r = read(fd, buf + got, (size_t)st.st_size - got);
+	if (fd >= 0) {
+		if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size <= PREFS_MAX &&
+		    (st.st_uid == uid || (also_root && st.st_uid == 0)) && (buf = malloc((size_t)st.st_size + 1)) != NULL) {
+			while (got < (size_t)st.st_size) {
+				ssize_t r = read(fd, buf + got, (size_t)st.st_size - got);
 
-		if (r <= 0)
-			break;
-		got += (size_t)r;
+				if (r <= 0)
+					break;
+				got += (size_t)r;
+			}
+			if (got != (size_t)st.st_size)
+				got = 0;
+		}
+		close(fd);
 	}
-	if (got == (size_t)st.st_size && got > 0) {
+	if (dropped)
+		restore_root(&saved);
+	if (buf && got > 0) {
 		CFDataRef data = CFDataCreate(NULL, (const UInt8 *)buf, (CFIndex)got);
 		CFPropertyListRef pl = data ? CFPropertyListCreateWithData(NULL, data, kCFPropertyListImmutable, NULL, NULL) : NULL;
 
@@ -74,11 +99,7 @@ static CFDictionaryRef load_plist(const char *path, uid_t uid, int also_root, in
 		if (data)
 			CFRelease(data);
 	}
-done:
 	free(buf);
-	close(fd);
-	if (dropped && seteuid(0) != 0)
-		_exit(FSUR_UNRECOGNIZED);	/* cannot get root back: stop rather than go on as the user */
 	return dict;
 }
 
@@ -153,6 +174,7 @@ int fs_read_prefs(struct fsprefs *p, const char *label, int *ignored)
 	char userpath[1024], machpath[1024];
 	const char *up = NULL, *mp = "/Library/Preferences/" PREFS_NAME;
 	uid_t uowner, mowner = 0;
+	gid_t ugid = 0;
 	int also_root = 1, have[4] = { 0, 0, 0, 0 }, ign_set = 0;
 	CFDictionaryRef ud, md;
 
@@ -165,6 +187,7 @@ int fs_read_prefs(struct fsprefs *p, const char *label, int *ignored)
 		if (m)
 			mp = m;
 		uowner = mowner = getuid();
+		ugid = getgid();
 		also_root = 0;
 	} else {
 		struct stat st;
@@ -176,11 +199,12 @@ int fs_read_prefs(struct fsprefs *p, const char *label, int *ignored)
 		    snprintf(userpath, sizeof userpath, "%s/Library/Preferences/" PREFS_NAME, pw->pw_dir) < (int)sizeof userpath) {
 			up = userpath;
 			uowner = st.st_uid;
+			ugid = pw->pw_gid;
 		}
 	}
 	snprintf(machpath, sizeof machpath, "%s", mp);
-	ud = up ? load_plist(up, uowner, 0, 1) : NULL;
-	md = load_plist(machpath, mowner, also_root, 0);
+	ud = up ? load_plist(up, uowner, ugid, 0, 1) : NULL;
+	md = load_plist(machpath, mowner, 0, also_root, 0);
 	if (ud)
 		pref_apply(ud, label, p, have, ignored, &ign_set);
 	if (md)
