@@ -1,4 +1,5 @@
 /* The bundles' portable rules (see fsrules.h). Pure C99, libc only. */
+#include <stdio.h>
 #include <string.h>
 #include "fsrules.h"
 
@@ -172,4 +173,23 @@ void fsrules_volname(const char *label, char *out, size_t outlen)
 	out[o] = 0;
 	if (o == 0)
 		strncpy(out, "Linux", outlen - 1), out[outlen - 1] = 0;
+}
+
+int fsrules_hint(const char *err, char *hint, size_t len)
+{
+	const char *p = NULL, *s = err, *q, *e;
+
+	while ((q = strstr(s, "(hint: "))) {
+		p = q + 7;
+		s = p;
+	}
+	if (!p || !len)
+		return 0;
+	e = strchr(p, '\n');
+	if (!e)
+		e = p + strlen(p);
+	if (e > p && e[-1] == ')')
+		e--;
+	snprintf(hint, len, "%.*s", (int)(e - p), p);
+	return 1;
 }

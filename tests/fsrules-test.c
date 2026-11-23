@@ -211,6 +211,18 @@ int main(void)
 	fsrules_volname("\xc3\xa9\xc3\xa9", out, 4);
 	iss(out, "\xc3\xa9", "a small buffer is cut on a character boundary");
 
+	{
+		char hint[64];
+
+		is(fsrules_hint("linuxfs: wrong password for /dev/disk4s1 (hint: test)\n", hint, sizeof hint) &&
+		   strcmp(hint, "test") == 0, 1, "the CLI's wrong-password message gives the volume's hint");
+		is(fsrules_hint("linuxfs: /dev/disk4s1 is an encrypted volume; give its password\n", hint, sizeof hint), 0,
+		   "and no hint when it names none");
+		is(fsrules_hint("a (hint: one)\nb (hint: two)\n", hint, sizeof hint) && strcmp(hint, "two") == 0, 1,
+		   "the last hint wins");
+		is(fsrules_hint("x (hint: long long long)", hint, 5) && strcmp(hint, "long") == 0, 1, "a small buffer cuts the hint");
+	}
+
 	printf("1..%d\n", tapno);
 	return failures != 0;
 }

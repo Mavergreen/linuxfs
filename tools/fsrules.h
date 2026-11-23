@@ -34,4 +34,8 @@ int fsrules_parse_mount(int argc, char **argv, struct mountreq *m);
  * 200 characters cut on a character boundary; "Linux" when that leaves nothing or the label is not UTF-8. */
 void fsrules_volname(const char *label, char *out, size_t outlen);
 
+/* The hint in the CLI's "wrong password for DEVICE (hint: HINT)" (the last one in ERR), into HINT (LEN bytes, cut to fit);
+ * 0 when ERR names none. */
+int fsrules_hint(const char *err, char *hint, size_t len);
+
 #endif

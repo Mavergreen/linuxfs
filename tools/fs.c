@@ -7,18 +7,26 @@
  * util -p BSD removable|fixed readonly|writable   recognised: the volume name on stdout, exit 255; else exit 254
  * util -k BSD                                     the filesystem's UUID on stdout, exit 255; else exit 254
  * fsck -q DEV                                     exit 0 (a quick check has nothing to do); -n or -y exit 8
- * mount                                           not yet (Tasks 6 and 7): exit 1
+ * mount [-o OPT]... DEV MNT                       as the console user: runs the CLI's da-mount and, for an encrypted volume,
+ *                                                  asks for the password (the keychain keeper first, then Apple's dialog);
+ *                                                  as root: not yet (exit 1)
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <poll.h>
+#include <signal.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/un.h>
+#include <sys/wait.h>
 #include <syslog.h>
 #include <unistd.h>
 #include "fsrules.h"
@@ -327,6 +335,431 @@ static int fsck(const char *fs, int argc, char **argv)
 	return 8;
 }
 
+/* ---- the mount role, as the console user ---------------------------------------------------------------------- */
+
+#define CLI_DEFAULT "/usr/local/mavergreen/linuxfs/bin/linuxfs"
+#define CAPTURE_MAX (64 * 1024)
+#define LOG_LINES 100
+#define PW_MAX 1024
+#define KC_DEADLINE_MS 5000
+#define DIALOG_SECONDS 120
+#define DIALOG_TRIES 3
+
+/* LINUXFS_CLI, LINUXFS_DIALOG and LINUXFS_KEYCHAIN_SOCK are for tests, and never obeyed by root */
+static const char *test_env(const char *name)
+{
+	return getuid() != 0 ? getenv(name) : NULL;
+}
+
+/* up to LOG_LINES lines of text to syslog, each prefixed by what */
+static void log_lines(const char *what, const char *text)
+{
+	int n = 0;
+	const char *p = text, *e;
+
+	while (*p && n < LOG_LINES) {
+		e = strchr(p, '\n');
+		if (!e)
+			e = p + strlen(p);
+		if (e > p) {
+			syslog(LOG_NOTICE, "%s: %.*s", what, (int)(e - p > 400 ? 400 : e - p), p);
+			n++;
+		}
+		p = *e ? e + 1 : e;
+	}
+}
+
+/* Runs argv with stdin from pw plus a newline (NULL: /dev/null) and stdout and stderr together captured into out
+ * (outlen bytes, NUL-ended; the rest is read and dropped). Returns its exit status, or -1 when it could not run or
+ * did not exit. */
+static int run_capture(char *const argv[], const char *pw, char *out, size_t outlen)
+{
+	int inp[2], outp[2], st = 0;
+	size_t got = 0;
+	pid_t pid;
+	ssize_t r;
+
+	out[0] = '\0';
+	if (pipe(inp) != 0)
+		return -1;
+	if (pipe(outp) != 0) {
+		close(inp[0]);
+		close(inp[1]);
+		return -1;
+	}
+	fcntl(inp[1], F_SETFD, FD_CLOEXEC);
+	fcntl(outp[0], F_SETFD, FD_CLOEXEC);
+	pid = fork();
+	if (pid < 0) {
+		close(inp[0]);
+		close(inp[1]);
+		close(outp[0]);
+		close(outp[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		if (pw) {
+			dup2(inp[0], 0);
+		} else {
+			int nul = open("/dev/null", O_RDONLY);
+
+			if (nul >= 0)
+				dup2(nul, 0);
+		}
+		dup2(outp[1], 1);
+		dup2(outp[1], 2);
+		execv(argv[0], argv);
+		_exit(127);
+	}
+	close(inp[0]);
+	close(outp[1]);
+	if (pw) {
+		size_t n = strlen(pw), off = 0;
+
+		while (off < n && (r = write(inp[1], pw + off, n - off)) > 0)
+			off += (size_t)r;
+		(void)!write(inp[1], "\n", 1);
+	}
+	close(inp[1]);
+	for (;;) {
+		char tmp[4096];
+
+		r = read(outp[0], tmp, sizeof tmp);
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r <= 0)
+			break;
+		if (got + (size_t)r < outlen) {
+			memcpy(out + got, tmp, (size_t)r);
+			got += (size_t)r;
+		}
+	}
+	out[got] = '\0';
+	close(outp[0]);
+	while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+		;
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+/* a keeper reply is whole once it has its lines: two after offered/saved, one after anything else */
+static int reply_whole(const char *rep)
+{
+	int nl = 0;
+	const char *p;
+
+	for (p = rep; *p; p++)
+		nl += *p == '\n';
+	return nl >= ((strncmp(rep, "offered\n", 8) == 0 || strncmp(rep, "saved\n", 6) == 0) ? 2 : 1);
+}
+
+/* One request to the keychain keeper (one per connection), its reply into rep (replen bytes, NUL-ended); the whole
+ * conversation within KC_DEADLINE_MS. 0 on a reply, -1 on any failure. */
+static int kc_ask(const char *req, size_t reqlen, char *rep, size_t replen)
+{
+	char path[1024];
+	struct sockaddr_un sa;
+	struct timeval t0, now;
+	const char *home, *over = test_env("LINUXFS_KEYCHAIN_SOCK");
+	int fd, one = 1, rc = -1;
+	size_t got = 0, sent = 0;
+
+	rep[0] = '\0';
+	if (over)
+		snprintf(path, sizeof path, "%s", over);
+	else if ((home = getenv("HOME")) != NULL)
+		snprintf(path, sizeof path, "%s/Library/Caches/dev.mavergreen.linuxfs/keychain.sock", home);
+	else
+		return -1;
+	memset(&sa, 0, sizeof sa);
+	sa.sun_family = AF_UNIX;
+	if (strlen(path) >= sizeof sa.sun_path)
+		return -1;
+	strcpy(sa.sun_path, path);
+	fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0)
+		return -1;
+	setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+	gettimeofday(&t0, NULL);
+	if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0 && errno != EINPROGRESS)
+		goto done;
+	while (rc != 0) {
+		struct pollfd pf;
+		long left;
+		ssize_t r;
+
+		pf.fd = fd;
+		pf.events = POLLIN | (sent < reqlen ? POLLOUT : 0);
+		pf.revents = 0;
+		gettimeofday(&now, NULL);
+		left = KC_DEADLINE_MS - ((long)(now.tv_sec - t0.tv_sec) * 1000 + (long)(now.tv_usec - t0.tv_usec) / 1000);
+		if (left <= 0)
+			goto done;
+		if (poll(&pf, 1, (int)left) < 0) {
+			if (errno == EINTR)
+				continue;
+			goto done;
+		}
+		if (pf.revents == 0)
+			continue;
+		if ((pf.revents & POLLOUT) && sent < reqlen) {
+			r = write(fd, req + sent, reqlen - sent);
+			if (r > 0)
+				sent += (size_t)r;
+			else if (r < 0 && errno != EAGAIN && errno != EINTR)
+				goto done;
+		}
+		if (pf.revents & (POLLIN | POLLHUP | POLLERR)) {
+			r = read(fd, rep + got, replen - 1 - got);
+			if (r > 0) {
+				got += (size_t)r;
+				rep[got] = '\0';
+				if (reply_whole(rep))
+					rc = 0;
+				else if (got >= replen - 1)
+					goto done;
+			} else if (r == 0) {
+				rc = reply_whole(rep) ? 0 : -1;
+				break;
+			} else if (errno != EAGAIN && errno != EINTR)
+				goto done;
+		}
+	}
+done:
+	close(fd);
+	return rc;
+}
+
+/* find: 0 with the password in pw and *saved set (offered 0, saved 1); -1 when there is none or no answer */
+static int kc_find(const char *bsd, char *pw, size_t pwlen, int *saved)
+{
+	char req[64], rep[PW_MAX + 32], *p, *e;
+	int n = snprintf(req, sizeof req, "find\t%s\n", bsd), rc = -1;
+
+	if (kc_ask(req, (size_t)n, rep, sizeof rep) != 0) {
+		syslog(LOG_NOTICE, "%s: the keychain keeper did not answer", bsd);
+		return -1;
+	}
+	if (strncmp(rep, "offered\n", 8) == 0)
+		*saved = 0, p = rep + 8;
+	else if (strncmp(rep, "saved\n", 6) == 0)
+		*saved = 1, p = rep + 6;
+	else {
+		syslog(LOG_NOTICE, "%s: the keychain keeper has no password", bsd);
+		return -1;
+	}
+	e = strchr(p, '\n');
+	if (e && e > p && (size_t)(e - p) < pwlen) {
+		memcpy(pw, p, (size_t)(e - p));
+		pw[e - p] = '\0';
+		rc = 0;
+	}
+	memset(rep, 0, sizeof rep);
+	syslog(LOG_NOTICE, "%s: the keychain keeper offers a %s password", bsd, rc == 0 && *saved ? "saved" : "offered");
+	return rc;
+}
+
+/* save or forget; failures are only logged */
+static void kc_tell(const char *verb, const char *bsd, const char *pw)
+{
+	char req[PW_MAX + 80], rep[64];
+	int n = pw ? snprintf(req, sizeof req, "%s\t%s\n%s\n", verb, bsd, pw) : snprintf(req, sizeof req, "%s\t%s\n", verb, bsd);
+
+	if (n < 0 || (size_t)n >= sizeof req || kc_ask(req, (size_t)n, rep, sizeof rep) != 0)
+		syslog(LOG_NOTICE, "%s: the keychain keeper did not take the %s", bsd, verb);
+	else
+		syslog(LOG_NOTICE, "%s: told the keychain keeper to %s", bsd, verb);
+	memset(req, 0, sizeof req);
+}
+
+/* The password dialog. 0 with the password in pw (PW_MAX bytes) and *remember; -1 for Cancel, timeout or any failure. */
+static int ask_dialog(const char *header, const char *message, char *pw, size_t pwlen, int *remember)
+{
+	const char *prog = test_env("LINUXFS_DIALOG");
+
+	if (prog) {
+		char out[PW_MAX + 32], *nl, *e;
+		char *argv[] = { (char *)prog, (char *)header, (char *)message, NULL };
+		int rc = run_capture(argv, NULL, out, sizeof out), ok = 0;
+
+		if (rc == 0 && (nl = strchr(out, '\n')) != NULL) {
+			*nl = '\0';
+			if (strcmp(out, "remember") == 0 || strcmp(out, "once") == 0) {
+				*remember = out[0] == 'r';
+				e = strchr(nl + 1, '\n');
+				if (e && (size_t)(e - (nl + 1)) < pwlen) {
+					memcpy(pw, nl + 1, (size_t)(e - (nl + 1)));
+					pw[e - (nl + 1)] = '\0';
+					ok = 1;
+				}
+			}
+		}
+		memset(out, 0, sizeof out);
+		return ok ? 0 : -1;
+	} else {
+		CFStringRef h = CFStringCreateWithCString(NULL, header, kCFStringEncodingUTF8);
+		CFStringRef m = CFStringCreateWithCString(NULL, message, kCFStringEncodingUTF8);
+		CFStringRef field = CFSTR("Password"), box = CFSTR("Remember this password in my keychain");
+		CFArrayRef fields = CFArrayCreate(NULL, (const void **)&field, 1, &kCFTypeArrayCallBacks);
+		CFArrayRef boxes = CFArrayCreate(NULL, (const void **)&box, 1, &kCFTypeArrayCallBacks);
+		CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+								     &kCFTypeDictionaryValueCallBacks);
+		CFUserNotificationRef n = NULL;
+		CFOptionFlags resp = 0;
+		SInt32 err = 0, rc = -1;
+		int ok = 0;
+
+		if (h && m && fields && boxes && d) {
+			CFDictionarySetValue(d, kCFUserNotificationAlertHeaderKey, h);
+			CFDictionarySetValue(d, kCFUserNotificationAlertMessageKey, m);
+			CFDictionarySetValue(d, kCFUserNotificationTextFieldTitlesKey, fields);
+			CFDictionarySetValue(d, kCFUserNotificationCheckBoxTitlesKey, boxes);
+			CFDictionarySetValue(d, kCFUserNotificationDefaultButtonTitleKey, CFSTR("Mount"));
+			CFDictionarySetValue(d, kCFUserNotificationAlternateButtonTitleKey, CFSTR("Cancel"));
+			n = CFUserNotificationCreate(NULL, DIALOG_SECONDS, kCFUserNotificationPlainAlertLevel | CFUserNotificationSecureTextField(0),
+						     &err, d);
+			if (n)
+				rc = CFUserNotificationReceiveResponse(n, DIALOG_SECONDS, &resp);
+			else
+				syslog(LOG_NOTICE, "no dialog: CFUserNotificationCreate failed (%d)", (int)err);
+			if (n && rc == 0 && (resp & 3) == kCFUserNotificationDefaultResponse) {
+				CFStringRef v = CFUserNotificationGetResponseValue(n, kCFUserNotificationTextFieldValuesKey, 0);
+
+				if (v && CFStringGetCString(v, pw, (CFIndex)pwlen, kCFStringEncodingUTF8) && pw[0]) {
+					*remember = (resp & CFUserNotificationCheckBoxChecked(0)) != 0;
+					ok = 1;
+				} else
+					memset(pw, 0, pwlen);
+			} else if (n && rc != 0) {
+				syslog(LOG_NOTICE, "the dialog timed out or failed (%d)", (int)rc);
+				CFUserNotificationCancel(n);
+			}
+		}
+		if (n)
+			CFRelease(n);
+		if (d)
+			CFRelease(d);
+		if (fields)
+			CFRelease(fields);
+		if (boxes)
+			CFRelease(boxes);
+		if (h)
+			CFRelease(h);
+		if (m)
+			CFRelease(m);
+		return ok ? 0 : -1;
+	}
+}
+
+/* the CLI, with the password (or none): its exit status, its captured output in out */
+static int run_cli(const char *cli, const struct mountreq *req, const char *pw, char *out, size_t outlen)
+{
+	char *argv[8];
+	int n = 0, rc;
+
+	argv[n++] = (char *)cli;
+	argv[n++] = "da-mount";
+	if (req->asked)
+		argv[n++] = "--asked";
+	if (req->ro)
+		argv[n++] = "--ro";
+	if (pw)
+		argv[n++] = "--password-stdin";
+	argv[n++] = (char *)req->dev;
+	argv[n++] = (char *)req->mnt;
+	argv[n] = NULL;
+	rc = run_capture(argv, pw, out, outlen);
+	syslog(LOG_NOTICE, "%s: %s exited %d%s", req->dev, "linuxfs da-mount", rc, pw ? " (with a password)" : "");
+	log_lines("linuxfs", out);
+	return rc;
+}
+
+static int mount_role(const char *fs, int argc, char **argv)
+{
+	struct mountreq req;
+	struct passwd *pw;
+	const char *cli, *bsd, *base, *hintp;
+	char *out, hint[256], header[400], message[400], pass[PW_MAX], saved_pw[PW_MAX];
+	int rc, wrong = 0, tries, saved = 0, remember;
+
+	openlog("linuxfs-mount", LOG_PID, LOG_DAEMON);
+	if (fsrules_parse_mount(argc - 1, argv + 1, &req) != 0) {
+		fprintf(stderr, "usage: mount_linuxfs_%s [-o options] device mountpoint\n", fs);
+		syslog(LOG_NOTICE, "mount_%s: bad arguments", fs);
+		return 1;
+	}
+	if (getuid() == 0) {
+		syslog(LOG_NOTICE, "mount_%s: %s as root: not yet", fs, req.dev);
+		return 1;
+	}
+	pw = getpwuid(getuid());
+	if (!pw || !pw->pw_dir || pw->pw_dir[0] != '/') {
+		syslog(LOG_NOTICE, "mount_%s: no home directory for uid %d", fs, (int)getuid());
+		return 1;
+	}
+	setenv("HOME", pw->pw_dir, 1);
+	setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin", 1);
+	setenv("LINUXFS_DA", "1", 1);
+	signal(SIGPIPE, SIG_IGN);
+	cli = test_env("LINUXFS_CLI");
+	if (!cli || !*cli)
+		cli = CLI_DEFAULT;
+	bsd = strncmp(req.dev, "/dev/", 5) == 0 ? req.dev + 5 : req.dev;
+	base = strrchr(req.mnt, '/');
+	base = base && base[1] ? base + 1 : req.mnt;
+	out = malloc(CAPTURE_MAX);
+	if (!out)
+		return 1;
+	syslog(LOG_NOTICE, "mount_%s: %s on %s%s%s", fs, req.dev, req.mnt, req.asked ? " (asked)" : "", req.ro ? " (read-only)" : "");
+
+	rc = run_cli(cli, &req, NULL, out, CAPTURE_MAX);
+	if (rc != 4)
+		goto out;
+	hint[0] = '\0';
+	hintp = fsrules_hint(out, hint, sizeof hint) ? hint : NULL;
+
+	/* the keeper's password first, silently */
+	if (kc_find(bsd, saved_pw, sizeof saved_pw, &saved) == 0) {
+		rc = run_cli(cli, &req, saved_pw, out, CAPTURE_MAX);
+		if (rc != 4) {
+			memset(saved_pw, 0, sizeof saved_pw);
+			goto out;
+		}
+		if (saved && strstr(out, "wrong password"))
+			kc_tell("forget", bsd, NULL);
+		if (fsrules_hint(out, hint, sizeof hint))
+			hintp = hint;
+		memset(saved_pw, 0, sizeof saved_pw);
+	}
+
+	for (tries = 0; tries < DIALOG_TRIES; tries++) {
+		snprintf(header, sizeof header, "Enter the password for \xe2\x80\x9c%s\xe2\x80\x9d", base);
+		snprintf(message, sizeof message, "%s%s%s", wrong ? "Wrong password." : "", wrong && hintp ? " " : "",
+			 hintp ? "Hint: " : "");
+		if (hintp)
+			snprintf(message + strlen(message), sizeof message - strlen(message), "%s", hintp);
+		if (ask_dialog(header, message, pass, sizeof pass, &remember) != 0) {
+			syslog(LOG_NOTICE, "mount_%s: %s: no password given", fs, req.dev);
+			rc = 4;
+			goto out;
+		}
+		rc = run_cli(cli, &req, pass, out, CAPTURE_MAX);
+		if (rc == 0 && remember)
+			kc_tell("save", bsd, pass);
+		memset(pass, 0, sizeof pass);
+		if (rc != 4)
+			goto out;
+		wrong = strstr(out, "wrong password") != NULL;
+		if (fsrules_hint(out, hint, sizeof hint))
+			hintp = hint;
+	}
+	rc = 4;
+out:
+	syslog(LOG_NOTICE, "mount_%s: %s: exit %d", fs, req.dev, rc);
+	free(out);
+	return rc;
+}
+
 int main(int argc, char **argv)
 {
 	enum fsrole role = FS_UTIL;
@@ -344,8 +777,7 @@ int main(int argc, char **argv)
 	case FS_FSCK:
 		return fsck(fs, argc, argv);
 	case FS_MOUNT:
-		syslog(LOG_NOTICE, "mount_linuxfs_%s: not yet", fs);
-		return 1;
+		return mount_role(fs, argc, argv);
 	}
 	return 1;
 }
