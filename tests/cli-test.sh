@@ -193,7 +193,7 @@ cat > "$T/bin/open" <<EOF
 #!/bin/sh
 echo "open \$*" >> "$T/calls"
 echo "\${LINUXFS_OPEN_INHERITED:-0}" >> "$T/openenv"
-[ "\$1" != --probe ] || [ -z "\${FAKE_OPEN_SLEEP:-}" ] || sleep "\$FAKE_OPEN_SLEEP"
+case "\$1:\$2" in --probe:*/rdisk4) [ -z "\${FAKE_OPEN_SLEEP:-}" ] || sleep "\$FAKE_OPEN_SLEEP" ;; esac
 if [ "\$1" = --probe ] && [ -n "\${FAKE_FUSION:-}" ]; then
   case "\$2" in
     */rdisk3s1) printf 'apfs\tFused\tfusion-main 00112233445566778899aabbccddeeff\n'; exit 0 ;;
@@ -457,8 +457,8 @@ for f in 1 notier2; do
   [ $rc -eq 3 ] && [ $rc2 -eq 3 ] && [ $(( $(date +%s) - s0 )) -lt 5 ]; ok $? "inherited, da-mount of a Fusion main or tier2 device exits 3 at once ($f)"
 done
 s0=$(date +%s)
-(FAKE_FUSION=notier2 LINUXFS_FUSION_WAIT=5 FAKE_OPEN_SLEEP=1; export FAKE_FUSION LINUXFS_FUSION_WAIT FAKE_OPEN_SLEEP; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); rc=$?
-[ $rc -eq 3 ] && [ $(( $(date +%s) - s0 )) -lt 12 ]; ok $? "the Fusion wait is wall-clock time, not iterations (took $(( $(date +%s) - s0 )) s)"
+(FAKE_FUSION=notier2 LINUXFS_FUSION_WAIT=5 FAKE_OPEN_SLEEP=3; export FAKE_FUSION LINUXFS_FUSION_WAIT FAKE_OPEN_SLEEP; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); rc=$?
+[ $rc -eq 3 ] && [ $(( $(date +%s) - s0 )) -lt 8 ]; ok $? "the Fusion wait is wall-clock time, not iterations (took $(( $(date +%s) - s0 )) s)"
 ! sh "$L" help 2>&1 | grep -q da-mount; ok $? "usage does not list the internal da-mount"
 sh "$L" frobnicate > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "an unknown command is misuse (exit 2)"
 echo "1..$n"; exit $bad
