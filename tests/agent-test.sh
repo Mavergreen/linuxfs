@@ -71,6 +71,12 @@ s=$(date +%s); r=$(printf 'find\tdisk6\n' | nc -w 9 -U "$SOCK" | tr '\n' ' '); e
 [ "$r" = "none " ] && [ $e -le 6 ]; ok $? "the agent answers the next client once the drip is dropped at the deadline (answer '$r' after $e s)"
 wait $dp
 [ ! -s "$D/drip.out" ] && [ "$(find_ disk6)" = "none " ]; ok $? "and the dripped request kept nothing"
+# spec: tools/agent.c --
+#       a full offer table (16 slots): the oldest offer goes, the rest stay
+kill $ap; wait $ap 2>/dev/null
+agent
+i=1; while [ $i -le 17 ]; do printf 'pw%s\n' $i | HOME=$H "$D/agent" --offer disk$i; i=$((i + 1)); sleep 0.05; done
+[ "$(find_ disk1)" = "none " ] && [ "$(find_ disk2)" = "offered pw2 " ] && [ "$(find_ disk17)" = "offered pw17 " ]; ok $? "a 17th offer evicts the oldest (disk1) and keeps disk2 and disk17"
 kill -9 $ap; wait $ap 2>/dev/null
 [ -S "$SOCK" ]; ok $? "killing the agent leaves its socket file behind"
 s=$(date +%s)
@@ -80,6 +86,14 @@ e=$(( $(date +%s) - s ))
 agent
 [ "$(find_ disk9)" = "none " ]; ok $? "a restarted agent replaces the stale socket and answers"
 kill $ap; wait $ap 2>/dev/null
+# spec: tools/agent.c --
+#       a socket directory that is a symlink is refused: exit 1, and the refusal is logged
+kill $ap 2>/dev/null; wait $ap 2>/dev/null
+H2=$(mktemp -d /tmp/lfagent2.XXXXXX); mkdir -p "$H2/Library/Caches" "$H2/elsewhere"
+ln -s "$H2/elsewhere" "$H2/Library/Caches/dev.mavergreen.linuxfs"
+HOME=$H2 LINUXFS_KEYCHAIN=off "$D/agent" 2> "$D/symlink.log"; rc=$?
+[ $rc = 1 ] && grep -q 'not a directory of this user' "$D/symlink.log" && [ ! -e "$H2/elsewhere/keychain.sock" ]; ok $? "a symlinked socket directory: the agent exits 1 and logs the refusal (rc $rc)"
+rm -rf "$H2"
 # spec: tools/agent.c --
 #       the login sweep: 15 s after start (here 2 s) it mounts the linuxfs_ disks nothing mounted; a disk with no
 #       linuxfs_ kind (this Mac has no bundles, so an attached image has none) is left alone

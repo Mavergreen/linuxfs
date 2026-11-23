@@ -2,7 +2,7 @@
 # platform: macOS-only -- packages the 10.9 build for a 10.9 guest with Mavergreen macFUSE (Linux, via Docker, makes the images)
 #   usage: p3-bundle.sh BUILT DEST
 #          Makes DEST, a self-contained P3 run of linuxfs (CLI, root helper):
-#          - bin/{lklfuse,linuxfs-probe,linuxfs-open,linuxfs-helper,linuxfs-agent} from BUILT
+#          - bin/{lklfuse,linuxfs-probe,linuxfs-open,linuxfs-helper} from BUILT
 #            (build/build-lkl-darwin.sh's output) and bin/linuxfs (cli/linuxfs);
 #          - the helper's LaunchDaemon plist, tests/p3-darwin.sh and run.sh;
 #          - images/{ext4,btrfs,xfs,ntfs,exfat}.img.gz, made by Linux (tests/lib/probe-images.sh), and
@@ -16,7 +16,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 S=$(cd "$1" && pwd); D=$2
 [ ! -e "$D" ] || { echo "p3-bundle.sh: $D exists" >&2; exit 1; }
 mkdir -p "$D/bin" "$D/images"; D=$(cd "$D" && pwd)
-for b in lklfuse linuxfs-probe linuxfs-open linuxfs-helper linuxfs-agent; do
+for b in lklfuse linuxfs-probe linuxfs-open linuxfs-helper; do
   [ -f "$S/$b" ] || { echo "p3-bundle.sh: no $b in $S" >&2; exit 1; }
   cp "$S/$b" "$D/bin/$b"; chmod 755 "$D/bin/$b"
 done
