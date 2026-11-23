@@ -411,8 +411,11 @@ cmd_da_mount() {
   device_nodes "$1" || usage
   mp=$2
   probed=$(probe_dev "$raw") || exit 3
-  rest=${probed#*"$tab"}; label=${rest%%"$tab"*}
+  type=${probed%%"$tab"*} rest=${probed#*"$tab"}; label=${rest%%"$tab"*}
+  # defence in depth: the bundles never claim these, so refuse them here too
+  case $type in exfat|vfat) exit 3 ;; esac
   if [ -z "$asked" ]; then
+    [ "$type" != ntfs3 ] || [ "$(pref NTFSTakeover off)" = on ] || exit 3
     [ "$(pref Automount on)" = on ] || exit 3
     [ -z "$label" ] || ! ignored "$label" || exit 3
   fi

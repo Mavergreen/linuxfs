@@ -416,5 +416,15 @@ ok $r "LINUXFS_ALL_USERS=1 mounts allow_other,uid=99,gid=99, without owner=root"
 sh "$L" unmount disk3s1 > /dev/null 2>&1
 (LINUXFS_OPEN_INHERITED=1; export LINUXFS_OPEN_INHERITED; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); ok $? "LINUXFS_OPEN_INHERITED=1 still mounts through the opener"
 sh "$L" unmount disk3s1 > /dev/null 2>&1
+for t in exfat vfat; do
+  (FAKE_PROBE=$t; export FAKE_PROBE; DA --asked /dev/disk3s1 "$T/dam" > /dev/null 2>&1); [ $? -eq 3 ]; ok $? "da-mount leaves $t to the Mac, even asked"
+done
+sh "$L" prefs NTFSTakeover off
+(FAKE_PROBE=ntfs3; export FAKE_PROBE; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); [ $? -eq 3 ]; ok $? "da-mount leaves NTFS to the Mac unless NTFSTakeover is on"
+(FAKE_PROBE=ntfs3; export FAKE_PROBE; DA --asked /dev/disk3s1 "$T/dam" > /dev/null 2>&1); ok $? "but an asked-for NTFS mount goes ahead"
+sh "$L" unmount disk3s1 > /dev/null 2>&1
+sh "$L" prefs NTFSTakeover on
+(FAKE_PROBE=ntfs3; export FAKE_PROBE; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); ok $? "with NTFSTakeover on, da-mount takes NTFS"
+sh "$L" unmount disk3s1 > /dev/null 2>&1; sh "$L" prefs NTFSTakeover off
 sh "$L" frobnicate > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "an unknown command is misuse (exit 2)"
 echo "1..$n"; exit $bad
