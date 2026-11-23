@@ -10,7 +10,8 @@
 enum fsrole { FS_UTIL, FS_MOUNT, FS_FSCK };
 
 /* The filesystem a program's name stands for: linuxfs_<fs>.util, mount_linuxfs_<fs> or fsck_linuxfs_<fs>
- * (any directory before it); NULL for anything else (*role is then untouched; role may be NULL), or an <fs> that is not ext4, btrfs, xfs, f2fs, apfs or ntfs. */
+ * (any directory before it). NULL for anything else, or an <fs> that is not ext4, btrfs, xfs, f2fs, apfs or
+ * ntfs; *role is then untouched. role may be NULL. */
 const char *fsrules_fs_from_name(const char *argv0, enum fsrole *role);
 
 /* The name tools/probe.c gives that filesystem: ntfs is ntfs3, the others unchanged. */

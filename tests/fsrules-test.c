@@ -96,6 +96,7 @@ int main(void)
 	p.automount = 1; p.ntfs_takeover = 0;
 	is(fsrules_claims("ntfs", "ntfs3", 1, &p), 0, "ntfs declines with takeover off");
 	is(fsrules_claims("ntfs", "ext4", 1, &p), 0, "ntfs claims nothing else");
+	is(fsrules_claims("ext4", "ext4", 1, NULL), 0, "no prefs declines");
 
 	{
 		char *a[] = { "-o", "nodev", "-o", "noowners", "-o", "nosuid", "/dev/disk2", "/Volumes/X" };
