@@ -7,7 +7,8 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 if [ "$(uname -s)" = Linux ]; then
-  D=${FSRULES_TEST_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/fsrules-test.XXXXXX")}
+  if [ -n "${FSRULES_TEST_DIR:-}" ]; then D=$FSRULES_TEST_DIR; mkdir -p "$D" || exit 1
+  else D=$(mktemp -d "${TMPDIR:-/tmp}/fsrules-test.XXXXXX") || exit 1; trap 'rm -rf "$D"' EXIT; fi
   cc -std=c99 -O2 -Wall -Werror -o "$D/fsrules-test" "$ROOT/tests/fsrules-test.c" "$ROOT/tools/fsrules.c" || exit 1
 else
   . "$ROOT/build/msc.sh"

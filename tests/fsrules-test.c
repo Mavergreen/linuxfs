@@ -34,7 +34,7 @@ static int parse(struct mountreq *m, int argc, char **argv)
 int main(void)
 {
 	enum fsrole r;
-	static const char *const six[] = { "ext4", "btrfs", "xfs", "f2fs", "apfs" };
+	static const char *const linux_fs[] = { "ext4", "btrfs", "xfs", "f2fs", "apfs" };
 	static const char *const types[] = { "ext4", "btrfs", "xfs", "f2fs", "apfs", "ntfs3", "exfat", "vfat", "hfs" };
 	struct fsprefs p;
 	struct mountreq m;
@@ -54,7 +54,13 @@ int main(void)
 	iss(fsrules_fs_from_name("linuxfs_hfs.util", &r), NULL, "an unknown filesystem is NULL");
 	iss(fsrules_fs_from_name("mount_linuxfs", &r), NULL, "mount_linuxfs with no filesystem is NULL");
 	iss(fsrules_fs_from_name("mount_linuxfs_", &r), NULL, "an empty filesystem is NULL");
+	iss(fsrules_fs_from_name("mount_linuxfs_hfs", &r), NULL, "mount_linuxfs_hfs is NULL");
+	iss(fsrules_fs_from_name("fsck_linuxfs_hfs", &r), NULL, "fsck_linuxfs_hfs is NULL");
 	iss(fsrules_fs_from_name("mount_hfs", &r), NULL, "another program is NULL");
+	iss(fsrules_fs_from_name("mount_linuxfs_ext4", NULL), "ext4", "a NULL role is tolerated");
+	r = FS_UTIL;
+	iss(fsrules_fs_from_name("mount_linuxfs_hfs", &r), NULL, "a failed lookup");
+	is(r == FS_UTIL, 1, "leaves the role alone");
 	iss(fsrules_fs_from_name("linuxfs_ext4", &r), NULL, "a util without .util is NULL");
 	iss(fsrules_fs_from_name("linuxfs_ext4.util/", &r), NULL, "a trailing slash is NULL");
 	iss(fsrules_fs_from_name(NULL, &r), NULL, "no name is NULL");
@@ -72,7 +78,7 @@ int main(void)
 	claimed_ok = others_ok = 1;
 	for (i = 0; i < 5; i++)
 		for (j = 0; j < 9; j++) {
-			int c = fsrules_claims(six[i], types[j], 0, &p);
+			int c = fsrules_claims(linux_fs[i], types[j], 0, &p);
 			if (j == i && !c) claimed_ok = 0;
 			if (j != i && c) others_ok = 0;
 		}
@@ -117,8 +123,14 @@ int main(void)
 	}
 	{
 		char *a[] = { "-o", "noowners,nordonly", "/dev/disk2", "/Volumes/X" };
-		parse(&m, 4, a);
+		is(parse(&m, 4, a), 0, "no-prefixed options parse");
 		is(m.asked == 0 && m.ro == 0, 1, "no-prefixed options are not owners or ro");
+	}
+	{
+		char *a[] = { "-oowners,rdonly", "/dev/disk2", "/Volumes/X" };
+		is(parse(&m, 3, a), 0, "the attached form -oowners,rdonly parses");
+		is(m.asked == 1 && m.ro == 1, 1, "and is read");
+		iss(m.mnt, "/Volumes/X", "with MNT after it");
 	}
 	{
 		char *a[] = { "-o", "nodev", "/dev/disk2" };
@@ -153,6 +165,26 @@ int main(void)
 	iss(out, "Linux", "only dots is Linux");
 	fsrules_volname("\xff", out, sizeof out);
 	iss(out, "Linux", "invalid UTF-8 is Linux");
+	fsrules_volname("\xc3", out, sizeof out);
+	iss(out, "Linux", "a truncated 2-byte sequence is Linux");
+	fsrules_volname("\xe2\x82", out, sizeof out);
+	iss(out, "Linux", "a truncated 3-byte sequence is Linux");
+	fsrules_volname("\xc0\x80", out, sizeof out);
+	iss(out, "Linux", "an overlong 2-byte form is Linux");
+	fsrules_volname("\xe0\x80\x80", out, sizeof out);
+	iss(out, "Linux", "an overlong 3-byte form is Linux");
+	fsrules_volname("\xed\xa0\x80", out, sizeof out);
+	iss(out, "Linux", "a surrogate is Linux");
+	fsrules_volname("\xf4\x90\x80\x80", out, sizeof out);
+	iss(out, "Linux", "a value above U+10FFFF is Linux");
+	memset(label, 'a', 199); strcpy(label + 199, "\xf0\x9f\x98\x80\xf0\x9f\x98\x80");
+	fsrules_volname(label, out, sizeof out);
+	is((int)strlen(out), 203, "a 4-byte character that is the 200th is kept whole, the next cut");
+	memset(label, 'a', 198); strcpy(label + 198, "\xf0\x9f\x98\x80\xf0\x9f\x98\x80\xf0\x9f\x98\x80");
+	fsrules_volname(label, out, sizeof out);
+	is((int)strlen(out), 198 + 8, "the 199th and 200th are kept, the 201st cut");
+	fsrules_volname("aaa\xf0\x9f\x98\x80", out, 7);
+	iss(out, "aaa", "a 4-byte character that does not fit the buffer is dropped whole");
 	fsrules_volname("Donn\xc3\xa9" "es \xf0\x9f\x98\x80", out, sizeof out);
 	iss(out, "Donn\xc3\xa9" "es \xf0\x9f\x98\x80", "UTF-8 is kept");
 	memset(label, 'a', 300); label[300] = 0;

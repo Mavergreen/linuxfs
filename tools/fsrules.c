@@ -18,6 +18,7 @@ static const char *known(const char *s, size_t n)
 const char *fsrules_fs_from_name(const char *argv0, enum fsrole *role)
 {
 	const char *b, *s;
+	enum fsrole r;
 	size_t n;
 
 	if (!argv0)
@@ -26,20 +27,19 @@ const char *fsrules_fs_from_name(const char *argv0, enum fsrole *role)
 	b = b ? b + 1 : argv0;
 	n = strlen(b);
 	if (strncmp(b, "mount_linuxfs_", 14) == 0) {
-		*role = FS_MOUNT;
-		return known(b + 14, n - 14);
-	}
-	if (strncmp(b, "fsck_linuxfs_", 13) == 0) {
-		*role = FS_FSCK;
-		return known(b + 13, n - 13);
-	}
-	if (strncmp(b, "linuxfs_", 8) == 0 && n > 8 + 5 && strcmp(b + n - 5, ".util") == 0) {
+		s = known(b + 14, n - 14);
+		r = FS_MOUNT;
+	} else if (strncmp(b, "fsck_linuxfs_", 13) == 0) {
+		s = known(b + 13, n - 13);
+		r = FS_FSCK;
+	} else if (strncmp(b, "linuxfs_", 8) == 0 && n > 8 + 5 && strcmp(b + n - 5, ".util") == 0) {
 		s = known(b + 8, n - 8 - 5);
-		if (s)
-			*role = FS_UTIL;
-		return s;
-	}
-	return NULL;
+		r = FS_UTIL;
+	} else
+		return NULL;
+	if (s && role)
+		*role = r;
+	return s;
 }
 
 const char *fsrules_probe_type(const char *fs)
@@ -57,7 +57,7 @@ void fsrules_default_prefs(struct fsprefs *p)
 
 int fsrules_claims(const char *fs, const char *probed_type, int removable, const struct fsprefs *p)
 {
-	if (!fs || !probed_type || !known(fs, strlen(fs)))
+	if (!fs || !probed_type || !p || !known(fs, strlen(fs)))
 		return 0;
 	if (strcmp(fs, "ntfs") == 0)
 		return strcmp(probed_type, "ntfs3") == 0 && p->ntfs_takeover && p->automount && removable;
@@ -90,6 +90,8 @@ int fsrules_parse_mount(int argc, char **argv, struct mountreq *m)
 			if (++i >= argc)
 				return -1;
 			options(argv[i], m);
+		} else if (strncmp(argv[i], "-o", 2) == 0) {
+			options(argv[i] + 2, m);
 		} else if (argv[i][0] == '-') {
 			return -1;
 		} else if (pos == 0) {
