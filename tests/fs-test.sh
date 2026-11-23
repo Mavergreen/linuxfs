@@ -123,6 +123,7 @@ echo "dialog: $1 | $2" >> "$STUB_LOG"
 n=$(cat "$STUB_LOG.n" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$STUB_LOG.n"
 set -- $DLG_PWS
 eval "pw=\${$n:-}"
+[ "$pw" != EMPTY ] || pw=
 printf '%s\n%s\n' "${DLG_MODE:-remember}" "$pw"
 EOS
 chmod +x "$M/cli" "$M/dialog"
@@ -215,6 +216,48 @@ kc hang; t0=$(date +%s)
 mt env STUB_PW=pw DLG_PWS=pw DLG_MODE=remember "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
 t1=$(date +%s); kcstop
 [ $rc = 0 ] && [ $((t1 - t0)) -lt 8 ]; ok $? "a hung keeper and 'remember' ticked: the save is skipped, not a second 5 s wait: $((t1 - t0)) s (rc $rc)"
+# a CLI that leaves a background child behind: the mount returns at once, and the child holds only fds 0-2
+cat > "$M/clibg" <<'EOS'
+#!/bin/sh
+/usr/bin/python -c 'import os
+o = []
+for f in range(3, 255):
+    try:
+        os.fstat(f); o.append(str(f))
+    except OSError:
+        pass
+open(os.environ["STUB_LOG"], "a").write("fds: " + " ".join(o) + "\n")'
+sleep 5 >/dev/null 2>&1 </dev/null &
+exit 0
+EOS
+chmod +x "$M/clibg"
+t0=$(date +%s)
+rm -f "$M/log"; env -u HOME STUB_LOG="$M/log" LINUXFS_CLI="$M/clibg" "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
+t1=$(date +%s)
+[ $rc = 0 ] && [ $((t1 - t0)) -lt 3 ]; ok $? "a CLI that leaves a background child: the mount returns in $((t1 - t0)) s, not when the child ends (rc $rc)"
+fds=$(sed -n 's/^fds: //p' "$M/log" | tr -d '\n'); case " $fds " in *" 255 "*) fds=$(echo " $fds " | sed 's/ 255 / /') ;; esac
+[ -z "$(echo $fds)" ]; ok $? "the CLI holds no fd above 2 but the shell's own script fd ('$fds')"
+# Mount with an empty field asks again, counted among the 3
+kc none
+mt env STUB_PW=pw DLG_PWS="EMPTY pw" DLG_MODE=once "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
+kcstop
+[ $rc = 0 ] && [ "$(grep -c '^dialog' "$M/log")" = 2 ]; ok $? "an empty password asks again instead of cancelling (rc $rc, $(grep -c '^dialog' "$M/log") dialogs)"
+kc none
+mt env STUB_PW=pw DLG_PWS="EMPTY EMPTY EMPTY" DLG_MODE=once "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
+kcstop
+[ $rc = 4 ] && [ "$(grep -c '^dialog' "$M/log")" = 3 ] && [ "$(grep -c '^args:' "$M/log")" = 1 ]; ok $? "three empty answers: three dialogs, exit 4, the CLI ran once (rc $rc)"
+# a hint that is not UTF-8 does not cancel the dialog
+cat > "$M/clibad" <<'EOS'
+#!/bin/sh
+echo "args: $*" >> "$STUB_LOG"
+case " $* " in *" --password-stdin "*) exit 0 ;; esac
+printf 'linuxfs: encrypted (hint: caf\351)\n' >&2; exit 4
+EOS
+chmod +x "$M/clibad"
+kc none
+mt env LINUXFS_CLI="$M/clibad" DLG_PWS=pw DLG_MODE=once "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
+kcstop
+[ $rc = 0 ] && grep -q '^dialog' "$M/log"; ok $? "a hint that is not UTF-8 is left out, and the dialog still runs (rc $rc)"
 # misuse
 for bad_args in "" "/dev/disk9" "-o /dev/disk9 /tmp/m" "/dev/disk9 /tmp/m extra" "-x /dev/disk9 /tmp/m"; do
   # shellcheck disable=SC2086

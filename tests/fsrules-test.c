@@ -221,6 +221,10 @@ int main(void)
 		is(fsrules_hint("a (hint: one)\nb (hint: two)\n", hint, sizeof hint) && strcmp(hint, "two") == 0, 1,
 		   "the last hint wins");
 		is(fsrules_hint("x (hint: long long long)", hint, 5) && strcmp(hint, "long") == 0, 1, "a small buffer cuts the hint");
+		is(fsrules_hint("x (hint: a\xc3\xa9)", hint, 3) && strcmp(hint, "a") == 0, 1, "a small buffer cuts the hint on a character boundary");
+		is(fsrules_hint("x (hint: a\xc3\xa9)", hint, 4) && strcmp(hint, "a\xc3\xa9") == 0, 1, "a hint in UTF-8 is kept");
+		is(fsrules_hint("x (hint: a\xff)", hint, sizeof hint), 0, "a hint that is not UTF-8 is dropped");
+		is(fsrules_hint("x (hint: a\xc3)", hint, sizeof hint), 0, "a truncated UTF-8 sequence in a hint is dropped");
 	}
 
 	printf("1..%d\n", tapno);

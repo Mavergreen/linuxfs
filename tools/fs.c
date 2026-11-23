@@ -374,44 +374,68 @@ static void log_lines(const char *what, const char *text)
  * did not exit. */
 static int run_capture(char *const argv[], const char *pw, char *out, size_t outlen)
 {
-	int inp[2], outp[2], st = 0;
+	int inp[2] = { -1, -1 }, outp[2], st = -1, nul = -1, fd;
 	size_t got = 0;
 	pid_t pid;
 	ssize_t r;
 
 	out[0] = '\0';
-	if (pipe(inp) != 0)
+	if (pw && pipe(inp) != 0)
 		return -1;
 	if (pipe(outp) != 0) {
-		close(inp[0]);
-		close(inp[1]);
+		if (pw) {
+			close(inp[0]);
+			close(inp[1]);
+		}
 		return -1;
 	}
-	fcntl(inp[1], F_SETFD, FD_CLOEXEC);
+	/* Every end is close-on-exec, so no descendant of the CLI (its backgrounded lklfuse) holds a pipe open: the read
+	 * below must see EOF when the CLI exits, not when the mount ends. dup2 into 0-2 clears the flag on those. */
+	if (pw) {
+		fcntl(inp[0], F_SETFD, FD_CLOEXEC);
+		fcntl(inp[1], F_SETFD, FD_CLOEXEC);
+	} else {
+		nul = open("/dev/null", O_RDONLY | O_CLOEXEC);
+	}
 	fcntl(outp[0], F_SETFD, FD_CLOEXEC);
+	fcntl(outp[1], F_SETFD, FD_CLOEXEC);
 	pid = fork();
 	if (pid < 0) {
-		close(inp[0]);
-		close(inp[1]);
+		if (pw) {
+			close(inp[0]);
+			close(inp[1]);
+		}
+		if (nul >= 0)
+			close(nul);
 		close(outp[0]);
 		close(outp[1]);
 		return -1;
 	}
 	if (pid == 0) {
-		if (pw) {
-			dup2(inp[0], 0);
-		} else {
-			int nul = open("/dev/null", O_RDONLY);
+		int in = pw ? inp[0] : nul;
+		int o = outp[1];
 
-			if (nul >= 0)
-				dup2(nul, 0);
-		}
-		dup2(outp[1], 1);
-		dup2(outp[1], 2);
+		/* park the three on high fds first, so dup2 onto 0-2 cannot clobber one still needed */
+		if (in >= 0 && in < 10)
+			in = fcntl(in, F_DUPFD_CLOEXEC, 10);
+		if (o < 10)
+			o = fcntl(o, F_DUPFD_CLOEXEC, 10);
+		if (in >= 0)
+			dup2(in, 0);
+		else
+			close(0);
+		dup2(o, 1);
+		dup2(o, 2);
+		for (fd = 3; fd < 1024; fd++)
+			close(fd);
+		signal(SIGPIPE, SIG_DFL);
 		execv(argv[0], argv);
 		_exit(127);
 	}
-	close(inp[0]);
+	if (nul >= 0)
+		close(nul);
+	if (pw)
+		close(inp[0]);
 	close(outp[1]);
 	if (pw) {
 		size_t n = strlen(pw), off = 0;
@@ -419,8 +443,8 @@ static int run_capture(char *const argv[], const char *pw, char *out, size_t out
 		while (off < n && (r = write(inp[1], pw + off, n - off)) > 0)
 			off += (size_t)r;
 		(void)!write(inp[1], "\n", 1);
+		close(inp[1]);
 	}
-	close(inp[1]);
 	for (;;) {
 		char tmp[4096];
 
@@ -436,8 +460,10 @@ static int run_capture(char *const argv[], const char *pw, char *out, size_t out
 	}
 	out[got] = '\0';
 	close(outp[0]);
-	while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
-		;
+	while (waitpid(pid, &st, 0) < 0) {
+		if (errno != EINTR)
+			return -1;
+	}
 	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
@@ -452,6 +478,7 @@ static int reply_whole(const char *rep)
 	return nl >= ((strncmp(rep, "offered\n", 8) == 0 || strncmp(rep, "saved\n", 6) == 0) ? 2 : 1);
 }
 
+static char kc_home[1024]; /* the passwd home directory of the user we run as */
 static int kc_hung; /* the keeper took its whole deadline without answering: no more requests to it */
 
 /* One request to the keychain keeper (one per connection), its reply into rep (replen bytes, NUL-ended); the whole
@@ -461,7 +488,7 @@ static int kc_ask(const char *req, size_t reqlen, char *rep, size_t replen)
 	char path[1024];
 	struct sockaddr_un sa;
 	struct timeval t0, now;
-	const char *home, *over = test_env("LINUXFS_KEYCHAIN_SOCK");
+	const char *over = test_env("LINUXFS_KEYCHAIN_SOCK");
 	int fd, one = 1, rc = -1;
 	size_t got = 0, sent = 0;
 
@@ -470,9 +497,8 @@ static int kc_ask(const char *req, size_t reqlen, char *rep, size_t replen)
 		return -1;
 	if (over)
 		snprintf(path, sizeof path, "%s", over);
-	else if ((home = getenv("HOME")) != NULL)
-		snprintf(path, sizeof path, "%s/Library/Caches/dev.mavergreen.linuxfs/keychain.sock", home);
-	else
+	else if (!kc_home[0] ||
+		 snprintf(path, sizeof path, "%s/Library/Caches/dev.mavergreen.linuxfs/keychain.sock", kc_home) >= (int)sizeof path)
 		return -1;
 	memset(&sa, 0, sizeof sa);
 	sa.sun_family = AF_UNIX;
@@ -542,9 +568,11 @@ static int kc_find(const char *bsd, char *pw, size_t pwlen, int *saved)
 	char req[64], rep[PW_MAX + 32], *p, *e;
 	int n = snprintf(req, sizeof req, "find\t%s\n", bsd), rc = -1;
 
+	if (n < 0 || (size_t)n >= sizeof req)
+		return -1;
 	if (kc_ask(req, (size_t)n, rep, sizeof rep) != 0) {
 		syslog(LOG_NOTICE, "%s: the keychain keeper did not answer", bsd);
-		return -1;
+		goto out;
 	}
 	if (strncmp(rep, "offered\n", 8) == 0)
 		*saved = 0, p = rep + 8;
@@ -552,16 +580,17 @@ static int kc_find(const char *bsd, char *pw, size_t pwlen, int *saved)
 		*saved = 1, p = rep + 6;
 	else {
 		syslog(LOG_NOTICE, "%s: the keychain keeper has no password", bsd);
-		return -1;
+		goto out;
 	}
 	e = strchr(p, '\n');
 	if (e && e > p && (size_t)(e - p) < pwlen) {
 		memcpy(pw, p, (size_t)(e - p));
 		pw[e - p] = '\0';
 		rc = 0;
+		syslog(LOG_NOTICE, "%s: the keychain keeper offers a %s password", bsd, *saved ? "saved" : "offered");
 	}
+out:
 	memset(rep, 0, sizeof rep);
-	syslog(LOG_NOTICE, "%s: the keychain keeper offers a %s password", bsd, rc == 0 && *saved ? "saved" : "offered");
 	return rc;
 }
 
@@ -583,7 +612,8 @@ static void kc_tell(const char *verb, const char *bsd, const char *pw)
 	memset(req, 0, sizeof req);
 }
 
-/* The password dialog. 0 with the password in pw (PW_MAX bytes) and *remember; -1 for Cancel, timeout or any failure. */
+/* The password dialog. 0 with the password in pw (PW_MAX bytes) and *remember; 1 when Mount was pressed with the
+ * field empty; -1 for Cancel, timeout or any failure. */
 static int ask_dialog(const char *header, const char *message, char *pw, size_t pwlen, int *remember)
 {
 	const char *prog = test_env("LINUXFS_DIALOG");
@@ -606,10 +636,27 @@ static int ask_dialog(const char *header, const char *message, char *pw, size_t 
 			}
 		}
 		memset(out, 0, sizeof out);
-		return ok ? 0 : -1;
+		return ok ? (pw[0] ? 0 : 1) : -1;
 	} else {
 		CFStringRef h = CFStringCreateWithCString(NULL, header, kCFStringEncodingUTF8);
 		CFStringRef m = CFStringCreateWithCString(NULL, message, kCFStringEncodingUTF8);
+		int ok = 0;
+
+		if (!h) {
+			syslog(LOG_NOTICE, "the dialog's header is not UTF-8: using a plain one");
+			h = CFStringCreateWithCString(NULL, "Enter the password", kCFStringEncodingUTF8);
+		}
+		if (!m) {	/* the hint is the only free text in it: leave it out, never the dialog */
+			char plain[400], *hp;
+
+			syslog(LOG_NOTICE, "the dialog's message is not UTF-8: leaving out the hint");
+			snprintf(plain, sizeof plain, "%s", message);
+			if ((hp = strstr(plain, "Hint: ")) != NULL)
+				*hp = '\0';
+			while (*plain && plain[strlen(plain) - 1] == ' ')
+				plain[strlen(plain) - 1] = '\0';
+			m = CFStringCreateWithCString(NULL, plain, kCFStringEncodingUTF8);
+		}
 		CFStringRef field = CFSTR("Password"), box = CFSTR("Remember this password in my keychain");
 		CFArrayRef fields = CFArrayCreate(NULL, (const void **)&field, 1, &kCFTypeArrayCallBacks);
 		CFArrayRef boxes = CFArrayCreate(NULL, (const void **)&box, 1, &kCFTypeArrayCallBacks);
@@ -618,7 +665,7 @@ static int ask_dialog(const char *header, const char *message, char *pw, size_t 
 		CFUserNotificationRef n = NULL;
 		CFOptionFlags resp = 0;
 		SInt32 err = 0, rc = -1;
-		int ok = 0;
+		int empty = 0;
 
 		if (h && m && fields && boxes && d) {
 			CFDictionarySetValue(d, kCFUserNotificationAlertHeaderKey, h);
@@ -636,11 +683,14 @@ static int ask_dialog(const char *header, const char *message, char *pw, size_t 
 			if (n && rc == 0 && (resp & 3) == kCFUserNotificationDefaultResponse) {
 				CFStringRef v = CFUserNotificationGetResponseValue(n, kCFUserNotificationTextFieldValuesKey, 0);
 
+				/* v is a CFString holding the password; CF gives no way to scrub it, only to release it */
 				if (v && CFStringGetCString(v, pw, (CFIndex)pwlen, kCFStringEncodingUTF8) && pw[0]) {
 					*remember = (resp & CFUserNotificationCheckBoxChecked(0)) != 0;
 					ok = 1;
-				} else
+				} else {
 					memset(pw, 0, pwlen);
+					empty = 1;
+				}
 			} else if (n && rc != 0) {
 				syslog(LOG_NOTICE, "the dialog timed out or failed (%d)", (int)rc);
 				CFUserNotificationCancel(n);
@@ -658,7 +708,7 @@ static int ask_dialog(const char *header, const char *message, char *pw, size_t 
 			CFRelease(h);
 		if (m)
 			CFRelease(m);
-		return ok ? 0 : -1;
+		return ok ? 0 : (empty ? 1 : -1);
 	}
 }
 
@@ -708,6 +758,7 @@ static int mount_role(const char *fs, int argc, char **argv)
 		syslog(LOG_NOTICE, "mount_%s: no home directory for uid %d", fs, (int)getuid());
 		return 1;
 	}
+	snprintf(kc_home, sizeof kc_home, "%s", pw->pw_dir);
 	setenv("HOME", pw->pw_dir, 1);
 	setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin", 1);
 	setenv("LINUXFS_DA", "1", 1);
@@ -749,7 +800,12 @@ static int mount_role(const char *fs, int argc, char **argv)
 			 hintp ? "Hint: " : "");
 		if (hintp)
 			snprintf(message + strlen(message), sizeof message - strlen(message), "%s", hintp);
-		if (ask_dialog(header, message, pass, sizeof pass, &remember) != 0) {
+		rc = ask_dialog(header, message, pass, sizeof pass, &remember);
+		if (rc > 0) {
+			syslog(LOG_NOTICE, "mount_%s: %s: an empty password: asking again", fs, req.dev);
+			continue;
+		}
+		if (rc != 0) {
 			syslog(LOG_NOTICE, "mount_%s: %s: no password given", fs, req.dev);
 			rc = 4;
 			goto out;
@@ -768,7 +824,7 @@ static int mount_role(const char *fs, int argc, char **argv)
 out:
 	syslog(LOG_NOTICE, "mount_%s: %s: exit %d", fs, req.dev, rc);
 	free(out);
-	return rc;
+	return rc < 0 ? 1 : rc;	/* the CLI could not run, or was killed */
 }
 
 int main(int argc, char **argv)

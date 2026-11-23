@@ -178,6 +178,8 @@ void fsrules_volname(const char *label, char *out, size_t outlen)
 int fsrules_hint(const char *err, char *hint, size_t len)
 {
 	const char *p = NULL, *s = err, *q, *e;
+	size_t o = 0;
+	int n;
 
 	while ((q = strstr(s, "(hint: "))) {
 		p = q + 7;
@@ -190,6 +192,15 @@ int fsrules_hint(const char *err, char *hint, size_t len)
 		e = p + strlen(p);
 	if (e > p && e[-1] == ')')
 		e--;
-	snprintf(hint, len, "%.*s", (int)(e - p), p);
+	while (p + o < e) {
+		n = u8len((const unsigned char *)p + o);
+		if (!n || p + o + n > e)
+			return 0;	/* not UTF-8: no hint at all */
+		o += (size_t)n;
+	}
+	for (o = 0; p + o < e && (n = u8len((const unsigned char *)p + o)) && o + (size_t)n < len; o += (size_t)n)
+		;
+	memcpy(hint, p, o);
+	hint[o] = '\0';
 	return 1;
 }
