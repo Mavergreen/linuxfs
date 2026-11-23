@@ -1,161 +1,94 @@
 /*
- * linuxfs-agent: the per-user automounter (LaunchAgent dev.mavergreen.linuxfs.agent, in the console session).
+ * linuxfs-agent: the per-user keychain keeper (LaunchAgent dev.mavergreen.linuxfs.agent, in the console session).
  * usage: linuxfs-agent
- *        linuxfs-agent --ask DISK [HINT [wrong]]
- * Watches DiskArbitration. A leaf medium the Mac finds no filesystem on is probed through linuxfs-open
- * (the root helper reads it); if it holds a Linux filesystem the agent claims it, which keeps the Mac's
- * "disk not readable" dialog away, and runs `linuxfs automount DISK` once it appears. An NTFS volume the
- * Mac would mount read-only is refused to the Mac and handed to `linuxfs automount` instead, only when the
- * NTFSTakeover preference is on. A disk that disappears is unmounted with `linuxfs unmount --force`.
- * Never HFS+, FAT or exFAT; APFS only where the Mac cannot read it (10.9 cannot).
- * An encrypted APFS volume (automount exits 4): the agent asks for its password, then runs
- * `linuxfs mount DISK --password-stdin`; a wrong one is asked for again, with the volume's hint, three tries in all.
- * A password the user asks to remember goes in the login keychain (service dev.mavergreen.linuxfs, account the
- * partition's UUID), and is tried first next time. The asking is `linuxfs-agent --ask DISK [HINT [wrong]]`: a
- * dialog, which prints "remember" or "once", a newline and the password.
- * LINUXFS_CLI, LINUXFS_OPEN and LINUXFS_ASKPASS name other programs, and LINUXFS_KEYCHAIN=off keeps the keychain
- * out of it (tests).
+ *        linuxfs-agent --offer DISK     (reads one password from stdin)
+ * DiskArbitration recognises, mounts and unmounts linuxfs's disks itself (the filesystem bundles); the agent is what is
+ * left for the one thing the mount program cannot do from outside the user's session: reach the login keychain.
+ * It listens on $HOME/Library/Caches/dev.mavergreen.linuxfs/keychain.sock (the directory 0700, the socket 0600) and
+ * answers peers of its own uid only. One request per connection, in lines; the password is never logged:
+ *     find TAB DISK NL            -> "offered NL PW NL" (an --offer for DISK within the last 60 s, used once), else
+ *                                    "saved NL PW NL" (the login keychain: service dev.mavergreen.linuxfs, account the
+ *                                    partition's UUID), else "none NL"
+ *     save TAB DISK NL PW NL      -> "ok NL"      (keeps PW in the keychain)
+ *     forget TAB DISK NL          -> "ok NL"
+ *     offer TAB DISK NL PW NL     -> "ok NL"      (PW, for the next find of DISK only; kept in memory)
+ * A request it does not understand is dropped with no answer. `linuxfs-agent --offer DISK` sends an offer, exits 0 when
+ * the agent says ok and 1 when no agent answers within 5 s.
+ * Login sweep: once, 15 s after it starts (LINUXFS_SWEEP_DELAY seconds instead, unless root), for every disk whose
+ * DiskArbitration volume kind starts with linuxfs_ and that has no volume path (DiskArbitration did not mount it, say
+ * because the keychain was not ready), it runs `linuxfs automount DISK`.
+ * LINUXFS_CLI names another linuxfs, and LINUXFS_KEYCHAIN=off swaps the keychain for a store in memory (tests).
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <DiskArbitration/DiskArbitration.h>
 #include <Security/Security.h>
-#include <mach-o/dyld.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/file.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
 extern char **environ;
 
 #define PREFIX "/usr/local/mavergreen/linuxfs"
-#define PREFS_DOMAIN CFSTR("dev.mavergreen.linuxfs")
-
-enum { ACT_NONE, ACT_PROBE, ACT_TAKEOVER };
+#define DIRNAME "Library/Caches/dev.mavergreen.linuxfs"
+#define SOCKNAME "keychain.sock"
+#define OFFER_TTL 60
+#define CLIENT_TIMEOUT 5
+#define SERVER_TIMEOUT 2
+#define SWEEP_DELAY 15
+#define PW_MAX 1024
 
 /*
- * What to do with a disk, from what DiskArbitration says of it: LEAF (no partitions under it), KIND (the
- * Mac's filesystem name for it, NULL when it found none), MOUNTED (it has a volume path) and the
- * NTFSTakeover and Automount preferences. Automount off means nothing is taken (review I4: dissenting from the
- * Mac's mount with nothing to mount it instead left NTFS unmountable). EJECTABLE: NTFS is taken over only on
- * ejectable media, as the helper serves it; internal NTFS is Windows's own (Boot Camp: review M8).
+ * A request's first line, LINE ("VERB TAB BSD", a trailing newline allowed): split in place, *VERB and *BSD set. 0 when it
+ * is one of the four verbs with a disk name (letters and digits only, as a BSD name is); -1 otherwise.
  */
-int agent_action(int leaf, const char *kind, int mounted, int takeover, int automount, int ejectable)
+int agent_parse_request(char *line, char **verb, char **bsd)
 {
-	if (!leaf || mounted || !automount)
-		return ACT_NONE;
-	if (!kind)
-		return ACT_PROBE;
-	if (strcmp(kind, "ntfs") == 0 && takeover && ejectable)
-		return ACT_TAKEOVER;
-	return ACT_NONE;
-}
+	static const char *verbs[] = { "find", "save", "forget", "offer", NULL };
+	size_t n = strlen(line);
+	char *tab;
+	int ok = 0;
 
-/* Whether a probe's "TYPE<TAB>LABEL" line names a filesystem the agent should claim the disk for. */
-int agent_claims(const char *probed)
-{
-	static const char *ours[] = { "ext4\t", "btrfs\t", "xfs\t", "f2fs\t", "apfs\t", NULL };
-
-	for (int i = 0; ours[i]; i++)
-		if (strncmp(probed, ours[i], strlen(ours[i])) == 0)
-			return 1;
+	if (n && line[n - 1] == '\n')
+		line[--n] = '\0';
+	tab = strchr(line, '\t');
+	if (!tab || !tab[1] || n - (size_t)(tab + 1 - line) > 63)
+		return -1;
+	*tab = '\0';
+	for (int i = 0; verbs[i]; i++)
+		ok |= strcmp(line, verbs[i]) == 0;
+	for (char *p = tab + 1; *p; p++)
+		if (!isalnum((unsigned char)*p))
+			return -1;
+	if (!ok)
+		return -1;
+	*verb = line;
+	*bsd = tab + 1;
 	return 0;
 }
 
-/*
- * Whether linuxfs has disk BSD mounted: its lklfuse holds an exclusive flock on DIR/linuxfs-rBSD.lock for as long
- * as it runs (the CLI's lock= for a device). Review M6: the Mac must not mount a disk under lklfuse.
- */
-int agent_holds(const char *dir, const char *bsd)
+/* Whether the login sweep mounts a disk: DiskArbitration gave it a linuxfs_ volume kind and no volume path. */
+int agent_sweeps(const char *kind, int has_path)
 {
-	char path[1024];
-	int fd, held;
-
-	snprintf(path, sizeof(path), "%s/linuxfs-r%s.lock", dir, bsd);
-	fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-	if (fd < 0)
-		return 0;
-	held = flock(fd, LOCK_SH | LOCK_NB) < 0 && errno == EWOULDBLOCK;
-	close(fd);
-	return held;
-}
-
-/* The hint in the CLI's "wrong password for DEVICE (hint: HINT)", into HINT (LEN bytes); 0 when it names none. */
-int agent_hint(const char *err, char *hint, size_t len)
-{
-	const char *p = NULL, *s = err, *q, *e;
-
-	while ((q = strstr(s, "(hint: "))) {
-		p = q + 7;
-		s = p;
-	}
-	if (!p || !len)
-		return 0;
-	e = strchr(p, '\n');
-	if (!e)
-		e = p + strlen(p);
-	if (e > p && e[-1] == ')')
-		e--;
-	snprintf(hint, len, "%.*s", (int)(e - p), p);
-	return 1;
-}
-
-/*
- * The asking's answer, BUF (N bytes, with room for a NUL after them): "remember" or "once", a newline, then the
- * password, whose one trailing newline is dropped. Sets *REMEMBER and *PW (into BUF); -1 when it is neither.
- */
-int agent_parse_answer(char *buf, size_t n, int *remember, const char **pw)
-{
-	char *nl = memchr(buf, '\n', n);
-	size_t pl;
-
-	if (!nl)
-		return -1;
-	*nl = '\0';
-	if (strcmp(buf, "remember") == 0)
-		*remember = 1;
-	else if (strcmp(buf, "once") == 0)
-		*remember = 0;
-	else
-		return -1;
-	pl = n - (size_t)(nl + 1 - buf);
-	if (pl && nl[pl] == '\n')
-		pl--;
-	nl[1 + pl] = '\0';
-	*pw = nl + 1;
-	return 0;
+	return kind && strncmp(kind, "linuxfs_", 8) == 0 && !has_path;
 }
 
 #ifndef LINUXFS_AGENT_NO_MAIN
-static const char *cli, *opener;
-static CFMutableSetRef claimed;		/* BSD names claimed at peek, mounted when they appear */
-static CFMutableSetRef mac_gets;		/* NTFS whose takeover failed: the Mac may mount it after all */
-static CFMutableDictionaryRef takeovers;	/* pid of a takeover's `linuxfs automount` -> its BSD name */
+static const char *cli;
 static DASessionRef session;
-static const char *askpass;		/* LINUXFS_ASKPASS, or NULL: this program, as --ask */
 static int use_keychain;
-
-/* What the agent is waiting on for an encrypted volume: automount, the asking, the mount with the password */
-enum { JOB_AUTOMOUNT = 1, JOB_ASK, JOB_UNLOCK };
-#define MAX_TRIES 3
-struct job {
-	pid_t pid;
-	int kind;
-	char bsd[64];
-	int fd;			/* JOB_ASK: its answer */
-	int tries;		/* passwords asked for so far, before this one */
-	int remember;		/* JOB_UNLOCK: keep the password in the keychain if it works */
-	int saved;		/* JOB_UNLOCK: the password came from the keychain */
-	char errpath[64];	/* JOB_UNLOCK: the CLI's stderr (its hint) */
-	char pw[1024];		/* JOB_UNLOCK */
-};
-static struct job jobs[16];
 
 static const char *env_or(const char *name, const char *dflt)
 {
@@ -164,62 +97,58 @@ static const char *env_or(const char *name, const char *dflt)
 	return v && *v ? v : dflt;
 }
 
-/* the CLI's lock directory (cli/linuxfs: LOCKS) */
-static const char *locks_dir(void)
+/* the socket's directory and path under HOME; 0 when HOME is unset or the path is too long for a socket */
+static int paths(char *dir, size_t dlen, char *sock, size_t slen)
 {
-	static char dir[1024];
 	const char *home = getenv("HOME");
+	struct sockaddr_un sa;
 
-	if (!dir[0])
-		snprintf(dir, sizeof(dir), "%s", env_or("LINUXFS_LOCKS", ""));
-	if (!dir[0])
-		snprintf(dir, sizeof(dir), "%s/Library/Caches/dev.mavergreen.linuxfs/locks", home ? home : "");
-	return dir;
+	if (!home || !*home)
+		return 0;
+	snprintf(dir, dlen, "%s/%s", home, DIRNAME);
+	snprintf(sock, slen, "%s/%s", dir, SOCKNAME);
+	return strlen(sock) < sizeof(sa.sun_path);
 }
 
-static int pref_on(CFStringRef key, int dflt)
+/* ---- the keychain, or with LINUXFS_KEYCHAIN=off a store in memory, by BSD name ---- */
+
+#define KC_SERVICE "dev.mavergreen.linuxfs"
+#define SLOTS 16
+
+struct slot {
+	char bsd[64];
+	char pw[PW_MAX];
+	time_t at;
+};
+static struct slot memstore[SLOTS];	/* LINUXFS_KEYCHAIN=off */
+static struct slot offers[SLOTS];	/* --offer, kept in memory in either case */
+
+static struct slot *slot_find(struct slot *t, const char *bsd)
 {
-	Boolean valid = false, on;
-
-	CFPreferencesAppSynchronize(PREFS_DOMAIN);
-	on = CFPreferencesGetAppBooleanValue(key, PREFS_DOMAIN, &valid);
-	return valid ? on : dflt;
-}
-
-static pid_t run_cli(const char *verb, const char *flag, const char *bsd)
-{
-	const char *argv[] = { cli, verb, flag ? flag : bsd, flag ? bsd : NULL, NULL };
-	pid_t pid;
-
-	syslog(LOG_NOTICE, "%s %s %s", cli, verb, bsd);
-	if (posix_spawn(&pid, cli, NULL, NULL, (char **)argv, environ) != 0) {
-		syslog(LOG_ERR, "cannot run %s: %s", cli, strerror(errno));
-		return -1;
-	}
-	return pid;
-}
-
-static struct job *job_add(pid_t pid, int kind, const char *bsd)
-{
-	for (size_t i = 0; i < sizeof(jobs) / sizeof(jobs[0]); i++)
-		if (!jobs[i].pid) {
-			memset(&jobs[i], 0, sizeof(jobs[i]));
-			jobs[i].pid = pid;
-			jobs[i].kind = kind;
-			jobs[i].fd = -1;
-			snprintf(jobs[i].bsd, sizeof(jobs[i].bsd), "%s", bsd);
-			return &jobs[i];
-		}
-	syslog(LOG_ERR, "too many disks waiting at once; not following %s", bsd);
+	for (int i = 0; i < SLOTS; i++)
+		if (t[i].bsd[0] && strcmp(t[i].bsd, bsd) == 0)
+			return &t[i];
 	return NULL;
 }
 
-static void automount(const char *bsd)
+static void slot_clear(struct slot *s)
 {
-	pid_t pid = run_cli("automount", NULL, bsd);
+	memset(s, 0, sizeof(*s));
+}
 
-	if (pid > 0)
-		job_add(pid, JOB_AUTOMOUNT, bsd);
+static void slot_put(struct slot *t, const char *bsd, const char *pw)
+{
+	struct slot *s = slot_find(t, bsd);
+
+	for (int i = 0; !s && i < SLOTS; i++)
+		if (!t[i].bsd[0])
+			s = &t[i];
+	if (!s)
+		s = &t[0];	/* full: the oldest-written slot is as good as any */
+	slot_clear(s);
+	snprintf(s->bsd, sizeof(s->bsd), "%s", bsd);
+	snprintf(s->pw, sizeof(s->pw), "%s", pw);
+	s->at = time(NULL);
 }
 
 /* The keychain account for disk BSD: its partition's UUID; 0 when it has none (then nothing is kept). */
@@ -240,8 +169,6 @@ static int keychain_account(const char *bsd, char *acct, size_t len)
 	return ok;
 }
 
-#define KC_SERVICE "dev.mavergreen.linuxfs"
-
 static int keychain_find(const char *bsd, char *pw, size_t len)
 {
 	char acct[64];
@@ -249,7 +176,15 @@ static int keychain_find(const char *bsd, char *pw, size_t len)
 	void *data = NULL;
 	int ok;
 
-	if (!use_keychain || !keychain_account(bsd, acct, sizeof(acct)) ||
+	if (!use_keychain) {
+		struct slot *s = slot_find(memstore, bsd);
+
+		if (!s || strlen(s->pw) >= len)
+			return 0;
+		snprintf(pw, len, "%s", s->pw);
+		return 1;
+	}
+	if (!keychain_account(bsd, acct, sizeof(acct)) ||
 	    SecKeychainFindGenericPassword(NULL, strlen(KC_SERVICE), KC_SERVICE, strlen(acct), acct, &n, &data, NULL) != errSecSuccess)
 		return 0;
 	ok = n < len;
@@ -268,8 +203,10 @@ static void keychain_save(const char *bsd, const char *pw)
 	SecKeychainItemRef item = NULL;
 	OSStatus st;
 
-	if (!use_keychain)
+	if (!use_keychain) {
+		slot_put(memstore, bsd, pw);
 		return;
+	}
 	if (!keychain_account(bsd, acct, sizeof(acct))) {
 		syslog(LOG_NOTICE, "%s has no partition UUID; its password is not kept", bsd);
 		return;
@@ -286,481 +223,385 @@ static void keychain_save(const char *bsd, const char *pw)
 		syslog(LOG_NOTICE, "kept %s's password in the keychain", bsd);
 }
 
-/* Asks for disk BSD's password: runs the asking with its stdout on a pipe, read when it exits. */
-static void ask(const char *bsd, int tries, const char *hint, int wrong)
+static void keychain_forget(const char *bsd)
 {
-	static char self[1024];
-	uint32_t sz = sizeof(self);
-	const char *argv[7];
-	int a = 0, p[2];
-	posix_spawn_file_actions_t fa;
-	pid_t pid;
-	struct job *j;
+	char acct[64];
+	SecKeychainItemRef item = NULL;
 
-	if (!askpass && !self[0] && _NSGetExecutablePath(self, &sz) != 0)
+	if (!use_keychain) {
+		struct slot *s = slot_find(memstore, bsd);
+
+		if (s)
+			slot_clear(s);
 		return;
-	argv[a++] = askpass ? askpass : self;
-	if (!askpass)
-		argv[a++] = "--ask";
-	argv[a++] = bsd;
-	if (*hint || wrong)
-		argv[a++] = hint;
-	if (wrong)
-		argv[a++] = "wrong";
-	argv[a] = NULL;
-	if (pipe(p) < 0)
-		return;
-	fcntl(p[0], F_SETFD, FD_CLOEXEC);
-	fcntl(p[1], F_SETFD, FD_CLOEXEC);
-	posix_spawn_file_actions_init(&fa);
-	posix_spawn_file_actions_adddup2(&fa, p[1], 1);
-	if (posix_spawn(&pid, argv[0], &fa, NULL, (char **)argv, environ) != 0) {
-		syslog(LOG_ERR, "cannot run %s: %s", argv[0], strerror(errno));
-		close(p[0]);
-		pid = -1;
 	}
-	posix_spawn_file_actions_destroy(&fa);
-	close(p[1]);
-	if (pid > 0 && (j = job_add(pid, JOB_ASK, bsd))) {
-		j->fd = p[0];
-		j->tries = tries;
-	} else if (pid > 0) {
-		close(p[0]);
+	if (keychain_account(bsd, acct, sizeof(acct)) &&
+	    SecKeychainFindGenericPassword(NULL, strlen(KC_SERVICE), KC_SERVICE, strlen(acct), acct, NULL, NULL, &item) == errSecSuccess) {
+		OSStatus st = SecKeychainItemDelete(item);
+
+		CFRelease(item);
+		if (st == errSecSuccess)
+			syslog(LOG_NOTICE, "forgot %s's password in the keychain", bsd);
+		else
+			syslog(LOG_ERR, "cannot forget %s's password in the keychain (%d)", bsd, (int)st);
 	}
 }
 
-/* `linuxfs mount BSD --password-stdin`, the password written to its stdin; its stderr kept for the hint. */
-static void unlock(const char *bsd, const char *pw, int tries, int remember, int saved)
+/* An --offer for BSD, taken (used once); 0 when there is none or it is older than OFFER_TTL. */
+static int offer_take(const char *bsd, char *pw, size_t len)
 {
-	const char *argv[] = { cli, "mount", bsd, "--password-stdin", NULL };
-	char errpath[64];
-	posix_spawn_file_actions_t fa;
-	int in[2], efd;
-	pid_t pid;
-	struct job *j;
-
-	snprintf(errpath, sizeof(errpath), "%s/linuxfs-agent.XXXXXX", env_or("TMPDIR", "/tmp"));
-	if (strlen(errpath) >= sizeof(errpath) - 1)
-		snprintf(errpath, sizeof(errpath), "/tmp/linuxfs-agent.XXXXXX");
-	efd = mkstemp(errpath);
-	if (efd < 0 || pipe(in) < 0) {
-		if (efd >= 0) {
-			close(efd);
-			unlink(errpath);
-		}
-		return;
-	}
-	fcntl(in[0], F_SETFD, FD_CLOEXEC);
-	fcntl(in[1], F_SETFD, FD_CLOEXEC);
-	fcntl(efd, F_SETFD, FD_CLOEXEC);
-	posix_spawn_file_actions_init(&fa);
-	posix_spawn_file_actions_adddup2(&fa, in[0], 0);
-	posix_spawn_file_actions_adddup2(&fa, efd, 2);
-	syslog(LOG_NOTICE, "%s mount %s --password-stdin", cli, bsd);
-	if (posix_spawn(&pid, cli, &fa, NULL, (char **)argv, environ) != 0) {
-		syslog(LOG_ERR, "cannot run %s: %s", cli, strerror(errno));
-		pid = -1;
-	}
-	posix_spawn_file_actions_destroy(&fa);
-	close(in[0]);
-	close(efd);
-	if (pid > 0) {
-		/* a password fits in the pipe's buffer, so this never waits on the CLI */
-		if (write(in[1], pw, strlen(pw)) < 0 || write(in[1], "\n", 1) < 0)
-			syslog(LOG_ERR, "cannot give %s its password", bsd);
-	}
-	close(in[1]);
-	if (pid > 0 && (j = job_add(pid, JOB_UNLOCK, bsd))) {
-		j->tries = tries;
-		j->remember = remember;
-		j->saved = saved;
-		snprintf(j->errpath, sizeof(j->errpath), "%s", errpath);
-		snprintf(j->pw, sizeof(j->pw), "%s", pw);
-	} else {
-		unlink(errpath);
-	}
-}
-
-/* An encrypted volume wants its password: the keychain's first, else ask. */
-static void need_password(const char *bsd)
-{
-	char pw[1024];
-
-	if (keychain_find(bsd, pw, sizeof(pw))) {
-		syslog(LOG_NOTICE, "%s: trying the password from the keychain", bsd);
-		unlock(bsd, pw, 0, 0, 1);
-		memset(pw, 0, sizeof(pw));
-		return;
-	}
-	ask(bsd, 0, "", 0);
-}
-
-static void job_done(pid_t pid, int status)
-{
-	int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-	struct job *j = NULL;
-	char buf[2048], hint[256] = "";
-	ssize_t n = 0, r;
-
-	for (size_t i = 0; i < sizeof(jobs) / sizeof(jobs[0]); i++)
-		if (jobs[i].pid == pid)
-			j = &jobs[i];
-	if (!j)
-		return;
-	switch (j->kind) {
-	case JOB_AUTOMOUNT:
-		if (code == 4)
-			need_password(j->bsd);
-		break;
-	case JOB_ASK:
-		while (code == 0 && (size_t)n < sizeof(buf) - 1 && (r = read(j->fd, buf + n, sizeof(buf) - 1 - n)) != 0) {
-			if (r < 0 && errno == EINTR)
-				continue;
-			if (r < 0)
-				break;
-			n += r;
-		}
-		close(j->fd);
-		if (code == 0) {
-			int remember;
-			const char *pw;
-
-			buf[n] = '\0';
-			if (agent_parse_answer(buf, (size_t)n, &remember, &pw) == 0)
-				unlock(j->bsd, pw, j->tries, remember, 0);
-			else
-				syslog(LOG_ERR, "the password dialog for %s answered nonsense", j->bsd);
-		}
-		memset(buf, 0, sizeof(buf));
-		break;
-	case JOB_UNLOCK: {
-		int fd = open(j->errpath, O_RDONLY | O_CLOEXEC);
-
-		if (fd >= 0) {
-			n = read(fd, buf, sizeof(buf) - 1);
-			buf[n > 0 ? n : 0] = '\0';
-			close(fd);
-			agent_hint(buf, hint, sizeof(hint));
-		}
-		unlink(j->errpath);
-		if (code == 0 && j->remember)
-			keychain_save(j->bsd, j->pw);
-		else if (code == 4 && j->saved)
-			ask(j->bsd, 0, hint, 1);	/* the keychain's password no longer works */
-		else if (code == 4 && j->tries + 1 < MAX_TRIES)
-			ask(j->bsd, j->tries + 1, hint, 1);
-		else if (code == 4)
-			syslog(LOG_NOTICE, "%s: wrong password %d times; not asking again", j->bsd, MAX_TRIES);
-		break;
-	}
-	}
-	memset(j, 0, sizeof(*j));
-}
-
-/* --ask DISK [HINT [wrong]]: the password dialog; prints "remember" or "once", a newline, the password. */
-static int ask_main(int argc, char **argv)
-{
-	const char *bsd = argv[2], *hint = argc > 3 ? argv[3] : "";
-	int wrong = argc > 4;
-	char msg[1024], pw[1024];
-	CFStringRef field = CFSTR("Password"), box = CFSTR("Remember this password in my keychain"), m, answer;
-	CFArrayRef fields = CFArrayCreate(NULL, (const void **)&field, 1, &kCFTypeArrayCallBacks);
-	CFArrayRef boxes = CFArrayCreate(NULL, (const void **)&box, 1, &kCFTypeArrayCallBacks);
-	CFUserNotificationRef note;
-	CFDictionaryRef d;
-	CFOptionFlags resp = 0;
-	SInt32 err = 0;
+	struct slot *s = slot_find(offers, bsd);
 	int ok;
 
-	snprintf(msg, sizeof(msg), "%sEnter the password of the encrypted APFS volume on %s. linuxfs mounts it read-only.%s%s",
-		 wrong ? "That password was not right. " : "", bsd, *hint ? "\n\nHint: " : "", hint);
-	m = CFStringCreateWithCString(NULL, msg, kCFStringEncodingUTF8);
-	{
-		const void *keys[] = { kCFUserNotificationAlertHeaderKey, kCFUserNotificationAlertMessageKey,
-				       kCFUserNotificationTextFieldTitlesKey, kCFUserNotificationCheckBoxTitlesKey,
-				       kCFUserNotificationDefaultButtonTitleKey, kCFUserNotificationAlternateButtonTitleKey };
-		const void *vals[] = { CFSTR("Unlock an encrypted volume"), m, fields, boxes, CFSTR("Mount"), CFSTR("Cancel") };
-
-		d = CFDictionaryCreate(NULL, keys, vals, 6, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-	}
-	note = CFUserNotificationCreate(NULL, 0, kCFUserNotificationPlainAlertLevel | CFUserNotificationSecureTextField(0), &err, d);
-	ok = note && CFUserNotificationReceiveResponse(note, 0, &resp) == 0 &&
-	     (resp & 0x3) == kCFUserNotificationDefaultResponse &&
-	     (answer = CFUserNotificationGetResponseValue(note, kCFUserNotificationTextFieldValuesKey, 0)) &&
-	     CFStringGetCString(answer, pw, sizeof(pw), kCFStringEncodingUTF8);
+	if (!s)
+		return 0;
+	ok = time(NULL) - s->at <= OFFER_TTL && strlen(s->pw) < len;
 	if (ok)
-		printf("%s\n%s\n", resp & CFUserNotificationCheckBoxChecked(0) ? "remember" : "once", pw);
-	memset(pw, 0, sizeof(pw));
-	return ok ? 0 : 1;
+		snprintf(pw, len, "%s", s->pw);
+	slot_clear(s);
+	return ok;
 }
 
-static CFStringRef cfname(const char *bsd)
-{
-	return CFStringCreateWithCString(NULL, bsd, kCFStringEncodingUTF8);
-}
+/* ---- the socket ---- */
 
-/* linuxfs-open --probe /dev/BSD, its first line in OUT; returns its exit status (-1 when it cannot run). */
-static int probe(const char *bsd, char *out, size_t len)
+static void put(int fd, const char *s)
 {
-	char dev[64];
-	const char *argv[] = { opener, "--probe", dev, NULL };
-	posix_spawn_file_actions_t fa;
-	int p[2], status;
-	ssize_t n;
-	pid_t pid;
+	size_t n = strlen(s);
 
-	snprintf(dev, sizeof(dev), "/dev/%s", bsd);
-	out[0] = '\0';
-	if (pipe(p) < 0)
-		return -1;
-	posix_spawn_file_actions_init(&fa);
-	posix_spawn_file_actions_adddup2(&fa, p[1], 1);
-	posix_spawn_file_actions_addclose(&fa, p[0]);
-	if (posix_spawn(&pid, opener, &fa, NULL, (char **)argv, environ) != 0) {
-		posix_spawn_file_actions_destroy(&fa);
-		close(p[0]);
-		close(p[1]);
-		return -1;
+	while (n) {
+		ssize_t w = write(fd, s, n);
+
+		if (w < 0 && errno == EINTR)
+			continue;
+		if (w <= 0)
+			return;
+		s += w;
+		n -= (size_t)w;
 	}
-	posix_spawn_file_actions_destroy(&fa);
-	close(p[1]);
-	n = read(p[0], out, len - 1);
-	close(p[0]);
-	out[n > 0 ? n : 0] = '\0';
-	out[strcspn(out, "\n")] = '\0';
-	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
-		;
-	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
-/* The facts agent_action needs; BSD filled with the disk's BSD name. Returns 0 when the disk has none. */
-static int describe(DADiskRef disk, char *bsd, size_t len, int *leaf, char *kind, size_t kindlen, int *mounted,
-		    int *ejectable)
+/* Reads from FD until LINES newlines have come (or EOF, the timeout, or BUF's CAP is full); the length, NUL-terminated. */
+static size_t read_lines(int fd, char *buf, size_t cap, int lines)
 {
-	CFDictionaryRef d;
-	CFStringRef k;
-	CFBooleanRef l, e, r;
-	const char *name = DADiskGetBSDName(disk);
+	size_t n = 0;
 
-	if (!name)
-		return 0;
-	snprintf(bsd, len, "%s", name);
-	d = DADiskCopyDescription(disk);
-	if (!d)
-		return 0;
-	l = CFDictionaryGetValue(d, kDADiskDescriptionMediaLeafKey);
-	*leaf = l && CFBooleanGetValue(l);
-	k = CFDictionaryGetValue(d, kDADiskDescriptionVolumeKindKey);
-	kind[0] = '\0';
-	if (k)
-		CFStringGetCString(k, kind, kindlen, kCFStringEncodingUTF8);
-	*mounted = CFDictionaryGetValue(d, kDADiskDescriptionVolumePathKey) != NULL;
-	e = CFDictionaryGetValue(d, kDADiskDescriptionMediaEjectableKey);
-	r = CFDictionaryGetValue(d, kDADiskDescriptionMediaRemovableKey);
-	*ejectable = (e && CFBooleanGetValue(e)) || (r && CFBooleanGetValue(r));
-	CFRelease(d);
-	return 1;
+	while (n < cap - 1) {
+		ssize_t r = read(fd, buf + n, cap - 1 - n);
+
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r <= 0)
+			break;
+		n += (size_t)r;
+		buf[n] = '\0';
+		for (size_t i = 0; i < n && lines > 0; i++)
+			if (buf[i] == '\n')
+				lines--;
+		if (lines <= 0)
+			break;
+	}
+	buf[n] = '\0';
+	return n;
 }
 
-static int action_for(DADiskRef disk, char *bsd, size_t len)
+static void serve(int fd)
 {
-	char kind[64];
-	int leaf, mounted, ejectable;
+	char buf[PW_MAX + 128], pw[PW_MAX], *verb, *bsd, *pwline, *nl;
+	uid_t uid;
+	gid_t gid;
+	struct timeval tv = { SERVER_TIMEOUT, 0 };
+	int one = 1, fl = fcntl(fd, F_GETFL);
+	int want_pw;
 
-	bsd[0] = '\0';
-	if (!describe(disk, bsd, len, &leaf, kind, sizeof(kind), &mounted, &ejectable))
-		return ACT_NONE;
-	return agent_action(leaf, kind[0] ? kind : NULL, mounted, pref_on(CFSTR("NTFSTakeover"), 0), pref_on(CFSTR("Automount"), 1),
-			    ejectable);
-}
-
-static DADissenterRef released(DADiskRef disk, void *ctx)
-{
-	(void)disk;
-	(void)ctx;
-	return NULL;	/* let whoever asks have it */
-}
-
-static void peeked(DADiskRef disk, void *ctx)
-{
-	char bsd[64], probed[512];
-	CFStringRef name;
-	int rc;
-
-	(void)ctx;
-	if (action_for(disk, bsd, sizeof(bsd)) != ACT_PROBE)
+	if (getpeereid(fd, &uid, &gid) != 0 || uid != geteuid()) {
+		syslog(LOG_NOTICE, "dropped a connection from uid %d", getpeereid(fd, &uid, &gid) == 0 ? (int)uid : -1);
 		return;
-	rc = probe(bsd, probed, sizeof(probed));
-	if (rc != 0 || !agent_claims(probed))
-		return;
-	syslog(LOG_NOTICE, "%s holds %s; claiming it", bsd, probed);
-	DADiskClaim(disk, kDADiskClaimOptionDefault, released, NULL, NULL, NULL);
-	name = CFStringCreateWithCString(NULL, bsd, kCFStringEncodingUTF8);
-	CFSetAddValue(claimed, name);
-	CFRelease(name);
-}
-
-static void appeared(DADiskRef disk, void *ctx)
-{
-	char bsd[64];
-	CFStringRef name;
-	int act;
-
-	(void)ctx;
-	act = action_for(disk, bsd, sizeof(bsd));
-	if (!bsd[0])
-		return;
-	name = CFStringCreateWithCString(NULL, bsd, kCFStringEncodingUTF8);
-	if (CFSetContainsValue(claimed, name)) {
-		CFSetRemoveValue(claimed, name);
-		automount(bsd);
-	} else if (act == ACT_PROBE) {
-		/* present before the agent started (login): no peek was seen */
-		char probed[512];
-
-		if (probe(bsd, probed, sizeof(probed)) == 0 && agent_claims(probed))
-			automount(bsd);
 	}
-	CFRelease(name);
-}
+	if (fl >= 0)
+		fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+	read_lines(fd, buf, sizeof(buf), 1);
+	nl = strchr(buf, '\n');
+	if (!nl)
+		goto done;
+	/* the first line is parsed on its own, in place: a password after it is kept apart */
+	{
+		char first[128];
+		size_t fl1 = (size_t)(nl - buf);
 
-/*
- * A disk being ejected (Finder, diskutil, hdiutil detach, even -force): lklfuse holds it open, so it would not go,
- * nor ever disappear, while linuxfs has it mounted (P3-2). Unmount linuxfs's volumes on it first, waiting for that
- * (at most EJECT_WAIT seconds), then let the eject go on. The run loop is held meanwhile, as DiskArbitration expects;
- * but it waits only 10 s for an answer, then finds the agent "not responding" and ejects without it, so the
- * disk still open fails busy (P3-3). So the agent answers sooner, and an unmount still running is reaped later.
- */
-#define EJECT_WAIT 7
-static DADissenterRef approve_eject(DADiskRef disk, void *ctx)
-{
-	const char *bsd = DADiskGetBSDName(disk);
-	pid_t pid;
-	int status, i;
+		if (fl1 >= sizeof(first))
+			goto done;
+		memcpy(first, buf, fl1);
+		first[fl1] = '\0';
+		if (agent_parse_request(first, &verb, &bsd) != 0)
+			goto done;
+		want_pw = strcmp(verb, "save") == 0 || strcmp(verb, "offer") == 0;
+		if (want_pw && !strchr(nl + 1, '\n'))
+			read_lines(fd, buf + (nl + 1 - buf) + strlen(nl + 1), sizeof(buf) - (size_t)(nl + 1 - buf) - strlen(nl + 1), 1);
+		pwline = nl + 1;
+		if (want_pw) {
+			char *e = strchr(pwline, '\n');
 
-	(void)ctx;
-	if (!bsd || (pid = run_cli("unmount", "--force", bsd)) <= 0)
-		return NULL;
-	for (i = 0; i < EJECT_WAIT * 10; i++) {
-		if (waitpid(pid, &status, WNOHANG) != 0)
-			return NULL;
-		usleep(100000);
-	}
-	syslog(LOG_ERR, "unmounting %s for its eject is taking over %d s; letting the eject go on", bsd, EJECT_WAIT);
-	return NULL;
-}
-
-static DADissenterRef approve_mount(DADiskRef disk, void *ctx)
-{
-	char bsd[64];
-	CFStringRef name;
-	CFNumberRef key;
-	pid_t pid;
-	int gets;
-
-	(void)ctx;
-	if (action_for(disk, bsd, sizeof(bsd)) != ACT_TAKEOVER) {
-		if (bsd[0] && agent_holds(locks_dir(), bsd))
-			return DADissenterCreate(NULL, kDAReturnExclusiveAccess, CFSTR("linuxfs has this volume mounted"));
-		return NULL;
-	}
-	name = cfname(bsd);
-	gets = CFSetContainsValue(mac_gets, name);
-	if (!gets && (pid = run_cli("automount", NULL, bsd)) > 0) {
-		key = CFNumberCreate(NULL, kCFNumberIntType, &pid);
-		CFDictionarySetValue(takeovers, key, name);
-		CFRelease(key);
-	}
-	CFRelease(name);
-	if (gets)
-		return NULL;
-	return DADissenterCreate(NULL, kDAReturnExclusiveAccess, CFSTR("linuxfs mounts this NTFS volume (NTFSTakeover)"));
-}
-
-/* A takeover's `linuxfs automount` failed (or declined): hand the volume back to the Mac's own driver. */
-static void takeover_done(pid_t pid, int status)
-{
-	CFNumberRef key = CFNumberCreate(NULL, kCFNumberIntType, &pid);
-	CFStringRef name = CFDictionaryGetValue(takeovers, key);
-	char bsd[64];
-	DADiskRef disk;
-
-	if (name) {
-		CFStringGetCString(name, bsd, sizeof(bsd), kCFStringEncodingUTF8);
-		if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-			syslog(LOG_NOTICE, "linuxfs did not mount %s; the Mac may", bsd);
-			CFSetAddValue(mac_gets, name);
-			if ((disk = DADiskCreateFromBSDName(NULL, session, bsd))) {
-				DADiskMount(disk, NULL, kDADiskMountOptionDefault, NULL, NULL);
-				CFRelease(disk);
-			}
+			if (!e || e == pwline || (size_t)(e - pwline) >= sizeof(pw))
+				goto done;
+			memcpy(pw, pwline, (size_t)(e - pwline));
+			pw[e - pwline] = '\0';
 		}
-		CFDictionaryRemoveValue(takeovers, key);
+		if (strcmp(verb, "find") == 0) {
+			char out[PW_MAX + 16];
+
+			if (offer_take(bsd, pw, sizeof(pw))) {
+				snprintf(out, sizeof(out), "offered\n%s\n", pw);
+				syslog(LOG_NOTICE, "%s: gave out an offered password", bsd);
+			} else if (keychain_find(bsd, pw, sizeof(pw))) {
+				snprintf(out, sizeof(out), "saved\n%s\n", pw);
+				syslog(LOG_NOTICE, "%s: gave out the saved password", bsd);
+			} else {
+				snprintf(out, sizeof(out), "none\n");
+			}
+			put(fd, out);
+			memset(out, 0, sizeof(out));
+		} else if (strcmp(verb, "save") == 0) {
+			keychain_save(bsd, pw);
+			put(fd, "ok\n");
+		} else if (strcmp(verb, "forget") == 0) {
+			keychain_forget(bsd);
+			put(fd, "ok\n");
+		} else {
+			slot_put(offers, bsd, pw);
+			syslog(LOG_NOTICE, "%s: took an offered password", bsd);
+			put(fd, "ok\n");
+		}
 	}
-	CFRelease(key);
+done:
+	memset(buf, 0, sizeof(buf));
+	memset(pw, 0, sizeof(pw));
 }
 
-static void disappeared(DADiskRef disk, void *ctx)
+static void accepted(CFSocketRef s, CFSocketCallBackType type, CFDataRef addr, const void *data, void *ctx)
 {
-	const char *bsd = DADiskGetBSDName(disk);
-	CFStringRef name;
+	int fd;
 
+	(void)s;
+	(void)addr;
 	(void)ctx;
-	if (!bsd)
+	if (type != kCFSocketAcceptCallBack)
 		return;
-	name = cfname(bsd);
-	CFSetRemoveValue(mac_gets, name);
-	CFSetRemoveValue(claimed, name);	/* review M9: a claim for a disk that never appeared */
-	CFRelease(name);
-	run_cli("unmount", "--force", bsd);
+	fd = *(const CFSocketNativeHandle *)data;
+	serve(fd);
+	close(fd);
 }
+
+static int listen_on(const char *dir, const char *path)
+{
+	struct sockaddr_un sa;
+	int fd;
+	char parent[1024];
+	const char *sub[] = { "Library", "Library/Caches", NULL };
+
+	/* Library and Library/Caches exist for any user; creating them is only for a bare HOME in tests */
+	for (int i = 0; sub[i]; i++) {
+		snprintf(parent, sizeof(parent), "%s/%s", getenv("HOME"), sub[i]);
+		mkdir(parent, 0700);
+	}
+	if (mkdir(dir, 0700) < 0 && errno != EEXIST)
+		return -1;
+	if (chmod(dir, 0700) < 0)
+		return -1;
+	unlink(path);	/* a stale socket from an agent that died */
+	fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0)
+		return -1;
+	memset(&sa, 0, sizeof(sa));
+	sa.sun_family = AF_UNIX;
+	snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", path);
+	if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0 || chmod(path, 0600) < 0 || listen(fd, 16) < 0) {
+		close(fd);
+		return -1;
+	}
+	fcntl(fd, F_SETFD, FD_CLOEXEC);
+	return fd;
+}
+
+/* ---- --offer DISK ---- */
+
+static int offer_main(const char *bsd)
+{
+	char dir[1024], path[1024], line[128], pw[PW_MAX], req[PW_MAX + 128], reply[16], *verb, *b;
+	struct sockaddr_un sa;
+	struct timeval tv = { CLIENT_TIMEOUT, 0 };
+	struct pollfd p;
+	size_t n = 0;
+	int fd, one = 1, fl;
+
+	snprintf(line, sizeof(line), "offer\t%s", bsd);
+	if (agent_parse_request(line, &verb, &b) != 0 || !paths(dir, sizeof(dir), path, sizeof(path))) {
+		fprintf(stderr, "linuxfs-agent: no such disk or no HOME\n");
+		return 2;
+	}
+	while (n < sizeof(pw) - 1) {
+		ssize_t r = read(0, pw + n, sizeof(pw) - 1 - n);
+
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r <= 0)
+			break;
+		n += (size_t)r;
+	}
+	pw[n] = '\0';
+	pw[strcspn(pw, "\n")] = '\0';
+	if (!pw[0]) {
+		fprintf(stderr, "linuxfs-agent: no password on stdin\n");
+		return 2;
+	}
+	fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0)
+		return 1;
+	setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+	fl = fcntl(fd, F_GETFL);
+	fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+	memset(&sa, 0, sizeof(sa));
+	sa.sun_family = AF_UNIX;
+	snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", path);
+	if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		p.fd = fd;
+		p.events = POLLOUT;
+		if ((errno != EINPROGRESS && errno != EAGAIN) || poll(&p, 1, CLIENT_TIMEOUT * 1000) != 1) {
+			close(fd);
+			return 1;
+		}
+	}
+	fcntl(fd, F_SETFL, fl);
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	snprintf(req, sizeof(req), "offer\t%s\n%s\n", bsd, pw);
+	put(fd, req);
+	memset(req, 0, sizeof(req));
+	memset(pw, 0, sizeof(pw));
+	read_lines(fd, reply, sizeof(reply), 1);
+	close(fd);
+	return strcmp(reply, "ok\n") == 0 ? 0 : 1;
+}
+
+/* ---- the login sweep ---- */
 
 static void reap(CFRunLoopTimerRef t, void *ctx)
 {
-	(void)t;
-	(void)ctx;
-	pid_t pid;
 	int status;
 
-	while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-		takeover_done(pid, status);
-		job_done(pid, status);
+	(void)t;
+	(void)ctx;
+	while (waitpid(-1, &status, WNOHANG) > 0)
+		;
+}
+
+static void automount(const char *bsd)
+{
+	const char *argv[] = { cli, "automount", bsd, NULL };
+	pid_t pid;
+
+	syslog(LOG_NOTICE, "%s automount %s", cli, bsd);
+	if (posix_spawn(&pid, cli, NULL, NULL, (char **)argv, environ) != 0)
+		syslog(LOG_ERR, "cannot run %s: %s", cli, strerror(errno));
+}
+
+static int swept;
+
+static void sweep_appeared(DADiskRef disk, void *ctx)
+{
+	const char *bsd = DADiskGetBSDName(disk);
+	CFDictionaryRef d = bsd ? DADiskCopyDescription(disk) : NULL;
+	CFStringRef k;
+	char kind[64] = "";
+
+	(void)ctx;
+	if (!d)
+		return;
+	swept++;
+	k = CFDictionaryGetValue(d, kDADiskDescriptionVolumeKindKey);
+	if (k)
+		CFStringGetCString(k, kind, sizeof(kind), kCFStringEncodingUTF8);
+	if (agent_sweeps(k ? kind : NULL, CFDictionaryGetValue(d, kDADiskDescriptionVolumePathKey) != NULL))
+		automount(bsd);
+	CFRelease(d);
+}
+
+/* The sweep's own session sees every disk there already is, as "appeared"; a moment later it is let go. */
+static void sweep_end(CFRunLoopTimerRef t, void *ctx)
+{
+	DASessionRef s = ctx;
+
+	(void)t;
+	syslog(LOG_NOTICE, "login sweep looked at %d disks", swept);
+	DAUnregisterCallback(s, sweep_appeared, NULL);
+	DASessionUnscheduleFromRunLoop(s, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+	CFRelease(s);
+}
+
+static void sweep(CFRunLoopTimerRef t, void *ctx)
+{
+	DASessionRef s = DASessionCreate(NULL);
+
+	(void)t;
+	(void)ctx;
+	syslog(LOG_NOTICE, "login sweep");
+	if (!s)
+		return;
+	DARegisterDiskAppearedCallback(s, NULL, sweep_appeared, NULL);
+	DASessionScheduleWithRunLoop(s, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+	{
+		CFRunLoopTimerContext tc = { 0, s, NULL, NULL, NULL };
+
+		CFRunLoopAddTimer(CFRunLoopGetCurrent(),
+				  CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 3, 0, 0, 0, sweep_end, &tc),
+				  kCFRunLoopDefaultMode);
 	}
 }
 
 int main(int argc, char **argv)
 {
-	DASessionRef s;
+	char dir[1024], path[1024];
+	const char *delay;
+	CFSocketRef cs;
+	CFRunLoopSourceRef src;
+	int fd;
 
-	if (argc >= 3 && argc <= 5 && strcmp(argv[1], "--ask") == 0)
-		return ask_main(argc, argv);
+	if (argc == 3 && strcmp(argv[1], "--offer") == 0)
+		return offer_main(argv[2]);
 	if (argc != 1) {
-		fprintf(stderr, "usage: linuxfs-agent\n       linuxfs-agent --ask DISK [HINT [wrong]]\n");
+		fprintf(stderr, "usage: linuxfs-agent\n       linuxfs-agent --offer DISK     (the password on stdin)\n");
 		return 2;
 	}
 	openlog("linuxfs-agent", LOG_PERROR | LOG_PID, LOG_USER);
 	cli = env_or("LINUXFS_CLI", PREFIX "/bin/linuxfs");
-	opener = env_or("LINUXFS_OPEN", PREFIX "/libexec/linuxfs-open");
-	askpass = getenv("LINUXFS_ASKPASS") && *getenv("LINUXFS_ASKPASS") ? getenv("LINUXFS_ASKPASS") : NULL;
 	use_keychain = strcmp(env_or("LINUXFS_KEYCHAIN", "on"), "off") != 0;
-	claimed = CFSetCreateMutable(NULL, 0, &kCFTypeSetCallBacks);
-	mac_gets = CFSetCreateMutable(NULL, 0, &kCFTypeSetCallBacks);
-	takeovers = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-	session = s = DASessionCreate(NULL);
-	if (!s) {
+	session = DASessionCreate(NULL);
+	if (!session) {
 		syslog(LOG_ERR, "no DiskArbitration session");
 		return 1;
 	}
-	DARegisterDiskPeekCallback(s, NULL, 0, peeked, NULL);
-	DARegisterDiskAppearedCallback(s, NULL, appeared, NULL);
-	DARegisterDiskMountApprovalCallback(s, NULL, approve_mount, NULL);
-	DARegisterDiskEjectApprovalCallback(s, NULL, approve_eject, NULL);
-	DARegisterDiskDisappearedCallback(s, NULL, disappeared, NULL);
-	DASessionScheduleWithRunLoop(s, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+	if (!paths(dir, sizeof(dir), path, sizeof(path)) || (fd = listen_on(dir, path)) < 0) {
+		syslog(LOG_ERR, "cannot listen on the keychain socket under %s", getenv("HOME") ? getenv("HOME") : "(no HOME)");
+		return 1;
+	}
+	cs = CFSocketCreateWithNative(NULL, fd, kCFSocketAcceptCallBack, accepted, NULL);
+	src = cs ? CFSocketCreateRunLoopSource(NULL, cs, 0) : NULL;
+	if (!src) {
+		syslog(LOG_ERR, "cannot watch the keychain socket");
+		return 1;
+	}
+	CFRunLoopAddSource(CFRunLoopGetCurrent(), src, kCFRunLoopDefaultMode);
+	delay = geteuid() == 0 ? NULL : getenv("LINUXFS_SWEEP_DELAY");
+	CFRunLoopAddTimer(CFRunLoopGetCurrent(),
+			  CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + (delay && *delay ? atof(delay) : SWEEP_DELAY),
+					       0, 0, 0, sweep, NULL),
+			  kCFRunLoopDefaultMode);
 	CFRunLoopAddTimer(CFRunLoopGetCurrent(),
 			  CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 1, 1, 0, 0, reap, NULL),
 			  kCFRunLoopDefaultMode);
-	syslog(LOG_NOTICE, "watching disks");
+	syslog(LOG_NOTICE, "keeping the keychain at %s", path);
 	CFRunLoopRun();
 	return 0;
 }
