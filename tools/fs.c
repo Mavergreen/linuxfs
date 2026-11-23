@@ -756,6 +756,13 @@ static int refuse(const char *what, const char *reason)
 	return 1;
 }
 
+/* a fatal early failure: syslog, then exit 1 */
+static void die(const char *what)
+{
+	syslog(LOG_NOTICE, "mount_root: %s", what);
+	_exit(1);
+}
+
 #ifdef LINUXFS_FS_TEST_DROP
 #define ROOT_ONLY_UID geteuid()	/* the tests' stand-in for root: whoever runs the test build owns the mount point */
 static const char *volumes_dir(void) { const char *v = getenv("LINUXFS_FS_TEST_VOLUMES"); return v && *v ? v : "/Volumes"; }
@@ -772,6 +779,8 @@ static int valid_mnt_path(const char *mnt)
 	const char *v = volumes_dir(), *name;
 	size_t n = strlen(v);
 
+	if (n > 0 && v[n - 1] == '/')	/* only a test's volumes directory can be "/" */
+		n--;
 	if (strncmp(mnt, v, n) != 0 || mnt[n] != '/')
 		return 0;
 	name = mnt + n + 1;
@@ -785,7 +794,7 @@ static void fill_std_fds(void)
 
 	for (fd = 0; fd <= 2; fd++)
 		if (fcntl(fd, F_GETFD) < 0 && open("/dev/null", O_RDWR) < 0)
-			_exit(1);
+			die("cannot open /dev/null for a closed standard descriptor");
 }
 
 /* Everything the mount program does as root, before login: _linuxfs's lookup, the device on fd 3, MNT handed to _linuxfs,
@@ -805,6 +814,7 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 	uid_t uid;
 	gid_t gid;
 
+	fill_std_fds();
 	bsd = strncmp(req->dev, "/dev/", 5) == 0 ? req->dev + 5 : req->dev;
 	if (!valid_bsd(bsd))
 		return refuse(fs, "the device is not diskN or diskNsM");
@@ -816,19 +826,17 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 	uid = pw->pw_uid;
 	gid = pw->pw_gid;
 	snprintf(name, sizeof name, "%s", pw->pw_name);
-	fill_std_fds();
 	snprintf(node, sizeof node, "/dev/r%s", bsd);
 	snprintf(devarg, sizeof devarg, "/dev/%s", bsd);
 
-	fd = open(node, O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
+	/* read-only when asked; else read-write, falling back to read-only (and --ro) */
+	fd = req->ro ? -1 : open(node, O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
 	if (fd < 0) {
 		fd = open(node, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
 		ro_fallback = 1;
 	}
-	if (fd < 0) {
-		syslog(LOG_NOTICE, "mount_%s: %s: cannot open: %s", fs, bsd, strerror(errno));
-		return 1;
-	}
+	if (fd < 0)
+		return refuse(fs, "the device cannot be opened");
 	if (fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode)) {
 		close(fd);
 		return refuse(fs, "the device node is not a character device");
@@ -842,12 +850,6 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 		close(fd);
 	}
 	fcntl(3, F_SETFD, 0);
-	{
-		int max = getdtablesize();
-
-		for (i = 4; i < max; i++)
-			close(i);
-	}
 
 	/* the mount point: the directory we open is the one we chown, so a swapped path cannot redirect it */
 	mfd = open(req->mnt, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
@@ -857,6 +859,18 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 		close(mfd);
 		return refuse(fs, "the mount point is not a directory");
 	}
+	{
+		struct stat vst;
+		int vfd = open(volumes_dir(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
+
+		if (vfd < 0 || fstat(vfd, &vst) != 0 || vst.st_dev != st.st_dev) {
+			if (vfd >= 0)
+				close(vfd);
+			close(mfd);
+			return refuse(fs, "the mount point is on another volume than /Volumes");
+		}
+		close(vfd);
+	}
 	if (st.st_uid != ROOT_ONLY_UID) {
 		close(mfd);
 		return refuse(fs, "the mount point is not owned by root");
@@ -864,10 +878,10 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 #ifdef LINUXFS_FS_TEST_DROP
 	printf("user %s\nuid %d\ngid %d\nfd3 %s %s\nmnt %s\n", name, (int)uid, (int)gid, node, ro_fallback ? "ro" : "rw", req->mnt);
 #else
+	/* only the owner changes: DiskArbitration's mode for the directory stays as it made it */
 	if (fchown(mfd, uid, gid) != 0) {
-		syslog(LOG_NOTICE, "mount_%s: %s: cannot hand the mount point over: %s", fs, bsd, strerror(errno));
 		close(mfd);
-		return 1;
+		return refuse(fs, "cannot hand the mount point to _linuxfs");
 	}
 #endif
 	close(mfd);
@@ -890,6 +904,8 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 	{
 		int max = getdtablesize();
 
+		for (i = 4; i < max; i++)
+			close(i);
 		printf("fds");
 		for (i = 3; i < max; i++)
 			if (fcntl(i, F_GETFD) >= 0 && !(fcntl(i, F_GETFD) & FD_CLOEXEC))
@@ -900,10 +916,8 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 	return 0;
 #else
 	if (initgroups(name, (int)gid) != 0 || setgid(gid) != 0 || setuid(uid) != 0 || getuid() != uid || geteuid() != uid ||
-	    getgid() != gid || getegid() != gid || setuid(0) != -1) {
-		syslog(LOG_NOTICE, "mount_%s: %s: could not drop to %s", fs, bsd, RUN_USER);
-		return 1;
-	}
+	    getgid() != gid || getegid() != gid || setuid(0) != -1)
+		return refuse(fs, "could not drop to _linuxfs");
 	signal(SIGPIPE, SIG_DFL);
 	{
 		sigset_t none;
@@ -913,11 +927,16 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 	}
 	umask(022);
 	if (chdir("/") != 0)
-		_exit(1);
+		die("cannot chdir to /");
 	syslog(LOG_NOTICE, "mount_%s: %s on %s as %s%s", fs, bsd, req->mnt, RUN_USER, ro_fallback ? " (read-only device)" : "");
+	{
+		int max = getdtablesize();	/* every descriptor but 0-3 is closed just before the exec */
+
+		for (i = 4; i < max; i++)
+			close(i);
+	}
 	execve(args[0], args, (char *const *)vars);
-	syslog(LOG_NOTICE, "mount_%s: %s: cannot run the CLI: %s", fs, bsd, strerror(errno));
-	return 1;
+	return refuse(fs, "cannot run the bundled CLI");
 #endif
 }
 

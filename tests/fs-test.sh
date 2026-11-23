@@ -289,8 +289,8 @@ plan -o nodev -o noowners -o nosuid "/dev/$E" "$V/NAME" > "$M/plan" 2>"$M/plan.e
 want rw "$E" "$V/NAME" > "$M/want"
 [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root plan: _linuxfs ids, the device on fd 3, the exact env and argv (rc $rc: $(diff "$M/plan" "$M/want" | head -3 | tr '\n' ';'))"
 plan -o owners,rdonly "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
-want rw "$E" "$V/NAME" --asked --ro > "$M/want"
-[ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root plan: owners and rdonly become --asked --ro (rc $rc)"
+want ro "$E" "$V/NAME" --asked --ro > "$M/want"
+[ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root plan: owners and rdonly become --asked --ro, and the device is opened read-only (rc $rc)"
 plan "$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
 want rw "$E" "$V/NAME" > "$M/want"
 [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root plan: a device named without /dev/ is accepted and passed as /dev/DEV (rc $rc)"
@@ -308,6 +308,13 @@ done
 mkdir -p "$D/vols2"
 env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES=/private/var "$DM" "/dev/$E" /private/var/empty > "$M/plan" 2>&1; rc=$?
 [ $rc = 1 ] && ! grep -q '^mnt' "$M/plan"; ok $? "root plan: a mount point not owned by the expected owner is refused (rc $rc)"
+# the mount point must be on the volumes directory's device: /dev (devfs) is not on /'s
+env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES=/ "$DM" "/dev/$E" /dev > "$M/plan" 2>&1; rc=$?
+[ $rc = 1 ] && ! grep -q '^mnt' "$M/plan" && grep -q 'another volume' "$M/plan"; ok $? "root plan: a mount point on another device than the volumes directory is refused (rc $rc: $(tail -1 "$M/plan"))"
+env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" "$DM" "/dev/$E" "$V/NAME" 2>&1 >/dev/null | grep -q .; [ $? -ne 0 ]; ok $? "root plan: a good run writes nothing to stderr"
+# every refusal is on stderr (and syslog) with a reason
+plan "/dev/disk9;ls" "$V/NAME" 2>&1 >/dev/null | grep -q '^linuxfs-mount: refused: '; ok $? "root plan: a refusal writes its reason to stderr"
+plan "/dev/disk99999" "$V/NAME" 2>&1 >/dev/null | grep -q '^linuxfs-mount: refused: '; ok $? "root plan: a device that cannot be opened is refused on stderr too"
 # every other descriptor is closed; the device is on 3 and stays open across exec
 plan "/dev/$E" "$V/NAME" 4</dev/null 5</dev/null 9</dev/null 3</dev/null > "$M/plan" 2>&1; rc=$?
 [ $rc = 0 ] && grep -qx 'fds 3' "$M/plan" && grep -qx "fd3 /dev/r$E rw" "$M/plan"; ok $? "root plan: inherited descriptors 3, 4, 5, 9 are gone; only the device is open, on 3 (rc $rc: $(grep fds "$M/plan"))"
