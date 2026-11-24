@@ -538,7 +538,7 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
         lp=$(lklfuse_fd | awk '{ print $2 }' | head -n 1)
         if [ -n "$lp" ] && kill_lklfuse "$lp"; then
           ok "before login: lklfuse ($lp) is killed"
-          if macfuse_term_fixed; then check "before login: with macFUSE's fix, SIGTERM ends lklfuse within 5 s, no SIGKILL" [ "$term_clean" = 1 ]
+          if macfuse_term_fixed; then check "before login: with macFUSE's fix, SIGTERM ends lklfuse within 5 s, no SIGKILL" test "$term_clean" = 1
           else echo "# before login: this macFUSE predates 5.5.0-mavericks.4: SIGTERM may be ignored ($([ "$term_clean" = 1 ] && echo ended || echo ignored))"; fi
           check "before login: with lklfuse dead, a read of $mp fails at once instead of hanging" bounded 100 sh -c '! ls "$1"' _ "$mp"
           check "before login: with lklfuse dead, diskutil unmount still unmounts $mp" login_unmount "$mp"
@@ -555,7 +555,7 @@ f = open(sys.argv[1], "a"); fcntl.flock(f, fcntl.LOCK_EX); sys.stdout.write("hel
               hold=$!
               j=0; while ! grep -q held "$W/lockhold.out" 2> /dev/null && [ $j -lt 100 ]; do j=$((j + 1)); sleep 0.1; done
               bounded 1800 sudo -n diskutil mount "$dev" > "$W/lockmount.log" 2>&1; lrc=$?
-              check "before login: with lklfuse's lock held, diskutil mount $dev fails ($(head -n 1 "$W/lockmount.log"))" [ "$lrc" -ne 0 ]
+              check "before login: with lklfuse's lock held, diskutil mount $dev fails ($(head -n 1 "$W/lockmount.log"))" test "$lrc" -ne 0
               check "before login: and nothing is left mounted from $dev" sh -c '! mount | grep -qF "linuxfs@$1 "' _ "${dev#/dev/}"
               # spec: tools/open.c fuse_chan -- the CLI's own lock check fails before root runs mount_macfuse at all, so none lingers: within a few seconds
               check "before login: and no root mount_macfuse survives it" root_mount_macfuse_gone 5
