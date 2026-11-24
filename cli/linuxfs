@@ -10,8 +10,9 @@
 #          linuxfs unignore VOLUME
 #          linuxfs automount DISK
 #   internal: linuxfs da-mount [--asked] [--ro] [--password-stdin] DEVICE MOUNTPOINT   (only with LINUXFS_DA=1: the bundle's mount program;
-#          before login also LINUXFS_OPEN_INHERITED=1, the device on fd 3, and LINUXFS_FUSE_FD=N: root mounted macFUSE on MOUNTPOINT
-#          and lklfuse serves that mount through /dev/fd/N)
+#          before login also LINUXFS_OPEN_INHERITED=1, the device on fd 3, LINUXFS_FUSE_FD=N and LINUXFS_FUSE_CHAN=C: root's
+#          channel is on fd C; once everything that can fail before lklfuse starts has passed, linuxfs-open says "ready" on it,
+#          root mounts macFUSE on MOUNTPOINT and sends the device back, and lklfuse serves that mount through /dev/fd/N)
 #          Mounts a Linux filesystem (ext4, btrfs, xfs, NTFS, exFAT, FAT, f2fs) with Linux's own driver, running in
 #          lklfuse. An image file is mounted directly: every file appears owned by you and only you can open the
 #          volume; new files are written with the filesystem root's owner. --linux-ids shows Linux's owners instead.
@@ -46,6 +47,8 @@ die() { echo "linuxfs: $*" >&2; exit 1; }
 usage() { sed -n 's/^#   usage: /usage: /p; s/^#          linuxfs /       linuxfs /p' "$0" >&2; exit 2; }
 tab=$(printf '\t')
 fusefd=   # set only by da-mount, from LINUXFS_FUSE_FD
+fusechan=   # set only by da-mount, from LINUXFS_FUSE_CHAN: root's channel, the descriptor the macFUSE device comes on
+lockfile=   # the lock lklfuse takes, set by cmd_mount
 
 # The mount table's mount points, one per line (a dead FUSE mount hangs anything that touches its directory).
 mounted_points() {
@@ -142,8 +145,10 @@ run_lklfuse() { # SOURCE MOUNTPOINT OPTIONS [OPENER-DEVICE [SECOND-OPENER-DEVICE
   lkm=$2; [ -z "$fusefd" ] || lkm=/dev/fd/$fusefd   # root's mount, already made: lklfuse serves its device
   if [ -n "${4:-}" ]; then
     rof=; case ,$3, in *,ro,*) rof=--ro ;; esac
-    if [ -n "${5:-}" ]; then launch "$OPENER" $rof "$4" --also "$5" "$LKLFUSE" -f -o "$3" /dev/fd/3 "$lkm"
-    else launch "$OPENER" $rof "$4" "$LKLFUSE" -f -o "$3" /dev/fd/3 "$lkm"
+    # with root's channel: linuxfs-open checks the lock, says "ready", and takes the macFUSE device root sends, onto $fusefd
+    chan=; [ -z "$fusechan" ] || chan="--fuse-chan $fusechan:$fusefd --lock $lockfile"
+    if [ -n "${5:-}" ]; then launch "$OPENER" $chan $rof "$4" --also "$5" "$LKLFUSE" -f -o "$3" /dev/fd/3 "$lkm"
+    else launch "$OPENER" $chan $rof "$4" "$LKLFUSE" -f -o "$3" /dev/fd/3 "$lkm"
     fi
   else
     launch "$LKLFUSE" -f -o "$3" "$1" "$lkm"
@@ -308,7 +313,8 @@ cmd_mount() {
     fi
     made=1
   else made=; [ -d "$mnt" ] || die "$mnt: no such directory"; ! is_mounted "$mnt" || die "$mnt already has a volume mounted"; fi
-  opts="type=$type,lock=$LOCKS/linuxfs-$lockname.lock"
+  lockfile=$LOCKS/linuxfs-$lockname.lock
+  opts="type=$type,lock=$lockfile"
   # the mount's own options (the kernel's): root gave them to mount_macfuse when it made the mount lklfuse serves
   [ -n "$fusefd" ] || opts="$opts,local,volname=$name,fsname=linuxfs@$(safe_name "$(basename "$src")"),noappledouble"
   if [ -n "$ids" ]; then :
@@ -452,6 +458,13 @@ cmd_da_mount() {
     [ "${LINUXFS_OPEN_INHERITED:-}" = 1 ] || { echo "linuxfs: LINUXFS_FUSE_FD comes only with the device inherited (LINUXFS_OPEN_INHERITED=1)" >&2; exit 2; }
     case $LINUXFS_FUSE_FD in *[!0-9]*|0*|[0-3]|5) echo "linuxfs: LINUXFS_FUSE_FD is not a descriptor above 3 (nor 5)" >&2; exit 2 ;; esac
     fusefd=$LINUXFS_FUSE_FD
+  fi
+  # LINUXFS_FUSE_CHAN: root's channel, inherited the same way; with the device it carries to FUSE_FD, never the same descriptor
+  if [ -n "${LINUXFS_FUSE_CHAN:-}" ]; then
+    [ -n "$fusefd" ] || { echo "linuxfs: LINUXFS_FUSE_CHAN comes only with LINUXFS_FUSE_FD" >&2; exit 2; }
+    case $LINUXFS_FUSE_CHAN in *[!0-9]*|0*|[0-3]|5) echo "linuxfs: LINUXFS_FUSE_CHAN is not a descriptor above 3 (nor 5)" >&2; exit 2 ;; esac
+    [ "$LINUXFS_FUSE_CHAN" != "$fusefd" ] || { echo "linuxfs: LINUXFS_FUSE_CHAN and LINUXFS_FUSE_FD are the same descriptor" >&2; exit 2; }
+    fusechan=$LINUXFS_FUSE_CHAN
   fi
   # the password first, before the probe, the prefs or the opener can inherit stdin and drain it; they get /dev/null
   dapw=

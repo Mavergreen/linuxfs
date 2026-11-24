@@ -173,11 +173,11 @@ lklfuse_fd() { lklfuses | awk '$1 == "_linuxfs" && $NF ~ /^\/dev\/fd\/[0-9]+$/';
 lklfuse_fd_runs() { [ -n "$(lklfuse_fd)" ]; }
 # spec: tools/fs.c mount_by_root -- no mount_macfuse root started outlives the mount program (it stops one that lingers)
 no_root_mount_macfuse() { ! ps -axww -o user=,pid=,command= | awk '$1 == "root" && /mount_macfuse/ && !/awk/' | grep -q .; }
-# spec: tools/fs.c mount_by_root -- waits up to 90 s (mount(2) gives up on INIT by itself in about 50 s) for no root
+# spec: tools/fs.c mount_by_root -- waits up to $1 s (default 90, past mount(2)'s own give-up on INIT after about 50 s) for no root
 #       mount_macfuse; prints ps when one is left
 root_mount_macfuse_gone() {
   j=0; while ! no_root_mount_macfuse; do
-    j=$((j + 1)); [ $j -le 90 ] || { ps -axww -o user,pid,ppid,stat,etime,command | grep -i 'fuse\|linuxfs' | grep -v grep | sed 's/^/# left: /'; return 1; }
+    j=$((j + 1)); [ $j -le "${1:-90}" ] || { ps -axww -o user,pid,ppid,stat,etime,command | grep -i 'fuse\|linuxfs' | grep -v grep | sed 's/^/# left: /'; return 1; }
     sleep 1
   done
 }
@@ -544,7 +544,8 @@ f = open(sys.argv[1], "a"); fcntl.flock(f, fcntl.LOCK_EX); sys.stdout.write("hel
               bounded 1800 sudo -n diskutil mount "$dev" > "$W/lockmount.log" 2>&1; lrc=$?
               check "before login: with lklfuse's lock held, diskutil mount $dev fails ($(head -n 1 "$W/lockmount.log"))" [ "$lrc" -ne 0 ]
               check "before login: and nothing is left mounted from $dev" sh -c '! mount | grep -qF "linuxfs@$1 "' _ "${dev#/dev/}"
-              check "before login: and no root mount_macfuse survives it" root_mount_macfuse_gone
+              # spec: tools/open.c fuse_chan -- the CLI's own lock check fails before root runs mount_macfuse at all, so none lingers: within a few seconds
+              check "before login: and no root mount_macfuse survives it" root_mount_macfuse_gone 5
               sudo -n kill "$hold" 2> /dev/null; sudo -n pkill -f "fcntl.flock" 2> /dev/null; wait "$hold" 2> /dev/null
               if bounded 600 sudo -n diskutil mount "$dev" > /dev/null 2>&1 && da_wait 300; then ok "before login: with the lock free, $dev mounts again"
               else notok "before login: with the lock free, $dev mounts again"; fi

@@ -86,6 +86,22 @@ env LINUXFS_OPEN_INHERITED=0 LINUXFS_HELPER_SOCKET=$NS "$D/open" --probe "$e" 3<
 $I "$D/open" "$e" /bin/echo 3<"/dev/r${e#/dev/}" > /dev/null 2>&1; rc=$?
 [ $rc -eq 0 ]; ok $? "inherited exec form never touches the helper socket (rc $rc)"
 $I "$D/open" 3<"/dev/r${e#/dev/}" > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "inherited misuse still exits 2"
+# spec: tools/open.c fuse_chan -- --fuse-chan CHAN:FD [--lock FILE]: before the mount, the lock is checked, "R" goes to root, and the
+#       one descriptor root sends comes back as FD for the program; a lock held, or anything but one descriptor, runs nothing
+cc -o "$D/chanroot" "$ROOT/tests/lib/chan-root.c" || exit 1
+cr() { MODE=$1; shift; env LINUXFS_OPEN_INHERITED=1 "$D/chanroot" "$MODE" "$D/open" "$@" 3<"/dev/r${e#/dev/}" 2>&1; }
+out=$(cr device --fuse-chan 6:4 --lock "$D/chan.lock" "$e" /bin/sh -c 'printf x >&4'); echo "$out" | tr '\n' ' ' > "$D/cr.txt"
+[ "$(echo "$out" | tr '\n' ' ')" = "ready byte x exit 0 " ]; ok $? "--fuse-chan: ready, the device comes back as fd 4, the program writes to it ($(cat "$D/cr.txt"))"
+out=$(cr device --fuse-chan 6:4 "$e" /bin/sh -c 'ls -l /dev/fd/6 > /dev/null 2>&1; echo chan-closed=$?'); echo "$out" | grep -q 'chan-closed=1'
+ok $? "and the channel is closed for the program"
+perl -e 'use Fcntl ":flock"; open(F, ">>", $ARGV[0]) or die; flock(F, LOCK_EX) or die; print "held\n"; $| = 1; sleep 20' "$D/held.lock" > "$D/held.out" 2>&1 & lkp=$!
+i=0; while ! grep -q held "$D/held.out" 2> /dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+out=$(cr device --fuse-chan 6:4 --lock "$D/held.lock" "$e" /bin/echo ran); kill $lkp 2>/dev/null; wait $lkp 2>/dev/null
+echo "$out" | grep -q '^not ready$' && echo "$out" | grep -q 'unable to exclusively lock' && echo "$out" | grep -q '^exit 1$' && ! echo "$out" | grep -q '^ran'
+ok $? "a lock held elsewhere: no \"R\", the program does not run, exit 1 ($(echo "$out" | tr '\n' ' '))"
+out=$(cr two --fuse-chan 6:4 "$e" /bin/echo ran); echo "$out" | grep -q '^exit 1$' && ! echo "$out" | grep -q '^ran'; ok $? "two descriptors from root: refused, the program does not run ($(echo "$out" | tr '\n' ' '))"
+out=$(cr device --fuse-chan 4:4 "$e" /bin/echo ran); echo "$out" | grep -q '^not ready$' && echo "$out" | grep -q '^exit 1$'; ok $? "--fuse-chan CHAN:FD with the same number twice is refused"
+out=$(cr device --fuse-chan 6:3 "$e" /bin/echo ran); echo "$out" | grep -q '^not ready$' && echo "$out" | grep -q '^exit 1$'; ok $? "--fuse-chan with FD 3 (the disk) is refused"
 # spec: tools/helper.c -- the UUID, through the helper (the CLI's linuxfs ignore, when it cannot read the raw node)
 [ "$("$D/open" --uuid "$D/ext4.img")" = "$("$D/probe" --uuid "$D/ext4.img")" ]; ok $? "linuxfs-open --uuid gets the helper's answer, the probe's UUID"
 "$D/open" --uuid "$D/zero.img" > /dev/null 2>&1; [ $? -eq 1 ]; ok $? "a disk with no filesystem has no UUID: exit 1"

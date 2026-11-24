@@ -234,7 +234,7 @@ case "\$1" in --noauto-add|--noauto-remove)
   [ -z "\${FAKE_NOAUTO_NO:-}" ] || { echo "linuxfs-open: \$FAKE_NOAUTO_NO" >&2; exit 1; }
   exit 0 ;;
 esac
-[ "\$1" != --ro ] || shift
+while :; do case "\$1" in --fuse-chan|--lock) shift 2 ;; --ro) shift ;; *) break ;; esac; done
 shift
 [ "\$1" != --also ] || shift 2
 exec "\$@"
@@ -530,6 +530,21 @@ for v in abc 3 5 2 04x; do
   : > "$T/calls"
   (LINUXFS_OPEN_INHERITED=1 LINUXFS_FUSE_FD=$v; export LINUXFS_OPEN_INHERITED LINUXFS_FUSE_FD; DA /dev/disk3s1 "$T/dam" 4</dev/null 5</dev/null > "$T/out" 2>&1); rc=$?
   [ $rc -eq 2 ] && ! grep -q lklfuse "$T/calls"; ok $? "LINUXFS_FUSE_FD='$v' is refused, exit 2 (got $rc)"
+done
+# spec: cli/linuxfs run_lklfuse -- with root's channel (LINUXFS_FUSE_CHAN=C, beside LINUXFS_FUSE_FD) the opener is told to check
+#       the lock, say "ready" on C and put the device root sends on FUSE_FD: --fuse-chan C:FD --lock FILE, before the device
+: > "$T/calls"; : > "$T/fdcalls"
+(LINUXFS_OPEN_INHERITED=1 LINUXFS_ALL_USERS=1 LINUXFS_FUSE_FD=4 LINUXFS_FUSE_CHAN=6 FAKE_FD_MNT=$T/dam; export LINUXFS_OPEN_INHERITED LINUXFS_ALL_USERS LINUXFS_FUSE_FD LINUXFS_FUSE_CHAN FAKE_FD_MNT
+ DA /dev/disk3s1 "$T/dam" 4</dev/null 6</dev/null > "$T/out" 2>&1); rc=$?
+grep -q "^open --fuse-chan 6:4 --lock $T/locks/linuxfs-rdisk3s1.lock /dev/rdisk3s1 $T/bin/lklfuse .* /dev/fd/3 /dev/fd/4\$" "$T/calls"
+ok $? "with LINUXFS_FUSE_CHAN=6 the opener gets --fuse-chan 6:4 and the lock file, and lklfuse still serves /dev/fd/4 (got $rc: $(grep '^open ' "$T/calls" | tail -n 1))"
+sh "$L" unmount "$T/dam" > /dev/null 2>&1
+(LINUXFS_OPEN_INHERITED=1 LINUXFS_FUSE_CHAN=6; export LINUXFS_OPEN_INHERITED LINUXFS_FUSE_CHAN; : > "$T/calls"; DA /dev/disk3s1 "$T/dam" 6</dev/null > "$T/out" 2>&1); rc=$?
+[ $rc -eq 2 ] && ! grep -q lklfuse "$T/calls"; ok $? "LINUXFS_FUSE_CHAN without LINUXFS_FUSE_FD is refused, exit 2 (got $rc)"
+for v in abc 3 5 4 04x; do
+  : > "$T/calls"
+  (LINUXFS_OPEN_INHERITED=1 LINUXFS_FUSE_FD=4 LINUXFS_FUSE_CHAN=$v; export LINUXFS_OPEN_INHERITED LINUXFS_FUSE_FD LINUXFS_FUSE_CHAN; DA /dev/disk3s1 "$T/dam" 4</dev/null > "$T/out" 2>&1); rc=$?
+  [ $rc -eq 2 ] && ! grep -q lklfuse "$T/calls"; ok $? "LINUXFS_FUSE_CHAN='$v' is refused, exit 2 (got $rc)"
 done
 out=$(LINUXFS_FUSE_FD=4 LINUXFS_OPEN_INHERITED=1 sh "$L" mount "$T/img" 4</dev/null 2>&1); rc=$?
 c=$(last)

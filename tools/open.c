@@ -15,12 +15,18 @@
  * With LINUXFS_OPEN_INHERITED=1 (the bundles' mount program, which opened the disk as root before dropping to _linuxfs)
  * fd 3 already is the device and the helper is never contacted: --probe probes fd 3 (pread from offset 0), and
  * [--ro] DEVICE PROGRAM [ARG...] runs PROGRAM with fd 3 as it is. --also exits 1: the partner cannot be probed there.
+ * There also --fuse-chan CHAN:FD [--lock FILE] (before DEVICE): the mount program's channel is open on CHAN. linuxfs-open
+ * takes FILE's lock to see it is free (and drops it: lklfuse takes it itself), writes "R" to the channel, waits (30 s at
+ * most) for the one descriptor root sends over it, the macFUSE device, puts it on FD and runs PROGRAM. A lock held, or no
+ * device, exits 1: root has run no mount_macfuse before "R", so a failure up to there leaves nothing mounted or waiting.
  */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -122,6 +128,96 @@ static int open_one(const char *device, int ro)
 	return fd;
 }
 
+#define CHAN_WAIT_S 30
+
+/* --fuse-chan CHAN:FD: the lock is free, "R" to root, and the macFUSE device from root onto FD; 0 when all of it went. */
+static int fuse_chan(const char *spec, const char *lock)
+{
+	int chan, fd, got = -1, nfd = 0, k, i;
+	ssize_t r;
+	char *colon;
+	struct pollfd p;
+	struct msghdr mh;
+	struct iovec iov;
+	struct cmsghdr *cm;
+	char b, cc[CMSG_SPACE(8 * sizeof(int))];
+
+	chan = (int)strtol(spec, &colon, 10);
+	if (*colon != ':' || chan <= 3 || chan == 5 || (fd = atoi(colon + 1)) <= 3 || fd == 5 || fd == chan) {
+		fprintf(stderr, "linuxfs-open: --fuse-chan wants CHAN:FD, both above 3, not 5, and different\n");
+		return -1;
+	}
+	if (fcntl(chan, F_GETFD) < 0) {
+		fprintf(stderr, "linuxfs-open: the channel on fd %d is not open\n", chan);
+		return -1;
+	}
+	if (lock) {
+		int lf = open(lock, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
+
+		if (lf < 0 || flock(lf, LOCK_EX | LOCK_NB) != 0) {
+			fprintf(stderr, "linuxfs-open: unable to exclusively lock %s\n", lock);
+			if (lf >= 0)
+				close(lf);
+			return -1;
+		}
+		close(lf);
+	}
+	if (write(chan, "R", 1) != 1) {
+		fprintf(stderr, "linuxfs-open: cannot tell the mount program it is ready\n");
+		return -1;
+	}
+	p.fd = chan;
+	p.events = POLLIN;
+	for (i = 0; i < CHAN_WAIT_S * 10; i++) {
+		p.revents = 0;
+		if (poll(&p, 1, 100) > 0 && p.revents)
+			break;
+	}
+	if (!p.revents) {
+		fprintf(stderr, "linuxfs-open: no macFUSE device within %d s\n", CHAN_WAIT_S);
+		return -1;
+	}
+	memset(&mh, 0, sizeof mh);
+	iov.iov_base = &b;
+	iov.iov_len = 1;
+	mh.msg_iov = &iov;
+	mh.msg_iovlen = 1;
+	mh.msg_control = cc;
+	mh.msg_controllen = sizeof cc;
+	r = recvmsg(chan, &mh, MSG_DONTWAIT);
+	i = r == 1 && !(mh.msg_flags & MSG_CTRUNC) ? 0 : -1;
+	for (cm = r >= 0 ? CMSG_FIRSTHDR(&mh) : NULL; cm; cm = CMSG_NXTHDR(&mh, cm)) {
+		if (cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS || cm->cmsg_len < CMSG_LEN(0)) {
+			i = -1;
+			continue;
+		}
+		for (k = 0; k < (int)((cm->cmsg_len - CMSG_LEN(0)) / sizeof(int)); k++) {
+			int one;
+
+			memcpy(&one, CMSG_DATA(cm) + k * sizeof(int), sizeof one);
+			if (nfd++ == 0)
+				got = one;
+			else
+				close(one);
+		}
+	}
+	if (i < 0 || nfd != 1) {
+		if (got >= 0)
+			close(got);
+		fprintf(stderr, "linuxfs-open: root's message was not one macFUSE device\n");
+		return -1;
+	}
+	if (got != fd && dup2(got, fd) < 0) {
+		close(got);
+		return -1;
+	}
+	if (got != fd)
+		close(got);
+	fcntl(fd, F_SETFD, 0);
+	close(chan);
+	return 0;
+}
+
 /* Inherited mode: fd 3 is the device. Returns main's exit status, or never returns (the exec). */
 static int inherited(int argc, char **argv)
 {
@@ -160,10 +256,24 @@ static int inherited(int argc, char **argv)
 		printf("%s\n", line);
 		return 0;
 	}
-	if (i < argc && strcmp(argv[i], "--ro") == 0)
-		i++;
-	if (argc - i < 2)
-		return usage();
+	{
+		const char *chan = NULL, *lock = NULL;
+
+		for (;;) {
+			if (i + 1 < argc && strcmp(argv[i], "--fuse-chan") == 0)
+				chan = argv[i + 1], i += 2;
+			else if (i + 1 < argc && strcmp(argv[i], "--lock") == 0)
+				lock = argv[i + 1], i += 2;
+			else if (i < argc && strcmp(argv[i], "--ro") == 0)
+				i++;
+			else
+				break;
+		}
+		if (argc - i < 2)
+			return usage();
+		if (chan && fuse_chan(chan, lock) != 0)
+			return 1;
+	}
 	i++;	/* DEVICE: fd 3 is it already */
 	if (strcmp(argv[i], "--also") == 0) {
 		fprintf(stderr, "linuxfs-open: --also is not available before login (the partner cannot be probed)\n");

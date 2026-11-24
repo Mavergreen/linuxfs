@@ -10,9 +10,11 @@
  * mount [-o OPT]... DEV MNT                       as the console user: runs the CLI's da-mount and, for an encrypted volume,
  *                                                  asks for the password (the keychain keeper first, then Apple's dialog);
  *                                                  as root (nobody logged in): opens /dev/rDEV as fd 3; then, with a macFUSE that
- *                                                  serves a /dev/fd/N mountpoint, runs mount_macfuse itself (allow_other) and hands
- *                                                  the device it sends to the bundled CLI's da-mount as fd 4 (LINUXFS_FUSE_FD=4),
- *                                                  run as _linuxfs, until mount_macfuse reports the mount; with an older macFUSE,
+ *                                                  serves a /dev/fd/N mountpoint, runs the bundled CLI's da-mount as _linuxfs first,
+ *                                                  until it is ready (nothing left that can fail before lklfuse starts), then runs
+ *                                                  mount_macfuse itself (allow_other) and hands the device it sends to the CLI over
+ *                                                  a channel (LINUXFS_FUSE_CHAN=6; fd 4 for lklfuse: LINUXFS_FUSE_FD=4), until
+ *                                                  mount_macfuse reports the mount; with an older macFUSE,
  *                                                  hands MNT to _linuxfs and runs that da-mount, which mounts by itself; both with
  *                                                  LINUXFS_OPEN_INHERITED=1
  *
@@ -611,7 +613,9 @@ static int run_cli(const char *cli, const struct mountreq *req, const char *pw, 
  * labelled 5.5.0-mavericks.2 that predate the patch exist: on those the gate passes, lklfuse cannot serve /dev/fd/N, and
  * root's mount fails, bounded, after STATUS_WAIT_S. */
 #define MACFUSE_FD_MOUNTPOINT_SINCE "5.5.0-mavericks.2"
-#define FUSE_FD 4		/* the macFUSE device, in the CLI and lklfuse: beside the disk on 3, and not 5 (the password's) */
+#define FUSE_FD 4		/* the macFUSE device, in lklfuse (placed there by linuxfs-open): beside the disk on 3, and not 5 (the password's) */
+#define CHAN_FD 6		/* the CLI's end of its channel to root: "ready" out, the macFUSE device in */
+#define READY_WAIT_S 30		/* for the CLI to finish everything it can know before the mount, and say so */
 #define DEVICE_WAIT_S 30	/* for mount_macfuse to send the device */
 #define STATUS_WAIT_S 60	/* for its mount status: mount(2) ends when lklfuse answers the kernel's INIT */
 #define REFUSED_WAIT_S 5	/* for that status after the CLI failed (its descriptors closed, the mount fails) */
@@ -911,6 +915,62 @@ static void stop(const char *fs, pid_t pid, int term_s)
 	fprintf(stderr, "linuxfs-mount: mount_macfuse (pid %d) is still running after SIGKILL; left\n", (int)pid);
 }
 
+/* "Ready" (one byte, R) from the CLI on sock within secs; 0 when it ends first (its status, once reaped, in *cli_rc and the time
+ * in *cli_end), closes the channel, or times out. */
+static int wait_ready(int sock, pid_t cpid, int *cli_rc, time_t *cli_end, int secs)
+{
+	struct pollfd p = { sock, POLLIN, 0 };
+	time_t end = time(NULL) + secs;
+	int w;
+
+	for (;;) {
+		char b;
+		ssize_t r;
+
+		p.revents = 0;
+		if (poll(&p, 1, 200) < 0 && errno != EINTR)
+			return 0;
+		if (p.revents) {
+			r = recv(sock, &b, 1, MSG_DONTWAIT);
+			if (r == 1)
+				return b == 'R';
+			if (r == 0 || (r < 0 && errno != EINTR && errno != EAGAIN))
+				return 0;
+		}
+		if (waitpid(cpid, &w, WNOHANG) == cpid) {
+			*cli_rc = WIFEXITED(w) ? WEXITSTATUS(w) : 1;
+			*cli_end = time(NULL);
+			return 0;
+		}
+		if (time(NULL) >= end)
+			return 0;
+	}
+}
+
+/* The device to the CLI over sock: one byte and the descriptor, without blocking; 1 when sent */
+static int send_device(int sock, int dev)
+{
+	struct msghdr msg;
+	struct iovec iov;
+	struct cmsghdr *c;
+	char b = 'D', cc[CMSG_SPACE(sizeof(int))];
+
+	memset(&msg, 0, sizeof msg);
+	memset(cc, 0, sizeof cc);
+	iov.iov_base = &b;
+	iov.iov_len = 1;
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = cc;
+	msg.msg_controllen = sizeof cc;
+	c = CMSG_FIRSTHDR(&msg);
+	c->cmsg_level = SOL_SOCKET;
+	c->cmsg_type = SCM_RIGHTS;
+	c->cmsg_len = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(c), &dev, sizeof dev);
+	return sendmsg(sock, &msg, MSG_DONTWAIT) == 1;
+}
+
 /* SIGTERM to process group pgid, then, after its leader (reaped, when it has not been yet: running) exits or STOP_WAIT_S, SIGKILL
  * to whatever of it is left */
 static void stop_group(pid_t pgid, int running)
@@ -926,50 +986,49 @@ static void stop_group(pid_t pgid, int running)
 		reap(pgid, STOP_WAIT_S, &st);
 }
 
-/* Root's mount, for a macFUSE that serves /dev/fd/N (macfuse's DETAILS.md): mount_macfuse, run as libfuse runs it, mounts MNT
- * with allow_other (root's to give) and sends the device; the CLI, as _linuxfs, gets it as fd FUSE_FD and its lklfuse serves it
- * through /dev/fd/FUSE_FD. Root waits, bounded, for mount_macfuse's status: 0 (and the CLI's 0) is exit 0; anything else
- * stops what _linuxfs started, unmounts MNT if it got mounted, stops mount_macfuse, and is the CLI's failure (or 1). Root
- * never reads the file system and never runs lklfuse. Every descriptor but 0-2 is closed in mount_macfuse, and in the CLI
- * all but 3 (the disk) and FUSE_FD. Unmounting (DiskArbitration, diskutil) ends lklfuse, which sees its device close. If lklfuse
- * dies first the mount stays, with nobody serving it: macFUSE fails its calls (a dead file system, ENXIO) rather than hang,
- * and it still unmounts (tests/smoke-mavericks.sh checks both). If the CLI fails before lklfuse answers INIT, mount_macfuse may
- * still hold its own copy of the device, blocked in mount(2): root's closing its copy cannot end that wait, and macFUSE offers
- * no ioctl that does (FUSEDEVIOCINTERRUPTREADERS wakes the device's readers, not the mount); the kernel gives up by itself,
- * EAGAIN after about 50 s (macfuse's smoke). So root stops it (stop()) and says so if even SIGKILL leaves it running. */
+/* Root's mount, for a macFUSE that serves /dev/fd/N (macfuse's DETAILS.md), in this order. (1) The CLI, as _linuxfs, runs with
+ * its end of a channel on CHAN_FD (and the disk on 3, nothing else): it does everything it can know before the mount (the lock,
+ * the probe, the access rule, the Fusion and ignore checks), and linuxfs-open writes "ready" on the channel just before lklfuse
+ * would start. (2) Only then does root run mount_macfuse, which mounts MNT with allow_other (root's to give) and sends the
+ * device; root passes it on over the channel (SCM_RIGHTS), and the CLI's linuxfs-open puts it on FUSE_FD for lklfuse, which
+ * serves it through /dev/fd/FUSE_FD. A CLI that ends, or is not ready within READY_WAIT_S, never has a mount_macfuse run for
+ * it. Root then waits, bounded, for mount_macfuse's status: 0 (and the CLI's 0) is exit 0; anything else stops what _linuxfs
+ * started, unmounts MNT if it got mounted, stops mount_macfuse, and is the CLI's failure (or 1). Root never reads the file
+ * system and never runs lklfuse. Every descriptor but 0-2 is closed in mount_macfuse, and in the CLI all but 3 and CHAN_FD.
+ * Unmounting (DiskArbitration, diskutil) ends lklfuse, which sees its device close. If lklfuse dies first the mount stays,
+ * with nobody serving it: macFUSE fails its calls (a dead file system, ENXIO) rather than hang, and it still unmounts
+ * (tests/smoke-mavericks.sh checks both). The one failure left after "ready" is lklfuse dying at startup, before it answers
+ * INIT: mount_macfuse may then still hold its own copy of the device, blocked in mount(2): root's closing its copy cannot end
+ * that wait, and macFUSE offers no ioctl that does (FUSEDEVIOCINTERRUPTREADERS wakes the device's readers, not the mount);
+ * the kernel gives up by itself, EAGAIN after about 50 s (macfuse's smoke). So root stops it (stop()) and says so if even
+ * SIGKILL leaves it running. */
 static int mount_by_root(const char *fs, const struct mountreq *req, const char *bsd, int ro, const char *name, uid_t uid,
 			 gid_t gid, char **args)
 {
-	static const char *const vars[] = { ROOT_CLI_ENV, "LINUXFS_FUSE_FD=" STR(FUSE_FD), NULL };
+	static const char *const vars[] = { ROOT_CLI_ENV, "LINUXFS_FUSE_FD=" STR(FUSE_FD), "LINUXFS_FUSE_CHAN=" STR(CHAN_FD), NULL };
 	char opts[400], vol[256], commenv[32], hout_buf[4096];
 	char daemon_env[] = "_FUSE_DAEMON_PATH=" PRIV_DIR "/lklfuse";
 	char *hargv[5], *henv[5];
 	const char *helper = mount_helper();
-	int cs[2], hout[2], nul, devfd, fd, w, got = 0, cli_rc = -2, ok = 0;
+	int cs[2], ch[2], hout[2], devfd, fd, w, got = 0, cli_rc = -2, ok = 0, hstarted = 0;
 	int32_t status = -1;
 	size_t hgot = 0, sgot = 0;
-	pid_t hpid, cpid;
+	pid_t hpid = -1, cpid = -1;
 	time_t deadline, cli_end = 0;
 
 	fsrules_volname(strrchr(req->mnt, '/') + 1, vol, sizeof vol);
 	snprintf(opts, sizeof opts, "allow_other,local,volname=%s,fsname=linuxfs@%s,noappledouble%s", vol, bsd, ro ? ",rdonly" : "");
-	/* hold FUSE_FD (on /dev/null) so nothing opened below lands there; the device replaces it */
-	nul = open("/dev/null", O_RDWR | O_CLOEXEC);
-	if (nul < 0 || (nul != FUSE_FD && dup2(nul, FUSE_FD) < 0))
-		return refuse(fs, "cannot hold a descriptor for the macFUSE device");
-	if (nul != FUSE_FD)
-		close(nul);
-	fcntl(FUSE_FD, F_SETFD, FD_CLOEXEC);
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, cs) != 0)
 		return refuse(fs, "cannot make mount_macfuse's socket");
-	if (pipe(hout) != 0) {
+	if (pipe(hout) != 0 || socketpair(AF_UNIX, SOCK_STREAM, 0, ch) != 0) {
 		close(cs[0]);
 		close(cs[1]);
-		return refuse(fs, "cannot make mount_macfuse's pipe");
+		return refuse(fs, "cannot make mount_macfuse's pipe, or the CLI's channel");
 	}
 	for (fd = 0; fd < 2; fd++) {
 		fcntl(cs[fd], F_SETFD, FD_CLOEXEC);
 		fcntl(hout[fd], F_SETFD, FD_CLOEXEC);
+		fcntl(ch[fd], F_SETFD, FD_CLOEXEC);
 	}
 	snprintf(commenv, sizeof commenv, "_FUSE_COMMFD=%d", cs[0]);
 	henv[0] = "_FUSE_CALL_BY_LIB=1";
@@ -988,7 +1047,7 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 		printf("helper-argv %s\n", hargv[fd]);
 	for (fd = 0; henv[fd]; fd++)
 		printf("helper-env %s\n", henv[fd]);
-	printf("fd%d the macFUSE device\n", FUSE_FD);
+	printf("fd%d the CLI's channel to root\n", CHAN_FD);
 	print_cli_plan(vars, args);
 	if (getenv("LINUXFS_FS_TEST_ROOT_CLI"))
 		args[0] = getenv("LINUXFS_FS_TEST_ROOT_CLI");
@@ -997,10 +1056,51 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 		close(cs[1]);
 		close(hout[0]);
 		close(hout[1]);
+		close(ch[0]);
+		close(ch[1]);
 		return 0;
 	}
 #endif
+	/* The CLI first, with its end of a channel on CHAN_FD: it does everything it can know before the mount (the lock, the
+	 * probe, the access rule, the Fusion and ignore checks), says "ready", and waits for the device. A CLI that exits or
+	 * fails before that never has a mount_macfuse run for it: nothing is left in mount(2) waiting for lklfuse's INIT. */
+	cpid = fork();
+	if (cpid == 0) {
+		setpgid(0, 0);	/* the CLI, its lklfuse and all: one group, for root to stop if the mount fails */
+		close(cs[0]);
+		close(cs[1]);
+		close(hout[0]);
+		close(hout[1]);
+		close(ch[0]);
+		if (ch[1] != CHAN_FD) {
+			dup2(ch[1], CHAN_FD);
+			close(ch[1]);
+		}
+		fcntl(CHAN_FD, F_SETFD, 0);
+		close(FUSE_FD);	/* only 3 (the disk) and the channel reach the CLI */
+		close(5);
+		if (become_run_user(fs, name, uid, gid) != 0)
+			_exit(1);
+		syslog(LOG_NOTICE, "mount_%s: %s on %s: da-mount as %s, the device to come on channel fd %d%s", fs, bsd, req->mnt, RUN_USER,
+		       CHAN_FD, ro ? " (read-only)" : "");
+		fd = root_cli(req, args, vars, CHAN_FD, name);
+		_exit(fd < 0 ? 1 : fd);
+	}
+	if (cpid > 0)
+		setpgid(cpid, cpid);
+	close(ch[1]);
+	close(3);	/* the disk is the CLI's now */
+	if (cpid < 0) {
+		syslog(LOG_NOTICE, "mount_%s: %s: cannot run the CLI", fs, bsd);
+		goto failed;
+	}
+	if (!wait_ready(ch[0], cpid, &cli_rc, &cli_end, wait_s(READY_WAIT_S))) {
+		syslog(LOG_NOTICE, "mount_%s: %s: the CLI did not get ready (%s); mount_macfuse is not run", fs, bsd,
+		       cli_rc == -2 ? "timed out" : "it ended first");
+		goto failed;
+	}
 	hpid = fork();
+	hstarted = 1;
 	if (hpid == 0) {
 		int in = open("/dev/null", O_RDONLY);
 
@@ -1016,41 +1116,22 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 	close(cs[0]);
 	close(hout[1]);
 	if (hpid < 0) {
-		close(cs[1]);
-		close(hout[0]);
-		return refuse(fs, "cannot run mount_macfuse");
+		syslog(LOG_NOTICE, "mount_%s: %s: cannot run mount_macfuse", fs, bsd);
+		goto failed;
 	}
 	syslog(LOG_NOTICE, "mount_%s: %s on %s: mount_macfuse -o %s (pid %d)", fs, bsd, req->mnt, opts, (int)hpid);
 	devfd = recv_device(cs[1], wait_s(DEVICE_WAIT_S));
-	if (devfd < 0 || dup2(devfd, FUSE_FD) < 0) {
+	if (devfd < 0 || !send_device(ch[0], devfd)) {
 		if (devfd >= 0)
 			close(devfd);
-		syslog(LOG_NOTICE, "mount_%s: %s: mount_macfuse sent no macFUSE device within %d s", fs, bsd, wait_s(DEVICE_WAIT_S));
+		syslog(LOG_NOTICE, "mount_%s: %s: no macFUSE device from mount_macfuse within %d s, or none to hand the CLI", fs, bsd,
+		       wait_s(DEVICE_WAIT_S));
 		fprintf(stderr, "linuxfs-mount: mount_macfuse sent no macFUSE device\n");
-		cpid = -1;
 		goto failed;
 	}
-	close(devfd);
-	cpid = fork();
-	if (cpid == 0) {
-		setpgid(0, 0);	/* the CLI, its lklfuse and all: one group, for root to stop if the mount fails */
-		close(cs[1]);
-		close(hout[0]);
-		if (become_run_user(fs, name, uid, gid) != 0)
-			_exit(1);
-		syslog(LOG_NOTICE, "mount_%s: %s on %s: da-mount as %s, the device on fd %d%s", fs, bsd, req->mnt, RUN_USER, FUSE_FD,
-		       ro ? " (read-only)" : "");
-		fd = root_cli(req, args, vars, FUSE_FD, name);
-		_exit(fd < 0 ? 1 : fd);
-	}
-	if (cpid > 0)
-		setpgid(cpid, cpid);
-	close(3);	/* the disk and the device are the CLI's now: mount_macfuse and lklfuse hold the device */
-	close(FUSE_FD);
-	if (cpid < 0) {
-		syslog(LOG_NOTICE, "mount_%s: %s: cannot run the CLI", fs, bsd);
-		goto failed;
-	}
+	close(devfd);	/* the CLI's lklfuse and mount_macfuse hold it; root's copy would only keep it open */
+	close(ch[0]);
+	ch[0] = -1;
 
 	deadline = time(NULL) + wait_s(STATUS_WAIT_S);
 	for (;;) {
@@ -1137,6 +1218,12 @@ failed:
 		stop(fs, hpid, STOP_WAIT_S);
 		if (cs[1] >= 0)
 			close(cs[1]);
+		if (!hstarted) {
+			close(cs[0]);
+			close(hout[1]);
+		}
+		if (ch[0] >= 0)
+			close(ch[0]);
 		fprintf(stderr, "linuxfs-mount: root's mount of %s failed\n", bsd);
 	}
 	if (hout[0] >= 0) {
