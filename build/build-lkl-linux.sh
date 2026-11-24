@@ -35,3 +35,4 @@ cp "$L/tests/boot" "$L/tests/disk" "$OUT/tests/"
 cp "$BLD/.config" "$OUT/kernel.config"
 grep -q '^CONFIG_NTFS3_FS=y' "$OUT/kernel.config" || { echo "build-lkl-linux.sh: ntfs3 not in the kernel config" >&2; exit 1; }
 grep -q "^CONFIG_APFS_FS=y" "$OUT/kernel.config" || { echo "build-lkl-linux.sh: apfs not in the kernel config" >&2; exit 1; }
+grep -q "^CONFIG_F2FS_FS=y" "$OUT/kernel.config" || { echo "build-lkl-linux.sh: f2fs not in the kernel config" >&2; exit 1; }

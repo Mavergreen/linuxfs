@@ -125,6 +125,16 @@ jobs:
             #       ends with the before-login checks (it logs the console user out and does not bring the session back)
             status=0; sh tests/smoke-mavericks.sh "$LINUXFS_VERSION" images images-after || status=$?
             [ "$status" -eq 0 ] || { echo "tests/smoke-mavericks.sh exited $status (77 is a skip, a failure here)"; exit 1; }
+      # spec: Mavergreen/mavericks-vm README -- copyback: true copies the workspace back after run, failure included, so the guest's
+      #       screenshots and system.log arrive in images-after
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: linuxfs-guest-out
+          if-no-files-found: warn
+          path: |
+            images-after/*.png
+            images-after/*.log
       - uses: actions/upload-artifact@v7
         if: always()
         with:
