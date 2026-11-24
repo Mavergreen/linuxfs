@@ -389,6 +389,45 @@ restore_login() {
   if [ -n "$olddisks" ]; then sudo -n defaults write "$AD" AutomountDisksWithoutUserLogin -bool "$( [ "$olddisks" = 1 ] && echo true || echo false )"
   else sudo -n defaults delete "$AD" AutomountDisksWithoutUserLogin 2> /dev/null; fi
 }
+# spec: tests/smoke-mavericks.sh header -- diagnostics only (never ok or not ok): why macFUSE refused the before-login mount for _linuxfs
+#       ("mount_macfuse: ... Operation not permitted"). Each experiment mounts the bundled lklfuse on an ext4 image file as USER,
+#       with the options cli/linuxfs gives an image (type, lock, local, volname, fsname, noappledouble) plus EXTRA.
+diag_try() {  # LABEL USER MNT EXTRA
+  dl=$1 du=$2 dm=$3 dx=$4
+  dimg=/private/tmp/linuxfs-diag/$dl.img; derr=/private/tmp/linuxfs-diag/$dl.err
+  cp "$W/img/ext4.img" "$dimg" && chmod 666 "$dimg" || { echo "# diag: $dl: cannot make its image"; return 0; }
+  sudo -n -u "$du" "$DLK" -f -o "type=ext4,lock=/private/tmp/linuxfs-diag/$dl.lock,local,volname=diag,fsname=linuxfs@diag,noappledouble$dx" "$dimg" "$dm" > "$derr" 2>&1 &
+  dp=$!; di=0
+  while [ $di -lt 150 ] && ! mount | grep -qF " on $dm ("; do
+    kill -0 "$dp" 2> /dev/null || break
+    di=$((di + 1)); sleep 0.1
+  done
+  if mount | grep -qF " on $dm ("; then echo "# diag: $dl: MOUNTED as $du on $dm ($(mount | grep -F " on $dm (" | head -n 1))"
+  else echo "# diag: $dl: NOT mounted as $du on $dm, options '$dx'"; fi
+  sed "s|^|# diag: $dl stderr: |" "$derr"
+  sudo -n pkill -f "lklfuse.*$dl.img" 2> /dev/null
+  wait "$dp" 2> /dev/null
+  if mount | grep -qF " on $dm ("; then sudo -n umount "$dm" 2>&1 | sed "s|^|# diag: $dl umount: |"; fi
+  return 0
+}
+diag_before_login() {
+  DLK=/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d/lklfuse
+  echo "# diag: (a) sysctl fuse:"; sysctl -a 2> /dev/null | grep -i fuse | sed 's/^/# diag: /'
+  for h in $(find /usr/local/mavergreen/macfuse /Library/Filesystems/macfuse.fs -name 'mount_macfuse*' 2> /dev/null); do ls -l "$h" | sed 's/^/# diag: helper: /'; done
+  ls -ld "$DLK" | sed 's/^/# diag: /'
+  mkdir -p /private/tmp/linuxfs-diag; chmod 1777 /private/tmp/linuxfs-diag
+  sudo -n mkdir -p /private/tmp/linuxfs-diag/mnt-b1 /private/tmp/linuxfs-diag/mnt-b2 && sudo -n chown _linuxfs /private/tmp/linuxfs-diag/mnt-b1 /private/tmp/linuxfs-diag/mnt-b2 && sudo -n chmod 0755 /private/tmp/linuxfs-diag/mnt-b1 /private/tmp/linuxfs-diag/mnt-b2
+  bounded 600 diag_try b-allow-other _linuxfs /private/tmp/linuxfs-diag/mnt-b1 ,allow_other
+  bounded 600 diag_try b-plain _linuxfs /private/tmp/linuxfs-diag/mnt-b2 ""
+  sudo -n mkdir /Volumes/linuxfs-diag-c && sudo -n chown _linuxfs /Volumes/linuxfs-diag-c && sudo -n chmod 0111 /Volumes/linuxfs-diag-c
+  bounded 600 diag_try c-volumes-0111-allow-other _linuxfs /Volumes/linuxfs-diag-c ,allow_other
+  bounded 600 diag_try c-volumes-0111-plain _linuxfs /Volumes/linuxfs-diag-c ""
+  mkdir -p /private/tmp/linuxfs-diag/mnt-d
+  bounded 600 diag_try d-control-vagrant "$me" /private/tmp/linuxfs-diag/mnt-d ,allow_other
+  sudo -n rmdir /Volumes/linuxfs-diag-c 2> /dev/null
+  sudo -n rm -rf /private/tmp/linuxfs-diag 2> /dev/null
+  return 0
+}
 if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
   cp "$W/img/ext4.img" "$W/img/login-ext4.img" || notok "before login: cannot copy ext4.img"
   sudo -n defaults write "$AD" AutomountDisksWithoutUserLogin -bool true
@@ -418,6 +457,7 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
     tail -n +"$((${loglog:-0} + 1))" /var/log/system.log 2> /dev/null | grep -i 'linuxfs\|diskarbitrationd\|fuse' | sed 's/^/# /'
     for f in $(sudo -n find /private/var/db/linuxfs -type f 2> /dev/null | head -n 8); do echo "# --- $f"; sudo -n head -c 4000 "$f" 2>&1 | sed 's/^/# /'; done
   fi
+  bounded 3000 diag_before_login
   restore_login
   # platform: 10.9 has no re-login without a reboot, and mavericks-vm has no mid-job reboot, so the user's return is not asked
   echo "# SKIP user return: mavericks-vm cannot re-login without a reboot (shipyard queued it); autoLoginUser is restored"
