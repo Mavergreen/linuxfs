@@ -541,12 +541,12 @@ hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
 s0=$(date +%s); hs hold "exit 3"; t=$(( $(date +%s) - s0 ))
 hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
 [ $rc = 3 ] && [ $t -lt 15 ] && [ -n "$hp" ] && gone "$hp"; ok $? "mount_macfuse holding the device with no status, the CLI failed: root exits 3 in $t s and mount_macfuse is gone (rc $rc)"
-s0=$(date +%s); HS_ENV=LINUXFS_FS_TEST_NOKILL=1 hs holdstubborn "exit 3"; t=$(( $(date +%s) - s0 ))
+s0=$(date +%s); HS_ENV=LINUXFS_FS_TEST_NOKILL=1; hs holdstubborn "exit 3"; unset HS_ENV; t=$(( $(date +%s) - s0 ))
 hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
 [ $rc = 3 ] && [ $t -lt 20 ] && [ -n "$hp" ] && grep -q "mount_macfuse (pid $hp) is still running after SIGKILL" "$M/plan"
 ok $? "one that outlives SIGKILL: root still exits 3 in $t s, and says it is left running ($(grep -i 'still running' "$M/plan" | tr '\n' ' '))"
 [ -z "$hp" ] || kill -9 "$hp" 2>/dev/null
-HS_ENV=LINUXFS_FS_TEST_NOKILL=1 hs stubborn ok
+HS_ENV=LINUXFS_FS_TEST_NOKILL=1; hs stubborn ok; unset HS_ENV
 hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
 [ $rc = 0 ] && [ -n "$hp" ] && grep -q "mount_macfuse (pid $hp) is still running after SIGKILL" "$M/plan"; ok $? "after a good mount too, a mount_macfuse that outlives SIGKILL is reported (rc $rc)"
 [ -z "$hp" ] || kill -9 "$hp" 2>/dev/null
@@ -561,7 +561,7 @@ hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
 hs twofds ok 2; sleep 2
 [ $rc = 1 ] && grep -q '^closed by root 2$' "$D/drop/mhelper.log"; ok $? "two descriptors in the device's message: refused (rc $rc), both closed ($(grep '^closed' "$D/drop/mhelper.log"))"
 # spec: tools/fs.c mount_role -- SIGCHLD back to its default first: started with it ignored, root would never see an exit status
-HS_WRAP='/usr/bin/perl -e $SIG{CHLD}="IGNORE";exec(@ARGV)' hs "" "exit 3"
+HS_WRAP='/usr/bin/perl -e $SIG{CHLD}="IGNORE";exec(@ARGV)'; hs "" "exit 3"; unset HS_WRAP
 [ $rc = 3 ]; ok $? "started with SIGCHLD ignored, root still gets the CLI's exit 3 (rc $rc)"
 # spec: tools/fs.c mount_by_root -- the force-unmount on failure takes only root's own mount: from linuxfs@DISK, a macfuse (or
 #       osxfuse) file system; another volume on MNT is left. (The matching case needs a real macFUSE mount: the VM smoke's.)

@@ -861,25 +861,23 @@ static int recv_device(int sock, int secs)
 	return fd;
 }
 
-/* What is mounted on MNT (MNT_NOWAIT, so no file system is asked): 0 nothing; 1 root's own mount, from linuxfs@BSD, a macfuse
- * (or osxfuse) file system; -1 something else, which is never root's to unmount */
+/* What is mounted on MNT, judged by the topmost mount, the one unmount(MNT) would hit: 0 nothing; 1 root's own mount, from
+ * linuxfs@BSD, a macfuse (or osxfuse) file system; -1 something else, which is never root's to unmount. The mount table is read
+ * with MNT_NOWAIT, last entry first (a later mount on the same path is on top), rather than by statfs(MNT), which asks the file
+ * system and so could hang on a dead macFUSE mount: no wait to bound. */
 static int mounted_on(const char *mnt, const char *bsd)
 {
 	struct statfs *m;
 	char from[64];
-	int n, i, r = 0;
+	int n, i;
 
 	snprintf(from, sizeof from, "linuxfs@%s", bsd);
 	n = getmntinfo(&m, MNT_NOWAIT);
-	for (i = 0; i < n; i++)
-		if (strcmp(m[i].f_mntonname, mnt) == 0) {
-			if (strcmp(m[i].f_mntfromname, from) == 0 &&
-			    (strncmp(m[i].f_fstypename, "macfuse", 7) == 0 || strncmp(m[i].f_fstypename, "osxfuse", 7) == 0))
-				r = 1;
-			else if (r == 0)
-				r = -1;
-		}
-	return r;
+	for (i = n - 1; i >= 0; i--)
+		if (strcmp(m[i].f_mntonname, mnt) == 0)
+			return strcmp(m[i].f_mntfromname, from) == 0 &&
+			       (strncmp(m[i].f_fstypename, "macfuse", 7) == 0 || strncmp(m[i].f_fstypename, "osxfuse", 7) == 0) ? 1 : -1;
+	return 0;
 }
 
 /* Waits up to secs for pid; 1 with *st when it was reaped */
