@@ -230,6 +230,13 @@ fstn_nested() {  # MP: lklfuse onto a directory inside the macfuse_ext4 volume
   bounded 300 "$L" unmount "$1/inner" > /dev/null 2>&1
   return 0
 }
+fstn_probe() {  # TAG: does a plain attach of a fresh copy still automount? (which step poisons the later ext4 attaches)
+  cp "$W/img/spike-ext4.img" "$W/img/spike-probe.img" || return 1
+  if da_attach "$W/img/spike-probe.img"; then
+    if da_wait 150; then ok "fstypename probe $1: a plain attach automounts ($mp)"; else notok "fstypename probe $1: a plain attach automounts"; echo "# probe $1: diskutil info:"; rec diskutil info "$disk"; echo "# probe $1: diskutil mount $disk: $(diskutil mount "$disk" 2>&1 | tr '\n' ' ')"; rec mount; fi
+  else notok "fstypename probe $1: hdiutil attach"; disk=$(image_disk "$W/img/spike-probe.img"); fi
+  cleanup_disk
+}
 fstn_section() {
   echo "# fstypename: macFUSE tools and versions in this install:"
   rec ls -la /Library/Filesystems/macfuse.fs/Contents/Resources /usr/local/bin /System/Library/Filesystems/macfuse_ext4.fs/Contents /System/Library/Filesystems/macfuse_ext4.fs/Contents/Resources
@@ -267,6 +274,7 @@ fstn_section() {
   else notok "fstypename: remounted within 30 s"; fi
   check "fstypename: diskutil eject, and no lklfuse is left on it" da_eject "$disk" "$mp"
   cleanup_disk
+  fstn_probe A-after-eject
   if da_attach_nomount "$W/img/spike-ext4.img"; then
     sleep 6
     if mount | grep -qF "linuxfs@"; then echo "# the agent's login sweep mounted it first; unmounting"; bounded 600 diskutil unmount "$disk" > /dev/null 2>&1; fi
@@ -280,12 +288,14 @@ fstn_section() {
     echo "# /etc/fstab after unignore:"; sed 's/^/#   /' /etc/fstab
   else notok "fstypename: hdiutil attach -nomount"; disk=$(image_disk "$W/img/spike-ext4.img"); fi
   cleanup_disk
+  fstn_probe B-after-ignore-unignore
   m=$W/mnt/spike; mkdir -p "$m"
   check "fstypename: linuxfs mount (the CLI's path)" bounded 600 "$L" mount "$W/img/spike-ext4.img" "$m"
   echo "# CLI path mount: $(mount | grep -F " on $m (")"
   echo "# CLI path stat -f %T: $(stat -f %T "$m")"
   check "fstypename: the CLI's mount reports macfuse_ext4" fstn_mount_line "$m"
   check "fstypename: the CLI's mount unmounts" unmount_and_wait "$W/img/spike-ext4.img" "$m"
+  fstn_probe C-after-cli-mount
 }
 
 imgfs=
