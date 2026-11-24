@@ -374,10 +374,11 @@ static void log_lines(const char *what, const char *text)
 	}
 }
 
-/* Runs argv with stdin from pw plus a newline (NULL: /dev/null) and stdout and stderr together captured into out
- * (outlen bytes, NUL-ended; the rest is read and dropped). Returns its exit status, or -1 when it could not run or
- * did not exit. */
-static int run_capture(char *const argv[], const char *pw, char *out, size_t outlen)
+/* Runs argv (with environment envp, or ours when NULL) with stdin from pw plus a newline (NULL: /dev/null) and stdout and
+ * stderr together captured into out (outlen bytes, NUL-ended; the rest is read and dropped). Every descriptor above 2 is
+ * closed in the child except keep_fd (-1: none), which it inherits as it is. Returns its exit status, or -1 when it could
+ * not run or did not exit. */
+static int run_capture(char *const argv[], char *const envp[], const char *pw, int keep_fd, char *out, size_t outlen)
 {
 	int inp[2] = { -1, -1 }, outp[2], st = -1, nul = -1, fd;
 	size_t got = 0;
@@ -434,9 +435,13 @@ static int run_capture(char *const argv[], const char *pw, char *out, size_t out
 		dup2(o, 1);
 		dup2(o, 2);
 		for (fd = 3; fd < getdtablesize(); fd++)
-			close(fd);
+			if (fd != keep_fd)
+				close(fd);
 		signal(SIGPIPE, SIG_DFL);
-		execv(argv[0], argv);
+		if (envp)
+			execve(argv[0], argv, envp);
+		else
+			execv(argv[0], argv);
 		_exit(127);
 	}
 	if (nul >= 0)
@@ -596,7 +601,7 @@ static int kc_find(const char *bsd, char *pw, size_t pwlen, int *saved)
 		memcpy(pw, p, (size_t)(e - p));
 		pw[e - p] = '\0';
 		rc = 0;
-		syslog(LOG_NOTICE, "%s: the keychain keeper offers a %s password", bsd, *saved ? "saved" : "offered");
+		syslog(LOG_NOTICE, "%s: the keychain keeper offers a password (%s)", bsd, *saved ? "saved" : "offered");
 	}
 out:
 	memset(rep, 0, sizeof rep);
@@ -630,7 +635,7 @@ static int ask_dialog(const char *header, const char *message, char *pw, size_t 
 	if (prog) {
 		char out[PW_MAX + 32], *nl, *e;
 		char *argv[] = { (char *)prog, (char *)header, (char *)message, NULL };
-		int rc = run_capture(argv, NULL, out, sizeof out), ok = 0;
+		int rc = run_capture(argv, NULL, NULL, -1, out, sizeof out), ok = 0;
 
 		if (rc == 0 && (nl = strchr(out, '\n')) != NULL) {
 			*nl = '\0';
@@ -738,7 +743,7 @@ static int run_cli(const char *cli, const struct mountreq *req, const char *pw, 
 	argv[n++] = (char *)req->dev;
 	argv[n++] = (char *)req->mnt;
 	argv[n] = NULL;
-	rc = run_capture(argv, pw, out, outlen);
+	rc = run_capture(argv, NULL, pw, -1, out, outlen);
 	syslog(LOG_NOTICE, "%s: %s exited %d%s", req->dev, "linuxfs da-mount", rc, pw ? " (with a password)" : "");
 	log_lines("linuxfs", out);
 	return rc;
@@ -810,7 +815,8 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 	char node[64], devarg[64], name[64];
 	char *args[8];
 	const char *bsd;
-	int fd, mfd, i, n = 0, ro_fallback = 0;
+	char *cout;
+	int fd, mfd, n = 0, ro_fallback = 0, rc;
 	uid_t uid;
 	gid_t gid;
 
@@ -897,12 +903,13 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 	args[n] = NULL;
 
 #ifdef LINUXFS_FS_TEST_DROP
-	for (i = 0; vars[i]; i++)
-		printf("env %s\n", vars[i]);
-	for (i = 0; args[i]; i++)
-		printf("argv %s\n", args[i]);
 	{
-		int max = getdtablesize();
+		int i, max = getdtablesize();
+
+		for (i = 0; vars[i]; i++)
+			printf("env %s\n", vars[i]);
+		for (i = 0; args[i]; i++)
+			printf("argv %s\n", args[i]);
 
 		for (i = 4; i < max; i++)
 			close(i);
@@ -913,7 +920,10 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 		printf("\n");
 	}
 	fflush(stdout);
-	return 0;
+	/* a stand-in for the bundled CLI, to see what run_capture hands it (fd 3 only) and what comes back */
+	if (!getenv("LINUXFS_FS_TEST_ROOT_CLI"))
+		return 0;
+	args[0] = getenv("LINUXFS_FS_TEST_ROOT_CLI");
 #else
 	if (initgroups(name, (int)gid) != 0 || setgid(gid) != 0 || setuid(uid) != 0 || getuid() != uid || geteuid() != uid ||
 	    getgid() != gid || getegid() != gid || setuid(0) != -1)
@@ -929,15 +939,20 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 	if (chdir("/") != 0)
 		die("cannot chdir to /");
 	syslog(LOG_NOTICE, "mount_%s: %s on %s as %s%s", fs, bsd, req->mnt, RUN_USER, ro_fallback ? " (read-only device)" : "");
-	{
-		int max = getdtablesize();	/* every descriptor but 0-3 is closed just before the exec */
-
-		for (i = 4; i < max; i++)
-			close(i);
-	}
-	execve(args[0], args, (char *const *)vars);
-	return refuse(fs, "cannot run the bundled CLI");
 #endif
+	/* The CLI's output goes to syslog, not nowhere: nobody is logged in to read it. Only fd 3 (the device) reaches it. */
+	cout = malloc(CAPTURE_MAX);
+	if (!cout)
+		die("out of memory");
+	rc = run_capture(args, (char *const *)vars, NULL, 3, cout, CAPTURE_MAX);
+	syslog(LOG_NOTICE, "%s: linuxfs da-mount exited %d (as %s)", req->dev, rc, name);
+	log_lines("linuxfs", cout);
+#ifdef LINUXFS_FS_TEST_DROP
+	printf("cli-rc %d\ncli-out %.200s\n", rc, cout);
+	fflush(stdout);
+#endif
+	free(cout);
+	return rc < 0 ? 1 : rc;
 }
 
 /* What DiskArbitration passed: the arguments after the program name, joined by spaces and cut at 200 bytes. They hold the device,

@@ -258,6 +258,42 @@ kc none
 mt env LINUXFS_CLI="$M/clibad" DLG_PWS=pw DLG_MODE=once "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
 kcstop
 [ $rc = 0 ] && grep -q '^dialog' "$M/log"; ok $? "a hint that is not UTF-8 is left out, and the dialog still runs (rc $rc)"
+# spec: tools/fs.c run_cli -- the mount program against the REAL cli/linuxfs (da-mount), with stand-ins only for lklfuse, the
+#       opener and the prober (the CLI's own LINUXFS_LKLFUSE, LINUXFS_OPEN and LINUXFS_PROBE): every argv form the mount program
+#       builds is accepted (not usage, exit 2), and the password reaches lklfuse on its fd 5
+R=$M/real; rm -rf "$R"; mkdir -p "$R/mnt"
+cat > "$R/open" <<'EOS'
+#!/bin/sh
+case $1 in --probe) printf '%s\tlbl\n' "${FAKE_PROBE:-ext4}"; exit 0 ;; esac
+[ "$1" != --ro ] || shift
+shift
+exec "$@"
+EOS
+cat > "$R/lklfuse" <<'EOS'
+#!/bin/sh
+echo "lklfuse: $*" >> "$LK_LOG"
+case "$*" in
+  *passfd=5*) IFS= read -r got <&5; echo "pw: $got" >> "$LK_LOG" ;;
+  *) if [ -n "${FAKE_ENCRYPTED:-}" ]; then echo "APFS: volume is encrypted (hint: blue)"; echo "can't mount disk: Required key not available"; exit 1; fi ;;
+esac
+exit 0
+EOS
+chmod +x "$R/open" "$R/lklfuse"
+real() { # ARGS...: the mount role (user path) running the real CLI, whose lklfuse exits at once as a successful mount
+  rm -f "$R/lk.log"
+  mt env LINUXFS_CLI="$ROOT/cli/linuxfs" LINUXFS_OPEN="$R/open" LINUXFS_LKLFUSE="$R/lklfuse" LINUXFS_PROBE="$R/open" \
+    LINUXFS_STATE="$R/state" LINUXFS_LOGS="$R/logs" LINUXFS_LOCKS="$R/locks" LINUXFS_DOMAIN=test.fsreal \
+    LINUXFS_MACHINE_DOMAIN="$R/no-machine" LK_LOG="$R/lk.log" "$@"; }
+real "$MD" /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
+[ $rc = 0 ] && grep -q "^lklfuse: .*$R/mnt" "$R/lk.log"; ok $? "the real CLI accepts the plain da-mount argv (rc $rc)"
+real "$MD" -o owners /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
+[ $rc = 0 ] && grep -q "^lklfuse: " "$R/lk.log"; ok $? "the real CLI accepts da-mount --asked (rc $rc)"
+real "$MD" -o rdonly /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
+[ $rc = 0 ] && grep -q "^lklfuse: .*,ro " "$R/lk.log"; ok $? "the real CLI accepts da-mount --ro and mounts read-only (rc $rc)"
+kc saved pw
+real env FAKE_PROBE=apfs FAKE_ENCRYPTED=pw "$MD" -o owners /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
+kcstop
+[ $rc = 0 ] && grep -q "^pw: pw\$" "$R/lk.log" && grep -q "passfd=5" "$R/lk.log"; ok $? "the real CLI accepts da-mount --password-stdin and lklfuse gets the password on fd 5 (rc $rc: $(tr '\n' '|' < "$R/lk.log" 2>/dev/null))"
 # misuse
 for bad_args in "" "/dev/disk9" "-o /dev/disk9 /tmp/m" "/dev/disk9 /tmp/m extra" "-x /dev/disk9 /tmp/m"; do
   # shellcheck disable=SC2086
@@ -291,6 +327,24 @@ want rw "$E" "$V/NAME" > "$M/want"
 plan -o owners,rdonly "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
 want ro "$E" "$V/NAME" --asked --ro > "$M/want"
 [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root plan: owners and rdonly become --asked --ro, and the device is opened read-only (rc $rc)"
+# spec: tools/fs.c mount_as_root -- the CLI's output goes to syslog and its status comes back; only fd 3 reaches it
+cat > "$M/rootcli" <<'EOS'
+#!/bin/sh
+echo "to stdout"; echo "to stderr" >&2
+/usr/bin/python -c 'import os
+o = []
+for f in range(3, 256):
+    try:
+        os.fstat(f); o.append(str(f))
+    except OSError:
+        pass
+print("fds: " + " ".join(o))'
+exit 5
+EOS
+chmod +x "$M/rootcli"
+env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_FS_TEST_ROOT_CLI="$M/rootcli" "$DM" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
+fdl=$(sed -n 's/^fds: //p' "$M/plan" | sed 's/ *255//'); [ -n "$fdl" ] || fdl=none
+[ $rc = 5 ] && grep -q '^cli-rc 5' "$M/plan" && grep -q 'to stdout' "$M/plan" && grep -q 'to stderr' "$M/plan" && [ "$fdl" = 3 ]; ok $? "root: the CLI's output is captured and its status 5 returned, and it holds only fd 3 (rc $rc, fds '$fdl')"
 plan "$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
 want rw "$E" "$V/NAME" > "$M/want"
 [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root plan: a device named without /dev/ is accepted and passed as /dev/DEV (rc $rc)"

@@ -352,6 +352,15 @@ out=$(echo x | FAKE_PROBE=ext4 sh "$L" mount "$T/enc.img" --password-stdin 2>&1)
 sh "$L" unmount "$T/enc.img" > /dev/null 2>&1
 mkdir -p "$T/dam"
 LINUXFS_DA=1 FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret LINUXFS_OPEN="$T/bin/open" sh "$L" da-mount --asked /dev/disk2s1 "$T/dam" < /dev/null > /dev/null 2>&1; [ $? -eq 4 ]; ok $? "da-mount of an encrypted volume exits 4, for the bundle's mount program to ask"
+# spec: tools/fs.c run_cli -- the mount program passes --password-stdin to da-mount, in any order with --asked and --ro
+for order in "--asked --password-stdin" "--password-stdin --asked" "--ro --password-stdin --asked"; do
+  rm -f "$T/pwgot"
+  out=$(printf 's3cret\n' | LINUXFS_DA=1 FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret LINUXFS_OPEN="$T/bin/open" sh "$L" da-mount $order /dev/disk2s1 "$T/dam" 2>&1); rc=$?
+  [ $rc -eq 0 ] && [ "$(cat "$T/pwgot" 2>/dev/null)" = s3cret ]; ok $? "da-mount $order mounts an encrypted volume with the password from stdin (got $rc: '$out')"
+  sh "$L" unmount "$T/dam" > /dev/null 2>&1; sh "$L" unmount disk2s1 > /dev/null 2>&1
+done
+out=$(printf 'nope\n' | LINUXFS_DA=1 FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret LINUXFS_OPEN="$T/bin/open" sh "$L" da-mount --asked --password-stdin /dev/disk2s1 "$T/dam" 2>&1); rc=$?
+[ $rc -eq 4 ] && echo "$out" | grep -q "wrong password"; ok $? "da-mount --password-stdin with a wrong password exits 4 (got $rc: '$out')"
 # spec: cli/linuxfs --
 #       review M7: after a reboot a record's pid may belong to some other process; it is not a mount
 sleep 60 & sp=$!

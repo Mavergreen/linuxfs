@@ -8,7 +8,7 @@
 #          linuxfs prefs [Automount|ReadOnly|NTFSTakeover|APFSWrite on|off]
 #          linuxfs ignore|unignore LABEL
 #          linuxfs automount DISK
-#   internal: linuxfs da-mount [--asked] [--ro] DEVICE MOUNTPOINT   (only with LINUXFS_DA=1: the bundle's mount program)
+#   internal: linuxfs da-mount [--asked] [--ro] [--password-stdin] DEVICE MOUNTPOINT   (only with LINUXFS_DA=1: the bundle's mount program)
 #          Mounts a Linux filesystem (ext4, btrfs, xfs, NTFS, exFAT, FAT, f2fs) with Linux's own driver, running in
 #          lklfuse. An image file is mounted directly: every file appears owned by you and only you can open the
 #          volume; new files are written with the filesystem root's owner. --linux-ids shows Linux's owners instead.
@@ -409,9 +409,9 @@ cmd_automount() {
 # (unless --asked: the user said to), or a Fusion second device, or a main device whose second never came.
 cmd_da_mount() {
   [ "${LINUXFS_DA:-}" = 1 ] || usage
-  asked= ro=
-  while [ "${1:-}" = --asked ] || [ "${1:-}" = --ro ]; do
-    case $1 in --asked) asked=1 ;; --ro) ro=1 ;; esac; shift
+  asked= ro= pws=
+  while [ "${1:-}" = --asked ] || [ "${1:-}" = --ro ] || [ "${1:-}" = --password-stdin ]; do
+    case $1 in --asked) asked=1 ;; --ro) ro=1 ;; --password-stdin) pws=1 ;; esac; shift
   done
   [ $# -eq 2 ] || usage
   device_nodes "$1" || usage
@@ -437,7 +437,10 @@ cmd_da_mount() {
       done ;;
   esac
   [ "$(pref ReadOnly off)" != on ] || ro=1
-  if [ -n "$ro" ]; then cmd_mount "$1" "$mp" --ro; else cmd_mount "$1" "$mp"; fi
+  set -- "$1" "$mp"
+  [ -z "$ro" ] || set -- "$@" --ro
+  [ -z "$pws" ] || set -- "$@" --password-stdin
+  cmd_mount "$@"
 }
 
 cmd_status() {
