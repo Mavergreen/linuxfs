@@ -303,6 +303,10 @@ static int run_capture(char *const argv[], char *const envp[], const char *pw, i
 	if (pw)
 		close(inp[0]);
 	close(outp[1]);
+	/* 3 to keep_to are the child's now: ours would keep a channel on keep_to from ever reading as closed while it runs */
+	for (fd = 3; fd <= keep_to; fd++)
+		if (fd != outp[0] && fd != inp[1])	/* (our own pipe ends may have taken numbers there) */
+			close(fd);
 	if (pw) {
 		size_t n = strlen(pw), off = 0;
 
@@ -792,11 +796,12 @@ static void print_cli_plan(const char *const *envp, char **args)
 }
 #endif
 
-/* The descriptor mount_macfuse sends over sock (SCM_RIGHTS, one byte) within secs; -1 when none. A message with anything but
- * one descriptor is refused, and every descriptor it carried is closed. */
-static int recv_device(int sock, int secs)
+/* The descriptor mount_macfuse sends over sock (SCM_RIGHTS, one byte) within secs; -1 when none, or when watch (the CLI's
+ * channel, from which nothing more is due) hangs up first: a CLI that has gone needs no mount_macfuse waiting for it. A message
+ * with anything but one descriptor is refused, and every descriptor it carried is closed. */
+static int recv_device(int sock, int secs, int watch)
 {
-	struct pollfd p = { sock, POLLIN, 0 };
+	struct pollfd p[2] = { { sock, POLLIN, 0 }, { watch, POLLIN, 0 } };
 	struct msghdr msg;
 	struct iovec iov;
 	struct cmsghdr *c;
@@ -812,7 +817,10 @@ static int recv_device(int sock, int secs)
 		left = secs * 1000L - ((long)(now.tv_sec - t0.tv_sec) * 1000 + (long)(now.tv_usec - t0.tv_usec) / 1000);
 		if (left <= 0)
 			return -1;
-		r = poll(&p, 1, (int)left);
+		p[0].revents = p[1].revents = 0;
+		r = poll(p, 2, (int)left);
+		if (r > 0 && p[1].revents)
+			return -1;
 		if (r > 0)
 			break;
 		if (r < 0 && errno != EINTR)
@@ -915,8 +923,8 @@ static void stop(const char *fs, pid_t pid, int term_s)
 	fprintf(stderr, "linuxfs-mount: mount_macfuse (pid %d) is still running after SIGKILL; left\n", (int)pid);
 }
 
-/* "Ready" (one byte, R) from the CLI on sock within secs; 0 when it ends first (its status, once reaped, in *cli_rc and the time
- * in *cli_end), closes the channel, or times out. */
+/* "Ready" (exactly one byte, R) from the CLI on sock within secs. 1 when it came; 0 when the CLI ended first (its status, once
+ * reaped, in *cli_rc and the time in *cli_end); -1 when the channel closed; -3 when it carried anything but that one byte; -2 on timeout. */
 static int wait_ready(int sock, pid_t cpid, int *cli_rc, time_t *cli_end, int secs)
 {
 	struct pollfd p = { sock, POLLIN, 0 };
@@ -924,18 +932,20 @@ static int wait_ready(int sock, pid_t cpid, int *cli_rc, time_t *cli_end, int se
 	int w;
 
 	for (;;) {
-		char b;
+		char b[16];
 		ssize_t r;
 
 		p.revents = 0;
 		if (poll(&p, 1, 200) < 0 && errno != EINTR)
-			return 0;
+			return -1;
 		if (p.revents) {
-			r = recv(sock, &b, 1, MSG_DONTWAIT);
-			if (r == 1)
-				return b == 'R';
-			if (r == 0 || (r < 0 && errno != EINTR && errno != EAGAIN))
-				return 0;
+			r = recv(sock, b, sizeof b, MSG_DONTWAIT);
+			if (r == 1 && b[0] == 'R')
+				return 1;
+			if (r > 0)
+				return -3;
+			if (r == 0 || (errno != EINTR && errno != EAGAIN))
+				return -1;
 		}
 		if (waitpid(cpid, &w, WNOHANG) == cpid) {
 			*cli_rc = WIFEXITED(w) ? WEXITSTATUS(w) : 1;
@@ -943,7 +953,7 @@ static int wait_ready(int sock, pid_t cpid, int *cli_rc, time_t *cli_end, int se
 			return 0;
 		}
 		if (time(NULL) >= end)
-			return 0;
+			return -2;
 	}
 }
 
@@ -972,7 +982,8 @@ static int send_device(int sock, int dev)
 }
 
 /* SIGTERM to process group pgid, then, after its leader (reaped, when it has not been yet: running) exits or STOP_WAIT_S, SIGKILL
- * to whatever of it is left */
+ * to whatever of it is left. A leader reaped already (running 0) leaves the group's pgid unusable by anyone else while any member
+ * lives, so kill(-pgid) still reaches only what was the CLI's (its lklfuse, its sleepers) */
 static void stop_group(pid_t pgid, int running)
 {
 	int st;
@@ -1077,7 +1088,7 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 			close(ch[1]);
 		}
 		fcntl(CHAN_FD, F_SETFD, 0);
-		close(FUSE_FD);	/* only 3 (the disk) and the channel reach the CLI */
+		close(FUSE_FD);	/* fd 4 is lklfuse's, put there by linuxfs-open from the device root sends: nothing of root's may sit on it */
 		close(5);
 		if (become_run_user(fs, name, uid, gid) != 0)
 			_exit(1);
@@ -1094,9 +1105,10 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 		syslog(LOG_NOTICE, "mount_%s: %s: cannot run the CLI", fs, bsd);
 		goto failed;
 	}
-	if (!wait_ready(ch[0], cpid, &cli_rc, &cli_end, wait_s(READY_WAIT_S))) {
+	w = wait_ready(ch[0], cpid, &cli_rc, &cli_end, wait_s(READY_WAIT_S));
+	if (w != 1) {
 		syslog(LOG_NOTICE, "mount_%s: %s: the CLI did not get ready (%s); mount_macfuse is not run", fs, bsd,
-		       cli_rc == -2 ? "timed out" : "it ended first");
+		       w == 0 ? "it ended first" : w == -2 ? "timed out" : w == -3 ? "garbled: more than \"ready\"" : "its channel closed");
 		goto failed;
 	}
 	hpid = fork();
@@ -1120,7 +1132,7 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 		goto failed;
 	}
 	syslog(LOG_NOTICE, "mount_%s: %s on %s: mount_macfuse -o %s (pid %d)", fs, bsd, req->mnt, opts, (int)hpid);
-	devfd = recv_device(cs[1], wait_s(DEVICE_WAIT_S));
+	devfd = recv_device(cs[1], wait_s(DEVICE_WAIT_S), ch[0]);
 	if (devfd < 0 || !send_device(ch[0], devfd)) {
 		if (devfd >= 0)
 			close(devfd);

@@ -100,6 +100,18 @@ out=$(cr device --fuse-chan 6:4 --lock "$D/held.lock" "$e" /bin/echo ran); kill 
 echo "$out" | grep -q '^not ready$' && echo "$out" | grep -q 'unable to exclusively lock' && echo "$out" | grep -q '^exit 1$' && ! echo "$out" | grep -q '^ran'
 ok $? "a lock held elsewhere: no \"R\", the program does not run, exit 1 ($(echo "$out" | tr '\n' ' '))"
 out=$(cr two --fuse-chan 6:4 "$e" /bin/echo ran); echo "$out" | grep -q '^exit 1$' && ! echo "$out" | grep -q '^ran'; ok $? "two descriptors from root: refused, the program does not run ($(echo "$out" | tr '\n' ' '))"
+out=$(cr close --fuse-chan 6:4 "$e" /bin/echo ran); echo "$out" | grep -q 'closed the channel without sending' && echo "$out" | grep -q '^exit 1$' && ! echo "$out" | grep -q '^ran'
+ok $? "root closing the channel without sending: exit 1, cleanly, the program does not run ($(echo "$out" | tr '\n' ' '))"
+s0=$(date +%s); out=$(LINUXFS_OPEN_CHAN_TIMEOUT=2 cr none --fuse-chan 6:4 "$e" /bin/echo ran); t=$(( $(date +%s) - s0 ))
+echo "$out" | grep -q 'no macFUSE device within 2 s' && echo "$out" | grep -q '^exit 1$' && [ $t -lt 5 ]; ok $? "no device at all: exit 1 at the (test-only, non-root) bound, in $t s"
+# spec: tools/open.c fuse_chan -- the lock stays held across the exec on fd 7: lklfuse's own open of /dev/fd/7 shares it, and no
+#       other process can take it while the program runs
+cat > "$D/lockprobe.pl" <<'EOP'
+use Fcntl ':flock';
+open(F, ">>", $ARGV[0]) or die; print((flock(F, LOCK_EX | LOCK_NB) ? "free" : "held") . "\n");
+EOP
+out=$(cr device --fuse-chan 6:4 --lock "$D/kept.lock" "$e" /bin/sh -c 'perl "$1" "$2"; perl "$1" /dev/fd/7' _ "$D/lockprobe.pl" "$D/kept.lock" | tr '\n' ' ')
+[ "$out" = "ready held free exit 0 " ] || [ "$(echo "$out" | sed 's/byte . //')" = "ready held free exit 0 " ]; ok $? "the lock is held while the program runs, and its /dev/fd/7 is the same lock, free to lklfuse ($out)"
 out=$(cr device --fuse-chan 4:4 "$e" /bin/echo ran); echo "$out" | grep -q '^not ready$' && echo "$out" | grep -q '^exit 1$'; ok $? "--fuse-chan CHAN:FD with the same number twice is refused"
 out=$(cr device --fuse-chan 6:3 "$e" /bin/echo ran); echo "$out" | grep -q '^not ready$' && echo "$out" | grep -q '^exit 1$'; ok $? "--fuse-chan with FD 3 (the disk) is refused"
 # spec: tools/helper.c -- the UUID, through the helper (the CLI's linuxfs ignore, when it cannot read the raw node)

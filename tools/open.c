@@ -16,9 +16,15 @@
  * fd 3 already is the device and the helper is never contacted: --probe probes fd 3 (pread from offset 0), and
  * [--ro] DEVICE PROGRAM [ARG...] runs PROGRAM with fd 3 as it is. --also exits 1: the partner cannot be probed there.
  * There also --fuse-chan CHAN:FD [--lock FILE] (before DEVICE): the mount program's channel is open on CHAN. linuxfs-open
- * takes FILE's lock to see it is free (and drops it: lklfuse takes it itself), writes "R" to the channel, waits (30 s at
- * most) for the one descriptor root sends over it, the macFUSE device, puts it on FD and runs PROGRAM. A lock held, or no
- * device, exits 1: root has run no mount_macfuse before "R", so a failure up to there leaves nothing mounted or waiting.
+ * takes FILE's lock (flock, exclusive, without waiting) and KEEPS it: the locked descriptor stays open on fd 7 across the exec,
+ * so lklfuse is run with lock=/dev/fd/7; opening /dev/fd/7 duplicates that descriptor (the same open file description: the
+ * checked behaviour on 10.9), so lklfuse's own flock succeeds at once while every other process stays excluded, from before
+ * "R" until lklfuse ends. It then writes "R" to the channel, waits for the one descriptor root sends over it (the macFUSE
+ * device; CHAN_WAIT_S, longer than root's own waits), puts it on FD and runs PROGRAM. What is guaranteed: nobody else can take
+ * the lock in between, and a lock held elsewhere, no device, or anything but one descriptor exits 1 with nothing run. What is
+ * not: the lock lasts as long as some process holds that open file description (lklfuse, and anything it forks), so a lklfuse
+ * that dies leaves it free at once; and root has run no mount_macfuse before "R", so a failure up to there leaves nothing
+ * mounted or waiting.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -128,7 +134,25 @@ static int open_one(const char *device, int ro)
 	return fd;
 }
 
-#define CHAN_WAIT_S 30
+#define LOCK_FD 7		/* where the held lock stays for lklfuse (cli/linuxfs passes lock=/dev/fd/7) */
+/* waiting for root's device: longer than root's own waits (30 s for the CLI's "ready", 30 s for mount_macfuse's device), so root
+ * gives up first and says why. LINUXFS_OPEN_CHAN_TIMEOUT shortens it, for tests, when not root. */
+#define CHAN_WAIT_S 45
+
+static int chan_wait_s(void)
+{
+	const char *t = getenv("LINUXFS_OPEN_CHAN_TIMEOUT");
+
+	return t && getuid() != 0 && atoi(t) > 0 ? atoi(t) : CHAN_WAIT_S;
+}
+
+/* A descriptor number from s, in 4..255 and not 5 (the password's) or LOCK_FD; -1 otherwise. endp gets the end. */
+static int fdnum(const char *s, char **endp)
+{
+	long v = strtol(s, endp, 10);
+
+	return *endp != s && v >= 4 && v <= 255 && v != 5 && v != LOCK_FD ? (int)v : -1;
+}
 
 /* --fuse-chan CHAN:FD: the lock is free, "R" to root, and the macFUSE device from root onto FD; 0 when all of it went. */
 static int fuse_chan(const char *spec, const char *lock)
@@ -142,9 +166,11 @@ static int fuse_chan(const char *spec, const char *lock)
 	struct cmsghdr *cm;
 	char b, cc[CMSG_SPACE(8 * sizeof(int))];
 
-	chan = (int)strtol(spec, &colon, 10);
-	if (*colon != ':' || chan <= 3 || chan == 5 || (fd = atoi(colon + 1)) <= 3 || fd == 5 || fd == chan) {
-		fprintf(stderr, "linuxfs-open: --fuse-chan wants CHAN:FD, both above 3, not 5, and different\n");
+	char *end;
+
+	chan = fdnum(spec, &colon);
+	if (chan < 0 || *colon != ':' || (fd = fdnum(colon + 1, &end)) < 0 || *end || fd == chan) {
+		fprintf(stderr, "linuxfs-open: --fuse-chan wants CHAN:FD, both 4 to 255, not 5 or %d, and different\n", LOCK_FD);
 		return -1;
 	}
 	if (fcntl(chan, F_GETFD) < 0) {
@@ -160,7 +186,14 @@ static int fuse_chan(const char *spec, const char *lock)
 				close(lf);
 			return -1;
 		}
-		close(lf);
+		if (lf != LOCK_FD) {
+			if (dup2(lf, LOCK_FD) < 0) {
+				close(lf);
+				return -1;
+			}
+			close(lf);
+		}
+		fcntl(LOCK_FD, F_SETFD, 0);	/* kept across the exec: the lock is held until lklfuse ends */
 	}
 	if (write(chan, "R", 1) != 1) {
 		fprintf(stderr, "linuxfs-open: cannot tell the mount program it is ready\n");
@@ -168,13 +201,13 @@ static int fuse_chan(const char *spec, const char *lock)
 	}
 	p.fd = chan;
 	p.events = POLLIN;
-	for (i = 0; i < CHAN_WAIT_S * 10; i++) {
+	for (i = 0; i < chan_wait_s() * 10; i++) {
 		p.revents = 0;
 		if (poll(&p, 1, 100) > 0 && p.revents)
 			break;
 	}
 	if (!p.revents) {
-		fprintf(stderr, "linuxfs-open: no macFUSE device within %d s\n", CHAN_WAIT_S);
+		fprintf(stderr, "linuxfs-open: no macFUSE device within %d s\n", chan_wait_s());
 		return -1;
 	}
 	memset(&mh, 0, sizeof mh);
@@ -185,6 +218,10 @@ static int fuse_chan(const char *spec, const char *lock)
 	mh.msg_control = cc;
 	mh.msg_controllen = sizeof cc;
 	r = recvmsg(chan, &mh, MSG_DONTWAIT);
+	if (r == 0) {
+		fprintf(stderr, "linuxfs-open: root closed the channel without sending the device\n");
+		return -1;
+	}
 	i = r == 1 && !(mh.msg_flags & MSG_CTRUNC) ? 0 : -1;
 	for (cm = r >= 0 ? CMSG_FIRSTHDR(&mh) : NULL; cm; cm = CMSG_NXTHDR(&mh, cm)) {
 		if (cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS || cm->cmsg_len < CMSG_LEN(0)) {
@@ -269,7 +306,7 @@ static int inherited(int argc, char **argv)
 			else
 				break;
 		}
-		if (argc - i < 2)
+		if (argc - i < 2 || (lock && !chan))
 			return usage();
 		if (chan && fuse_chan(chan, lock) != 0)
 			return 1;

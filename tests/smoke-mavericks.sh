@@ -522,6 +522,8 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
         check "before login: the mount at $mp is root's (no 'mounted by')" mounted_by_root "$mp"
         check "before login: the lklfuse serving it runs as _linuxfs, on a /dev/fd/N mountpoint" lklfuse_fd_runs
         check "before login: no lklfuse runs as root" no_root_lklfuse
+        # spec: tools/open.c fuse_chan -- the opener holds the lock from before "ready" on fd 7, which lklfuse's lock= names
+        check "before login: lklfuse's lock is the descriptor the opener holds (lock=/dev/fd/7)" sh -c 'ps -axww -o command= | grep "lklfuse.*lock=/dev/fd/7" | grep -qv grep'
         check "before login: the user can write and read the volume over ssh" rw_works "$mp"
         # spec: macfuse DETAILS.md "A mount made for you" -- a daemon that dies leaves the mount with nobody serving it: macFUSE
         #       answers it with an error (ENXIO, the dead file system) instead of a hang, and its owner still unmounts it
@@ -535,7 +537,8 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
             check "before login: what the user wrote reads back" rw_reads "$mp"
             # spec: tools/fs.c mount_by_root -- the CLI failing before lklfuse answers INIT (its lock held, so lklfuse exits at
             #       once): the mount fails, nothing is left mounted, and no root mount_macfuse survives (macFUSE's, if one does)
-            lk=$(lklfuse_fd | tr ',' '\n' | sed -n 's/^lock=//p' | head -n 1)
+            # spec: tools/open.c fuse_chan -- (lklfuse's own command line names /dev/fd/7, the lock the opener holds; the file is the only one in _linuxfs's lock directory)
+            lk=$(sudo -n sh -c 'ls "$1"/*.lock 2> /dev/null | head -n 1' _ /private/var/db/linuxfs/Library/Caches/dev.mavergreen.linuxfs/locks)
             if [ -n "$lk" ] && login_unmount "$mp"; then
               sudo -n -u _linuxfs /usr/bin/python -c 'import fcntl, sys, time
 f = open(sys.argv[1], "a"); fcntl.flock(f, fcntl.LOCK_EX); sys.stdout.write("held\n"); sys.stdout.flush(); time.sleep(300)' "$lk" > "$W/lockhold.out" 2>&1 &

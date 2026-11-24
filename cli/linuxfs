@@ -47,6 +47,7 @@ die() { echo "linuxfs: $*" >&2; exit 1; }
 usage() { sed -n 's/^#   usage: /usage: /p; s/^#          linuxfs /       linuxfs /p' "$0" >&2; exit 2; }
 tab=$(printf '\t')
 fusefd=   # set only by da-mount, from LINUXFS_FUSE_FD
+chanused=   # root's channel went to a lklfuse (the device with it): a failure of that one is final
 fusechan=   # set only by da-mount, from LINUXFS_FUSE_CHAN: root's channel, the descriptor the macFUSE device comes on
 lockfile=   # the lock lklfuse takes, set by cmd_mount
 
@@ -146,13 +147,19 @@ run_lklfuse() { # SOURCE MOUNTPOINT OPTIONS [OPENER-DEVICE [SECOND-OPENER-DEVICE
   if [ -n "${4:-}" ]; then
     rof=; case ,$3, in *,ro,*) rof=--ro ;; esac
     # with root's channel: linuxfs-open checks the lock, says "ready", and takes the macFUSE device root sends, onto $fusefd
+    # (the lock stays held by the opener, on fd 7, from before "ready": lklfuse's lock= is that descriptor, never a path another
+    # mount could take in between)
     chan=; [ -z "$fusechan" ] || chan="--fuse-chan $fusechan:$fusefd --lock $lockfile"
+    [ -z "$fusechan" ] || set -- "$1" "$2" "$(printf '%s\n' "$3" | sed "s|lock=[^,]*|lock=/dev/fd/7|")" "$4" "${5:-}"
     if [ -n "${5:-}" ]; then launch "$OPENER" $chan $rof "$4" --also "$5" "$LKLFUSE" -f -o "$3" /dev/fd/3 "$lkm"
     else launch "$OPENER" $chan $rof "$4" "$LKLFUSE" -f -o "$3" /dev/fd/3 "$lkm"
     fi
   else
     launch "$LKLFUSE" -f -o "$3" "$1" "$lkm"
   fi
+  # the channel is the opener's now, and so is root's one device: this shell and its other children hold neither, and no second try
+  # can have a device (a retry would find fd 4 shut)
+  if [ -n "$fusechan" ]; then eval "exec $fusechan<&-"; chanused=1; fusechan=; fi
   i=0
   while ! is_mounted "$2"; do
     if ! kill -0 "$pid" 2>/dev/null; then wait "$pid"; return $?; fi
@@ -324,11 +331,18 @@ cmd_mount() {
   [ -z "$apfs_rw" ] || opts="$opts,opts=readwrite"
   [ -z "$tier2opt" ] || opts="$opts,$tier2opt"
   [ -z "$extra" ] || opts="$opts,$extra"
+  [ -z "$fusechan" ] || [ -n "$open_dev" ] || die "LINUXFS_FUSE_CHAN needs the opener (the device inherited): root's device cannot reach lklfuse otherwise"
   mkdir -p "$STATE" "$LOGS" "$LOCKS" && chmod 700 "$LOCKS"
   log=$LOGS/$(basename "$src").log
   mode=rw; [ -z "$ro" ] || mode=ro
   tries=0
   while ! run_lklfuse "$src" "$mnt" "$opts" "$open_dev" "$also"; do
+    if [ -n "$chanused" ]; then   # root's device was in the lklfuse that failed: nothing to retry with
+      [ -z "$made" ] || rmdir "$mnt" 2>/dev/null
+      cat "$log" >&2
+      grep -q 'unable to exclusively lock\|failed to open .*linuxfs-.*\.lock' "$log" && die "$target is already mounted by linuxfs"
+      die "cannot mount $target"
+    fi
     if [ "$type" = ntfs3 ] && [ -z "$ro" ] && grep -q 'volume is dirty' "$log"; then
       echo "linuxfs: $target is a dirty NTFS volume (Windows hibernated or was not shut down); mounting it read-only" >&2
       ro=1 mode=ro opts="$opts,ro"; continue

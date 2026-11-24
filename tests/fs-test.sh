@@ -485,7 +485,7 @@ hs() { # HELPER-MODE CLI-MODE [WAIT]: root's mount with both stand-ins; status i
     ${HS_WRAP:-} "$DM" "/dev/$E" "$V/NAME" 7</dev/null > "$M/plan" 2>&1; rc=$?; }
 gone() { [ -z "$1" ] || ! ps -p "$1" > /dev/null; }
 hs "" ok; t0=$rc
-[ $t0 = 0 ] && grep -q '^status 0$' "$D/drop/mhelper.log" && grep -q '^cli-rc 0' "$M/plan"; ok $? "root: the helper's device reaches the CLI, the CLI answers INIT, status 0: exit 0 (rc $t0)"
+[ $t0 = 0 ] && grep -q '^status 0$' "$D/drop/mhelper.log" && grep -q '^cli-rc 0' "$M/plan"; ok $? "root: the helper's device reaches the CLI, the CLI answers INIT, status 0: exit 0 (rc $t0: $(tail -n 4 "$M/plan" | tr '\n' ';'))"
 fdl=$(sed -n 's/^fds: //p' "$M/fdcli.log" | sed 's/ *255//')
 [ "$fdl" = "3 6:sock" ]; ok $? "the CLI holds the disk on 3 and its channel on 6, nothing else ('$fdl')"
 grep -q '^device on 4$' "$M/fdcli.log"; ok $? "the device reaches the CLI over the channel, as fd 4"
@@ -505,6 +505,17 @@ s0=$(date +%s); hs "" "exit 3"; t=$(( $(date +%s) - s0 ))
 s0=$(date +%s); hs "" noready 2; t=$(( $(date +%s) - s0 ))
 cp1=$(sed -n 's/^pid //p' "$M/fdcli.log")
 [ $rc = 1 ] && [ ! -e "$D/drop/mhelper.log" ] && [ $t -lt 8 ] && gone "$cp1"; ok $? "a CLI that is never ready: root gives up in $t s, runs no mount_macfuse, the CLI is stopped (rc $rc)"
+# spec: tools/fs.c wait_ready -- "ready" is exactly one byte, R: another byte, or R with more, is a CLI gone wrong, and the mount
+#       fails at once with no mount_macfuse run (the log says garbled, not timed out)
+for g in garble rr; do
+  s0=$(date +%s); hs "" $g 20; t=$(( $(date +%s) - s0 ))
+  [ $rc = 1 ] && [ ! -e "$D/drop/mhelper.log" ] && [ $t -lt 8 ]; ok $? "a CLI that sends '$g' instead of \"ready\": no mount_macfuse, root exits 1 in $t s, not at the 20 s bound (rc $rc)"
+done
+# spec: tools/fs.c recv_device -- root also watches the CLI's channel: a CLI that dies after "ready" has mount_macfuse stopped at
+#       once, not after the wait for a device (nofd: the helper never sends one; the bound here is 20 s)
+s0=$(date +%s); hs nofd "diesAfterR 3" 20; t=$(( $(date +%s) - s0 ))
+hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
+[ $rc = 3 ] && [ $t -lt 10 ] && gone "$hp"; ok $? "a CLI that dies right after \"ready\": root stops mount_macfuse and exits 3 in $t s, not at the bound (rc $rc)"
 s0=$(date +%s); hs nofd ok 2; t=$(( $(date +%s) - s0 ))
 hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
 [ $rc = 1 ] && [ $t -lt 8 ] && gone "$hp"; ok $? "a helper that sends no device: exit 1 after the bounded wait ($t s), the helper is killed (rc $rc)"

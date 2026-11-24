@@ -7,6 +7,9 @@
  *   exit N        exit N at once, before "R": a CLI whose preflight failed
  *   noready       neither "R" nor an exit: sleep 30 s
  *   linger        as ok, then leave a sleeper running (logs "lingerer PID") and exit 0
+ *   garble        "X" instead of "R", then sleep 30 s
+ *   rr            "RR" and trailing bytes in one write, then sleep 30 s: more than "ready"
+ *   diesAfterR N  "R", then exit N at once, without waiting for the device
  *   afterready N  "R", take the device, and exit N without answering INIT (lklfuse died at startup)
  *   (otherwise)   "R", take the device, answer INIT, print "answered INIT", exit 0
  */
@@ -67,8 +70,19 @@ int main(int argc, char **argv)
 			usleep(100000);
 		return 1;
 	}
+	if (strcmp(mode, "garble") == 0 || strcmp(mode, "rr") == 0) {
+		const char *g = mode[0] == 'g' ? "X" : "RR\ntrailing";
+
+		if (write(6, g, strlen(g)) < 0)
+			return 2;
+		for (i = 0; i < 300; i++)
+			usleep(100000);
+		return 1;
+	}
 	if (write(6, "R", 1) != 1)
 		return 2;
+	if (strncmp(mode, "diesAfterR", 10) == 0)
+		return atoi(mode + 10);
 	p.fd = 6;
 	p.events = POLLIN;
 	if (poll(&p, 1, 10000) != 1)

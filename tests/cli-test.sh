@@ -538,6 +538,7 @@ done
  DA /dev/disk3s1 "$T/dam" 4</dev/null 6</dev/null > "$T/out" 2>&1); rc=$?
 grep -q "^open --fuse-chan 6:4 --lock $T/locks/linuxfs-rdisk3s1.lock /dev/rdisk3s1 $T/bin/lklfuse .* /dev/fd/3 /dev/fd/4\$" "$T/calls"
 ok $? "with LINUXFS_FUSE_CHAN=6 the opener gets --fuse-chan 6:4 and the lock file, and lklfuse still serves /dev/fd/4 (got $rc: $(grep '^open ' "$T/calls" | tail -n 1))"
+grep -q "^open --fuse-chan .*lock=/dev/fd/7[, ]" "$T/calls"; ok $? "and lklfuse's lock= is /dev/fd/7, the lock the opener holds"
 sh "$L" unmount "$T/dam" > /dev/null 2>&1
 (LINUXFS_OPEN_INHERITED=1 LINUXFS_FUSE_CHAN=6; export LINUXFS_OPEN_INHERITED LINUXFS_FUSE_CHAN; : > "$T/calls"; DA /dev/disk3s1 "$T/dam" 6</dev/null > "$T/out" 2>&1); rc=$?
 [ $rc -eq 2 ] && ! grep -q lklfuse "$T/calls"; ok $? "LINUXFS_FUSE_CHAN without LINUXFS_FUSE_FD is refused, exit 2 (got $rc)"

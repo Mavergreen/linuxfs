@@ -1,7 +1,8 @@
 /* platform: macOS-only -- a stand-in for the mount program's side of the CLI's channel, for helper-test.sh
  *   usage: chan-root MODE PROGRAM [ARG...]
  * Runs PROGRAM with a socket on fd 6 (its end of the channel) and, as root does, waits up to 5 s for "R" from it, then
- * (MODE device) sends one descriptor, the write end of a pipe, (two) two descriptors, or (none) nothing; then waits up to
+ * (MODE device) sends one descriptor, the write end of a pipe, (two) two descriptors, (none) nothing, or (close) closes
+ * its end of the channel without sending; then waits up to
  * 5 s for PROGRAM and for a byte on the pipe. Prints: "ready" or "not ready", "byte B" when one came through the pipe,
  * and "exit N". */
 #include <poll.h>
@@ -69,6 +70,8 @@ int main(int argc, char **argv)
 			send_fds(sv[0], &pp[1], 1);
 		else if (strcmp(argv[1], "two") == 0)
 			send_fds(sv[0], two, 2);
+		else if (strcmp(argv[1], "close") == 0)
+			close(sv[0]);
 	} else {
 		printf("not ready\n");
 	}
