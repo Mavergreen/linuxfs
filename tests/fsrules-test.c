@@ -98,7 +98,6 @@ int main(void)
 	{
 		char *a[] = { "-o", "nodev", "-o", "noowners", "-o", "nosuid", "/dev/disk2", "/Volumes/X" };
 		is(parse(&m, 8, a), 0, "repeated -o and DEV MNT parse");
-		is(m.asked, 0, "owners not asked");
 		is(m.ro, 0, "not read-only");
 		iss(m.dev, "/dev/disk2", "dev");
 		iss(m.mnt, "/Volumes/X", "mnt");
@@ -106,28 +105,27 @@ int main(void)
 	{
 		char *a[] = { "-o", "nodev", "-o", "owners", "/dev/disk2", "/Volumes/X" };
 		is(parse(&m, 6, a), 0, "owners parses");
-		is(m.asked, 1, "owners asks for ownership");
+		is(m.ro, 0, "and is ignored: 10.9 passes noowners, asked for or not, so there is nothing to ask");
 	}
 	{
 		char *a[] = { "-o", "rdonly,nodev", "/dev/disk2", "/Volumes/X" };
 		is(parse(&m, 4, a), 0, "a comma list parses");
 		is(m.ro, 1, "rdonly is read-only");
-		is(m.asked, 0, "and not owners");
 	}
 	{
 		char *a[] = { "-o", "nodev,ro,owners", "/dev/disk2", "/Volumes/X" };
 		is(parse(&m, 4, a), 0, "ro,owners in one list parses");
-		is(m.ro == 1 && m.asked == 1, 1, "both are seen");
+		is(m.ro, 1, "ro is seen beside it");
 	}
 	{
 		char *a[] = { "-o", "noowners,nordonly", "/dev/disk2", "/Volumes/X" };
 		is(parse(&m, 4, a), 0, "no-prefixed options parse");
-		is(m.asked == 0 && m.ro == 0, 1, "no-prefixed options are not owners or ro");
+		is(m.ro, 0, "no-prefixed options are not ro");
 	}
 	{
 		char *a[] = { "-oowners,rdonly", "/dev/disk2", "/Volumes/X" };
 		is(parse(&m, 3, a), 0, "the attached form -oowners,rdonly parses");
-		is(m.asked == 1 && m.ro == 1, 1, "and is read");
+		is(m.ro, 1, "and is read");
 		iss(m.mnt, "/Volumes/X", "with MNT after it");
 	}
 	{

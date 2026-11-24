@@ -116,9 +116,7 @@ static void options(const char *list, struct mountreq *m)
 	while (*list) {
 		size_t n = strcspn(list, ",");
 
-		if (n == 6 && strncmp(list, "owners", 6) == 0)
-			m->asked = 1;
-		else if ((n == 6 && strncmp(list, "rdonly", 6) == 0) || (n == 2 && strncmp(list, "ro", 2) == 0))
+		if ((n == 6 && strncmp(list, "rdonly", 6) == 0) || (n == 2 && strncmp(list, "ro", 2) == 0))
 			m->ro = 1;
 		list += n;
 		if (*list == ',')
@@ -130,7 +128,7 @@ int fsrules_parse_mount(int argc, char **argv, struct mountreq *m)
 {
 	int i = 0, pos = 0;
 
-	m->asked = m->ro = 0;
+	m->ro = 0;
 	m->dev = m->mnt = NULL;
 	for (; i < argc; i++) {
 		if (strcmp(argv[i], "-o") == 0) {

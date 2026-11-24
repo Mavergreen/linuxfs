@@ -45,9 +45,9 @@ enum fsaccess { FSA_RW, FSA_RO, FSA_REFUSE };
 enum fsaccess fsrules_access(const char *probed_type, unsigned flags, int ro, int before_login, const struct fsprefs *p,
 			     const char **why);
 
-struct mountreq { int asked, ro; const char *dev, *mnt; };
+struct mountreq { int ro; const char *dev, *mnt; };
 
-/* mount_linuxfs_<fs>'s arguments: [-o a,b]... (or -oa,b) DEV MNT. `owners` sets asked, `rdonly` or `ro` sets ro.
+/* mount_linuxfs_<fs>'s arguments: [-o a,b]... (or -oa,b) DEV MNT. `rdonly` or `ro` sets ro; every other option is ignored (10.9 passes noowners, whether the mount was asked for or automatic).
  * 0, or -1 on misuse. */
 int fsrules_parse_mount(int argc, char **argv, struct mountreq *m);
 

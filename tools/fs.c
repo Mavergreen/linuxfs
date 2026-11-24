@@ -14,12 +14,11 @@
  *                                                  until it is ready (nothing left that can fail before lklfuse starts), then runs
  *                                                  mount_macfuse itself (allow_other) and hands the device it sends to the CLI over
  *                                                  a channel (LINUXFS_FUSE_CHAN=6; fd 4 for lklfuse: LINUXFS_FUSE_FD=4), until
- *                                                  mount_macfuse reports the mount; with an older macFUSE,
- *                                                  hands MNT to _linuxfs and runs that da-mount, which mounts by itself; both with
- *                                                  LINUXFS_OPEN_INHERITED=1
+ *                                                  mount_macfuse reports the mount, all through paths that are root's alone
+ *                                                  (path_trusted); with an older macFUSE, refuses ("too old to mount before login")
  *
  * -DLINUXFS_FS_TEST_DROP (tests only, never in the shipped binary) takes the root path as whatever user runs it, up to the
- * drop: the privileged calls (fchown, initgroups, setgid, setuid) are replaced by printing the plan; the macFUSE manifest, the
+ * drop: the privileged calls (initgroups, setgid, setuid) are replaced by printing the plan; the macFUSE manifest, the
  * mount helper, the CLI and the waits are the test's (LINUXFS_FS_TEST_*).
  */
 #include <CoreFoundation/CoreFoundation.h>
@@ -592,8 +591,6 @@ static int run_cli(const char *cli, const struct mountreq *req, const char *pw, 
 
 	argv[n++] = (char *)cli;
 	argv[n++] = "da-mount";
-	if (req->asked)
-		argv[n++] = "--asked";
 	if (req->ro)
 		argv[n++] = "--ro";
 	if (pw)
@@ -612,9 +609,12 @@ static int run_cli(const char *cli, const struct mountreq *req, const char *pw, 
 #define RUN_USER "_linuxfs"
 #define MOUNT_MACFUSE "/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse"
 #define MACFUSE_MANIFEST "/usr/local/mavergreen/macfuse/mavergreen.plist"
+#define LIBFUSE "/usr/local/lib/libfuse3.4.dylib"	/* lklfuse, as _linuxfs, loads this */
 /* The first Mavergreen macFUSE release that ships the fd-mountpoint patch (its libfuse 3 serves a /dev/fd/N mountpoint
- * another process mounted: macfuse's DETAILS.md, "A mount made for you"). build/package.sh's MACFUSE_MIN is later (5.5.0-mavericks.4, where lklfuse also ends on
- * SIGTERM, enforced only at install time: a macFUSE replaced later by .2 or .3 passes this gate); .2 and .3 serve it fine and only stop slowly, so the gate stays here. Dev builds
+ * another process mounted: macfuse's DETAILS.md, "A mount made for you"): the gate for mounting before login at all. build/package.sh's
+ * MACFUSE_MIN is later (5.5.0-mavericks.4), enforced only at install time: .4 is the combination tested here, and it carries the
+ * single-threaded-loop fix. lklfuse's ending on SIGTERM on 10.9 was LKL's setjmp saving the signal mask (patches/0011), not
+ * macFUSE's; .2 and .3 with that patch are untested, so a macFUSE replaced later by one of them passes this gate. Dev builds
  * labelled 5.5.0-mavericks.2 that predate the patch exist: on those the gate passes, lklfuse cannot serve /dev/fd/N, and
  * root's mount fails, bounded, after STATUS_WAIT_S. */
 #define MACFUSE_FD_MOUNTPOINT_SINCE "5.5.0-mavericks.2"
@@ -656,6 +656,10 @@ static const char *mount_helper(void) { const char *v = getenv("LINUXFS_FS_TEST_
 static int wait_s(int s) { const char *v = getenv("LINUXFS_FS_TEST_WAIT"); return v && atoi(v) > 0 ? atoi(v) : s; }
 /* LINUXFS_FS_TEST_NOKILL: SIGKILL becomes a no-op, for a stand-in that outlives it as a process in an uninterruptible wait would */
 static int kill_sig(void) { return getenv("LINUXFS_FS_TEST_NOKILL") ? 0 : SIGKILL; }
+/* path_trusted checks nothing at or above this directory: the tests' files are under the user's home, not under root's */
+static const char *trust_root(void) { const char *v = getenv("LINUXFS_FS_TEST_TRUST_ROOT"); return v && *v ? v : NULL; }
+/* lklfuse's libfuse is checked in a test build only when the test names one */
+static const char *libfuse_path(void) { const char *v = getenv("LINUXFS_FS_TEST_LIBFUSE"); return v && *v ? v : NULL; }
 #else
 #define ROOT_ONLY_UID 0
 static const char *volumes_dir(void) { return "/Volumes"; }
@@ -664,7 +668,46 @@ static const char *macfuse_manifest(void) { return MACFUSE_MANIFEST; }
 static const char *mount_helper(void) { return MOUNT_MACFUSE; }
 static int wait_s(int s) { return s; }
 static int kill_sig(void) { return SIGKILL; }
+static const char *trust_root(void) { return NULL; }
+static const char *libfuse_path(void) { return LIBFUSE; }
 #endif
+
+/* Whether a file or directory is root's and writable by root alone (a group counts only when it is gid 0: /usr/local is root:wheel 0775) */
+static int root_only(const struct stat *st)
+{
+	return st->st_uid == ROOT_ONLY_UID && !(st->st_mode & S_IWOTH) && (!(st->st_mode & S_IWGRP) || st->st_gid == 0);
+}
+
+/* Whether root may trust the file at path: it is resolved (realpath) into out, which is what must then be opened or run, and
+ * the resolved file is a regular file, and it and every directory above it are root's and not writable by anyone else. Whoever
+ * could write any of them could swap in their own. 0 when trusted; -1 when something on the way is writable by a user;
+ * -2 when it is missing or not a regular file. */
+static int path_trusted(const char *path, char *out, size_t outlen)
+{
+	char real[PATH_MAX], trust[PATH_MAX], prefix[PATH_MAX];
+	const char *tr = trust_root();
+	struct stat st;
+	size_t i, skip = 0;
+
+	if (!realpath(path, real) || lstat(real, &st) != 0 || !S_ISREG(st.st_mode))
+		return -2;
+	if (!root_only(&st) || strlen(real) >= outlen)
+		return -1;
+	if (tr && !(realpath(tr, trust) && (skip = strlen(trust)) > 0))
+		return -1;
+	if (!skip && (lstat("/", &st) != 0 || !root_only(&st)))
+		return -1;
+	for (i = 1; real[i]; i++) {
+		if (real[i] != '/' || i <= skip)
+			continue;
+		memcpy(prefix, real, i);
+		prefix[i] = '\0';
+		if (lstat(prefix, &st) != 0 || !S_ISDIR(st.st_mode) || !root_only(&st))
+			return -1;
+	}
+	memcpy(out, real, strlen(real) + 1);
+	return 0;
+}
 
 /* MNT is exactly <volumes>/<name>: one component, not . or .. */
 static int valid_mnt_path(const char *mnt)
@@ -711,17 +754,25 @@ static int macfuse_version(const char *s, unsigned v[4])
 	return *s ? -1 : 0;
 }
 
-/* Whether the installed macFUSE's libfuse serves a /dev/fd/N mountpoint: its manifest (root's alone) names a version at or
- * past MACFUSE_FD_MOUNTPOINT_SINCE. Logged either way. Only the file is checked (root's, not a symlink, writable by root
- * alone), not its parent directories: whoever could swap it there could only choose between the two mount paths, each
- * safe (root never runs lklfuse on either), and could at worst make root's mount fail, bounded. */
+/* Whether the installed macFUSE's libfuse serves a /dev/fd/N mountpoint: its manifest names a version at or past
+ * MACFUSE_FD_MOUNTPOINT_SINCE. Logged either way. 1 when it does, 0 when it does not or the manifest is missing or unreadable
+ * (not root's, a symlink, writable by anyone else), -1 when a directory above the manifest is writable by a user (path_trusted):
+ * that tree is where mount_macfuse is run from, so the same trust rule applies. */
 static int macfuse_serves_fd(const char *fs)
 {
-	CFDictionaryRef d = plist_load_owned(macfuse_manifest(), ROOT_ONLY_UID);
-	CFTypeRef v = d ? CFDictionaryGetValue(d, CFSTR("version")) : NULL;
-	char ver[64] = "";
+	char resolved[PATH_MAX], ver[64] = "";
+	CFDictionaryRef d = NULL;
+	CFTypeRef v;
 	unsigned have[4], need[4];
-	int i, ok = 0;
+	int i, ok = 0, t = path_trusted(macfuse_manifest(), resolved, sizeof resolved);
+
+	if (t == -1) {
+		syslog(LOG_NOTICE, "mount_%s: macFUSE's manifest is in a path writable by a user", fs);
+		return -1;
+	}
+	if (t == 0)
+		d = plist_load_owned(macfuse_manifest(), ROOT_ONLY_UID);
+	v = d ? CFDictionaryGetValue(d, CFSTR("version")) : NULL;
 
 	if (v && CFGetTypeID(v) == CFStringGetTypeID() && CFStringGetCString(v, ver, sizeof ver, kCFStringEncodingUTF8) &&
 	    macfuse_version(ver, have) == 0 && macfuse_version(MACFUSE_FD_MOUNTPOINT_SINCE, need) == 0) {
@@ -737,7 +788,7 @@ static int macfuse_serves_fd(const char *fs)
 	if (ok)
 		syslog(LOG_NOTICE, "mount_%s: macFUSE %s serves /dev/fd/N: root mounts, _linuxfs serves", fs, ver);
 	else
-		syslog(LOG_NOTICE, "mount_%s: macFUSE %s is before %s, which serves /dev/fd/N: _linuxfs mounts", fs,
+		syslog(LOG_NOTICE, "mount_%s: macFUSE %s is before %s, which serves /dev/fd/N: too old to mount before login", fs,
 		       ver[0] ? ver : "(no readable version)", MACFUSE_FD_MOUNTPOINT_SINCE);
 	return ok;
 }
@@ -1019,7 +1070,7 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 			 gid_t gid, char **args)
 {
 	static const char *const vars[] = { ROOT_CLI_ENV, "LINUXFS_FUSE_FD=" STR(FUSE_FD), "LINUXFS_FUSE_CHAN=" STR(CHAN_FD), NULL };
-	char opts[400], vol[256], commenv[32], hout_buf[4096];
+	char opts[400], vol[256], commenv[32], hout_buf[4096], rhelper[PATH_MAX];
 	char daemon_env[] = "_FUSE_DAEMON_PATH=" PRIV_DIR "/lklfuse";
 	char *hargv[5], *henv[5];
 	const char *helper = mount_helper();
@@ -1074,6 +1125,26 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 		return 0;
 	}
 #endif
+	/* What root runs and what lklfuse loads: resolved, and every part of each path root's alone (path_trusted). The resolved
+	 * helper path is what runs, so a swap after this check has nothing to land on. */
+	for (fd = 0; fd < 2; fd++) {
+		const char *what = fd ? libfuse_path() : helper;
+		char resolved[PATH_MAX];
+		int t = what ? path_trusted(what, resolved, sizeof resolved) : 0;
+
+		if (t != 0) {
+			close(cs[0]);
+			close(cs[1]);
+			close(hout[0]);
+			close(hout[1]);
+			close(ch[0]);
+			close(ch[1]);
+			return refuse(fs, t == -1 ? "macFUSE's install path is writable by a user" : "a macFUSE file is missing or not a regular file");
+		}
+		if (!fd)
+			snprintf(rhelper, sizeof rhelper, "%s", resolved);
+	}
+	hargv[0] = rhelper;
 	/* The CLI first, with its end of a channel on CHAN_FD: it does everything it can know before the mount (the lock, the
 	 * probe, the access rule, the Fusion and ignore checks), says "ready", and waits for the device. A CLI that exits or
 	 * fails before that never has a mount_macfuse run for it: nothing is left in mount(2) waiting for lklfuse's INIT. */
@@ -1124,7 +1195,7 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 			if (fd != cs[0])
 				close(fd);
 		fcntl(cs[0], F_SETFD, 0);
-		execve(hargv[0], hargv, henv);
+		execve(rhelper, hargv, henv);
 		_exit(127);
 	}
 	close(cs[0]);
@@ -1267,13 +1338,12 @@ failed:
  * or with root's mount's outcome. Test builds print the plan and return 0 instead of the privileged calls. */
 static int mount_as_root(const char *fs, const struct mountreq *req)
 {
-	static const char *const vars[] = { ROOT_CLI_ENV, NULL };
 	struct passwd *pw;
 	struct stat st;
 	char node[64], devarg[64], name[64];
 	char *args[8];
 	const char *bsd;
-	int fd, mfd, n = 0, ro_fallback = 0, ro, rc, by_root;
+	int fd, mfd, n = 0, ro_fallback = 0, ro, by_root;
 	uid_t uid;
 	gid_t gid;
 
@@ -1368,44 +1438,28 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 		return refuse(fs, "the mount point is not owned by root");
 	}
 	by_root = macfuse_serves_fd(fs);
+	if (by_root < 0) {
+		close(mfd);
+		return refuse(fs, "macFUSE's install path is writable by a user");
+	}
+	if (!by_root) {
+		close(mfd);
+		return refuse(fs, "macFUSE is too old to mount before login; update macFUSE");
+	}
 #ifdef LINUXFS_FS_TEST_DROP
 	printf("user %s\nuid %d\ngid %d\nfd3 %s %s\nmnt %s\n", name, (int)uid, (int)gid, node, ro_fallback ? "ro" : "rw", req->mnt);
-#else
-	/* only the owner changes: DiskArbitration's mode for the directory stays as it made it; root's own mount keeps it root's */
-	if (!by_root && fchown(mfd, uid, gid) != 0) {
-		close(mfd);
-		return refuse(fs, "cannot hand the mount point to _linuxfs");
-	}
 #endif
 	close(mfd);
 
 	args[n++] = PRIV_DIR "/linuxfs";
 	args[n++] = "da-mount";
-	if (req->asked)
-		args[n++] = "--asked";
 	if (ro)
 		args[n++] = "--ro";
 	args[n++] = devarg;
 	args[n++] = (char *)req->mnt;
 	args[n] = NULL;
 
-	if (by_root)
-		return mount_by_root(fs, req, bsd, ro, name, uid, gid, args);
-#ifdef LINUXFS_FS_TEST_DROP
-	print_cli_plan(vars, args);
-	/* a stand-in for the bundled CLI, to see what run_capture hands it and what comes back */
-	if (!getenv("LINUXFS_FS_TEST_ROOT_CLI"))
-		return 0;
-	args[0] = getenv("LINUXFS_FS_TEST_ROOT_CLI");
-#endif
-	if (become_run_user(fs, name, uid, gid) != 0)
-		return 1;
-#ifndef LINUXFS_FS_TEST_DROP
-	syslog(LOG_NOTICE, "mount_%s: %s on %s as %s%s", fs, bsd, req->mnt, RUN_USER, ro_fallback ? " (read-only device)" : "");
-#endif
-	/* Only fd 3 (the device) reaches the CLI. */
-	rc = root_cli(req, args, vars, 3, name);
-	return rc < 0 ? 1 : rc;
+	return mount_by_root(fs, req, bsd, ro, name, uid, gid, args);
 }
 
 /* What DiskArbitration passed: the arguments after the program name, joined by spaces and cut at 200 bytes. They hold the device,
@@ -1447,7 +1501,7 @@ static int mount_role(const char *fs, int argc, char **argv)
 		syslog(LOG_NOTICE, "mount_%s: bad arguments", fs);
 		return 1;
 	}
-	syslog(LOG_NOTICE, "mount_%s: parsed asked=%d ro=%d", fs, req.asked, req.ro);
+	syslog(LOG_NOTICE, "mount_%s: parsed ro=%d", fs, req.ro);
 #ifdef LINUXFS_FS_TEST_DROP
 	if (1)
 #else
@@ -1473,7 +1527,7 @@ static int mount_role(const char *fs, int argc, char **argv)
 	out = malloc(CAPTURE_MAX);
 	if (!out)
 		return 1;
-	syslog(LOG_NOTICE, "mount_%s: %s on %s%s%s", fs, req.dev, req.mnt, req.asked ? " (asked)" : "", req.ro ? " (read-only)" : "");
+	syslog(LOG_NOTICE, "mount_%s: %s on %s%s", fs, req.dev, req.mnt, req.ro ? " (read-only)" : "");
 
 	rc = run_cli(cli, &req, NULL, out, CAPTURE_MAX);
 	if (rc != 4)
