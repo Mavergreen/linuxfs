@@ -1,14 +1,13 @@
 #!/bin/sh
 # platform: macOS-only -- packages the 10.9 build for a 10.9 guest with Mavergreen macFUSE (Linux, via Docker, makes the images)
 #   usage: p3-bundle.sh BUILT DEST
-#          Makes DEST, a self-contained P3 run of linuxfs (CLI, root helper, automount agent):
-#          - bin/{lklfuse,linuxfs-probe,linuxfs-open,linuxfs-helper,linuxfs-agent} from BUILT
+#          Makes DEST, a self-contained P3 run of linuxfs (CLI, root helper):
+#          - bin/{lklfuse,linuxfs-probe,linuxfs-open,linuxfs-helper} from BUILT
 #            (build/build-lkl-darwin.sh's output) and bin/linuxfs (cli/linuxfs);
 #          - the helper's LaunchDaemon plist, tests/p3-darwin.sh and run.sh;
 #          - images/{ext4,btrfs,xfs,ntfs,exfat}.img.gz, made by Linux (tests/lib/probe-images.sh), and
 #            images/apfs.img.gz, filled by Linux's lklfuse (tests/lib/apfs-image.sh), and images/enc.img.gz with
-#            enc-expected.txt, the encrypted container macOS made (tests/fixtures/apfs), and enc-gpt.img.gz, the same
-#            in a GPT partition (tests/lib/gpt-wrap.py), for the agent's keychain;
+#            enc-expected.txt, the encrypted container macOS made (tests/fixtures/apfs);
 #          - README and SHA256SUMS.
 #          After the run, tests/p3-check-bundle.sh DEST checks the images it left in DEST/out.
 set -eu
@@ -17,7 +16,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 S=$(cd "$1" && pwd); D=$2
 [ ! -e "$D" ] || { echo "p3-bundle.sh: $D exists" >&2; exit 1; }
 mkdir -p "$D/bin" "$D/images"; D=$(cd "$D" && pwd)
-for b in lklfuse linuxfs-probe linuxfs-open linuxfs-helper linuxfs-agent; do
+for b in lklfuse linuxfs-probe linuxfs-open linuxfs-helper; do
   [ -f "$S/$b" ] || { echo "p3-bundle.sh: no $b in $S" >&2; exit 1; }
   cp "$S/$b" "$D/bin/$b"; chmod 755 "$D/bin/$b"
 done
@@ -29,11 +28,6 @@ sh "$ROOT/build/linux-host.sh" sh "$ROOT/build/build-lkl-linux.sh" /work/gate0-l
 LINUX_HOST_FUSE=1 sh "$ROOT/build/linux-host.sh" sh "$ROOT/tests/lib/apfs-image.sh" "$I/apfs.img"
 for i in ext4 btrfs xfs ntfs exfat apfs; do gzip -9c "$I/$i.img" > "$D/images/$i.img.gz"; done
 cp "$ROOT/tests/fixtures/apfs/enc.img.gz" "$D/images/enc.img.gz"; cp "$ROOT/tests/fixtures/apfs/expected.txt" "$D/images/enc-expected.txt"
-# spec: tools/agent.c --
-#       the same container in a GPT partition, as an external disk is: the agent's keychain wants a partition UUID
-gzip -dc "$ROOT/tests/fixtures/apfs/enc.img.gz" > "$I/enc.img"
-sh "$ROOT/build/linux-host.sh" python3 -I "$ROOT/tests/lib/gpt-wrap.py" "$I/enc.img" "$I/enc-gpt.img"
-gzip -9c "$I/enc-gpt.img" > "$D/images/enc-gpt.img.gz"
 rm -rf "$I"
 cat > "$D/run.sh" <<'RUN'
 #!/bin/sh
