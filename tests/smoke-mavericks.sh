@@ -215,7 +215,12 @@ login_eject() {  # whole disk: ejected, and no _linuxfs lklfuse within 10 s
 }
 da_eject() {  # whole disk, mount point: leaves no lklfuse on it
   pids=$(lklfuse_on "$2" | awk '{ print $2 }')
-  bounded 600 diskutil eject "$1" > /dev/null 2>&1 || return 1
+  # spec: tests/smoke-mavericks.sh da_unmount -- a volume can be briefly busy right after writes (run 45449093147: ext4 GPT
+  #       eject once); say who holds it and try once more, printed
+  if ! bounded 600 diskutil eject "$1"; then
+    echo "# diskutil eject $1 failed; open files on $2:"; lsof +D "$2" 2> /dev/null | sed 's/^/#   /' | head -n 20
+    sleep 2; echo "# retrying diskutil eject $1"; bounded 600 diskutil eject "$1" || return 1
+  fi
   for p in $pids; do bounded 300 sh -c 'while ps -p "$1" > /dev/null; do sleep 0.1; done' _ "$p" || { echo "lklfuse $p still runs"; return 1; }; done
   j=0; while [ -n "$(lklfuse_on "$2")" ]; do
     j=$((j + 1)); [ $j -le 10 ] || { echo "lklfuse still on $2 ten seconds after the eject:"; lklfuses; ps -axww -o user=,pid=,command= | grep -i 'fuse' | grep -v grep; return 1; }
