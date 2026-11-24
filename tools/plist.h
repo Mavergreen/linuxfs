@@ -17,4 +17,8 @@ void prefs_load(CFDictionaryRef *user, CFDictionaryRef *machine);
 /* A preference as a boolean (also 1/0 and "YES"/"NO"/"true"/"false"), or -1 when absent or not one. D may be NULL. */
 int pref_bool(CFDictionaryRef d, CFStringRef key);
 
+/* A plist only OWNER can have written (a product's manifest): a regular file, not a symlink, at most 1 MiB, owned by OWNER and
+ * writable by no one else; NULL for anything else. The caller releases what is not NULL. */
+CFDictionaryRef plist_load_owned(const char *path, uid_t owner);
+
 #endif

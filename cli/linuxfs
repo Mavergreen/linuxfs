@@ -9,7 +9,9 @@
 #          linuxfs ignore [VOLUME]
 #          linuxfs unignore VOLUME
 #          linuxfs automount DISK
-#   internal: linuxfs da-mount [--asked] [--ro] [--password-stdin] DEVICE MOUNTPOINT   (only with LINUXFS_DA=1: the bundle's mount program)
+#   internal: linuxfs da-mount [--asked] [--ro] [--password-stdin] DEVICE MOUNTPOINT   (only with LINUXFS_DA=1: the bundle's mount program;
+#          before login also LINUXFS_OPEN_INHERITED=1, the device on fd 3, and LINUXFS_FUSE_FD=N: root mounted macFUSE on MOUNTPOINT
+#          and lklfuse serves that mount through /dev/fd/N)
 #          Mounts a Linux filesystem (ext4, btrfs, xfs, NTFS, exFAT, FAT, f2fs) with Linux's own driver, running in
 #          lklfuse. An image file is mounted directly: every file appears owned by you and only you can open the
 #          volume; new files are written with the filesystem root's owner. --linux-ids shows Linux's owners instead.
@@ -43,6 +45,7 @@ FSTAB=${LINUXFS_FSTAB:-/etc/fstab}   # read only: the root helper writes it
 die() { echo "linuxfs: $*" >&2; exit 1; }
 usage() { sed -n 's/^#   usage: /usage: /p; s/^#          linuxfs /       linuxfs /p' "$0" >&2; exit 2; }
 tab=$(printf '\t')
+fusefd=   # set only by da-mount, from LINUXFS_FUSE_FD
 
 # The mount table's mount points, one per line (a dead FUSE mount hangs anything that touches its directory).
 mounted_points() {
@@ -136,13 +139,14 @@ launch() {
 
 run_lklfuse() { # SOURCE MOUNTPOINT OPTIONS [OPENER-DEVICE [SECOND-OPENER-DEVICE]]   (the password: $password, if set)
   [ -z "${password+x}" ] || set -- "$1" "$2" "$3,passfd=5" "${4:-}" "${5:-}"
+  lkm=$2; [ -z "$fusefd" ] || lkm=/dev/fd/$fusefd   # root's mount, already made: lklfuse serves its device
   if [ -n "${4:-}" ]; then
     rof=; case ,$3, in *,ro,*) rof=--ro ;; esac
-    if [ -n "${5:-}" ]; then launch "$OPENER" $rof "$4" --also "$5" "$LKLFUSE" -f -o "$3" /dev/fd/3 "$2"
-    else launch "$OPENER" $rof "$4" "$LKLFUSE" -f -o "$3" /dev/fd/3 "$2"
+    if [ -n "${5:-}" ]; then launch "$OPENER" $rof "$4" --also "$5" "$LKLFUSE" -f -o "$3" /dev/fd/3 "$lkm"
+    else launch "$OPENER" $rof "$4" "$LKLFUSE" -f -o "$3" /dev/fd/3 "$lkm"
     fi
   else
-    launch "$LKLFUSE" -f -o "$3" "$1" "$2"
+    launch "$LKLFUSE" -f -o "$3" "$1" "$lkm"
   fi
   i=0
   while ! is_mounted "$2"; do
@@ -286,9 +290,11 @@ cmd_mount() {
     fi
     made=1
   else made=; [ -d "$mnt" ] || die "$mnt: no such directory"; ! is_mounted "$mnt" || die "$mnt already has a volume mounted"; fi
-  opts="type=$type,lock=$LOCKS/linuxfs-$lockname.lock,local,volname=$name,fsname=linuxfs@$(safe_name "$(basename "$src")"),noappledouble"
+  opts="type=$type,lock=$LOCKS/linuxfs-$lockname.lock"
+  # the mount's own options (the kernel's): root gave them to mount_macfuse when it made the mount lklfuse serves
+  [ -n "$fusefd" ] || opts="$opts,local,volname=$name,fsname=linuxfs@$(safe_name "$(basename "$src")"),noappledouble"
   if [ -n "$ids" ]; then :
-  elif [ "${LINUXFS_ALL_USERS:-}" = 1 ]; then opts="$opts,allow_other,uid=99,gid=99"
+  elif [ "${LINUXFS_ALL_USERS:-}" = 1 ]; then [ -n "$fusefd" ] || opts="$opts,allow_other"; opts="$opts,uid=99,gid=99"
   else opts="$opts,uid=$(id -u),gid=$(id -g),owner=root"; fi
   [ -z "$ro" ] || opts="$opts,ro"
   [ -z "$apfs_rw" ] || opts="$opts,opts=readwrite"
@@ -423,6 +429,12 @@ cmd_da_mount() {
     case $1 in --asked) asked=1 ;; --ro) ro=1 ;; --password-stdin) pws=1 ;; esac; shift
   done
   [ $# -eq 2 ] || usage
+  # LINUXFS_FUSE_FD: the macFUSE device root mounted with, inherited with the disk (fd 3); never fd 0-3, nor 5 (the password's)
+  if [ -n "${LINUXFS_FUSE_FD:-}" ]; then
+    [ "${LINUXFS_OPEN_INHERITED:-}" = 1 ] || { echo "linuxfs: LINUXFS_FUSE_FD comes only with the device inherited (LINUXFS_OPEN_INHERITED=1)" >&2; exit 2; }
+    case $LINUXFS_FUSE_FD in *[!0-9]*|0*|[0-3]|5) echo "linuxfs: LINUXFS_FUSE_FD is not a descriptor above 3 (nor 5)" >&2; exit 2 ;; esac
+    fusefd=$LINUXFS_FUSE_FD
+  fi
   # the password first, before the probe, the prefs or the opener can inherit stdin and drain it; they get /dev/null
   dapw=
   if [ -n "$pws" ]; then IFS= read -r dapw || [ -n "$dapw" ] || die "no password on stdin"; fi

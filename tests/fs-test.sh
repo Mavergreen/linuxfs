@@ -380,6 +380,106 @@ fdl=$(sed -n 's/^fds: //p' "$M/plan" | sed 's/ *255//')
 # spec: tools/fs.c -- test environment overrides are not honoured by the mount role's environment; the shipped build has no test code at all
 env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_CLI=/bin/false LINUXFS_OPEN=/bin/false LINUXFS_LKLFUSE=/bin/false "$DM" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1
 grep -qx "env LINUXFS_OPEN=$H/linuxfs-open" "$M/plan" && grep -qx "env LINUXFS_LKLFUSE=$H/lklfuse" "$M/plan"; ok $? "root plan: a caller's LINUXFS_OPEN and LINUXFS_LKLFUSE are not passed on"
+# spec: tools/fs.c mount_as_root -- with a macFUSE whose libfuse serves /dev/fd/N (Mavergreen's manifest at or past the first
+#       release that ships it), root runs mount_macfuse itself (allow_other is root's to give), takes the device it sends, and
+#       hands it to the CLI as fd 4 (LINUXFS_FUSE_FD=4) beside the disk on 3; an older or unreadable manifest keeps the plan above
+MF=$D/macfuse; mkdir -p "$MF"
+manifest() { plist "$MF/$1.plist" "<key>identifier</key><string>dev.mavergreen.macfuse</string><key>version</key><string>$1</string>"; }
+for v in 5.5.0-mavericks.1 5.5.0-mavericks.2 5.5.0-mavericks.10 5.6.0-mavericks.1 6.0.0-mavericks.1 5.4.9-mavericks.9 garbage 5.5.0; do manifest "$v"; done
+ln -sf "$MF/5.5.0-mavericks.2.plist" "$MF/link.plist"
+cp "$MF/5.5.0-mavericks.2.plist" "$MF/writable.plist"; chmod 664 "$MF/writable.plist"
+HELPER=/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse
+fplan() { # MANIFEST ARGS...: the drop build's plan with that macFUSE manifest (COMMFD's number as N)
+  mf=$1; shift
+  env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_FS_TEST_MACFUSE="$mf" "$DM" "$@" | sed 's/^helper-env _FUSE_COMMFD=[0-9][0-9]*$/helper-env _FUSE_COMMFD=N/'; }
+fwant() { # RW HELPER-OPTIONS DEV MNT [ARGV-FLAGS]: the plan the brief prescribes for root's mount
+  rw=$1 hopts=$2 dv=$3 mn=$4; shift 4
+  printf 'user daemon\nuid %s\ngid %s\nfd3 /dev/r%s %s\nmnt %s\n' "$UID_D" "$(id -g daemon)" "$dv" "$rw" "$mn"
+  printf 'helper %s\nhelper-argv -o\nhelper-argv %s\nhelper-argv %s\n' "$HELPER" "$hopts" "$mn"
+  printf 'helper-env _FUSE_CALL_BY_LIB=1\nhelper-env _FUSE_COMMVERS=2\nhelper-env _FUSE_DAEMON_PATH=%s/lklfuse\nhelper-env _FUSE_COMMFD=N\nfd4 the macFUSE device\n' "$H"
+  printf 'env HOME=/private/var/db/linuxfs\nenv PATH=/usr/bin:/bin:/usr/sbin:/sbin\nenv LINUXFS_DA=1\nenv LINUXFS_ALL_USERS=1\nenv LINUXFS_OPEN_INHERITED=1\n'
+  printf 'env LINUXFS_LKLFUSE=%s/lklfuse\nenv LINUXFS_PROBE=%s/linuxfs-probe\nenv LINUXFS_OPEN=%s/linuxfs-open\nenv LINUXFS_FUSE_FD=4\n' "$H" "$H" "$H"
+  printf 'argv %s/linuxfs\nargv da-mount\n' "$H"
+  for a in "$@"; do printf 'argv %s\n' "$a"; done
+  printf 'argv /dev/%s\nargv %s\n' "$dv" "$mn"
+}
+fplan "$MF/5.5.0-mavericks.2.plist" -o nodev -o noowners -o nosuid "/dev/$E" "$V/NAME" > "$M/plan" 2>"$M/plan.err"; rc=$?
+fwant rw "allow_other,local,volname=NAME,fsname=linuxfs@$E,noappledouble" "$E" "$V/NAME" > "$M/want"
+[ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root mount plan: mount_macfuse's fixed path, argv, the libfuse handshake's environment, the device as fd 4, LINUXFS_FUSE_FD=4 (rc $rc: $(diff "$M/plan" "$M/want" | head -4 | tr '\n' ';'))"
+fplan "$MF/5.5.0-mavericks.2.plist" -o owners,rdonly "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
+fwant ro "allow_other,local,volname=NAME,fsname=linuxfs@$E,noappledouble,rdonly" "$E" "$V/NAME" --asked --ro > "$M/want"
+[ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root mount plan: read-only adds rdonly to mount_macfuse's options and --ro to the CLI's (rc $rc: $(diff "$M/plan" "$M/want" | head -4 | tr '\n' ';'))"
+mkdir -p "$V/a,b=c"
+fplan "$MF/5.5.0-mavericks.2.plist" "/dev/$E" "$V/a,b=c" > "$M/plan" 2>&1
+grep -qx "helper-argv allow_other,local,volname=a-b-c,fsname=linuxfs@$E,noappledouble" "$M/plan"; ok $? "root mount plan: the volume name is the mount point's, made safe for an option list ($(grep '^helper-argv a' "$M/plan"))"
+fplan "$MF/5.5.0-mavericks.2.plist" "/dev/$E" "$V/NAME" 2>&1 >/dev/null | grep -q .; [ $? -ne 0 ]; ok $? "root mount plan: a good run writes nothing to stderr"
+# spec: tools/fs.c -- the capability gate: MACFUSE_FD_MOUNTPOINT_SINCE, compared as numbers (5.5.0-mavericks.10 is past .2)
+for v in 5.5.0-mavericks.2 5.5.0-mavericks.10 5.6.0-mavericks.1 6.0.0-mavericks.1; do
+  fplan "$MF/$v.plist" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1
+  grep -q '^helper-argv' "$M/plan" && grep -qx 'env LINUXFS_FUSE_FD=4' "$M/plan"; ok $? "macFUSE $v serves /dev/fd/N: root mounts"
+done
+want rw "$E" "$V/NAME" > "$M/want"
+for v in 5.5.0-mavericks.1 5.4.9-mavericks.9 garbage 5.5.0 link writable missing; do
+  fplan "$MF/$v.plist" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
+  [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "macFUSE manifest $v (older, unreadable, a symlink, group-writable or none): the plan before this one, _linuxfs mounts (rc $rc: $(diff "$M/plan" "$M/want" | head -2 | tr '\n' ';'))"
+done
+# spec: tools/fs.c -- the handshake, with a stand-in mount helper (tests/lib/mount-helper-stub.c) and a stand-in CLI that answers
+#       INIT by writing to fd 4 (the stand-in device); root waits for the helper's status, bounded
+"$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld -o "$D/drop/mhelper" "$ROOT/tests/lib/mount-helper-stub.c" || exit 1
+cat > "$M/fdcli" <<'EOS'
+#!/bin/sh
+# spec: tests/fs-test.sh -- the stand-in CLI: its mode (ok | linger | exit N) in $0.mode; logs its env and descriptors to $0.log
+m=$(cat "$0.mode" 2>/dev/null)
+env > "$0.log"
+/usr/bin/python -c 'import os, stat
+o = []
+for f in range(3, 256):
+    try:
+        s = os.fstat(f); o.append(str(f) + (":sock" if stat.S_ISSOCK(s.st_mode) else ""))
+    except OSError:
+        pass
+print("fds: " + " ".join(o))' >> "$0.log"
+case $m in
+  exit*) exit "${m#exit }" ;;
+  linger) printf x >&4; sleep 30 > /dev/null 2>&1 < /dev/null 4>&- & echo "lingerer $!" >> "$0.log"; exit 0 ;;
+  *) printf x >&4; echo "answered INIT"; exit 0 ;;
+esac
+EOS
+chmod +x "$M/fdcli"
+hs() { # HELPER-MODE CLI-MODE [WAIT]: root's mount with both stand-ins; status in rc, output in $M/plan
+  rm -f "$D/drop/mhelper.log" "$M/fdcli.log"
+  if [ -n "$1" ]; then echo "$1" > "$D/drop/mhelper.mode"; else rm -f "$D/drop/mhelper.mode"; fi
+  echo "$2" > "$M/fdcli.mode"
+  env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_FS_TEST_MACFUSE="$MF/5.5.0-mavericks.2.plist" \
+    LINUXFS_FS_TEST_MOUNT_HELPER="$D/drop/mhelper" LINUXFS_FS_TEST_ROOT_CLI="$M/fdcli" ${3:+LINUXFS_FS_TEST_WAIT=$3} \
+    "$DM" "/dev/$E" "$V/NAME" 7</dev/null > "$M/plan" 2>&1; rc=$?; }
+gone() { [ -z "$1" ] || ! ps -p "$1" > /dev/null; }
+hs "" ok; t0=$rc
+[ $t0 = 0 ] && grep -q '^status 0$' "$D/drop/mhelper.log" && grep -q '^cli-rc 0' "$M/plan"; ok $? "root: the helper's device reaches the CLI, the CLI answers INIT, status 0: exit 0 (rc $t0)"
+fdl=$(sed -n 's/^fds: //p' "$M/fdcli.log" | sed 's/ *255//')
+[ "$fdl" = "3 4:sock" ]; ok $? "the CLI holds the disk on 3 and the device on 4, nothing else ('$fdl')"
+grep -qx LINUXFS_FUSE_FD=4 "$M/fdcli.log"; ok $? "the CLI's environment names the device: LINUXFS_FUSE_FD=4"
+hfd=$(sed -n 's/^env _FUSE_COMMFD=//p' "$D/drop/mhelper.log")
+[ "$(grep '^env ' "$D/drop/mhelper.log" | sort | tr '\n' ' ')" = "$(printf 'env _FUSE_CALL_BY_LIB=1\nenv _FUSE_COMMFD=%s\nenv _FUSE_COMMVERS=2\nenv _FUSE_DAEMON_PATH=%s/lklfuse\n' "$hfd" "$H" | sort | tr '\n' ' ')" ]
+ok $? "the helper's environment is the handshake's four variables and nothing else ($(grep '^env ' "$D/drop/mhelper.log" | tr '\n' ' '))"
+[ "$(sed -n 's/^fds //p' "$D/drop/mhelper.log")" = "0 1 2 $hfd" ]; ok $? "the helper holds 0-2 and its socket only, never the disk ($(sed -n 's/^fds //p' "$D/drop/mhelper.log"))"
+[ "$(grep '^argv ' "$D/drop/mhelper.log" | tr '\n' '|')" = "argv -o|argv allow_other,local,volname=NAME,fsname=linuxfs@$E,noappledouble|argv $V/NAME|" ]; ok $? "the helper's argv is -o OPTIONS MNT"
+hs "status 5" ok
+hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
+[ $rc != 0 ] && gone "$hp"; ok $? "a helper status of 5 fails the mount (rc $rc) and the helper is gone"
+s0=$(date +%s); hs "" "exit 3"; t=$(( $(date +%s) - s0 ))
+[ $rc = 3 ] && grep -q '^status 57$' "$D/drop/mhelper.log" && [ $t -lt 8 ]; ok $? "a CLI that refuses (exit 3) closes the device, the mount fails, and root exits 3 in $t s (rc $rc, $(grep '^status' "$D/drop/mhelper.log"))"
+s0=$(date +%s); hs nofd ok 2; t=$(( $(date +%s) - s0 ))
+hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
+[ $rc = 1 ] && [ ! -e "$M/fdcli.log" ] && [ $t -lt 8 ] && gone "$hp"; ok $? "a helper that sends no device: exit 1 after the bounded wait ($t s), the CLI never runs, the helper is killed (rc $rc)"
+s0=$(date +%s); hs nostatus linger 2; t=$(( $(date +%s) - s0 ))
+hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log"); lp=$(sed -n 's/^lingerer //p' "$M/fdcli.log")
+sleep 1
+[ $rc = 1 ] && [ $t -lt 10 ] && gone "$hp" && [ -n "$lp" ] && gone "$lp"; ok $? "a helper that never reports: exit 1 after the bounded wait ($t s); the helper and what the CLI left running are killed (rc $rc, lingerer '$lp')"
+hs "" linger
+lp=$(sed -n 's/^lingerer //p' "$M/fdcli.log")
+[ $rc = 0 ] && [ -n "$lp" ] && ps -p "$lp" > /dev/null; ok $? "on success what the CLI left running (lklfuse) keeps running (rc $rc)"
+[ -z "$lp" ] || kill "$lp" 2>/dev/null
 ! strings "$D/linuxfs-fs" | grep -q 'LINUXFS_FS_TEST'; ok $? "the shipped build carries no LINUXFS_FS_TEST_* code"
 ! grep -q 'LINUXFS_FS_TEST' "$ROOT"/build/*.sh; ok $? "no build script defines LINUXFS_FS_TEST_DROP"
 echo "1..$n"; exit $bad

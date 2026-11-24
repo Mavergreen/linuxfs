@@ -40,9 +40,10 @@ static void restore_root(const struct ids *save)
 }
 
 /* the plist at path, owned by uid (or by root too when also_root), a regular file that is not a symlink and at most
- * 1 MiB; NULL for anything else, including unparseable. With drop, from root, it is opened and read as uid/gid (no
- * other groups), so root's reach never extends into what the user can name; root is back before it is parsed. */
-static CFDictionaryRef load_plist(const char *path, uid_t uid, gid_t gid, int also_root, int drop)
+ * 1 MiB (with locked, also writable by its owner alone); NULL for anything else, including unparseable. With drop, from
+ * root, it is opened and read as uid/gid (no other groups), so root's reach never extends into what the user can name;
+ * root is back before it is parsed. */
+static CFDictionaryRef load_plist(const char *path, uid_t uid, gid_t gid, int also_root, int drop, int locked)
 {
 	struct stat st;
 	struct ids saved;
@@ -59,7 +60,8 @@ static CFDictionaryRef load_plist(const char *path, uid_t uid, gid_t gid, int al
 	fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
 	if (fd >= 0) {
 		if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size <= PREFS_MAX &&
-		    (st.st_uid == uid || (also_root && st.st_uid == 0)) && (buf = malloc((size_t)st.st_size + 1)) != NULL) {
+		    (st.st_uid == uid || (also_root && st.st_uid == 0)) && !(locked && (st.st_mode & 022)) &&
+		    (buf = malloc((size_t)st.st_size + 1)) != NULL) {
 			while (got < (size_t)st.st_size) {
 				ssize_t r = read(fd, buf + got, (size_t)st.st_size - got);
 
@@ -142,6 +144,11 @@ void prefs_load(CFDictionaryRef *user, CFDictionaryRef *machine)
 		}
 	}
 	snprintf(machpath, sizeof machpath, "%s", mp);
-	*user = up ? load_plist(up, uowner, ugid, 0, 1) : NULL;
-	*machine = load_plist(machpath, mowner, 0, also_root, 0);
+	*user = up ? load_plist(up, uowner, ugid, 0, 1, 0) : NULL;
+	*machine = load_plist(machpath, mowner, 0, also_root, 0, 0);
+}
+
+CFDictionaryRef plist_load_owned(const char *path, uid_t owner)
+{
+	return load_plist(path, owner, 0, 0, 0, 1);
 }

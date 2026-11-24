@@ -15,6 +15,7 @@ cat > "$T/bin/lklfuse" <<EOF
 #!/bin/sh
 echo "\$*" >> "$T/calls"
 mnt=\$(eval echo "\\\${\$#}")
+case "\$mnt" in /dev/fd/*) fdn=\${mnt#/dev/fd/}; if { true >&"\$fdn"; } 2>/dev/null; then echo "fd \$fdn open" >> "$T/fdcalls"; else echo "fd \$fdn closed" >> "$T/fdcalls"; fi; mnt=\$FAKE_FD_MNT ;; esac
 case "\${FAKE_MODE:-ok}" in
   dirty) case "\$*" in *,ro\ *|*,ro) ;; *) echo "ntfs3: volume is dirty and \"force\" flag is not set!"; exit 1 ;; esac ;;
   locked) echo "unable to exclusively lock /tmp/x.lock: Resource temporarily unavailable"; exit 2 ;;
@@ -485,6 +486,29 @@ done
 s0=$(date +%s)
 (FAKE_FUSION=notier2 LINUXFS_FUSION_WAIT=5 FAKE_OPEN_SLEEP=3; export FAKE_FUSION LINUXFS_FUSION_WAIT FAKE_OPEN_SLEEP; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); rc=$?
 [ $rc -eq 3 ] && [ $(( $(date +%s) - s0 )) -lt 8 ]; ok $? "the Fusion wait is wall-clock time, not iterations (took $(( $(date +%s) - s0 )) s)"
+# spec: tools/fs.c mount_as_root -- before login root mounts macFUSE and hands the device on as LINUXFS_FUSE_FD: da-mount
+#       (inherited only) gives lklfuse /dev/fd/N as its mount point and leaves the kernel's options (allow_other) to root
+: > "$T/fdcalls"
+(LINUXFS_OPEN_INHERITED=1 LINUXFS_ALL_USERS=1 LINUXFS_FUSE_FD=4 FAKE_FD_MNT=$T/dam; export LINUXFS_OPEN_INHERITED LINUXFS_ALL_USERS LINUXFS_FUSE_FD FAKE_FD_MNT
+ DA /dev/disk3s1 "$T/dam" 4</dev/null > "$T/out" 2>&1); rc=$?
+c=$(last)
+[ $rc -eq 0 ] && case $c in *" /dev/fd/3 /dev/fd/4") true ;; *) false ;; esac; ok $? "with LINUXFS_FUSE_FD=4, lklfuse's mount point is /dev/fd/4 (got $rc: '$c')"
+grep -qx 'fd 4 open' "$T/fdcalls"; ok $? "and lklfuse holds fd 4 ($(cat "$T/fdcalls"))"
+case $c in *uid=99,gid=99*) r=0 ;; *) r=1 ;; esac; case $c in *allow_other*|*volname=*|*noappledouble*) r=1 ;; esac
+ok $r "lklfuse gets uid=99,gid=99 and none of the mount's own options (allow_other, volname, noappledouble): root gave them to mount_macfuse"
+sh "$L" unmount "$T/dam" > /dev/null 2>&1
+: > "$T/calls"
+(LINUXFS_FUSE_FD=4; export LINUXFS_FUSE_FD; DA /dev/disk3s1 "$T/dam" 4</dev/null > "$T/out" 2>&1); rc=$?
+[ $rc -eq 2 ] && ! grep -q lklfuse "$T/calls"; ok $? "LINUXFS_FUSE_FD without LINUXFS_OPEN_INHERITED is refused, exit 2, no lklfuse (got $rc)"
+for v in abc 3 5 2 04x; do
+  : > "$T/calls"
+  (LINUXFS_OPEN_INHERITED=1 LINUXFS_FUSE_FD=$v; export LINUXFS_OPEN_INHERITED LINUXFS_FUSE_FD; DA /dev/disk3s1 "$T/dam" 4</dev/null 5</dev/null > "$T/out" 2>&1); rc=$?
+  [ $rc -eq 2 ] && ! grep -q lklfuse "$T/calls"; ok $? "LINUXFS_FUSE_FD='$v' is refused, exit 2 (got $rc)"
+done
+out=$(LINUXFS_FUSE_FD=4 LINUXFS_OPEN_INHERITED=1 sh "$L" mount "$T/img" 4</dev/null 2>&1); rc=$?
+c=$(last)
+[ $rc -eq 0 ] && case $c in *" $T/img $out") true ;; *) false ;; esac; ok $? "linuxfs mount IMAGE ignores LINUXFS_FUSE_FD: only da-mount honours it (got $rc: '$c')"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
 # spec: cli/linuxfs cmd_ignore -- linuxfs ignore|unignore VOLUME: an /etc/fstab noauto entry, written by the root helper
 #       (linuxfs-open --noauto-add SPEC BUNDLE | --noauto-remove SPEC). A device: UUID= when the probe has one, else LABEL= the
 #       volume name DiskArbitration sees (the safe name); a label: LABEL= that safe name, with the bundle of the attached disk

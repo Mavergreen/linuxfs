@@ -9,8 +9,9 @@
 #       ReadOnly in the user's plist (read by the root mount program) mounts read-only; a label with a slash or a control
 #       character gets a safe /Volumes name; the encrypted APFS fixture shows the password dialog (screenshot), times out
 #       with no mount, mounts through --password-stdin and the keeper's --offer, then from the login keychain with no dialog;
-#       last, before login (the user's console session ended), an attached ext4 disk is mounted by lklfuse as _linuxfs with
-#       allow_other. No lklfuse ever runs as root. exFAT keeps no symlinks, hard links, modes or xattrs, and ntfs3 keeps no
+#       last, before login (the user's console session ended), an attached ext4 disk is mounted by root with allow_other and
+#       served by lklfuse as _linuxfs (a SKIP, with the reason, when the guest's macFUSE cannot serve /dev/fd/N); with that
+#       lklfuse killed, diskutil unmount still works. No lklfuse ever runs as root. exFAT keeps no symlinks, hard links, modes or xattrs, and ntfs3 keeps no
 #       POSIX mode without its acl option, so those are not asked of them. Any hang, new panic or new lklfuse crash report
 #       fails it. Linux checks the images afterwards (on-mavericks.yml's fsck job).
 #   usage: smoke-mavericks.sh VERSION IN OUT
@@ -167,6 +168,15 @@ lklfuses() { ps -axww -o user=,pid=,command= | awk '/lklfuse/ && !/awk/'; }
 lklfuse_user_is() { lklfuse_on "$2" | awk -v u="$1" '$1 == u { f = 1 } END { exit !f }'; }
 lklfuse_has() { lklfuse_on "$2" | grep -q "$1"; }
 no_root_lklfuse() { lklfuses | awk '$1 == "root" { f = 1 } END { exit f }'; }
+# spec: tools/fs.c mount_by_root -- before login: the lklfuse lines run by _linuxfs whose mountpoint is /dev/fd/N (root's mount)
+lklfuse_fd() { lklfuses | awk '$1 == "_linuxfs" && $NF ~ /^\/dev\/fd\/[0-9]+$/'; }
+lklfuse_fd_runs() { [ -n "$(lklfuse_fd)" ]; }
+mounted_by_root() { l=$(mount | grep -F " on $1 ("); echo "$l"; [ -n "$l" ] && ! echo "$l" | grep -q "mounted by"; }
+login_unmount() { bounded 600 sudo -n diskutil unmount "$1" && ! mount | grep -qF " on $1 ("; }
+login_eject() {  # whole disk: ejected, and no _linuxfs lklfuse within 10 s
+  bounded 600 sudo -n diskutil eject "$1" || return 1
+  j=0; while [ -n "$(lklfuses | awk '$1 == "_linuxfs"')" ]; do j=$((j + 1)); [ $j -le 100 ] || { lklfuses; return 1; }; sleep 0.1; done
+}
 da_eject() {  # whole disk, mount point: leaves no lklfuse on it
   pids=$(lklfuse_on "$2" | awk '{ print $2 }')
   bounded 600 diskutil eject "$1" > /dev/null 2>&1 || return 1
@@ -468,16 +478,43 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
   bad0=$bad; loglog=$(wc -l < /var/log/system.log 2> /dev/null | tr -d ' ')
   out=$(bounded 3000 sudo -n hdiutil attach -imagekey diskimage-class=CRawDiskImage "$W/img/login-ext4.img" 2>&1)
   disks=$(printf '%s\n' "$out" | awk '/^\/dev\/disk/ { print $1 }' | tr '\n' ' '); disk=${disks%% *}
-  if [ -n "$disk" ] && da_wait 300; then
-    ok "before login: $dev mounted at $mp"
-    echo "# before login: $(stat -f '%Sp %Su' "$mp") is the mount's mode and owner (right after the mount); lklfuse:"
-    lklfuses | sed 's/^/# /'
-    check "before login: the mount at $mp is mounted by _linuxfs" sh -c 'mount | grep -F " on $1 (" | grep -q "mounted by _linuxfs"' _ "$mp"
-    check "before login: the lklfuse on $mp runs as _linuxfs" lklfuse_user_is _linuxfs "$mp"
-    check "before login: the lklfuse on $mp was given allow_other" lklfuse_has allow_other "$mp"
-    check "before login: no lklfuse runs as root" no_root_lklfuse
-    check "before login: the user can read and write the volume over ssh" rw_works "$mp"
-  else notok "before login: the ext4 image mounted within 30 s"; echo "$out" | sed 's/^/# /'; fi
+  # spec: tools/fs.c macfuse_serves_fd -- the mount program logs which way it mounts: root's mount needs a macFUSE whose
+  #       libfuse serves /dev/fd/N (MACFUSE_FD_MOUNTPOINT_SINCE); before that the before-login mount is not this release's to check
+  gate= i=0
+  while [ -n "$disk" ] && [ -z "$gate" ] && [ $i -lt 30 ]; do
+    gate=$(tail -n +"$((${loglog:-0} + 1))" /var/log/system.log 2> /dev/null | sed -n -e 's/.*mount_[a-z0-9]*: \(macFUSE .* serves .*\)$/\1/p' -e 's/.*mount_[a-z0-9]*: \(macFUSE .* is before .*\)$/\1/p' | tail -n 1)
+    [ -n "$gate" ] || { i=$((i + 1)); sleep 1; }
+  done
+  echo "# before login: ${gate:-the mount program logged no macFUSE gate within 30 s}"
+  case $gate in
+    *"is before"*)
+      n=$((n + 1)); echo "ok $n - # SKIP before login: root's mount and _linuxfs's lklfuse: $gate" ;;
+    *)
+      if [ -n "$disk" ] && da_wait 300; then
+        ok "before login: $dev mounted at $mp"
+        echo "# before login: $(stat -f '%Sp %Su' "$mp") is the mount's mode and owner (right after the mount); lklfuse:"
+        lklfuses | sed 's/^/# /'
+        mount | grep -F " on $mp (" | sed 's/^/# /'
+        check "before login: the mount at $mp is root's (no 'mounted by')" mounted_by_root "$mp"
+        check "before login: the lklfuse serving it runs as _linuxfs, on a /dev/fd/N mountpoint" lklfuse_fd_runs
+        check "before login: no lklfuse runs as root" no_root_lklfuse
+        check "before login: the user can write and read the volume over ssh" rw_works "$mp"
+        # spec: macfuse DETAILS.md "A mount made for you" -- a daemon that dies leaves the mount with nobody serving it: macFUSE
+        #       answers it with an error (ENXIO, the dead file system) instead of a hang, and its owner still unmounts it
+        lp=$(lklfuse_fd | awk '{ print $2 }' | head -n 1)
+        if [ -n "$lp" ] && sudo -n kill "$lp" && bounded 300 sh -c 'while ps -p "$1" > /dev/null; do sleep 0.1; done' _ "$lp"; then
+          ok "before login: lklfuse ($lp) is killed"
+          check "before login: with lklfuse dead, a read of $mp fails at once instead of hanging" bounded 100 sh -c '! ls "$1"' _ "$mp"
+          check "before login: with lklfuse dead, diskutil unmount still unmounts $mp" login_unmount "$mp"
+          if bounded 600 sudo -n diskutil mount "$dev" > /dev/null 2>&1 && da_wait 300; then
+            ok "before login: diskutil mount mounts $dev again, at $mp"
+            check "before login: what the user wrote reads back" rw_reads "$mp"
+          else notok "before login: diskutil mount mounts $dev again"; fi
+        else notok "before login: kill lklfuse ($lp)"; fi
+        check "before login: eject unmounts and leaves no lklfuse" login_eject "$disk" && disk=
+        check "before login: no lklfuse runs as root, after the eject" no_root_lklfuse
+      else notok "before login: the ext4 image mounted within 30 s"; echo "$out" | sed 's/^/# /'; fi ;;
+  esac
   if [ "$bad" != "$bad0" ]; then
     echo "# before login, what is left, to find why:"
     sudo -n ls -la /Volumes 2>&1 | sed 's/^/# /'; for m in /Volumes/*; do sudo -n ls -lad "$m" 2>&1 | sed 's/^/# /'; done
