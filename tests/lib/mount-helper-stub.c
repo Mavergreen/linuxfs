@@ -7,11 +7,17 @@
  *   status N   send N (an errno) instead of 0      nofd     never send the device; sleep 30 s
  *   nostatus   send the device, never a status; sleep 30 s
  *   linger     status 0, then sleep 30 s           stubborn   the same, ignoring SIGTERM
+ *   hold       keep its own copy of the device and send no status, as mount_macfuse blocked in mount(2) on INIT may; sleep 30 s
+ *   holdstubborn   the same, ignoring SIGTERM (with LINUXFS_FS_TEST_NOKILL root's SIGKILL is a no-op: one that outlives it)
+ *   partial    2 of the status's 4 bytes, then nothing; sleep 30 s
+ *   twofds     two descriptors in one message, ignoring SIGTERM; logs "closed by root N" for how many root closed within 1.5 s
+ *   foreign    attach ARGV0.img (hdiutil) on MNT, then status 5: a volume on MNT that is not this mount
  */
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/wait.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,8 +64,58 @@ int main(int argc, char **argv)
 		sleep(30);
 		return 72;
 	}
+	if (strcmp(mode, "holdstubborn") == 0 || strcmp(mode, "twofds") == 0)
+		signal(SIGTERM, SIG_IGN);
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, dev) != 0)
 		return 73;
+	if (strcmp(mode, "twofds") == 0) {
+		int two[2], second[2];
+		struct msghdr msg;
+		struct iovec iov;
+		char b = 0, cc[CMSG_SPACE(2 * sizeof(int))];
+		struct cmsghdr *c;
+		struct pollfd pp[2];
+		int closed = 0, k;
+
+		if (socketpair(AF_UNIX, SOCK_STREAM, 0, second) != 0)
+			return 73;
+		two[0] = dev[1];
+		two[1] = second[1];
+		memset(&msg, 0, sizeof msg);
+		iov.iov_base = &b;
+		iov.iov_len = 1;
+		msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
+		msg.msg_control = cc;
+		msg.msg_controllen = sizeof cc;
+		c = CMSG_FIRSTHDR(&msg);
+		c->cmsg_level = SOL_SOCKET;
+		c->cmsg_type = SCM_RIGHTS;
+		c->cmsg_len = CMSG_LEN(2 * sizeof(int));
+		memcpy(CMSG_DATA(c), two, sizeof two);
+		if (sendmsg(comm, &msg, 0) != 1)
+			return 74;
+		close(dev[1]);
+		close(second[1]);
+		pp[0].fd = dev[0];
+		pp[1].fd = second[0];
+		for (k = 0; k < 15 && closed < 2; k++) {	/* 1.5 s, a tenth at a time (an end already at EOF polls ready at once) */
+			usleep(100000);
+			pp[0].events = pp[1].events = POLLIN;
+			pp[0].revents = pp[1].revents = 0;
+			poll(pp, 2, 0);
+			closed = 0;
+			for (i = 0; i < 2; i++) {
+				char x;
+
+				if ((pp[i].revents & (POLLIN | POLLHUP)) && read(pp[i].fd, &x, 1) == 0)
+					closed++;
+			}
+		}
+		fprintf(log, "closed by root %d\n", closed);
+		fflush(log);
+		return 0;
+	}
 	{
 		struct msghdr msg;
 		struct iovec iov;
@@ -81,12 +137,39 @@ int main(int argc, char **argv)
 		if (sendmsg(comm, &msg, 0) != 1)
 			return 74;
 	}
-	close(dev[1]);
+	if (strncmp(mode, "hold", 4) != 0)
+		close(dev[1]);
 	fprintf(log, "sent the device\n");
 	fflush(log);
-	if (strcmp(mode, "nostatus") == 0) {
-		sleep(30);
+	if (strcmp(mode, "nostatus") == 0 || strncmp(mode, "hold", 4) == 0) {
+		for (i = 0; i < 300; i++)
+			usleep(100000);	/* sleep(30), in steps a SIGTERM that is ignored cannot cut short */
 		return 75;
+	}
+	if (strcmp(mode, "partial") == 0) {
+		if (write(comm, &st, 2) != 2)
+			return 76;
+		sleep(30);
+		return 77;
+	}
+	if (strcmp(mode, "foreign") == 0) {
+		char img[1024];
+		pid_t ap;
+		int ws;
+
+		snprintf(img, sizeof img, "%s.img", argv[0]);
+		ap = fork();
+		if (ap == 0) {
+			execl("/usr/bin/hdiutil", "hdiutil", "attach", "-quiet", "-nobrowse", "-mountpoint", argv[argc - 1], img, (char *)NULL);
+			_exit(127);
+		}
+		waitpid(ap, &ws, 0);
+		fprintf(log, "attached %d\n", WIFEXITED(ws) ? WEXITSTATUS(ws) : -1);
+		fflush(log);
+		st = 5;
+		if (write(comm, &st, sizeof st) != (ssize_t)sizeof st)
+			return 76;
+		return 0;
 	}
 	{
 		struct pollfd p = { dev[0], POLLIN, 0 };

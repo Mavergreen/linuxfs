@@ -68,17 +68,17 @@ grep -q "launchctl load.*/Library/LaunchAgents/$A.plist" "$comp/Scripts/postinst
 grep -q "launchctl load.*/Library/LaunchDaemons/$H.plist" "$comp/Scripts/postinstall" 2>/dev/null || fail "the postinstall does not load the helper"
 grep -q 'needs macfuse\|macfuse.*not installed\|requires macfuse\|macfuse' "$comp/Scripts/preinstall" ||
   fail "the preinstall does not mention macfuse"
-grep -q "'5\.5\.0-mavericks\.1'" "$comp/Scripts/preinstall" ||
-  fail "the preinstall does not require macfuse 5.5.0-mavericks.1 (its first release) or later"
+grep -q "'5\.5\.0-mavericks\.2'" "$comp/Scripts/preinstall" ||
+  fail "the preinstall does not require macfuse 5.5.0-mavericks.2 (the first that serves /dev/fd/N) or later"
 # platform: the preinstall reads macfuse's version with PlistBuddy, which only macOS has
 if [ -x /usr/libexec/PlistBuddy ]; then
-  for mv in 5.4.9-mavericks.3:refused 5.5.0-mavericks.1:accepted; do
+  for mv in 5.4.9-mavericks.3:refused 5.5.0-mavericks.1:refused 5.5.0-mavericks.2:accepted 5.5.0-mavericks.10:accepted; do
     ver=${mv%%:*} want=${mv#*:} r="$T/mf-$ver"
     mkdir -p "$r/usr/local/mavergreen/macfuse"
     printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>version</key><string>%s</string></dict></plist>\n' \
       "$ver" > "$r/usr/local/mavergreen/macfuse/mavergreen.plist"
     ROOT="$r" sh "$comp/Scripts/preinstall" "$pkg" "$r" "$r" "$r" > "$T/pre-$ver.out" 2>&1 || :
-    if grep -q '5\.5\.0-mavericks\.1' "$T/pre-$ver.out"; then got=refused; else got=accepted; fi
+    if grep -q 'or newer (installed' "$T/pre-$ver.out"; then got=refused; else got=accepted; fi
     [ "$got" = "$want" ] || fail "the preinstall $got macfuse $ver (want $want): $(cat "$T/pre-$ver.out")"
   done
 fi

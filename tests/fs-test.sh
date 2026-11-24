@@ -494,13 +494,13 @@ case $m in
 esac
 EOS
 chmod +x "$M/fdcli"
-hs() { # HELPER-MODE CLI-MODE [WAIT]: root's mount with both stand-ins; status in rc, output in $M/plan
+hs() { # HELPER-MODE CLI-MODE [WAIT]: root's mount with both stand-ins; status in rc, output in $M/plan; HS_ENV adds to its environment, HS_WRAP runs it
   rm -f "$D/drop/mhelper.log" "$M/fdcli.log"
   if [ -n "$1" ]; then echo "$1" > "$D/drop/mhelper.mode"; else rm -f "$D/drop/mhelper.mode"; fi
   echo "$2" > "$M/fdcli.mode"
   env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_FS_TEST_MACFUSE="$MF/5.5.0-mavericks.2.plist" \
-    LINUXFS_FS_TEST_MOUNT_HELPER="$D/drop/mhelper" LINUXFS_FS_TEST_ROOT_CLI="$M/fdcli" ${3:+LINUXFS_FS_TEST_WAIT=$3} \
-    "$DM" "/dev/$E" "$V/NAME" 7</dev/null > "$M/plan" 2>&1; rc=$?; }
+    LINUXFS_FS_TEST_MOUNT_HELPER="$D/drop/mhelper" LINUXFS_FS_TEST_ROOT_CLI="$M/fdcli" ${3:+LINUXFS_FS_TEST_WAIT=$3} ${HS_ENV:-} \
+    ${HS_WRAP:-} "$DM" "/dev/$E" "$V/NAME" 7</dev/null > "$M/plan" 2>&1; rc=$?; }
 gone() { [ -z "$1" ] || ! ps -p "$1" > /dev/null; }
 hs "" ok; t0=$rc
 [ $t0 = 0 ] && grep -q '^status 0$' "$D/drop/mhelper.log" && grep -q '^cli-rc 0' "$M/plan"; ok $? "root: the helper's device reaches the CLI, the CLI answers INIT, status 0: exit 0 (rc $t0)"
@@ -535,6 +535,42 @@ hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
 s0=$(date +%s); hs stubborn ok; t=$(( $(date +%s) - s0 ))
 hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
 [ $rc = 0 ] && [ -n "$hp" ] && gone "$hp" && [ $t -ge 3 ] && [ $t -lt 7 ]; ok $? "one that ignores SIGTERM is killed a second later (rc $rc, $t s)"
+# spec: tools/fs.c mount_by_root -- a CLI that fails before lklfuse answers INIT while mount_macfuse keeps the device (blocked in
+#       mount(2) on INIT, as the real one may be): root still ends, bounded, and stops it; one that outlives even SIGKILL
+#       (LINUXFS_FS_TEST_NOKILL makes root's SIGKILL a no-op) is reported, on stderr and syslog, not left silently
+s0=$(date +%s); hs hold "exit 3"; t=$(( $(date +%s) - s0 ))
+hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
+[ $rc = 3 ] && [ $t -lt 15 ] && [ -n "$hp" ] && gone "$hp"; ok $? "mount_macfuse holding the device with no status, the CLI failed: root exits 3 in $t s and mount_macfuse is gone (rc $rc)"
+s0=$(date +%s); HS_ENV=LINUXFS_FS_TEST_NOKILL=1 hs holdstubborn "exit 3"; t=$(( $(date +%s) - s0 ))
+hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
+[ $rc = 3 ] && [ $t -lt 20 ] && [ -n "$hp" ] && grep -q "mount_macfuse (pid $hp) is still running after SIGKILL" "$M/plan"
+ok $? "one that outlives SIGKILL: root still exits 3 in $t s, and says it is left running ($(grep -i 'still running' "$M/plan" | tr '\n' ' '))"
+[ -z "$hp" ] || kill -9 "$hp" 2>/dev/null
+HS_ENV=LINUXFS_FS_TEST_NOKILL=1 hs stubborn ok
+hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
+[ $rc = 0 ] && [ -n "$hp" ] && grep -q "mount_macfuse (pid $hp) is still running after SIGKILL" "$M/plan"; ok $? "after a good mount too, a mount_macfuse that outlives SIGKILL is reported (rc $rc)"
+[ -z "$hp" ] || kill -9 "$hp" 2>/dev/null
+# spec: tools/fs.c mount_by_root -- the status is read without blocking, under the same deadline: 2 of its 4 bytes and no more
+#       end in the bounded wait, not a hang (a watchdog ends a hung run at 20 s)
+s0=$(date +%s); hs partial ok 2 & hj=$!
+( sleep 20; kill $hj 2>/dev/null; pkill -f "$DM" 2>/dev/null ) & wd=$!
+wait $hj; rc=$?; t=$(( $(date +%s) - s0 )); kill $wd 2>/dev/null
+hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
+[ $t -lt 15 ] && gone "$hp" && grep -q "^linuxfs-mount: root's mount of $E failed" "$M/plan"; ok $? "a status cut short after 2 bytes: root gives up in the bounded wait ($t s) and stops mount_macfuse"
+# spec: tools/fs.c recv_device -- a message with more than one descriptor is refused, and root closes every one it got
+hs twofds ok 2; sleep 2
+[ $rc = 1 ] && grep -q '^closed by root 2$' "$D/drop/mhelper.log"; ok $? "two descriptors in the device's message: refused (rc $rc), both closed ($(grep '^closed' "$D/drop/mhelper.log"))"
+# spec: tools/fs.c mount_role -- SIGCHLD back to its default first: started with it ignored, root would never see an exit status
+HS_WRAP='/usr/bin/perl -e $SIG{CHLD}="IGNORE";exec(@ARGV)' hs "" "exit 3"
+[ $rc = 3 ]; ok $? "started with SIGCHLD ignored, root still gets the CLI's exit 3 (rc $rc)"
+# spec: tools/fs.c mount_by_root -- the force-unmount on failure takes only root's own mount: from linuxfs@DISK, a macfuse (or
+#       osxfuse) file system; another volume on MNT is left. (The matching case needs a real macFUSE mount: the VM smoke's.)
+rm -f "$D/foreign.dmg"; hdiutil create -quiet -size 4m -fs HFS+ -volname foreign "$D/foreign.dmg" && cp "$D/foreign.dmg" "$D/drop/mhelper.img"
+hs foreign ok
+fm=$(mount | grep -F " on $V/NAME (")
+[ $rc != 0 ] && grep -q '^attached 0$' "$D/drop/mhelper.log" && [ -n "$fm" ]; ok $? "a volume on MNT that is not root's mount is never force-unmounted (rc $rc, '$fm')"
+fd9=$(hdiutil info | awk -v p="$D/drop/mhelper.img" '/^image-path/ { sub(/^image-path[ \t]*:[ \t]*/, ""); cur = ($0 == p) } cur && /^\/dev\/disk[0-9]+[ \t]/ { print $1; exit }')
+[ -z "$fd9" ] || hdiutil detach -quiet -force "$fd9" 2>/dev/null
 ! strings "$D/linuxfs-fs" | grep -q 'LINUXFS_FS_TEST'; ok $? "the shipped build carries no LINUXFS_FS_TEST_* code"
 ! grep -q 'LINUXFS_FS_TEST' "$ROOT"/build/*.sh; ok $? "no build script defines LINUXFS_FS_TEST_DROP"
 echo "1..$n"; exit $bad

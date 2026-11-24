@@ -171,6 +171,16 @@ no_root_lklfuse() { lklfuses | awk '$1 == "root" { f = 1 } END { exit f }'; }
 # spec: tools/fs.c mount_by_root -- before login: the lklfuse lines run by _linuxfs whose mountpoint is /dev/fd/N (root's mount)
 lklfuse_fd() { lklfuses | awk '$1 == "_linuxfs" && $NF ~ /^\/dev\/fd\/[0-9]+$/'; }
 lklfuse_fd_runs() { [ -n "$(lklfuse_fd)" ]; }
+# spec: tools/fs.c mount_by_root -- no mount_macfuse root started outlives the mount program (it stops one that lingers)
+no_root_mount_macfuse() { ! ps -axww -o user=,pid=,command= | awk '$1 == "root" && /mount_macfuse/ && !/awk/' | grep -q .; }
+# spec: tools/fs.c mount_by_root -- waits up to 90 s (mount(2) gives up on INIT by itself in about 50 s) for no root
+#       mount_macfuse; prints ps when one is left
+root_mount_macfuse_gone() {
+  j=0; while ! no_root_mount_macfuse; do
+    j=$((j + 1)); [ $j -le 90 ] || { ps -axww -o user,pid,ppid,stat,etime,command | grep -i 'fuse\|linuxfs' | grep -v grep | sed 's/^/# left: /'; return 1; }
+    sleep 1
+  done
+}
 mounted_by_root() { l=$(mount | grep -F " on $1 ("); echo "$l"; [ -n "$l" ] && ! echo "$l" | grep -q "mounted by"; }
 login_unmount() { bounded 600 sudo -n diskutil unmount "$1" && ! mount | grep -qF " on $1 ("; }
 login_eject() {  # whole disk: ejected, and no _linuxfs lklfuse within 10 s
@@ -488,7 +498,11 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
   echo "# before login: ${gate:-the mount program logged no macFUSE gate within 30 s}"
   case $gate in
     *"is before"*)
-      n=$((n + 1)); echo "ok $n - # SKIP before login: root's mount and _linuxfs's lklfuse: $gate" ;;
+      n=$((n + 1)); echo "ok $n - # SKIP before login: root's mount and _linuxfs's lklfuse: $gate"
+      # spec: tools/fs.c mount_as_root -- the older path (_linuxfs mounts) still runs no lklfuse as root, and ejects clean
+      check "before login (older macFUSE): no lklfuse runs as root" no_root_lklfuse
+      if [ -n "$disk" ]; then check "before login (older macFUSE): eject leaves no lklfuse" login_eject "$disk" && disk=; fi
+      check "before login (older macFUSE): no lklfuse runs as root, after the eject" no_root_lklfuse ;;
     *)
       if [ -n "$disk" ] && da_wait 300; then
         ok "before login: $dev mounted at $mp"
@@ -509,6 +523,22 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
           if bounded 600 sudo -n diskutil mount "$dev" > /dev/null 2>&1 && da_wait 300; then
             ok "before login: diskutil mount mounts $dev again, at $mp"
             check "before login: what the user wrote reads back" rw_reads "$mp"
+            # spec: tools/fs.c mount_by_root -- the CLI failing before lklfuse answers INIT (its lock held, so lklfuse exits at
+            #       once): the mount fails, nothing is left mounted, and no root mount_macfuse survives (macFUSE's, if one does)
+            lk=$(lklfuse_fd | tr ',' '\n' | sed -n 's/^lock=//p' | head -n 1)
+            if [ -n "$lk" ] && login_unmount "$mp"; then
+              sudo -n -u _linuxfs /usr/bin/python -c 'import fcntl, sys, time
+f = open(sys.argv[1], "a"); fcntl.flock(f, fcntl.LOCK_EX); sys.stdout.write("held\n"); sys.stdout.flush(); time.sleep(300)' "$lk" > "$W/lockhold.out" 2>&1 &
+              hold=$!
+              j=0; while ! grep -q held "$W/lockhold.out" 2> /dev/null && [ $j -lt 100 ]; do j=$((j + 1)); sleep 0.1; done
+              bounded 1800 sudo -n diskutil mount "$dev" > "$W/lockmount.log" 2>&1; lrc=$?
+              check "before login: with lklfuse's lock held, diskutil mount $dev fails ($(head -n 1 "$W/lockmount.log"))" [ "$lrc" -ne 0 ]
+              check "before login: and nothing is left mounted from $dev" sh -c '! mount | grep -qF "linuxfs@$1 "' _ "${dev#/dev/}"
+              check "before login: and no root mount_macfuse survives it" root_mount_macfuse_gone
+              sudo -n kill "$hold" 2> /dev/null; sudo -n pkill -f "fcntl.flock" 2> /dev/null; wait "$hold" 2> /dev/null
+              if bounded 600 sudo -n diskutil mount "$dev" > /dev/null 2>&1 && da_wait 300; then ok "before login: with the lock free, $dev mounts again"
+              else notok "before login: with the lock free, $dev mounts again"; fi
+            else notok "before login: find lklfuse's lock ($lk) and unmount $mp for the held-lock case"; fi
           else notok "before login: diskutil mount mounts $dev again"; fi
         else notok "before login: kill lklfuse ($lp)"; fi
         check "before login: eject unmounts and leaves no lklfuse" login_eject "$disk" && disk=

@@ -4,7 +4,7 @@
 #   usage: package.sh --stage DIR --version V --out DIR [--updater-app APP]
 #          Packages build/stage.sh's stage DIR as OUT/linuxfs-V.pkg: dev.mavergreen.base first, then
 #          dev.mavergreen.linuxfs, with the 10.9.5 floor; its preinstall refuses a volume without Mavergreen
-#          macFUSE 5.5.0-mavericks.1 or later (--requires macfuse>=, the floor MACFUSE_MIN). V is UPSTREAM_VERSION with its -mavericks.N. A caller without git
+#          macFUSE 5.5.0-mavericks.2 or later (--requires macfuse>=, the floor MACFUSE_MIN). V is UPSTREAM_VERSION with its -mavericks.N. A caller without git
 #          exports SOURCE_DATE_EPOCH.
 set -eu
 umask 022
@@ -28,10 +28,11 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$stage" ] && [ -n "$V" ] && [ -n "$out" ] || usage
 short=$LINUXFS_SHORT
-# spec: tests/package-test.sh -- macfuse's first release, which every linuxfs build runs against. A floor, not the
-#       build's pin (components/macfuse/version): linuxfs and macfuse update separately, so a floor that followed the
-#       pin would fail a linuxfs update until macfuse's own updater had run. Raise it only when linuxfs needs a newer one.
-MACFUSE_MIN=5.5.0-mavericks.1
+# spec: tests/package-test.sh -- the first macfuse release whose libfuse 3 serves a /dev/fd/N mountpoint, which the before-login
+#       mount needs (tools/fs.c MACFUSE_FD_MOUNTPOINT_SINCE). A floor, not the build's pin (components/macfuse/version):
+#       linuxfs and macfuse update separately, so a floor that followed the pin would fail a linuxfs update until macfuse's
+#       own updater had run. Raise it only when linuxfs needs a newer one.
+MACFUSE_MIN=5.5.0-mavericks.2
 id="$(sh "$SHIPYARD_SCRIPTS/product-name.sh" identifier "$short" 2>/dev/null)" ||
   die "the shipyard at $SHIPYARD_SCRIPTS does not register $short"
 up="$(upstream_version)"

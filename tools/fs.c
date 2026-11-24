@@ -606,9 +606,10 @@ static int run_cli(const char *cli, const struct mountreq *req, const char *pw, 
 #define RUN_USER "_linuxfs"
 #define MOUNT_MACFUSE "/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse"
 #define MACFUSE_MANIFEST "/usr/local/mavergreen/macfuse/mavergreen.plist"
-/* The first Mavergreen macFUSE release after 5.5.0-mavericks.1 that ships the fd-mountpoint patch (its libfuse 3 serves a
- * /dev/fd/N mountpoint another process mounted: macfuse's DETAILS.md, "A mount made for you"). Change it to that release's
- * version when macFUSE releases it, if it is named otherwise. */
+/* The first Mavergreen macFUSE release that ships the fd-mountpoint patch (its libfuse 3 serves a /dev/fd/N mountpoint
+ * another process mounted: macfuse's DETAILS.md, "A mount made for you"), as build/package.sh's MACFUSE_MIN. Dev builds
+ * labelled 5.5.0-mavericks.2 that predate the patch exist: on those the gate passes, lklfuse cannot serve /dev/fd/N, and
+ * root's mount fails, bounded, after STATUS_WAIT_S. */
 #define MACFUSE_FD_MOUNTPOINT_SINCE "5.5.0-mavericks.2"
 #define FUSE_FD 4		/* the macFUSE device, in the CLI and lklfuse: beside the disk on 3, and not 5 (the password's) */
 #define DEVICE_WAIT_S 30	/* for mount_macfuse to send the device */
@@ -644,6 +645,8 @@ static const char *run_user(void) { const char *u = getenv("LINUXFS_FS_TEST_USER
 static const char *macfuse_manifest(void) { const char *v = getenv("LINUXFS_FS_TEST_MACFUSE"); return v && *v ? v : "/nonexistent"; }
 static const char *mount_helper(void) { const char *v = getenv("LINUXFS_FS_TEST_MOUNT_HELPER"); return v && *v ? v : MOUNT_MACFUSE; }
 static int wait_s(int s) { const char *v = getenv("LINUXFS_FS_TEST_WAIT"); return v && atoi(v) > 0 ? atoi(v) : s; }
+/* LINUXFS_FS_TEST_NOKILL: SIGKILL becomes a no-op, for a stand-in that outlives it as a process in an uninterruptible wait would */
+static int kill_sig(void) { return getenv("LINUXFS_FS_TEST_NOKILL") ? 0 : SIGKILL; }
 #else
 #define ROOT_ONLY_UID 0
 static const char *volumes_dir(void) { return "/Volumes"; }
@@ -651,6 +654,7 @@ static const char *run_user(void) { return RUN_USER; }
 static const char *macfuse_manifest(void) { return MACFUSE_MANIFEST; }
 static const char *mount_helper(void) { return MOUNT_MACFUSE; }
 static int wait_s(int s) { return s; }
+static int kill_sig(void) { return SIGKILL; }
 #endif
 
 /* MNT is exactly <volumes>/<name>: one component, not . or .. */
@@ -699,7 +703,9 @@ static int macfuse_version(const char *s, unsigned v[4])
 }
 
 /* Whether the installed macFUSE's libfuse serves a /dev/fd/N mountpoint: its manifest (root's alone) names a version at or
- * past MACFUSE_FD_MOUNTPOINT_SINCE. Logged either way. */
+ * past MACFUSE_FD_MOUNTPOINT_SINCE. Logged either way. Only the file is checked (root's, not a symlink, writable by root
+ * alone), not its parent directories: whoever could swap it there could only choose between the two mount paths, each
+ * safe (root never runs lklfuse on either), and could at worst make root's mount fail, bounded. */
 static int macfuse_serves_fd(const char *fs)
 {
 	CFDictionaryRef d = plist_load_owned(macfuse_manifest(), ROOT_ONLY_UID);
@@ -782,16 +788,17 @@ static void print_cli_plan(const char *const *envp, char **args)
 }
 #endif
 
-/* The descriptor mount_macfuse sends over sock (SCM_RIGHTS, one byte) within secs; -1 when none */
+/* The descriptor mount_macfuse sends over sock (SCM_RIGHTS, one byte) within secs; -1 when none. A message with anything but
+ * one descriptor is refused, and every descriptor it carried is closed. */
 static int recv_device(int sock, int secs)
 {
 	struct pollfd p = { sock, POLLIN, 0 };
 	struct msghdr msg;
 	struct iovec iov;
 	struct cmsghdr *c;
-	char b, cc[CMSG_SPACE(sizeof(int))];
+	char b, cc[CMSG_SPACE(8 * sizeof(int))];
 	struct timeval t0, now;
-	int fd = -1, r;
+	int fd = -1, r, fds = 0, bad = 0;
 
 	gettimeofday(&t0, NULL);
 	for (;;) {
@@ -814,12 +821,32 @@ static int recv_device(int sock, int secs)
 	msg.msg_iovlen = 1;
 	msg.msg_control = cc;
 	msg.msg_controllen = sizeof cc;
-	if (recvmsg(sock, &msg, 0) != 1 || (msg.msg_flags & MSG_CTRUNC))
+	r = (int)recvmsg(sock, &msg, MSG_DONTWAIT);
+	if (r != 1 || (msg.msg_flags & MSG_CTRUNC))
+		bad = 1;
+	for (c = r >= 0 ? CMSG_FIRSTHDR(&msg) : NULL; c; c = CMSG_NXTHDR(&msg, c)) {
+		size_t k, nfd;
+
+		if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS || c->cmsg_len < CMSG_LEN(0)) {
+			bad = 1;
+			continue;
+		}
+		nfd = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+		for (k = 0; k < nfd; k++) {
+			int got;
+
+			memcpy(&got, CMSG_DATA(c) + k * sizeof(int), sizeof got);
+			if (fds++ == 0)
+				fd = got;
+			else
+				close(got);
+		}
+	}
+	if (bad || fds != 1) {
+		if (fd >= 0)
+			close(fd);
 		return -1;
-	c = CMSG_FIRSTHDR(&msg);
-	if (!c || c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS || c->cmsg_len != CMSG_LEN(sizeof(int)))
-		return -1;
-	memcpy(&fd, CMSG_DATA(c), sizeof fd);
+	}
 #ifndef LINUXFS_FS_TEST_DROP
 	{
 		struct stat st;
@@ -834,17 +861,25 @@ static int recv_device(int sock, int secs)
 	return fd;
 }
 
-/* MNT is in the mount table; MNT_NOWAIT, so no file system is asked */
-static int mounted_on(const char *mnt)
+/* What is mounted on MNT (MNT_NOWAIT, so no file system is asked): 0 nothing; 1 root's own mount, from linuxfs@BSD, a macfuse
+ * (or osxfuse) file system; -1 something else, which is never root's to unmount */
+static int mounted_on(const char *mnt, const char *bsd)
 {
 	struct statfs *m;
-	int n, i;
+	char from[64];
+	int n, i, r = 0;
 
+	snprintf(from, sizeof from, "linuxfs@%s", bsd);
 	n = getmntinfo(&m, MNT_NOWAIT);
 	for (i = 0; i < n; i++)
-		if (strcmp(m[i].f_mntonname, mnt) == 0)
-			return 1;
-	return 0;
+		if (strcmp(m[i].f_mntonname, mnt) == 0) {
+			if (strcmp(m[i].f_mntfromname, from) == 0 &&
+			    (strncmp(m[i].f_fstypename, "macfuse", 7) == 0 || strncmp(m[i].f_fstypename, "osxfuse", 7) == 0))
+				r = 1;
+			else if (r == 0)
+				r = -1;
+		}
+	return r;
 }
 
 /* Waits up to secs for pid; 1 with *st when it was reaped */
@@ -860,18 +895,22 @@ static int reap(pid_t pid, int secs, int *st)
 	return 0;
 }
 
-/* SIGTERM to process pid, then SIGKILL when it has not exited within STOP_WAIT_S; reaped */
-static void stop(pid_t pid)
+/* SIGTERM to process pid, then SIGKILL when it has not exited within term_s; reaped. One still there STOP_WAIT_S after the
+ * SIGKILL (a mount(2) blocked on INIT may not be interruptible) is said, to syslog and stderr: never left silently. */
+static void stop(const char *fs, pid_t pid, int term_s)
 {
 	int st;
 
 	if (pid <= 0)
 		return;
 	kill(pid, SIGTERM);
-	if (!reap(pid, STOP_WAIT_S, &st)) {
-		kill(pid, SIGKILL);
-		reap(pid, STOP_WAIT_S, &st);
-	}
+	if (reap(pid, term_s, &st))
+		return;
+	kill(pid, kill_sig());
+	if (reap(pid, STOP_WAIT_S, &st))
+		return;
+	syslog(LOG_NOTICE, "mount_%s: mount_macfuse (pid %d) is still running after SIGKILL; left", fs, (int)pid);
+	fprintf(stderr, "linuxfs-mount: mount_macfuse (pid %d) is still running after SIGKILL; left\n", (int)pid);
 }
 
 /* SIGTERM to process group pgid, then, after its leader (reaped, when it has not been yet: running) exits or STOP_WAIT_S, SIGKILL
@@ -896,7 +935,10 @@ static void stop_group(pid_t pgid, int running)
  * never reads the file system and never runs lklfuse. Every descriptor but 0-2 is closed in mount_macfuse, and in the CLI
  * all but 3 (the disk) and FUSE_FD. Unmounting (DiskArbitration, diskutil) ends lklfuse, which sees its device close. If lklfuse
  * dies first the mount stays, with nobody serving it: macFUSE fails its calls (a dead file system, ENXIO) rather than hang,
- * and it still unmounts (tests/smoke-mavericks.sh checks both). */
+ * and it still unmounts (tests/smoke-mavericks.sh checks both). If the CLI fails before lklfuse answers INIT, mount_macfuse may
+ * still hold its own copy of the device, blocked in mount(2): root's closing its copy cannot end that wait, and macFUSE offers
+ * no ioctl that does (FUSEDEVIOCINTERRUPTREADERS wakes the device's readers, not the mount); the kernel gives up by itself,
+ * EAGAIN after about 50 s (macfuse's smoke). So root stops it (stop()) and says so if even SIGKILL leaves it running. */
 static int mount_by_root(const char *fs, const struct mountreq *req, const char *bsd, int ro, const char *name, uid_t uid,
 			 gid_t gid, char **args)
 {
@@ -907,7 +949,7 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 	const char *helper = mount_helper();
 	int cs[2], hout[2], nul, devfd, fd, w, got = 0, cli_rc = -2, ok = 0;
 	int32_t status = -1;
-	size_t hgot = 0;
+	size_t hgot = 0, sgot = 0;
 	pid_t hpid, cpid;
 	time_t deadline, cli_end = 0;
 
@@ -1045,8 +1087,12 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 			}
 		}
 		if (!got && p[0].revents) {
-			r = recv(cs[1], &status, sizeof status, MSG_WAITALL);
-			got = r == (ssize_t)sizeof status ? 1 : -1;
+			/* without blocking, a piece at a time: the deadline bounds a status cut short too */
+			r = recv(cs[1], (char *)&status + sgot, sizeof status - sgot, MSG_DONTWAIT);
+			if (r > 0 && (sgot += (size_t)r) == sizeof status)
+				got = 1;
+			else if (r == 0 || (r < 0 && errno != EINTR && errno != EAGAIN))
+				got = -1;
 		}
 		if (cli_rc == -2 && waitpid(cpid, &w, WNOHANG) == cpid) {
 			cli_rc = WIFEXITED(w) ? WEXITSTATUS(w) : 1;
@@ -1064,11 +1110,7 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 		 * and is reaped; no root helper outlives the mount program */
 		if (hpid > 0 && !reap(hpid, STOP_WAIT_S, &w)) {
 			syslog(LOG_NOTICE, "mount_%s: %s: mount_macfuse (pid %d) is still running after the mount; stopped", fs, bsd, (int)hpid);
-			kill(hpid, SIGTERM);
-			if (!reap(hpid, 1, &w)) {
-				kill(hpid, SIGKILL);
-				reap(hpid, STOP_WAIT_S, &w);
-			}
+			stop(fs, hpid, 1);
 		}
 	} else {
 		if (got > 0)
@@ -1085,13 +1127,16 @@ failed:
 			cli_rc = WIFEXITED(w) ? WEXITSTATUS(w) : 1;
 		if (cpid > 0)	/* the CLI and its lklfuse, if any: without the mount there is nothing for them to serve */
 			stop_group(cpid, cli_rc == -2);
-		if (mounted_on(req->mnt)) {
+		fd = mounted_on(req->mnt, bsd);
+		if (fd < 0)
+			syslog(LOG_NOTICE, "mount_%s: %s: %s holds another volume than root's mount; left mounted", fs, bsd, req->mnt);
+		if (fd > 0) {
 			if (unmount(req->mnt, MNT_FORCE) == 0)
 				syslog(LOG_NOTICE, "mount_%s: %s: unmounted %s", fs, bsd, req->mnt);
 			else
 				syslog(LOG_NOTICE, "mount_%s: %s: cannot unmount %s: %s", fs, bsd, req->mnt, strerror(errno));
 		}
-		stop(hpid);
+		stop(fs, hpid, STOP_WAIT_S);
 		if (cs[1] >= 0)
 			close(cs[1]);
 		fprintf(stderr, "linuxfs-mount: root's mount of %s failed\n", bsd);
@@ -1287,6 +1332,8 @@ static int mount_role(const char *fs, int argc, char **argv)
 	char *out, hint[256], header[400], message[400], pass[PW_MAX], saved_pw[PW_MAX];
 	int rc, wrong = 0, tries, saved = 0, remember;
 
+	/* whoever started us may have left SIGCHLD ignored, and then no child's exit status would ever be seen */
+	signal(SIGCHLD, SIG_DFL);
 	openlog("linuxfs-mount", LOG_PID, LOG_DAEMON);
 	log_request(fs, argc, argv);
 	if (fsrules_parse_mount(argc - 1, argv + 1, &req) != 0) {
