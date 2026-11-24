@@ -64,6 +64,53 @@ int fsrules_claims(const char *fs, const char *probed_type, int removable, const
 	return strcmp(fs, probed_type) == 0;
 }
 
+unsigned fsrules_probe_flags(const char *fusion, const char *words)
+{
+	unsigned f = fusion && strncmp(fusion, "fusion-", 7) == 0 ? FSF_FUSION : 0;
+
+	while (words && *words) {
+		size_t n = strcspn(words, " ");
+
+		if (n == 9 && strncmp(words, "encrypted", 9) == 0)
+			f |= FSF_ENCRYPTED;
+		else if (n == 5 && strncmp(words, "dirty", 5) == 0)
+			f |= FSF_DIRTY;
+		words += n;
+		while (*words == ' ')
+			words++;
+	}
+	return f;
+}
+
+enum fsaccess fsrules_access(const char *probed_type, unsigned flags, int ro, int before_login, const struct fsprefs *p,
+			     const char **why)
+{
+	const char *w = "";
+	enum fsaccess a = FSA_RO;
+
+	if (!probed_type || !p)
+		w = "", a = FSA_REFUSE;
+	else if (before_login && (flags & FSF_ENCRYPTED))
+		w = "encrypted", a = FSA_REFUSE;
+	else if (ro)
+		w = "asked";
+	else if (p->readonly)
+		w = "ReadOnly";
+	else if (flags & FSF_ENCRYPTED)
+		w = "encrypted";
+	else if (strcmp(probed_type, "apfs") == 0 && (flags & FSF_FUSION))
+		w = "fusion";
+	else if (strcmp(probed_type, "apfs") == 0 && !p->apfs_write)
+		w = "apfs";
+	else if (strcmp(probed_type, "ntfs3") == 0 && (flags & FSF_DIRTY))
+		w = "dirty";
+	else
+		a = FSA_RW;
+	if (why)
+		*why = w;
+	return a;
+}
+
 static void options(const char *list, struct mountreq *m)
 {
 	while (*list) {

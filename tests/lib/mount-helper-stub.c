@@ -6,10 +6,12 @@
  * Its environment, arguments, open descriptors and pid go to ARGV0.log; ARGV0.mode, when present, changes what it does:
  *   status N   send N (an errno) instead of 0      nofd     never send the device; sleep 30 s
  *   nostatus   send the device, never a status; sleep 30 s
+ *   linger     status 0, then sleep 30 s           stubborn   the same, ignoring SIGTERM
  */
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -101,5 +103,9 @@ int main(int argc, char **argv)
 	fflush(log);
 	if (write(comm, &st, sizeof st) != (ssize_t)sizeof st)
 		return 76;
+	if (strcmp(mode, "stubborn") == 0)
+		signal(SIGTERM, SIG_IGN);
+	if (strcmp(mode, "linger") == 0 || strcmp(mode, "stubborn") == 0)
+		sleep(30);
 	return 0;
 }

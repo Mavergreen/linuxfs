@@ -2,12 +2,18 @@
  * linuxfs-probe (and linuxfs_probe_fd, for linuxfs-helper): names the filesystem on a device or image by its superblock, as lklfuse's type= spells it.
  * usage: linuxfs-probe PATH
  *        linuxfs-probe --uuid PATH
- * Prints "TYPE<TAB>LABEL" (the label empty where none is read) and exits 0; prints "unknown" and exits 1 when
- * no superblock it knows is there; exits 2 when PATH cannot be read. Reads at most the first 68 KiB.
+ *        linuxfs-probe --access TYPE FUSION FLAGS [ro] [readonly] [apfs-write] [before-login]
+ * Prints "TYPE<TAB>LABEL" (the label empty where none is read), then a tab and the Fusion role, and a tab and the flags
+ * (probe.h), when there are any; exits 0; prints "unknown" and exits 1 when no superblock it knows is there; exits 2 when
+ * PATH cannot be read. Reads at most the first 68 KiB, and what an APFS or NTFS volume's name and flags need beyond it.
+ * --access prints how a volume the probe described so (its third and fourth fields, "" when absent) mounts, by
+ * fsrules_access, with the request (ro) and preferences (readonly: ReadOnly; apfs-write: APFSWrite) the words name:
+ * "rw", "ro REASON" or "refuse REASON"; exits 2 on misuse. It is the CLI's way to the root mount program's rule.
  * --uuid prints the filesystem's UUID as linuxfs_probe_uuid gives it (what the bundles' util -k tells DiskArbitration)
  * and exits 0; exits 1, printing nothing, when there is none.
  */
 #include "probe.h"
+#include "fsrules.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -23,10 +29,29 @@ static size_t have;
 static int probe_fd = -1;	/* for the reads beyond SPAN that an APFS volume's name needs */
 static size_t uuid_off;		/* where the 16 UUID bytes sit in buf, or 0 when the filesystem has none */
 static char extra[64];		/* a third field: an APFS Fusion device's role and container */
+static char vflags[32];		/* a fourth: "encrypted", "dirty" */
 
 const char *linuxfs_probe_extra(void)
 {
 	return extra;
+}
+
+const char *linuxfs_probe_flags(void)
+{
+	return vflags;
+}
+
+int linuxfs_probe_line(char *out, size_t len, const char *type, const char *label)
+{
+	int n;
+
+	if (*vflags)
+		n = snprintf(out, len, "%s\t%s\t%s\t%s", type, label, extra, vflags);
+	else if (*extra)
+		n = snprintf(out, len, "%s\t%s\t%s", type, label, extra);
+	else
+		n = snprintf(out, len, "%s\t%s", type, label);
+	return n < 0 || (size_t)n >= len ? -1 : 0;
 }
 
 
@@ -228,7 +253,14 @@ static void ntfs_label(char *out, size_t outlen)
 
 			if (vo + vl <= len)
 				label_utf16(r + a + vo, vl / 2, out, outlen);
-			break;
+		}
+		/* $VOLUME_INFORMATION (resident): its flags at 10 in the value; VOLUME_IS_DIRTY is 1, what ntfs3 refuses to write */
+		if (type == 0x70 && r[a + 8] == 0) {
+			uint32_t vl = get32(r, a + 0x10);
+			size_t vo = r[a + 0x14] | r[a + 0x15] << 8;
+
+			if (vl >= 12 && vo + 12 <= len && (r[a + vo + 10] & 1))
+				snprintf(vflags, sizeof vflags, "dirty");
 		}
 		a += len;
 	}
@@ -267,11 +299,12 @@ static void exfat_label(char *out, size_t outlen)
 
 /*
  * APFS volume 0's name: the container's object map (a B-tree of virtual oid -> physical block) gives the block of
- * the volume superblock, which holds the name. Apple's "Apple File System Reference" layouts: nx_superblock_t
+ * the volume superblock, which holds the name and whether the volume is encrypted. Apple's "Apple File System Reference" layouts: nx_superblock_t
  * (nx_block_size at 36, nx_omap_oid at 160, nx_fs_oid[] at 184), omap_phys_t (om_tree_oid at 48),
  * btree_node_phys_t (flags at 32, level at 34, nkeys at 36, table space at 40, entries from 56; a root node keeps a
  * 40-byte btree_info_t at its end), omap keys {oid, xid} and values {flags, size, paddr}, apfs_superblock_t ("APSB"
- * at 32, apfs_volname at 704). Leaves the label empty on anything unexpected.
+ * at 32, apfs_fs_flags at 264, whose APFS_FS_UNENCRYPTED (1) clear is what linux-apfs-rw asks a password for,
+ * apfs_volname at 704). Leaves the label empty, and the flags, on anything unexpected.
  */
 static void apfs_label(char *out, size_t outlen)
 {
@@ -320,6 +353,8 @@ static void apfs_label(char *out, size_t outlen)
 		if (level == 0) {
 			if (read_block(b, bs, best) == 0 && memcmp(b + 32, "APSB", 4) == 0) {
 				label_bytes(b + 704, 256, out, outlen);
+				if (!(b[264] & 1))
+					snprintf(vflags, sizeof vflags, "encrypted");
 			}
 			goto done;
 		}
@@ -407,6 +442,7 @@ const char *linuxfs_probe_fd(int fd, char *lab, size_t lablen, int *err)
 	uuid_off = 0;
 	*err = 0;
 	extra[0] = '\0';
+	vflags[0] = '\0';
 	while (have < SPAN) {
 		r = pread(fd, buf + have, SPAN - have, have);
 		if (r < 0 && errno == EINTR)
@@ -449,12 +485,38 @@ int linuxfs_probe_uuid(char *out, size_t outlen)
 #ifndef LINUXFS_PROBE_NO_MAIN
 int main(int argc, char **argv)
 {
-	char lab[512], uuid[40];
+	char lab[512], uuid[40], line[700];
 	const char *type, *path;
 	int fd, err, want_uuid = argc == 3 && strcmp(argv[1], "--uuid") == 0;
 
+	if (argc >= 5 && strcmp(argv[1], "--access") == 0) {
+		static const char *const names[] = { "rw", "ro", "refuse" };
+		struct fsprefs p;
+		const char *why;
+		int i, ro = 0, login = 0;
+		enum fsaccess a;
+
+		fsrules_default_prefs(&p);
+		for (i = 5; i < argc; i++) {
+			if (strcmp(argv[i], "ro") == 0)
+				ro = 1;
+			else if (strcmp(argv[i], "readonly") == 0)
+				p.readonly = 1;
+			else if (strcmp(argv[i], "apfs-write") == 0)
+				p.apfs_write = 1;
+			else if (strcmp(argv[i], "before-login") == 0)
+				login = 1;
+			else
+				goto usage;
+		}
+		a = fsrules_access(argv[2], fsrules_probe_flags(argv[3], argv[4]), ro, login, &p, &why);
+		printf("%s%s%s\n", names[a], *why ? " " : "", why);
+		return 0;
+	}
 	if (argc != 2 && !want_uuid) {
-		fprintf(stderr, "usage: linuxfs-probe PATH\n       linuxfs-probe --uuid PATH\n");
+usage:
+		fprintf(stderr, "usage: linuxfs-probe PATH\n       linuxfs-probe --uuid PATH\n"
+			"       linuxfs-probe --access TYPE FUSION FLAGS [ro] [readonly] [apfs-write] [before-login]\n");
 		return 2;
 	}
 	path = argv[argc - 1];
@@ -479,10 +541,9 @@ int main(int argc, char **argv)
 		printf("unknown\n");
 		return 1;
 	}
-	if (*linuxfs_probe_extra())
-		printf("%s\t%s\t%s\n", type, lab, linuxfs_probe_extra());
-	else
-		printf("%s\t%s\n", type, lab);
+	if (linuxfs_probe_line(line, sizeof line, type, lab) != 0)
+		return 2;
+	printf("%s\n", line);
 	return 0;
 }
 #endif

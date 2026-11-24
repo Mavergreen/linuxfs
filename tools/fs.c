@@ -1060,10 +1060,16 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 		syslog(LOG_NOTICE, "mount_%s: %s mounted on %s by root, served by %s%s", fs, bsd, req->mnt, RUN_USER,
 		       cli_rc == -2 ? " (the CLI had not finished)" : "");
 		close(cs[1]);
-		/* mount_macfuse has said all it has to; it is not stopped, since what it does on a signal is not known (its
-		 * source is closed): one that lingers is left to launchd */
-		if (hpid > 0 && !reap(hpid, STOP_WAIT_S, &w))
-			syslog(LOG_NOTICE, "mount_%s: %s: mount_macfuse (pid %d) is still running after the mount; left", fs, bsd, (int)hpid);
+		/* mount_macfuse has said all it has to: one still running STOP_WAIT_S later gets SIGTERM, then after 1 s SIGKILL,
+		 * and is reaped; no root helper outlives the mount program */
+		if (hpid > 0 && !reap(hpid, STOP_WAIT_S, &w)) {
+			syslog(LOG_NOTICE, "mount_%s: %s: mount_macfuse (pid %d) is still running after the mount; stopped", fs, bsd, (int)hpid);
+			kill(hpid, SIGTERM);
+			if (!reap(hpid, 1, &w)) {
+				kill(hpid, SIGKILL);
+				reap(hpid, STOP_WAIT_S, &w);
+			}
+		}
 	} else {
 		if (got > 0)
 			syslog(LOG_NOTICE, "mount_%s: %s: mount_macfuse reported %d", fs, bsd, (int)status);
@@ -1116,7 +1122,7 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 	char node[64], devarg[64], name[64];
 	char *args[8];
 	const char *bsd;
-	int fd, mfd, n = 0, ro_fallback = 0, rc, by_root;
+	int fd, mfd, n = 0, ro_fallback = 0, ro, rc, by_root;
 	uid_t uid;
 	gid_t gid;
 
@@ -1156,6 +1162,35 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 		close(fd);
 	}
 	fcntl(3, F_SETFD, 0);
+
+	/* how it mounts, by the rule the CLI follows too (fsrules_access, the probe's type and flags): decided here, before
+	 * macFUSE mounts it, so the kernel's mount is read-only whenever what lklfuse serves will be. An encrypted volume is
+	 * refused: before login there is no keychain, and no one to ask for its password. */
+	{
+		char label[256];
+		struct fsprefs p;
+		const char *type, *why = "";
+		int err = 0;
+
+		type = linuxfs_probe_fd(3, label, sizeof label, &err);
+		if (!type)
+			return refuse(fs, "no filesystem linuxfs knows on the device");
+		fs_read_prefs(&p);
+		switch (fsrules_access(type, fsrules_probe_flags(linuxfs_probe_extra(), linuxfs_probe_flags()), req->ro || ro_fallback,
+				       1, &p, &why)) {
+		case FSA_REFUSE:
+			return refuse(fs, "an encrypted volume before login: no keychain, and no one to ask for its password");
+		case FSA_RO:
+			ro = 1;
+			break;
+		default:
+			ro = 0;
+			break;
+		}
+#ifndef LINUXFS_FS_TEST_DROP
+		syslog(LOG_NOTICE, "mount_%s: %s: %s is %s%s%s", fs, bsd, type, ro ? "read-only (" : "read-write", why, ro ? ")" : "");
+#endif
+	}
 
 	/* the mount point: the directory we open is the one we chown, so a swapped path cannot redirect it */
 	mfd = open(req->mnt, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
@@ -1197,14 +1232,14 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 	args[n++] = "da-mount";
 	if (req->asked)
 		args[n++] = "--asked";
-	if (req->ro || ro_fallback)
+	if (ro)
 		args[n++] = "--ro";
 	args[n++] = devarg;
 	args[n++] = (char *)req->mnt;
 	args[n] = NULL;
 
 	if (by_root)
-		return mount_by_root(fs, req, bsd, req->ro || ro_fallback, name, uid, gid, args);
+		return mount_by_root(fs, req, bsd, ro, name, uid, gid, args);
 #ifdef LINUXFS_FS_TEST_DROP
 	print_cli_plan(vars, args);
 	/* a stand-in for the bundled CLI, to see what run_capture hands it and what comes back */

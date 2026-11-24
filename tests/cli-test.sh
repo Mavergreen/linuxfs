@@ -7,6 +7,17 @@ set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d "${TMPDIR:-/tmp}/cli-test.XXXXXX"); T=$(cd "$T" && pwd); trap 'pkill -f "$T/bin/lklfuse" 2>/dev/null; rm -rf "$T"' EXIT
 mkdir -p "$T/bin" "$T/Volumes"; : > "$T/mtab"
+# spec: tools/fsrules.h fsrules_access -- the stand-in prober answers --access with the real one (tools/probe.c and fsrules.c),
+#       so the rule the CLI follows here is the one the root mount program follows
+if [ "$(uname -s)" = Linux ]; then
+  cc -O2 -Wall -Werror -o "$T/realprobe" "$ROOT/tools/probe.c" "$ROOT/tools/fsrules.c" || exit 1
+else
+  . "$ROOT/build/msc.sh"
+  CL=$(sh "$SHIPYARD_SCRIPTS/fetch_clang22.sh" "$ROOT/components/clang22" 2>/dev/null) || exit 1
+  SDK=$(sh "$SHIPYARD_SCRIPTS/fetch_sdk.sh" 2>/dev/null) || exit 1
+  "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld \
+    -o "$T/realprobe" "$ROOT/tools/probe.c" "$ROOT/tools/fsrules.c" || exit 1
+fi
 cat > "$T/bin/mount" <<EOF
 #!/bin/sh
 cat "$T/mtab"
@@ -37,6 +48,7 @@ exit 0
 EOF
 cat > "$T/bin/probe" <<EOF
 #!/bin/sh
+if [ "\$1" = --access ]; then echo "\$*" >> "$T/accesscalls"; exec "$T/realprobe" "\$@"; fi
 if [ "\$1" = --uuid ]; then [ -n "\${FAKE_UUID:-}" ] || exit 1; echo "\$FAKE_UUID"; exit 0; fi
 echo "\$1" >> "$T/probecalls"
 case "\$1" in */rdisk3) echo unknown; exit 1 ;; esac
@@ -49,7 +61,7 @@ fi
 case "\${FAKE_PROBE:-ext4}" in
   none) echo unknown; exit 1 ;;
   unreadable) exit 2 ;;
-  *) printf '%s\t%s\n' "\${FAKE_PROBE:-ext4}" "\${FAKE_LABEL-my data}" ;;
+  *) printf '%s\t%s%s\n' "\${FAKE_PROBE:-ext4}" "\${FAKE_LABEL-my data}" "\${FAKE_FLAGS:+\$(printf '\t\t%s' "\$FAKE_FLAGS")}" ;;
 esac
 EOF
 cat > "$T/bin/diskutil" <<EOF
@@ -184,6 +196,13 @@ out=$(FAKE_PROBE=ntfs3 FAKE_LABEL=Win FAKE_MODE=dirty sh "$L" mount "$T/img" 2>&
 ok $? "a dirty NTFS volume mounts read-only, and says so"
 case $(last) in *,ro\ *) r=0 ;; *) r=1 ;; esac; ok $r "the retry passes ro"
 sh "$L" unmount "$T/img" > /dev/null 2>&1
+# spec: tools/fsrules.h fsrules_access -- what the probe says (its fourth field) decides at once, by the root mount program's rule
+: > "$T/calls"; : > "$T/accesscalls"
+out=$(FAKE_PROBE=ntfs3 FAKE_LABEL=Win FAKE_FLAGS=dirty FAKE_MODE=dirty sh "$L" mount "$T/img" 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(grep -c . "$T/calls")" = 1 ] && echo "$out" | grep -q "dirty NTFS volume" && case $(last) in *,ro\ *) true ;; *) false ;; esac
+ok $? "a volume the probe calls dirty mounts read-only at once: one lklfuse, with ro, and it says why (rc $rc: $(tr '\n' '|' < "$T/calls"))"
+grep -qx -- "--access ntfs3  dirty" "$T/accesscalls"; ok $? "the CLI asks linuxfs-probe --access with the probe's type, Fusion role and flags ($(tr '\n' '|' < "$T/accesscalls"))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
 
 out=$(FAKE_MODE=locked sh "$L" mount "$T/img" 2>&1); rc=$?
 [ $rc -eq 1 ] && echo "$out" | grep -q "already mounted by linuxfs" && [ ! -e "$T/Volumes/my data" ]
@@ -208,7 +227,7 @@ if [ "\$1" = --probe ] && [ -n "\${FAKE_FUSION:-}" ]; then
   echo unknown; exit 1
 fi
 if [ "\$1" = --probe ] && [ -n "\${FAKE_OPEN_EAT:-}" ]; then cat > /dev/null; fi
-if [ "\$1" = --probe ]; then t=\${FAKE_PROBE:-ext4}; [ "\$t" != unreadable ] || t=ext4; printf '%s\t%s\n' "\$t" "\${FAKE_OPEN_LABEL-helped}"; exit 0; fi
+if [ "\$1" = --probe ]; then t=\${FAKE_PROBE:-ext4}; [ "\$t" != unreadable ] || t=ext4; printf '%s\t%s%s\n' "\$t" "\${FAKE_OPEN_LABEL-helped}" "\${FAKE_FLAGS:+\$(printf '\t\t%s' "\$FAKE_FLAGS")}"; exit 0; fi
 if [ "\$1" = --uuid ]; then [ -n "\${FAKE_UUID:-}" ] || { echo "linuxfs-open: \$2: this filesystem has no UUID" >&2; exit 1; }; echo "\$FAKE_UUID"; exit 0; fi
 case "\$1" in --noauto-add|--noauto-remove)
   printf '%s\n' "\$*" >> "$T/noauto"
@@ -254,6 +273,8 @@ echo "$out" | grep -q "^/dev/disk4	ext4	data	-\$" && ! echo "$out" | grep -q "^/
 ok $? "list shows a disk with no partition table (a superfloppy, an attached image), not a partitioned one"
 echo "$out" | grep -q "^/dev/disk3s1	ext4	data	-\$" && echo "$out" | grep -q "^/dev/disk3s2	ext4	data	/Volumes/win\$"
 ok $? "list probes each partition and shows the Mac's mount (got: $(echo "$out" | tr '\n' '|'))"
+out=$(FAKE_PROBE=ntfs3 FAKE_LABEL=data FAKE_FLAGS=dirty sh "$L" list 2>&1)
+echo "$out" | grep -q "^/dev/disk3s1	ntfs3	data	-\$"; ok $? "list shows the type and label only, not the probe's flags (got: $(echo "$out" | grep disk3s1 | tr '\t' ' '))"
 cat > "$T/bin/defaults" <<EOF
 #!/bin/sh
 f="$T/defaults.\$2"; touch "\$f"
@@ -317,6 +338,11 @@ sh "$L" status | grep -q "apfs	rw\$"; ok $? "status says rw"
 sh "$L" unmount "$T/img" > /dev/null 2>&1
 FAKE_PROBE=apfs sh "$L" mount --ro "$T/img" > /dev/null 2>&1
 case $(last) in *opts=readwrite*) r=1 ;; *,ro\ *) r=0 ;; *) r=1 ;; esac; ok $r "--ro still mounts APFS read-only, without readwrite"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+: > "$T/calls"
+out=$(printf 's3cret\n' | FAKE_PROBE=apfs FAKE_FLAGS=encrypted FAKE_ENCRYPTED=s3cret sh "$L" mount "$T/img" --password-stdin 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(grep -c . "$T/calls")" = 1 ] && ! grep -q readwrite "$T/calls" && echo "$out" | grep -q "encrypted APFS volume, which linuxfs mounts read-only" && ! echo "$out" | grep -qi experimental
+ok $? "with APFSWrite on, a volume the probe calls encrypted mounts read-only at once, saying why (rc $rc: $(tr '\n' '|' < "$T/calls"))"
 sh "$L" unmount "$T/img" > /dev/null 2>&1
 sh "$L" prefs APFSWrite off
 LINUXFS_DA=1 LINUXFS_OPEN=$LO FAKE_PROBE=apfs sh "$L" mount disk3s1 > /dev/null 2>&1; ok $? "a device mount takes APFS"

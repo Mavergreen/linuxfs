@@ -17,7 +17,7 @@ cc() { "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wal
 cc -DLINUXFS_PROBE_NO_MAIN -o "$D/helper" "$ROOT/tools/helper.c" "$ROOT/tools/probe.c" "$ROOT/tools/fstab.c" "$ROOT/tools/fsrules.c" \
   "$ROOT/tools/plist.c" -framework IOKit -framework CoreFoundation || exit 1
 cc -DLINUXFS_PROBE_NO_MAIN -o "$D/open" "$ROOT/tools/open.c" "$ROOT/tools/probe.c" || exit 1
-cc -o "$D/probe" "$ROOT/tools/probe.c" || exit 1
+cc -o "$D/probe" "$ROOT/tools/probe.c" "$ROOT/tools/fsrules.c" || exit 1
 cc -DLINUXFS_PROBE_NO_MAIN -o "$D/policy" "$ROOT/tests/helper-policy-test.c" "$ROOT/tools/probe.c" "$ROOT/tools/fstab.c" "$ROOT/tools/fsrules.c" \
   "$ROOT/tools/plist.c" -framework IOKit -framework CoreFoundation || exit 1
 sh "$ROOT/build/linux-host.sh" sh -c 'truncate -s 32M "$1/ext4.img" && mkfs.ext4 -q -F -L helped "$1/ext4.img" &&

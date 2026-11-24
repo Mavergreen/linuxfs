@@ -6,7 +6,7 @@
  *        linuxfs-helper --noauto-remove-all                        (run by pre-uninstall, as root: noauto-remove-all)
  * Protocol, one request per connection, one line each way:
  *   "open /dev/rdiskNsM rw|ro"  ->  "ok TYPE<TAB>LABEL" plus the descriptor (SCM_RIGHTS), or "no REASON"
- *   "probe /dev/rdiskNsM"       ->  "ok TYPE<TAB>LABEL", or "no REASON"
+ *   "probe /dev/rdiskNsM"       ->  "ok TYPE<TAB>LABEL[<TAB>FUSION[<TAB>FLAGS]]" (probe.h), or "no REASON"
  *   "uuid /dev/rdiskNsM"        ->  "ok UUID" (the probe's, as the bundles' util -k gives it), or "no REASON"
  *   "noauto-add SPEC BUNDLE"    ->  "ok", or "no REASON": /etc/fstab gets SPEC's linuxfs noauto entry (fstab.h); SPEC is
  *                                   UUID=... or LABEL=<label>, which may hold spaces: BUNDLE is the line's last word. Only
@@ -692,7 +692,14 @@ void helper_serve(int c, uid_t peer, uid_t console, int test_files)
 		close(fd);
 		return;
 	}
-	snprintf(msg, sizeof(msg), "ok %s\t%s%s%s\n", type, label, *linuxfs_probe_extra() ? "\t" : "", linuxfs_probe_extra());
+	{
+		char line[sizeof(msg) - 4];
+
+		if (linuxfs_probe_line(line, sizeof(line), type, label) != 0)
+			snprintf(msg, sizeof(msg), "no the probe's answer is too long\n");
+		else
+			snprintf(msg, sizeof(msg), "ok %s\n", line);
+	}
 	reply(c, msg, mode[0] ? fd : -1);
 	close(fd);
 }

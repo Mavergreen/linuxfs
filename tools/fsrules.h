@@ -25,6 +25,26 @@ void fsrules_default_prefs(struct fsprefs *p);
  * global Automount: a volume is kept from mounting by itself by its own /etc/fstab noauto entry (fstab.h). */
 int fsrules_claims(const char *fs, const char *probed_type, int removable, const struct fsprefs *p);
 
+/* What linuxfs-probe says of a volume beyond its type and label (probe.h): its third field, an APFS Fusion device's role
+ * ("fusion-main UUID", "fusion-tier2 UUID") or "", and its fourth, space-separated words: "encrypted" (an APFS volume 0
+ * that needs its password) and "dirty" (an NTFS volume Windows left in use). Other words are ignored; NULL is "". */
+#define FSF_FUSION 1u
+#define FSF_ENCRYPTED 2u
+#define FSF_DIRTY 4u
+unsigned fsrules_probe_flags(const char *fusion, const char *words);
+
+enum fsaccess { FSA_RW, FSA_RO, FSA_REFUSE };
+
+/* How a volume the probe named probed_type, with flags, mounts: the one rule the root mount program (before it has
+ * macFUSE mount) and cli/linuxfs (through linuxfs-probe --access) both follow. Before login an encrypted volume is
+ * refused: no keychain and no one to ask for its password. Otherwise read-only when asked (ro, which DiskArbitration's
+ * rdonly sets), when the ReadOnly preference is on, for an encrypted volume or an APFS Fusion container, for APFS without
+ * APFSWrite (linux-apfs-rw's writing is experimental), and for a dirty NTFS volume (ntfs3 refuses to write it). *why, when
+ * why is not NULL, is the reason: "encrypted" for the refusal; for read-only the first of "asked", "ReadOnly",
+ * "encrypted", "fusion", "apfs" and "dirty"; "" for read-write. A NULL probed_type or prefs is refused. */
+enum fsaccess fsrules_access(const char *probed_type, unsigned flags, int ro, int before_login, const struct fsprefs *p,
+			     const char **why);
+
 struct mountreq { int asked, ro; const char *dev, *mnt; };
 
 /* mount_linuxfs_<fs>'s arguments: [-o a,b]... (or -oa,b) DEV MNT. `owners` sets asked, `rdonly` or `ro` sets ro.

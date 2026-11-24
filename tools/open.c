@@ -4,7 +4,7 @@
  *                                                        runs PROGRAM with the partition open on fd 3 (and
  *                                                        DEVICE2, read-only, on fd 4: an APFS Fusion container's
  *                                                        second device)
- *        linuxfs-open --probe DEVICE                     prints "TYPE<TAB>LABEL", as linuxfs-probe does
+ *        linuxfs-open --probe DEVICE                     prints "TYPE<TAB>LABEL[<TAB>FUSION[<TAB>FLAGS]]", as linuxfs-probe does
  *        linuxfs-open --uuid DEVICE                      prints the filesystem's UUID, as linuxfs-probe --uuid does
  *        linuxfs-open --noauto-add SPEC BUNDLE           has the helper add SPEC's noauto entry to /etc/fstab
  *        linuxfs-open --noauto-remove SPEC               has it take that entry away (SPEC: UUID=... or LABEL=...)
@@ -136,8 +136,8 @@ static int inherited(int argc, char **argv)
 		return 1;
 	}
 	if (argc == 3 && (strcmp(argv[1], "--probe") == 0 || strcmp(argv[1], "--uuid") == 0)) {
-		char label[256], uuid[40];
-		const char *type, *extra;
+		char label[256], uuid[40], line[400];
+		const char *type;
 		int err = 0;
 
 		type = linuxfs_probe_fd(3, label, sizeof(label), &err);
@@ -155,11 +155,9 @@ static int inherited(int argc, char **argv)
 			printf("%s\n", uuid);
 			return 0;
 		}
-		extra = linuxfs_probe_extra();
-		if (extra && *extra)
-			printf("%s\t%s\t%s\n", type, label, extra);
-		else
-			printf("%s\t%s\n", type, label);
+		if (linuxfs_probe_line(line, sizeof(line), type, label) != 0)
+			return 1;
+		printf("%s\n", line);
 		return 0;
 	}
 	if (i < argc && strcmp(argv[i], "--ro") == 0)

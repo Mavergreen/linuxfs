@@ -9,7 +9,7 @@ set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 if [ "$(uname -s)" = Linux ]; then
   D=${PROBE_TEST_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/probe-test.XXXXXX")}
-  cc -O2 -Wall -Werror -o "$D/probe" "$ROOT/tools/probe.c" || exit 1
+  cc -O2 -Wall -Werror -o "$D/probe" "$ROOT/tools/probe.c" "$ROOT/tools/fsrules.c" || exit 1
   cc -O2 -Wall -Werror -DLINUXFS_PROBE_NO_MAIN -o "$D/probe-uuid" "$ROOT/tests/probe-uuid.c" "$ROOT/tools/probe.c" || exit 1
 else
   . "$ROOT/build/msc.sh"
@@ -17,7 +17,7 @@ else
   CL=$(sh "$SHIPYARD_SCRIPTS/fetch_clang22.sh" "$ROOT/components/clang22" 2>/dev/null) || exit 1
   SDK=$(sh "$SHIPYARD_SCRIPTS/fetch_sdk.sh" 2>/dev/null) || exit 1
   "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld \
-    -o "$D/probe" "$ROOT/tools/probe.c" || exit 1
+    -o "$D/probe" "$ROOT/tools/probe.c" "$ROOT/tools/fsrules.c" || exit 1
   "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN \
     -o "$D/probe-uuid" "$ROOT/tests/probe-uuid.c" "$ROOT/tools/probe.c" || exit 1
 fi
@@ -45,6 +45,12 @@ n=$((n + 1)); m=$("$D/probe" "$D/fusion-ssd.img"); t=$("$D/probe" "$D/fusion-hdd
 u=$(printf '%s\n' "$m" | sed -n "s/^apfs${T}Fused${T}fusion-main \([0-9a-f]\{32\}\)\$/\1/p")
 if [ -n "$u" ] && [ "$t" = "apfs${T}${T}fusion-tier2 $u" ]; then echo "ok $n - a Fusion container's two devices name their roles and the same container"
 else echo "not ok $n - Fusion: main '$m', second '$t'"; bad=1; fi
+# spec: tools/probe.c -- the fourth field: a dirty NTFS volume, an encrypted APFS volume (macOS made it: volume 0 encrypted)
+want ntfs-dirty.img "ntfs3${T}Windows${T}${T}dirty" 0
+gunzip -c "$ROOT/tests/fixtures/apfs/enc.img.gz" > "$D/enc.img"
+n=$((n + 1)); got=$("$D/probe" "$D/enc.img"); rc=$?
+case $got in "apfs${T}"*"${T}${T}encrypted") [ $rc -eq 0 ] ;; *) false ;; esac
+if [ $? -eq 0 ]; then echo "ok $n - enc.img: an encrypted APFS volume says so ($got)"; else echo "not ok $n - enc.img: got '$got' ($rc)"; bad=1; fi
 want short.img unknown 1
 want ext4-cut.img unknown 1
 want zero.img unknown 1
@@ -94,4 +100,23 @@ none "Fusion tier2 device: no UUID" "$D/fusion-hdd.img"
 n=$((n + 1)); want_u=$(uuid fusion-ssd.img | tr a-f A-F); got=$("$D/probe-uuid" "$D/fusion-ssd.img"); rc=$?
 if [ -n "$want_u" ] && [ "$got" = "$want_u" ] && [ $rc -eq 0 ]; then echo "ok $n - Fusion main device: the container's UUID $got"
 else echo "not ok $n - Fusion main: got '$got' ($rc), want '$want_u'"; bad=1; fi
+# spec: tools/fsrules.h fsrules_access -- linuxfs-probe --access TYPE FUSION FLAGS [WORD...]: the CLI's way to the same rule
+acc() { # WANT ARGS...
+  n=$((n + 1)); w=$1; shift; got=$("$D/probe" --access "$@" 2>/dev/null); rc=$?
+  if [ "$got" = "$w" ] && [ $rc -eq 0 ]; then echo "ok $n - --access $*: $w"
+  else echo "not ok $n - --access $*: got '$got' ($rc), want '$w'"; bad=1; fi
+}
+acc rw ext4 "" ""
+acc "ro asked" ext4 "" "" ro
+acc "ro ReadOnly" ext4 "" "" readonly
+acc "ro apfs" apfs "" ""
+acc rw apfs "" "" apfs-write
+acc "ro fusion" apfs "fusion-main 0011" "" apfs-write
+acc "ro encrypted" apfs "" "encrypted" apfs-write
+acc "refuse encrypted" apfs "" "encrypted" before-login
+acc "ro dirty" ntfs3 "" "dirty"
+n=$((n + 1)); "$D/probe" --access ext4 "" "" bogus > /dev/null 2>&1; rc=$?
+if [ $rc -eq 2 ]; then echo "ok $n - --access with an unknown word is misuse (2)"; else echo "not ok $n - --access bogus: exit $rc, want 2"; bad=1; fi
+n=$((n + 1)); "$D/probe" --access ext4 "" > /dev/null 2>&1; rc=$?
+if [ $rc -eq 2 ]; then echo "ok $n - --access without FLAGS is misuse (2)"; else echo "not ok $n - --access short: exit $rc, want 2"; bad=1; fi
 echo "1..$n"; exit $bad

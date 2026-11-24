@@ -255,12 +255,15 @@ mt env LINUXFS_CLI="$M/clibad" DLG_PWS=pw DLG_MODE=once "$MD" /dev/disk9 /tmp/m 
 kcstop
 [ $rc = 0 ] && grep -q '^dialog' "$M/log"; ok $? "a hint that is not UTF-8 is left out, and the dialog still runs (rc $rc)"
 # spec: tools/fs.c run_cli -- the mount program against the REAL cli/linuxfs (da-mount), with stand-ins only for lklfuse, the
-#       opener and the prober (the CLI's own LINUXFS_LKLFUSE, LINUXFS_OPEN and LINUXFS_PROBE): every argv form the mount program
-#       builds is accepted (not usage, exit 2), and the password reaches lklfuse on its fd 5
+#       opener and the prober (the CLI's own LINUXFS_LKLFUSE, LINUXFS_OPEN and LINUXFS_PROBE; its --access is the real
+#       linuxfs-probe's): every argv form the mount program builds is accepted (not usage, exit 2), and the password reaches
+#       lklfuse on its fd 5
 R=$M/real; rm -rf "$R"; mkdir -p "$R/mnt"
+"$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld \
+  -o "$D/linuxfs-probe" "$ROOT/tools/probe.c" "$ROOT/tools/fsrules.c" || exit 1
 cat > "$R/open" <<'EOS'
 #!/bin/sh
-case $1 in --probe) printf '%s\tlbl\n' "${FAKE_PROBE:-ext4}"; exit 0 ;; esac
+case $1 in --access) exec "$REAL_PROBE" "$@" ;; --probe) printf '%s\tlbl\n' "${FAKE_PROBE:-ext4}"; exit 0 ;; esac
 [ "$1" != --ro ] || shift
 shift
 exec "$@"
@@ -279,7 +282,7 @@ real() { # ARGS...: the mount role (user path) running the real CLI, whose lklfu
   rm -f "$R/lk.log"
   mt env LINUXFS_CLI="$ROOT/cli/linuxfs" LINUXFS_OPEN="$R/open" LINUXFS_LKLFUSE="$R/lklfuse" LINUXFS_PROBE="$R/open" \
     LINUXFS_STATE="$R/state" LINUXFS_LOGS="$R/logs" LINUXFS_LOCKS="$R/locks" LINUXFS_DOMAIN=test.fsreal \
-    LINUXFS_MACHINE_DOMAIN="$R/no-machine" LK_LOG="$R/lk.log" "$@"; }
+    LINUXFS_MACHINE_DOMAIN="$R/no-machine" LK_LOG="$R/lk.log" REAL_PROBE="$D/linuxfs-probe" "$@"; }
 real "$MD" /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
 [ $rc = 0 ] && grep -q "^lklfuse: .*$R/mnt" "$R/lk.log"; ok $? "the real CLI accepts the plain da-mount argv (rc $rc)"
 plist "$R/stale.plist" "<key>Automount</key><false/><key>Ignore:lbl</key><true/>"
@@ -310,7 +313,8 @@ V=$D/vols; rm -rf "$V"; mkdir -p "$V/NAME" "$V/other"; : > "$V/file"; ln -s "$V/
 H=/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d
 UID_D=$(id -u daemon)
 plan() { # ARGS...: the drop build's plan for user daemon, volumes under $V
-  env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" "$DM" "$@"; }
+  env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_PREFS_USER="$D/none.plist" \
+    LINUXFS_PREFS_MACHINE="${MACHP:-$D/none2.plist}" "$DM" "$@"; }
 want() { # RW [ARGV-FLAGS] DEV MNT: the plan the brief prescribes
   rw=$1; dv=$2; mn=$3; shift 3
   printf 'user daemon\nuid %s\ngid %s\nfd3 /dev/r%s %s\nmnt %s\n' "$UID_D" "$(id -g daemon)" "$dv" "$rw" "$mn"
@@ -391,7 +395,9 @@ cp "$MF/5.5.0-mavericks.2.plist" "$MF/writable.plist"; chmod 664 "$MF/writable.p
 HELPER=/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse
 fplan() { # MANIFEST ARGS...: the drop build's plan with that macFUSE manifest (COMMFD's number as N)
   mf=$1; shift
-  env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_FS_TEST_MACFUSE="$mf" "$DM" "$@" | sed 's/^helper-env _FUSE_COMMFD=[0-9][0-9]*$/helper-env _FUSE_COMMFD=N/'; }
+  env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_FS_TEST_MACFUSE="$mf" LINUXFS_PREFS_USER="$D/none.plist" \
+    LINUXFS_PREFS_MACHINE="${MACHP:-$D/none2.plist}" "$DM" "$@" > "$M/fplan.out"; frc=$?
+  sed 's/^helper-env _FUSE_COMMFD=[0-9][0-9]*$/helper-env _FUSE_COMMFD=N/' "$M/fplan.out"; return $frc; }
 fwant() { # RW HELPER-OPTIONS DEV MNT [ARGV-FLAGS]: the plan the brief prescribes for root's mount
   rw=$1 hopts=$2 dv=$3 mn=$4; shift 4
   printf 'user daemon\nuid %s\ngid %s\nfd3 /dev/r%s %s\nmnt %s\n' "$UID_D" "$(id -g daemon)" "$dv" "$rw" "$mn"
@@ -413,6 +419,48 @@ mkdir -p "$V/a,b=c"
 fplan "$MF/5.5.0-mavericks.2.plist" "/dev/$E" "$V/a,b=c" > "$M/plan" 2>&1
 grep -qx "helper-argv allow_other,local,volname=a-b-c,fsname=linuxfs@$E,noappledouble" "$M/plan"; ok $? "root mount plan: the volume name is the mount point's, made safe for an option list ($(grep '^helper-argv a' "$M/plan"))"
 fplan "$MF/5.5.0-mavericks.2.plist" "/dev/$E" "$V/NAME" 2>&1 >/dev/null | grep -q .; [ $? -ne 0 ]; ok $? "root mount plan: a good run writes nothing to stderr"
+# spec: tools/fsrules.h fsrules_access -- root decides read-only before the kernel mount, by the CLI's rule (the probe's type and
+#       flags, ReadOnly, APFSWrite, DiskArbitration's rdonly), so the mount matches what lklfuse serves; an encrypted
+#       volume before login is refused: no keychain and no one to ask for its password
+cp "$D/apfs.img" "$D/apfs-enc.img"
+/usr/bin/python - "$D/apfs-enc.img" <<'EOP'
+import struct, sys
+f = open(sys.argv[1], 'r+b'); n = 0
+while True:
+    b = f.read(4096)
+    if len(b) < 4096: break
+    if b[32:36] == b'APSB':
+        f.seek(-4096 + 264, 1); f.write(struct.pack('<B', ord(b[264]) & 0xfe)); f.seek(4096 - 265, 1); n += 1
+assert n > 0
+EOP
+td=$(att ntfs-dirty.img); a=$(att apfs.img); ae=$(att apfs-enc.img); devs="$devs $td $a $ae"
+TD=${td#/dev/} A=${a#/dev/} AE=${ae#/dev/}
+plist "$D/apfswrite.plist" "<key>APFSWrite</key><true/>"
+plist "$D/readonly.plist" "<key>ReadOnly</key><true/>"
+F2=$MF/5.5.0-mavericks.2.plist
+fro() { # DEV WHAT [MACHINE-PREFS]: root's mount of DEV is read-only (rdonly, --ro), the device still opened read-write
+  MACHP=${3:-} fplan "$F2" "/dev/$1" "$V/NAME" > "$M/plan" 2>&1; rc=$?
+  fwant rw "allow_other,local,volname=NAME,fsname=linuxfs@$1,noappledouble,rdonly" "$1" "$V/NAME" --ro > "$M/want"
+  [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root mount plan: $2: rdonly to mount_macfuse, --ro to the CLI (rc $rc: $(diff "$M/plan" "$M/want" | head -4 | tr '\n' ';'))"
+}
+frw() { # DEV WHAT [MACHINE-PREFS]: root's mount of DEV is read-write
+  MACHP=${3:-} fplan "$F2" "/dev/$1" "$V/NAME" > "$M/plan" 2>&1; rc=$?
+  fwant rw "allow_other,local,volname=NAME,fsname=linuxfs@$1,noappledouble" "$1" "$V/NAME" > "$M/want"
+  [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root mount plan: $2: read-write (rc $rc: $(diff "$M/plan" "$M/want" | head -4 | tr '\n' ';'))"
+}
+fro "$TD" "a dirty NTFS volume"
+frw "$T" "a clean NTFS volume"
+fro "$A" "APFS without APFSWrite"
+frw "$A" "APFS with APFSWrite" "$D/apfswrite.plist"
+fro "$E" "the ReadOnly preference" "$D/readonly.plist"
+MACHP=$D/apfswrite.plist fplan "$F2" "/dev/$AE" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc=$?
+[ $rc = 1 ] && ! grep -q '^helper' "$M/plan" && ! grep -q '^argv' "$M/plan" && grep -q '^linuxfs-mount: refused: .*encrypted' "$M/plan.err"
+ok $? "root: an encrypted volume before login is refused, nothing run (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
+fplan "$MF/5.5.0-mavericks.1.plist" "/dev/$AE" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc=$?
+[ $rc = 1 ] && ! grep -q '^argv' "$M/plan" && grep -q 'encrypted' "$M/plan.err"; ok $? "and so with an older macFUSE: _linuxfs never runs for it (rc $rc)"
+fplan "$MF/5.5.0-mavericks.1.plist" "/dev/$TD" "$V/NAME" > "$M/plan" 2>&1; rc=$?
+want rw "$TD" "$V/NAME" --ro > "$M/want"
+[ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "with an older macFUSE the CLI is told --ro by the same rule (rc $rc: $(diff "$M/plan" "$M/want" | head -2 | tr '\n' ';'))"
 # spec: tools/fs.c -- the capability gate: MACFUSE_FD_MOUNTPOINT_SINCE, compared as numbers (5.5.0-mavericks.10 is past .2)
 for v in 5.5.0-mavericks.2 5.5.0-mavericks.10 5.6.0-mavericks.1 6.0.0-mavericks.1; do
   fplan "$MF/$v.plist" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1
@@ -480,6 +528,13 @@ hs "" linger
 lp=$(sed -n 's/^lingerer //p' "$M/fdcli.log")
 [ $rc = 0 ] && [ -n "$lp" ] && ps -p "$lp" > /dev/null; ok $? "on success what the CLI left running (lklfuse) keeps running (rc $rc)"
 [ -z "$lp" ] || kill "$lp" 2>/dev/null
+# spec: tools/fs.c mount_by_root -- mount_macfuse still running 2 s after a good mount: SIGTERM, then SIGKILL 1 s later; reaped
+s0=$(date +%s); hs linger ok; t=$(( $(date +%s) - s0 ))
+hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
+[ $rc = 0 ] && [ -n "$hp" ] && gone "$hp" && [ $t -ge 2 ] && [ $t -lt 6 ]; ok $? "a mount_macfuse that lingers after a good mount is stopped and reaped: no root helper left (rc $rc, $t s)"
+s0=$(date +%s); hs stubborn ok; t=$(( $(date +%s) - s0 ))
+hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
+[ $rc = 0 ] && [ -n "$hp" ] && gone "$hp" && [ $t -ge 3 ] && [ $t -lt 7 ]; ok $? "one that ignores SIGTERM is killed a second later (rc $rc, $t s)"
 ! strings "$D/linuxfs-fs" | grep -q 'LINUXFS_FS_TEST'; ok $? "the shipped build carries no LINUXFS_FS_TEST_* code"
 ! grep -q 'LINUXFS_FS_TEST' "$ROOT"/build/*.sh; ok $? "no build script defines LINUXFS_FS_TEST_DROP"
 echo "1..$n"; exit $bad

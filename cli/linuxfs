@@ -122,7 +122,7 @@ cmd_list() {
     esac
     at=$(mac_mount_of "/dev/$d")
     [ -n "$at" ] || at=$(records | awk -F"$tab" -v s="/dev/r$d" '$2 == s { print $3 }')
-    printf '/dev/%s\t%s\t%s\n' "$d" "$out" "${at:--}"
+    printf '/dev/%s\t%s\t%s\n' "$d" "$(printf '%s\n' "$out" | cut -f 1,2)" "${at:--}"
   done
 }
 
@@ -157,7 +157,20 @@ run_lklfuse() { # SOURCE MOUNTPOINT OPTIONS [OPENER-DEVICE [SECOND-OPENER-DEVICE
   return 0
 }
 
-# A disk's "TYPE<TAB>LABEL[<TAB>EXTRA]": from the probe when the raw node is readable, else through the helper.
+# The fields of a probe's "TYPE<TAB>LABEL[<TAB>FUSION[<TAB>FLAGS]]": sets type, label, fusion (an APFS Fusion device's role
+# and container, or "") and flags (space-separated: encrypted, dirty; or "").
+fields() { # PROBE-LINE
+  type=${1%%"$tab"*} label= fusion= flags=
+  case $1 in *"$tab"*)
+    _f=${1#*"$tab"}; label=${_f%%"$tab"*}
+    case $_f in *"$tab"*)
+      _f=${_f#*"$tab"}; fusion=${_f%%"$tab"*}
+      case $_f in *"$tab"*) flags=${_f#*"$tab"} ;; esac ;;
+    esac ;;
+  esac
+}
+
+# A disk's "TYPE<TAB>LABEL[<TAB>FUSION[<TAB>FLAGS]]": from the probe when the raw node is readable, else through the helper.
 probe_dev() { if [ -r "$1" ] && [ "${LINUXFS_OPEN_INHERITED:-}" != 1 ]; then "$PROBE" "$1" 2>/dev/null < /dev/null; else "$OPENER" --probe "$1" 2>/dev/null < /dev/null; fi; }
 
 # The attached disk (/dev/rdiskN...) whose probe names it ROLE (main|tier2) of APFS Fusion container UUID.
@@ -245,8 +258,7 @@ cmd_mount() {
     1) die "$target: no filesystem linuxfs knows (ext4, btrfs, xfs, NTFS, exFAT, FAT, f2fs)" ;;
     *) die "$target: cannot read it" ;;
   esac
-  type=${probed%%"$tab"*} rest=${probed#*"$tab"}; label=${rest%%"$tab"*} fusion=
-  case $rest in *"$tab"*) fusion=${rest#*"$tab"} ;; esac
+  fields "$probed"
   # APFS Fusion: read-only, from both devices; the second is found among the attached disks, or given (--tier2)
   also= tier2opt=
   case $fusion in
@@ -254,7 +266,6 @@ cmd_mount() {
       m=$(fusion_partner main "${fusion#* }")
       die "$target is the second device of an APFS Fusion container; mount its main device${m:+ (${m#/dev/r})} instead" ;;
     "fusion-main "*)
-      ro=1
       if [ -z "$tier2" ] && [ -n "${raw:-}" ] && [ "$src" = "$raw" ]; then tier2=$(fusion_partner tier2 "${fusion#* }"); fi
       [ -n "$tier2" ] || die "$target is the main device of an APFS Fusion container, and its second device is not attached (give an image's with --tier2 PATH)"
       if device_nodes "$tier2"; then
@@ -271,15 +282,22 @@ cmd_mount() {
     IFS= read -r password || [ -n "${password:-}" ] || die "no password on stdin"
   fi
   case $extra in *type=*) type=$(printf '%s\n' "$extra" | tr ',' '\n' | sed -n 's/^type=//p' | tail -n 1) ;; esac
-  # APFS: read-only unless the user opted in (APFSWrite), since linux-apfs-rw's write support is experimental;
-  # then read-write through its readwrite option, with a warning
-  apfs_rw=
-  if [ "$type" = apfs ]; then
-    if [ "$(pref APFSWrite off)" = on ] && [ -z "$ro" ] && [ -z "$fusion" ]; then
-      apfs_rw=1
-      echo "linuxfs: writing APFS is experimental (linux-apfs-rw); it may damage the volume, so keep a backup" >&2
-    else ro=1; fi
-  fi
+  # read-only or not by the root mount program's own rule (tools/fsrules.h fsrules_access, through linuxfs-probe --access):
+  # asked, an encrypted volume, an APFS Fusion container, APFS unless the user opted in (APFSWrite: linux-apfs-rw's write
+  # support is experimental, so read-write through its readwrite option, with a warning), a dirty NTFS volume
+  apfs_rw= aw=
+  [ "$type" != apfs ] || [ "$(pref APFSWrite off)" != on ] || aw=apfs-write
+  access=$("$PROBE" --access "$type" "$fusion" "$flags" ${ro:+ro} $aw < /dev/null) || die "$target: cannot tell how to mount it"
+  case $access in
+    rw) if [ "$type" = apfs ]; then
+          apfs_rw=1
+          echo "linuxfs: writing APFS is experimental (linux-apfs-rw); it may damage the volume, so keep a backup" >&2
+        fi ;;
+    "ro encrypted") ro=1; [ -z "$aw" ] || echo "linuxfs: $target is an encrypted APFS volume, which linuxfs mounts read-only" >&2 ;;
+    "ro dirty") ro=1; echo "linuxfs: $target is a dirty NTFS volume (Windows hibernated or was not shut down); mounting it read-only" >&2 ;;
+    ro|"ro "*) ro=1 ;;
+    *) die "$target: cannot tell how to mount it ($access)" ;;
+  esac
   name=$(safe_name "$label"); [ -n "$name" ] || name=$(safe_name "$(basename "$target")")
   [ -n "$name" ] || name=Linux
   if [ -z "$mnt" ]; then
@@ -402,14 +420,14 @@ cmd_automount() {
   [ $# -eq 1 ] || usage
   device_nodes "$1" || usage
   probed=$(probe_dev "$raw") || exit 3
-  type=${probed%%"$tab"*} rest=${probed#*"$tab"}; label=${rest%%"$tab"*}
-  case $rest in
-    *"${tab}fusion-tier2 "*)   # the second device: mount the container from its main device, once both are here
-      main=$(fusion_partner main "${rest##*fusion-tier2 }"); [ -n "$main" ] || exit 3
+  fields "$probed"
+  case $fusion in
+    "fusion-tier2 "*)   # the second device: mount the container from its main device, once both are here
+      main=$(fusion_partner main "${fusion#* }"); [ -n "$main" ] || exit 3
       records | awk -F"$tab" -v s="$main" '$2 == s { f = 1 } END { exit !f }' && exit 3
       set -- "${main#/dev/r}" ;;
-    *"${tab}fusion-main "*)
-      [ -n "$(fusion_partner tier2 "${rest##*fusion-main }")" ] || exit 3 ;;
+    "fusion-main "*)
+      [ -n "$(fusion_partner tier2 "${fusion#* }")" ] || exit 3 ;;
   esac
   case $type in
     exfat|vfat) exit 3 ;;
@@ -441,18 +459,18 @@ cmd_da_mount() {
   device_nodes "$1" || usage
   mp=$2
   probed=$(probe_dev "$raw" < /dev/null) || exit 3
-  type=${probed%%"$tab"*} rest=${probed#*"$tab"}; label=${rest%%"$tab"*}
+  fields "$probed"
   # defence in depth: the bundles never claim these, so refuse them here too
   case $type in exfat|vfat) exit 3 ;; esac
   if [ -z "$asked" ]; then
     [ "$type" != ntfs3 ] || [ "$(pref NTFSTakeover off)" = on ] || exit 3
   fi
-  case $rest in
-    *"${tab}fusion-tier2 "*) exit 3 ;;
-    *"${tab}fusion-main "*)
+  case $fusion in
+    "fusion-tier2 "*) exit 3 ;;
+    "fusion-main "*)
       # with the device inherited on fd 3 only it can be probed, so its partner can never be found
       [ "${LINUXFS_OPEN_INHERITED:-}" != 1 ] || exit 3
-      uuid=${rest##*fusion-main } deadline=$(( $(date +%s) + (FUSION_WAIT + 9) / 10 ))
+      uuid=${fusion#* } deadline=$(( $(date +%s) + (FUSION_WAIT + 9) / 10 ))
       while [ -z "$(fusion_partner tier2 "$uuid" < /dev/null)" ]; do
         [ "$(date +%s)" -lt "$deadline" ] || exit 3
         sleep 0.1
@@ -481,7 +499,7 @@ bundle_of() { case $1 in ext4|btrfs|xfs|f2fs|apfs) echo "linuxfs_$1" ;; ntfs3) e
 # DiskArbitration would call it Linux, as it calls every such volume. Sets type, uuid and name.
 volume_of() { # RAW
   probed=$(probe_dev "$1") || die "$1: no filesystem linuxfs knows, or it cannot be read"
-  type=${probed%%"$tab"*} rest=${probed#*"$tab"}; label=${rest%%"$tab"*}
+  fields "$probed"
   uuid=$(uuid_dev "$1"); name=$(safe_name "$label")
   [ -n "$uuid$name" ] || die "$1 has no UUID or label to name it by in /etc/fstab"
 }

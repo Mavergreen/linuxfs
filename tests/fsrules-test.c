@@ -224,6 +224,44 @@ int main(void)
 		is(fsrules_hint("x (hint: a\xc3)", hint, sizeof hint), 0, "a truncated UTF-8 sequence in a hint is dropped");
 	}
 
+	{
+		struct fsprefs d, aw, ro;
+		const char *why;
+
+		fsrules_default_prefs(&d);
+		aw = d;
+		aw.apfs_write = 1;
+		ro = d;
+		ro.readonly = 1;
+		is((int)fsrules_probe_flags("", ""), 0, "no probe words: no flags");
+		is((int)fsrules_probe_flags(NULL, NULL), 0, "absent probe fields: no flags");
+		is((int)fsrules_probe_flags("fusion-main 0123", ""), FSF_FUSION, "a Fusion role is FSF_FUSION");
+		is((int)fsrules_probe_flags("", "encrypted"), FSF_ENCRYPTED, "encrypted is FSF_ENCRYPTED");
+		is((int)fsrules_probe_flags("", "dirty"), FSF_DIRTY, "dirty is FSF_DIRTY");
+		is((int)fsrules_probe_flags("fusion-tier2 ab", "dirty  encrypted"), FSF_FUSION | FSF_DIRTY | FSF_ENCRYPTED,
+		   "words are separated by spaces, in any order");
+		is((int)fsrules_probe_flags("", "encryptedx xdirty other"), 0, "only whole known words count");
+#define ACC(type, flags, asked, login, prefs, want, wwhy, what) \
+		do { why = "unset"; is(fsrules_access(type, flags, asked, login, prefs, &why), want, what); iss(why, wwhy, what ": why"); } while (0)
+		ACC("ext4", 0, 0, 0, &d, FSA_RW, "", "ext4 mounts read-write");
+		ACC("ext4", 0, 1, 0, &d, FSA_RO, "asked", "asked for read-only: read-only");
+		ACC("ext4", 0, 0, 1, &ro, FSA_RO, "ReadOnly", "the ReadOnly preference: read-only");
+		ACC("apfs", 0, 0, 0, &d, FSA_RO, "apfs", "APFS: read-only by default");
+		ACC("apfs", 0, 0, 0, &aw, FSA_RW, "", "APFS with APFSWrite: read-write");
+		ACC("apfs", FSF_FUSION, 0, 0, &aw, FSA_RO, "fusion", "an APFS Fusion container: read-only whatever APFSWrite says");
+		ACC("apfs", FSF_ENCRYPTED, 0, 0, &aw, FSA_RO, "encrypted", "an encrypted APFS volume: read-only whatever APFSWrite says");
+		ACC("apfs", FSF_ENCRYPTED, 0, 1, &aw, FSA_REFUSE, "encrypted", "an encrypted volume before login: refused (no keychain, no one to ask)");
+		ACC("apfs", FSF_ENCRYPTED, 1, 1, &ro, FSA_REFUSE, "encrypted", "refused before login even when read-only was asked");
+		ACC("ntfs3", FSF_DIRTY, 0, 0, &d, FSA_RO, "dirty", "a dirty NTFS volume: read-only");
+		ACC("ntfs3", 0, 0, 0, &d, FSA_RW, "", "a clean NTFS volume: read-write");
+		ACC("ext4", FSF_DIRTY, 0, 0, &d, FSA_RW, "", "dirty means nothing but on NTFS");
+		ACC("apfs", FSF_ENCRYPTED, 1, 0, &aw, FSA_RO, "asked", "asked comes first among the reasons for read-only");
+		ACC("apfs", 0, 0, 0, &ro, FSA_RO, "ReadOnly", "then the ReadOnly preference");
+		is(fsrules_access(NULL, 0, 0, 0, &d, &why), FSA_REFUSE, "no type: refused");
+		is(fsrules_access("ext4", 0, 0, 0, NULL, NULL), FSA_REFUSE, "no preferences: refused");
+#undef ACC
+	}
+
 	printf("1..%d\n", tapno);
 	return failures != 0;
 }
