@@ -160,7 +160,7 @@ jobs:
           for z in "$d"/*.img.gz; do gunzip "$z"; done
           LINUX_HOST_SHARE="$HOME" sh build/linux-host.sh sh -c '
             rc=0
-            for c in ext4:ext4 btrfs:btrfs xfs:xfs ntfs:ntfs exfat:exfat f2fs:f2fs ext4:da-ext4 btrfs:da-btrfs xfs:da-xfs ntfs:da-ntfs f2fs:da-f2fs ext4:da-ext4-off ext4:da-ext4-ro ext4:login-ext4; do
+            for c in ext4:ext4 btrfs:btrfs xfs:xfs ntfs:ntfs exfat:exfat f2fs:f2fs ext4:da-ext4 btrfs:da-btrfs xfs:da-xfs ntfs:da-ntfs f2fs:da-f2fs ext4:da-ext4-noauto ntfs:da-ntfs-noauto ext4:da-ext4-ro ext4:login-ext4; do
               fs=${c%%:*} img=$1/${c#*:}.img
               if [ ! -f "$img" ]; then echo "not ok - $img: the guest returned no such image"; rc=1
               elif sh tests/lib/check-fs.sh "$fs" "$img"; then echo "ok - $img is clean ($fs)"
