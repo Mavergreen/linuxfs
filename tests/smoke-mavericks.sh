@@ -301,17 +301,36 @@ fstn_use_macfuse() {
   [ -d "$FSD/macfuse_ext4.fs" ] || sudo -n mv /private/var/tmp/spike-macfuse_ext4.fs "$FSD/macfuse_ext4.fs"
   da_restart
 }
-fstn_try() {  # TAG IMG: a plain attach of a copy; on failure, what DA and diskutil say
+FSN=0
+fstn_state() {  # TAG: what could hold per-volume state
+  echo "# state $1: mount (fuse/linuxfs): $(mount | grep -i 'fuse\|linuxfs' | tr '\n' '|')"
+  echo "# state $1: processes: $(ps -axww -o user=,pid=,command= | grep -i '[l]klfuse\|[m]ount_macfuse\|[l]inuxfs-' | cut -c1-160 | tr '\n' '|')"
+  echo "# state $1: /Volumes: $(ls -la /Volumes | tr '\n' '|')"
+  echo "# state $1: DA's databases:"; rec sudo -n ls -laR /var/db/diskarbitration /var/db/.DiskArbitration /Library/Preferences/SystemConfiguration/com.apple.DiskArbitration.diskarbitrationd.plist
+  echo "# state $1: lock files: $(ls -la "$HOME"/Library/Caches/dev.mavergreen.linuxfs/locks 2>&1 | tr '\n' '|')"
+}
+fstn_try() {  # TAG IMG: a plain attach of a copy, with fs_usage on diskarbitrationd; on failure, what DA and diskutil say
   cp "$2" "$W/img/spike-probe.img" || return 1
-  t0=$(date +%s); da_mark "try $1"
+  FSN=$((FSN + 1)); fsu=/private/tmp/fsu-$FSN.log
+  sudo -n sh -c 'fs_usage -w -f filesys diskarbitrationd > "$1" 2>&1 & echo $! > /private/tmp/fsu.pid' _ "$fsu"
+  sleep 1
+  t0=$(date +%s); da_mark "try $1"; log0=$(wc -l < /var/log/system.log | tr -d ' ')
   if da_attach "$W/img/spike-probe.img" && da_wait 150; then
-    ok "$1: a plain attach automounts ($(( $(date +%s) - t0 )) s): $(mount | grep -F " on $mp (" | sed 's/^.* (//')"; cleanup_disk; return 0
+    ok "$1: a plain attach automounts ($(( $(date +%s) - t0 )) s): $(mount | grep -F " on $mp (" | sed 's/^.* (//')"
+    sudo -n kill "$(cat /private/tmp/fsu.pid)" 2> /dev/null; sudo -n sh -c 'head -c 300000 "$1" > "$2"' _ "$fsu" "$OUT/fsu-$FSN-$(echo "$1" | tr -c 'a-zA-Z0-9\n' _ | cut -c1-40).log"; cleanup_disk; return 0
   fi
   notok "$1: a plain attach automounts"
-  d=$(image_disk "$W/img/spike-probe.img")
-  echo "# $1: disk '$d'; diskutil info:"; rec diskutil info "$d"
-  echo "# $1: /etc/fstab:"; rec cat /etc/fstab
-  echo "# $1: diskutil mount $d: $(bounded 600 diskutil mount "$d" 2>&1 | tr '\n' ' ')"
+  fstn_state "$1 (right after the failed attach)"
+  d=$(image_disk "$W/img/spike-probe.img"); echo "# $1: image_disk '$d'; hdiutil info: $(hdiutil info | grep -A6 spike-probe | tr '\n' '|')"
+  # the same image attached without automount: what DA knows, and what diskutil mount says
+  if bounded 3000 hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$W/img/spike-probe.img" > "$W/nm.out" 2>&1; then
+    d=$(awk '/^\/dev\/disk/ { print $1; exit }' "$W/nm.out"); sleep 3
+    echo "# $1: -nomount gave $d; diskutil info:"; rec diskutil info "$d"
+    echo "# $1: diskutil mount $d: $(bounded 600 diskutil mount "$d" 2>&1 | tr '\n' ' ')"
+    echo "# $1: mount after that: $(mount | grep -i 'fuse\|linuxfs' | tr '\n' '|')"
+  else echo "# $1: -nomount attach: $(tr '\n' ' ' < "$W/nm.out")"; fi
+  echo "# $1: system.log since the attach:"; tail -n +"$((log0 + 1))" /var/log/system.log | grep -v 'mds\|fseventsd' | cut -c1-220 | sed 's/^/#   /'
+  sudo -n kill "$(cat /private/tmp/fsu.pid)" 2> /dev/null; sudo -n sh -c 'head -c 300000 "$1" > "$2"' _ "$fsu" "$OUT/fsu-$FSN-FAILED.log"
   disk=$d; cleanup_disk; return 1
 }
 fstn_exp() {  # TAG IMG VFSTYPE mount|nomount helper|manual restart|keep
@@ -334,7 +353,9 @@ fstn_exp() {  # TAG IMG VFSTYPE mount|nomount helper|manual restart|keep
   else sudo -n sed -i '' '/# linuxfs$/d' /etc/fstab; fi
   da_mark "exp $tag: fstab entry removed"
   echo "# exp $tag ($(date +%s)): fstab now: $(tr '\n' '|' < /etc/fstab)"
+  fstn_state "$tag after unignore, disk still attached"
   cleanup_disk
+  fstn_state "$tag after eject"
   fstn_try "exp $tag, same image" "$simg" && return 0
   fstn_try "exp $tag, other ext4 image (another UUID)" "$W/img/spike-other.img"
   da_restart; da_mark "exp $tag: after killall diskarbitrationd"
@@ -352,11 +373,9 @@ fstn_experiments() {
   gunzip -c "$IN/ext4-slash.img.gz" > "$W/img/spike-other.img" || { notok "no ext4-slash.img.gz"; return 1; }
   da_debug_on || { echo "# no debug DA (plist '$DAPL'): going on without"; DEBUGDA=; }
   fstn_exp macfuse-helper-mount "$W/img/spike-ext4.img" macfuse_ext4 mount helper keep
-  fstn_exp macfuse-helper-nomount "$W/img/spike-ext4.img" macfuse_ext4 nomount helper restart
   if fstn_use_baseline; then
     fstn_baseline_nested
     fstn_exp baseline-helper-mount "$W/img/spike-ext4.img" linuxfs_ext4 mount helper keep
-    fstn_exp baseline-helper-nomount "$W/img/spike-ext4.img" linuxfs_ext4 nomount helper restart
   else notok "baseline bundle setup"; fi
   fstn_use_macfuse
   da_debug_off
