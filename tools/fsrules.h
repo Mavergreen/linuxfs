@@ -17,11 +17,12 @@ const char *fsrules_fs_from_name(const char *argv0, enum fsrole *role);
 /* The name tools/probe.c gives that filesystem: ntfs is ntfs3, the others unchanged. */
 const char *fsrules_probe_type(const char *fs);
 
-struct fsprefs { int automount, readonly, ntfs_takeover, apfs_write; };
+struct fsprefs { int readonly, ntfs_takeover, apfs_write; };
 void fsrules_default_prefs(struct fsprefs *p);
 
 /* Whether the bundle for <fs> claims a disk the probe named <probed_type>. NTFS is the Mac's unless
- * NTFSTakeover and Automount are on and the disk is removable. A NULL fs, probed_type or prefs declines (returns 0). */
+ * NTFSTakeover is on and the disk is removable. A NULL fs, probed_type or prefs declines (returns 0). There is no
+ * global Automount: a volume is kept from mounting by itself by its own /etc/fstab noauto entry (fstab.h). */
 int fsrules_claims(const char *fs, const char *probed_type, int removable, const struct fsprefs *p);
 
 struct mountreq { int asked, ro; const char *dev, *mnt; };

@@ -2,17 +2,32 @@
  * linuxfs-helper: the one root part of linuxfs. Opens a disk partition that holds a Linux filesystem, for the
  * user at the console, and hands them the descriptor; lklfuse then runs as that user.
  * usage: linuxfs-helper [--socket PATH] [--timeout SECONDS]       (run by launchd as dev.mavergreen.linuxfs.helper)
+ *        linuxfs-helper --migrate-prefs                            (run by the postinstall, as root)
  * Protocol, one request per connection, one line each way:
  *   "open /dev/rdiskNsM rw|ro"  ->  "ok TYPE<TAB>LABEL" plus the descriptor (SCM_RIGHTS), or "no REASON"
  *   "probe /dev/rdiskNsM"       ->  "ok TYPE<TAB>LABEL", or "no REASON"
- * It refuses a peer other than root or the console user (before reading its request), a path other than a raw
- * disk node, a partition the Mac has mounted, a disk with partitions under it, a system partition by type (EFI,
- * Apple, Windows, from IOKit), FAT, exFAT or NTFS on internal media, and any partition whose superblock is not a
- * filesystem linuxfs knows.
+ *   "uuid /dev/rdiskNsM"        ->  "ok UUID" (the probe's, as the bundles' util -k gives it), or "no REASON"
+ *   "noauto-add SPEC BUNDLE"    ->  "ok", or "no REASON": /etc/fstab gets SPEC's linuxfs noauto entry (fstab.h); SPEC is
+ *                                   UUID=... or LABEL=<label>, which may hold spaces: BUNDLE is the line's last word
+ *   "noauto-remove SPEC"        ->  "ok", or "no REASON": SPEC's linuxfs entry goes
+ * It refuses a peer other than root or the console user (before reading its request), a request of more than one line,
+ * a path other than a raw disk node, a partition the Mac has mounted, a disk with partitions under it, a system partition
+ * by type (EFI, Apple, Windows, from IOKit), FAT, exFAT or NTFS on internal media, and any partition whose superblock is
+ * not a filesystem linuxfs knows. It checks SPEC and BUNDLE itself, never trusting the CLI, and edits only linuxfs's own
+ * lines of an /etc/fstab that is a regular root-owned file of at most 64 KiB, writing it whole (a new file beside it,
+ * renamed over it); adding an entry that is there, or removing one that is not, is "ok". It never runs a program.
+ * --migrate-prefs turns each Ignore:<LABEL> = true preference (the console user's and the machine's: the old way to keep a
+ * volume from mounting by itself) into a LABEL= entry, when a disk with a volume of that name is attached to give the
+ * bundle; it prints "user|machine<TAB>LABEL" for each it converted, for the postinstall to delete, and logs the others.
+ * LINUXFS_FSTAB names another fstab (tests), obeyed only when not root.
  */
+#include "fsrules.h"
+#include "fstab.h"
+#include "plist.h"
 #include "probe.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
+#include <dirent.h>
 #include <errno.h>
 #include <strings.h>
 #include <fcntl.h>
@@ -20,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -152,6 +168,237 @@ const char *helper_media_refusal(const char *content, int leaf, int ejectable, c
 	return NULL;
 }
 
+/* The fstab to edit: /etc/fstab, or LINUXFS_FSTAB when not root (tests). */
+const char *helper_fstab_path(void)
+{
+	const char *t = getuid() != 0 ? getenv("LINUXFS_FSTAB") : NULL;
+
+	return t && *t ? t : "/etc/fstab";
+}
+
+static char why_buf[512];
+
+static const char *why_errno(const char *what)
+{
+	snprintf(why_buf, sizeof(why_buf), "%s: %s", what, strerror(errno));
+	return why_buf;
+}
+
+/*
+ * Adds SPEC's linuxfs noauto entry for BUNDLE to the fstab at PATH, or removes it (BUNDLE NULL). NULL when done (or there
+ * was nothing to do), else why not. PATH must be a regular file owned by root (by the caller, when not root: tests) of at
+ * most FSTAB_MAX bytes, or absent; it is read whole, edited in memory (fstab.c: every other line kept byte for byte) and
+ * replaced by a new file made beside it (O_EXCL, O_NOFOLLOW, mode 0644, root:wheel), synced, then renamed over it, so a
+ * reader sees the old or the new, never part. Edits are one at a time: each holds a lock on the directory.
+ */
+const char *helper_noauto(const char *path, const char *spec, const char *bundle)
+{
+	static char in[FSTAB_MAX + 2], out[FSTAB_MAX + 1];
+	char dir[1024], tmp[1100], *slash;
+	const char *why = NULL;
+	struct stat st;
+	size_t len = 0, w;
+	long n;
+	ssize_t r;
+	int dfd, fd, tfd = -1, changed, retried = 0;
+
+	if ((why = fstab_spec_refusal(spec)) || (bundle && (why = fstab_bundle_refusal(bundle))))
+		return why;
+	if (snprintf(dir, sizeof(dir), "%s", path) >= (int)sizeof(dir) || snprintf(tmp, sizeof(tmp), "%s.linuxfs-new", path) >= (int)sizeof(tmp))
+		return "the fstab's path is too long";
+	if (!(slash = strrchr(dir, '/')))
+		return "the fstab's path is not absolute";
+	slash[slash == dir ? 1 : 0] = '\0';
+	/* /etc is a symlink to /private/etc on the Mac, root's own: followed; the fstab itself never is */
+	dfd = open(dir, O_RDONLY | O_NOCTTY);
+	if (dfd < 0)
+		return why_errno("cannot open the fstab's directory");
+	if (fstat(dfd, &st) != 0 || !S_ISDIR(st.st_mode)) {
+		close(dfd);
+		return "the fstab's directory is not a directory";
+	}
+	if (flock(dfd, LOCK_EX) != 0) {
+		why = why_errno("cannot lock the fstab's directory");
+		goto done;
+	}
+	fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
+	if (fd < 0 && errno != ENOENT) {
+		why = errno == ELOOP ? "the fstab is a symlink" : why_errno("cannot open the fstab");
+		goto done;
+	}
+	if (fd >= 0) {
+		if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
+			why = "the fstab is not a regular file";
+		else if (st.st_uid != getuid())
+			why = getuid() == 0 ? "the fstab is not owned by root" : "the fstab is not owned by the caller";
+		else if (st.st_size > FSTAB_MAX)
+			why = "the fstab is over 64 KiB";
+		while (!why && len <= FSTAB_MAX) {
+			r = read(fd, in + len, sizeof(in) - len);
+			if (r < 0 && errno == EINTR)
+				continue;
+			if (r < 0)
+				why = why_errno("cannot read the fstab");
+			if (r <= 0)
+				break;
+			len += (size_t)r;
+		}
+		if (!why && len > FSTAB_MAX)
+			why = "the fstab is over 64 KiB";
+		close(fd);
+		if (why)
+			goto done;
+	}
+	n = fstab_edit(in, len, spec, bundle, out, sizeof(out), &changed);
+	if (n < 0) {
+		why = "the fstab would be over 64 KiB";
+		goto done;
+	}
+	if (!changed)
+		goto done;
+	while ((tfd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_NOCTTY, 0644)) < 0 && errno == EEXIST && !retried++)
+		unlink(tmp);	/* a crash's leftover: the lock is held, so no other edit's */
+	if (tfd < 0) {
+		why = why_errno("cannot make the new fstab");
+		goto done;
+	}
+	for (w = 0; w < (size_t)n && !why; ) {
+		r = write(tfd, out + w, (size_t)n - w);
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r <= 0)
+			why = why_errno("cannot write the new fstab");
+		else
+			w += (size_t)r;
+	}
+	if (!why && (fchmod(tfd, 0644) != 0 || (getuid() == 0 && fchown(tfd, 0, 0) != 0)))
+		why = why_errno("cannot set the new fstab's owner and mode");
+	if (!why && fsync(tfd) != 0)
+		why = why_errno("cannot sync the new fstab");
+	if (close(tfd) != 0 && !why)
+		why = why_errno("cannot write the new fstab");
+	if (!why && rename(tmp, path) != 0)
+		why = why_errno("cannot replace the fstab");
+	if (why)
+		unlink(tmp);
+	else
+		fsync(dfd);
+done:
+	close(dfd);	/* and the lock with it */
+	return why;
+}
+
+/* ---- --migrate-prefs: Ignore:<LABEL> preferences become fstab entries ---- */
+
+#define MIGRATE_DISKS 64
+
+struct seen_disk { const char *type; char vol[256]; };
+
+/* The attached disks linuxfs's bundles would mount, with the volume name DiskArbitration gives each (the util's -p). */
+static int scan_disks(struct seen_disk *d, int max)
+{
+	DIR *dev = opendir("/dev");
+	struct dirent *e;
+	char path[300], label[512];
+	const char *type;
+	int n = 0, fd, err;
+
+	while (dev && n < max && (e = readdir(dev))) {
+		if (snprintf(path, sizeof(path), "/dev/%s", e->d_name) >= (int)sizeof(path) || !helper_device_ok(path))
+			continue;
+		fd = open(path, O_RDONLY | O_NONBLOCK | O_NOCTTY);
+		if (fd < 0)
+			continue;
+		type = linuxfs_probe_fd(fd, label, sizeof(label), &err);
+		close(fd);
+		if (!type || !fstab_bundle_for(type))
+			continue;
+		d[n].type = type;	/* probe.c's names are literals */
+		fsrules_volname(label, d[n].vol, sizeof(d[n].vol));
+		n++;
+	}
+	if (dev)
+		closedir(dev);
+	return n;
+}
+
+/* One Ignore:<RAW> = true from DOM: converted (printed to OUT) or logged. */
+static void migrate_one(FILE *out, const char *dom, const char *raw, struct seen_disk *disks, int *ndisks)
+{
+	char name[256], spec[300];
+	const char *why, *bundle = NULL;
+	int i, len = (int)strcspn(raw, "\n");
+
+	if (raw[len]) {
+		fprintf(stderr, "linuxfs-helper: Ignore:%.*s... (%s) left as it is: a label with a newline cannot be written to /etc/fstab\n", len, raw, dom);
+		return;
+	}
+	fsrules_volname(raw, name, sizeof(name));
+	if (strcmp(name, "Linux") == 0 && strcmp(raw, "Linux") != 0) {
+		fprintf(stderr, "linuxfs-helper: Ignore:%s (%s) left as it is: no volume is given that name\n", raw, dom);
+		return;
+	}
+	snprintf(spec, sizeof(spec), "LABEL=%s", name);
+	if ((why = fstab_spec_refusal(spec))) {
+		fprintf(stderr, "linuxfs-helper: Ignore:%s (%s) left as it is: %s\n", raw, dom, why);
+		return;
+	}
+	if (*ndisks < 0)
+		*ndisks = scan_disks(disks, MIGRATE_DISKS);
+	for (i = 0; i < *ndisks && !bundle; i++)
+		if (strcmp(disks[i].vol, name) == 0)
+			bundle = fstab_bundle_for(disks[i].type);
+	if (!bundle) {
+		fprintf(stderr, "linuxfs-helper: Ignore:%s (%s) left as it is: no disk named %s is attached to give its filesystem; "
+			"attach it and run linuxfs ignore /dev/diskNsM\n", raw, dom, name);
+		return;
+	}
+	if ((why = helper_noauto(helper_fstab_path(), spec, bundle))) {
+		fprintf(stderr, "linuxfs-helper: Ignore:%s (%s) left as it is: %s\n", raw, dom, why);
+		return;
+	}
+	fprintf(out, "%s\t%s\n", dom, raw);
+}
+
+/* Converts each Ignore:<LABEL> = true of the console user's and the machine's preferences (plist.c reads them as root
+ * safely); 0. */
+int helper_migrate(FILE *out)
+{
+	static struct seen_disk disks[MIGRATE_DISKS];
+	static const char *const dom[2] = { "user", "machine" };
+	CFDictionaryRef d[2];
+	int ndisks = -1, j;
+
+	prefs_load(&d[0], &d[1]);
+	for (j = 0; j < 2; j++) {
+		CFIndex count, i;
+		const void **keys;
+
+		if (!d[j])
+			continue;
+		count = CFDictionaryGetCount(d[j]);
+		keys = calloc((size_t)count + 1, sizeof(*keys));
+		if (keys) {
+			CFDictionaryGetKeysAndValues(d[j], keys, NULL);
+			for (i = 0; i < count; i++) {
+				char key[1100];
+
+				if (CFGetTypeID(keys[i]) != CFStringGetTypeID() || pref_bool(d[j], keys[i]) != 1 ||
+				    !CFStringHasPrefix(keys[i], CFSTR("Ignore:")))
+					continue;
+				if (!CFStringGetCString(keys[i], key, sizeof(key), kCFStringEncodingUTF8)) {
+					fprintf(stderr, "linuxfs-helper: an Ignore: preference (%s) left as it is: its label is too long\n", dom[j]);
+					continue;
+				}
+				migrate_one(out, dom[j], key + 7, disks, &ndisks);
+			}
+			free(keys);
+		}
+		CFRelease(d[j]);
+	}
+	return 0;
+}
+
 #ifndef LINUXFS_HELPER_NO_MAIN
 static uid_t console_uid(void)
 {
@@ -187,30 +434,65 @@ static void reply(int c, const char *msg, int fd)
 /* Handles one request; returns nothing, always replies. */
 void helper_serve(int c, uid_t peer, uid_t console, int test_files)
 {
-	char req[256], dev[128], mode[8], where[1024], label[512], msg[1024];
+	char req[2048], dev[128], mode[8], where[1024], label[512], msg[1024], uuid[40] = "", *nl;
 	const char *type, *why;
 	struct media_facts facts = { "", 1, 1 };
 	ssize_t n;
-	int fd, err, rw = 0, items;
+	size_t got = 0;
+	int fd, err, rw = 0, items, want_uuid = 0;
 
 	/* the peer first, so nobody else can hold the helper up with a request that never comes */
 	if (!helper_peer_ok(peer, console)) {
 		reply(c, "no only the user at the console may open disks\n", -1);
 		return;
 	}
-	n = read(c, req, sizeof(req) - 1);
-	if (n <= 0)
+	/* one line, read until its newline (the socket's receive timeout bounds a client that dawdles) */
+	while (got < sizeof(req) - 1 && !memchr(req, '\n', got)) {
+		n = read(c, req + got, sizeof(req) - 1 - got);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			break;
+		got += (size_t)n;
+	}
+	if (got == 0)
 		return;
-	req[n] = '\0';
-	req[strcspn(req, "\n")] = '\0';
+	req[got] = '\0';
+	nl = memchr(req, '\n', got);
+	if (memchr(req, '\0', got) || (nl && nl + 1 < req + got)) {
+		reply(c, "no a request is one line\n", -1);
+		return;
+	}
+	if (nl)
+		*nl = '\0';
+	if (strncmp(req, "noauto-add ", 11) == 0 || strncmp(req, "noauto-remove ", 14) == 0) {
+		char *spec = req + (req[7] == 'a' ? 11 : 14), *bundle = NULL;
+
+		if (req[7] == 'a') {
+			bundle = strrchr(spec, ' ');
+			if (!bundle) {
+				reply(c, "no request is noauto-add SPEC BUNDLE\n", -1);
+				return;
+			}
+			*bundle++ = '\0';
+		}
+		why = helper_noauto(helper_fstab_path(), spec, bundle);
+		if (why)
+			snprintf(msg, sizeof(msg), "no %s\n", why);
+		reply(c, why ? msg : "ok\n", -1);
+		return;
+	}
 	mode[0] = '\0';
 	items = sscanf(req, "open %127s %7s", dev, mode);
 	if (items == 2 && (strcmp(mode, "rw") == 0 || strcmp(mode, "ro") == 0)) {
 		rw = strcmp(mode, "rw") == 0;
 	} else if (sscanf(req, "probe %127s", dev) == 1 && strncmp(req, "probe ", 6) == 0) {
 		mode[0] = '\0';
+	} else if (sscanf(req, "uuid %127s", dev) == 1 && strncmp(req, "uuid ", 5) == 0) {
+		mode[0] = '\0';
+		want_uuid = 1;
 	} else {
-		reply(c, "no request is open DEVICE rw|ro or probe DEVICE\n", -1);
+		reply(c, "no request is open DEVICE rw|ro, probe DEVICE, uuid DEVICE, noauto-add SPEC BUNDLE or noauto-remove SPEC\n", -1);
 		return;
 	}
 	if (!helper_device_ok(dev) && !test_files) {
@@ -252,6 +534,13 @@ void helper_serve(int c, uid_t peer, uid_t console, int test_files)
 		close(fd);
 		return;
 	}
+	if (want_uuid) {
+		if (linuxfs_probe_uuid(uuid, sizeof(uuid)) == 0)
+			snprintf(msg, sizeof(msg), "ok %s\n", uuid);
+		reply(c, uuid[0] ? msg : "no this filesystem has no UUID\n", -1);
+		close(fd);
+		return;
+	}
 	snprintf(msg, sizeof(msg), "ok %s\t%s%s%s\n", type, label, *linuxfs_probe_extra() ? "\t" : "", linuxfs_probe_extra());
 	reply(c, msg, mode[0] ? fd : -1);
 	close(fd);
@@ -266,6 +555,12 @@ int main(int argc, char **argv)
 	uid_t peer;
 	gid_t gid;
 
+	if (argc == 2 && strcmp(argv[1], "--migrate-prefs") == 0) {
+		setvbuf(stdout, NULL, _IOLBF, 0);
+		signal(SIGALRM, SIG_DFL);
+		alarm(120);	/* a disk that never answers its probe must not hold up the install */
+		return helper_migrate(stdout);
+	}
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc)
 			path = argv[++i];
@@ -274,7 +569,7 @@ int main(int argc, char **argv)
 		else if (strcmp(argv[i], "--test-files") == 0)
 			test_files = 1;	/* tests only: regular files stand in for disks, the caller for the console */
 		else {
-			fprintf(stderr, "usage: linuxfs-helper [--socket PATH]\n");
+			fprintf(stderr, "usage: linuxfs-helper [--socket PATH] [--timeout SECONDS]\n       linuxfs-helper --migrate-prefs\n");
 			return 2;
 		}
 	}

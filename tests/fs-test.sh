@@ -12,7 +12,7 @@ D=$HOME/Library/Caches/mm-build/linuxfs-fs-test; rm -rf "$D"; mkdir -p "$D"
 CL=$(sh "$SHIPYARD_SCRIPTS/fetch_clang22.sh" "$ROOT/components/clang22" 2>/dev/null) || exit 1
 SDK=$(sh "$SHIPYARD_SCRIPTS/fetch_sdk.sh" 2>/dev/null) || exit 1
 "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN \
-  -o "$D/linuxfs-fs" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/probe.c" \
+  -o "$D/linuxfs-fs" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" \
   -framework CoreFoundation -framework DiskArbitration || exit 1
 for n in linuxfs_ext4.util linuxfs_ntfs.util linuxfs_btrfs.util fsck_linuxfs_ext4 mount_linuxfs_ext4 bogus.util; do cp "$D/linuxfs-fs" "$D/$n"; done
 sh "$ROOT/build/linux-host.sh" sh -c "cd '$D' && sh '$ROOT/tests/lib/probe-images.sh' '$D' && blkid -s UUID -o value ext4.img > ext4.uuid && blkid -s UUID -o value btrfs.img > btrfs.uuid" || exit 1
@@ -29,7 +29,7 @@ plist() { printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><
 plist "$D/empty.plist" ""
 plist "$D/take.plist" "<key>NTFSTakeover</key><true/>"
 plist "$D/takestr.plist" "<key>NTFSTakeover</key><string>YES</string>"
-plist "$D/takeoff.plist" "<key>NTFSTakeover</key><true/><key>Automount</key><false/>"
+plist "$D/takeoff.plist" "<key>NTFSTakeover</key><true/><key>Automount</key><false/>"   # a stale Automount, from before it was dropped
 printf 'this is not a plist' > "$D/corrupt.plist"
 u() { # BIN ARGS... : the util with the test prefs (USERP, MACHP)
   x=$1; shift; LINUXFS_PREFS_USER=${USERP:-$D/none.plist} LINUXFS_PREFS_MACHINE=${MACHP:-$D/none2.plist} "$D/$x" "$@"; }
@@ -61,26 +61,20 @@ USERP=$D/takestr.plist u linuxfs_ntfs.util -p "$T" removable writable >/dev/null
 USERP=$D/take.plist u linuxfs_ntfs.util -p "$T" fixed writable >/dev/null; rc=$?
 [ $rc = 254 ]; ok $? "NTFSTakeover=true but fixed: exits 254 (rc $rc)"
 USERP=$D/takeoff.plist u linuxfs_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
-[ $rc = 254 ]; ok $? "NTFSTakeover=true with Automount=false: exits 254 (rc $rc)"
+[ $rc = 255 ]; ok $? "a stale Automount=false is not read: NTFSTakeover=true still claims (rc $rc)"
 USERP=$D/corrupt.plist MACHP=$D/take.plist u linuxfs_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
 [ $rc = 255 ]; ok $? "a corrupt user plist counts as absent: the machine's NTFSTakeover=true holds (rc $rc)"
 USERP=$D/empty.plist MACHP=$D/take.plist u linuxfs_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
 [ $rc = 255 ]; ok $? "prefs fall back key by key: a user plist lacking the key leaves the machine's NTFSTakeover=true (rc $rc)"
-USERP=$D/takeoff.plist MACHP=$D/take.plist u linuxfs_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
-[ $rc = 254 ]; ok $? "and the user's Automount=false beats the machine's (rc $rc)"
 USERP=$D/missing.plist MACHP=$D/missing2.plist u linuxfs_ext4.util -p "$E" removable writable >/dev/null; rc=$?
 [ $rc = 255 ]; ok $? "missing plists use the defaults: ext4 still claimed (rc $rc)"
 ln -sf "$D/take.plist" "$D/link.plist"
 USERP=$D/link.plist u linuxfs_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
 [ $rc = 254 ]; ok $? "a symlinked user plist is refused, as absent (rc $rc)"
+# spec: tools/fs.c util -- a stale Ignore:<LABEL> is not read: DiskArbitration applies /etc/fstab's noauto, per volume
 plist "$D/ign.plist" "<key>Ignore:my data</key><true/>"
-USERP=$D/ign.plist u linuxfs_ext4.util -p "$E" removable writable >/dev/null; rc=$?
-[ $rc = 254 ]; ok $? "Ignore:<LABEL> true makes the util decline that disk (rc $rc)"
-plist "$D/unign.plist" "<key>Ignore:my data</key><false/>"
-USERP=$D/unign.plist MACHP=$D/ign.plist u linuxfs_ext4.util -p "$E" removable writable >/dev/null; rc=$?
-[ $rc = 255 ]; ok $? "a user Ignore false overrides a machine Ignore true (rc $rc)"
-USERP=$D/empty.plist MACHP=$D/ign.plist u linuxfs_ext4.util -p "$E" removable writable >/dev/null; rc=$?
-[ $rc = 254 ]; ok $? "the machine's Ignore holds when the user's plist lacks the key (rc $rc)"
+out=$(USERP=$D/ign.plist MACHP=$D/ign.plist u linuxfs_ext4.util -p "$E" removable writable); rc=$?
+[ $rc = 255 ] && [ "$out" = "my data" ]; ok $? "the probe does not consult Ignore:<LABEL>: still claimed (rc $rc, '$out')"
 for bad_args in "-p diskX removable writable" "-p ../disk2 removable writable" "-p ${E}s removable writable" "-p $E sometimes writable" "-p $E" "-z" ""; do
   # shellcheck disable=SC2086
   u linuxfs_ext4.util $bad_args >/dev/null 2>&1; rc=$?
@@ -286,6 +280,9 @@ real() { # ARGS...: the mount role (user path) running the real CLI, whose lklfu
     LINUXFS_MACHINE_DOMAIN="$R/no-machine" LK_LOG="$R/lk.log" "$@"; }
 real "$MD" /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
 [ $rc = 0 ] && grep -q "^lklfuse: .*$R/mnt" "$R/lk.log"; ok $? "the real CLI accepts the plain da-mount argv (rc $rc)"
+plist "$R/stale.plist" "<key>Automount</key><false/><key>Ignore:lbl</key><true/>"
+real env LINUXFS_DOMAIN="$R/stale" "$MD" /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
+[ $rc = 0 ] && grep -q "^lklfuse: .*$R/mnt" "$R/lk.log"; ok $? "a stale Automount=false and Ignore:<LABEL> are not read: the real CLI mounts (rc $rc)"
 real "$MD" -o owners /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
 [ $rc = 0 ] && grep -q "^lklfuse: " "$R/lk.log"; ok $? "the real CLI accepts da-mount --asked (rc $rc)"
 real "$MD" -o rdonly /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
@@ -304,7 +301,7 @@ done
 #     drop; it prints the plan instead of dropping and exec'ing) stands in. The shipped build has no such code.
 mkdir -p "$D/drop"
 "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN \
-  -DLINUXFS_FS_TEST_DROP -o "$D/drop/mount_linuxfs_ext4" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/probe.c" \
+  -DLINUXFS_FS_TEST_DROP -o "$D/drop/mount_linuxfs_ext4" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" \
   -framework CoreFoundation -framework DiskArbitration || exit 1
 DM=$D/drop/mount_linuxfs_ext4
 V=$D/vols; rm -rf "$V"; mkdir -p "$V/NAME" "$V/other"; : > "$V/file"; ln -s "$V/NAME" "$V/link"

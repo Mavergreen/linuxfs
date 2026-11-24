@@ -16,9 +16,10 @@
  * the agent says ok and 1 when no agent answers within 5 s.
  * Login sweep: once, 15 s after it starts (LINUXFS_SWEEP_DELAY seconds instead, unless root), for every disk whose
  * DiskArbitration volume kind starts with linuxfs_ and that has no volume path (DiskArbitration did not mount it, say
- * because the keychain was not ready), it runs `linuxfs automount DISK`.
- * LINUXFS_CLI names another linuxfs, and LINUXFS_KEYCHAIN=off swaps the keychain for a store in memory (tests); like
- * LINUXFS_SWEEP_DELAY, they are honoured only when not root.
+ * because the keychain was not ready), it runs `linuxfs automount DISK` -- unless /etc/fstab has linuxfs's noauto entry
+ * for the volume's UUID or name (linuxfs ignore), which is why DiskArbitration left it alone.
+ * LINUXFS_CLI names another linuxfs, LINUXFS_FSTAB another fstab, and LINUXFS_KEYCHAIN=off swaps the keychain for a store in
+ * memory (tests); like LINUXFS_SWEEP_DELAY, they are honoured only when not root.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <DiskArbitration/DiskArbitration.h>
@@ -40,6 +41,7 @@
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
+#include "fstab.h"
 
 extern char **environ;
 
@@ -87,6 +89,12 @@ int agent_parse_request(char *line, char **verb, char **bsd)
 int agent_sweeps(const char *kind, int has_path)
 {
 	return kind && strncmp(kind, "linuxfs_", 8) == 0 && !has_path;
+}
+
+/* And when FSTAB (LEN bytes of /etc/fstab) has no linuxfs noauto entry for the volume's UUID or name (either may be NULL). */
+int agent_sweeps_volume(const char *kind, int has_path, const char *fstab, size_t len, const char *uuid, const char *volname)
+{
+	return agent_sweeps(kind, has_path) && !fstab_has_noauto(fstab, len, uuid, volname);
 }
 
 #ifndef LINUXFS_AGENT_NO_MAIN
@@ -580,13 +588,32 @@ static void automount(const char *bsd)
 }
 
 static int swept;
+static char fstab[FSTAB_MAX];
+static size_t fstab_len;
+
+/* /etc/fstab, at most FSTAB_MAX bytes of it, into fstab; none when it is missing or not a regular file */
+static void read_fstab(void)
+{
+	struct stat st;
+	ssize_t r;
+	int fd = open(env_or("LINUXFS_FSTAB", "/etc/fstab"), O_RDONLY | O_NONBLOCK | O_NOCTTY);
+
+	fstab_len = 0;
+	if (fd < 0)
+		return;
+	if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode))
+		while (fstab_len < sizeof(fstab) && (r = read(fd, fstab + fstab_len, sizeof(fstab) - fstab_len)) > 0)
+			fstab_len += (size_t)r;
+	close(fd);
+}
 
 static void sweep_appeared(DADiskRef disk, void *ctx)
 {
 	const char *bsd = DADiskGetBSDName(disk);
 	CFDictionaryRef d = bsd ? DADiskCopyDescription(disk) : NULL;
-	CFStringRef k;
-	char kind[64] = "";
+	CFStringRef k, name, us;
+	CFUUIDRef u;
+	char kind[64] = "", vol[1024] = "", uuid[40] = "";
 
 	(void)ctx;
 	if (!d)
@@ -595,8 +622,20 @@ static void sweep_appeared(DADiskRef disk, void *ctx)
 	k = CFDictionaryGetValue(d, kDADiskDescriptionVolumeKindKey);
 	if (k)
 		CFStringGetCString(k, kind, sizeof(kind), kCFStringEncodingUTF8);
-	if (agent_sweeps(k ? kind : NULL, CFDictionaryGetValue(d, kDADiskDescriptionVolumePathKey) != NULL))
-		automount(bsd);
+	name = CFDictionaryGetValue(d, kDADiskDescriptionVolumeNameKey);
+	if (name && CFGetTypeID(name) == CFStringGetTypeID())
+		CFStringGetCString(name, vol, sizeof(vol), kCFStringEncodingUTF8);
+	u = CFDictionaryGetValue(d, kDADiskDescriptionVolumeUUIDKey);
+	if (u && CFGetTypeID(u) == CFUUIDGetTypeID() && (us = CFUUIDCreateString(NULL, u))) {
+		CFStringGetCString(us, uuid, sizeof(uuid), kCFStringEncodingUTF8);
+		CFRelease(us);
+	}
+	if (agent_sweeps(k ? kind : NULL, CFDictionaryGetValue(d, kDADiskDescriptionVolumePathKey) != NULL)) {
+		if (agent_sweeps_volume(kind, 0, fstab, fstab_len, uuid, vol))
+			automount(bsd);
+		else
+			syslog(LOG_NOTICE, "%s: left alone: /etc/fstab says noauto (linuxfs ignore)", bsd);
+	}
 	CFRelease(d);
 }
 
@@ -621,6 +660,7 @@ static void sweep(CFRunLoopTimerRef t, void *ctx)
 	syslog(LOG_NOTICE, "login sweep");
 	if (!s)
 		return;
+	read_fstab();
 	DARegisterDiskAppearedCallback(s, NULL, sweep_appeared, NULL);
 	DASessionScheduleWithRunLoop(s, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
 	{

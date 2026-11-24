@@ -4,7 +4,8 @@
 #       helper and the keychain keeper (linuxfs-agent) are running; `linuxfs mount` mounts ext4, btrfs, xfs, NTFS (ntfs3),
 #       exFAT and f2fs images, writes through each, unmounts, mounts again and reads it all back. Then DiskArbitration's six
 #       bundles: ext4, btrfs, xfs, f2fs, NTFS (NTFSTakeover on) and APFS, raw and GPT-wrapped, are mounted by an attach within 30 s (personality, reads, writes, unmount and mount, eject
-#       leaves no lklfuse); NTFS with NTFSTakeover off is Apple's; Automount off mounts nothing on a plain attach (refused for the prefs in system.log) and `diskutil mount` mounts it;
+#       leaves no lklfuse); NTFS with NTFSTakeover off is Apple's; `linuxfs ignore` (an /etc/fstab noauto entry: ext4 by device, NTFS by
+#       label) mounts nothing on a plain attach and never runs the mount program, `diskutil mount` mounts it, and after `linuxfs unignore` a plain attach does;
 #       ReadOnly in the user's plist (read by the root mount program) mounts read-only; a label with a slash or a control
 #       character gets a safe /Volumes name; the encrypted APFS fixture shows the password dialog (screenshot), times out
 #       with no mount, mounts through --password-stdin and the keeper's --offer, then from the login keychain with no dialog;
@@ -248,45 +249,61 @@ if da_attach "$W/img/ntfs.img"; then
 else notok "ntfs, NTFSTakeover off: hdiutil attach"; disk=$(image_disk "$W/img/ntfs.img"); fi
 cleanup_disk
 
-# spec: tests/smoke-mavericks.sh header -- Automount off: nothing mounts a plain attach (hdiutil fails with no mountable file
-#       systems, as it does for a disk the Mac cannot read), the log says prefs refused it, and diskutil mount mounts it
-"$L" prefs Automount off
-if cp "$W/img/ext4.img" "$W/img/da-ext4-off.img"; then
-  img=$W/img/da-ext4-off.img
+# spec: tests/smoke-mavericks.sh header -- linuxfs ignore: an /etc/fstab noauto entry keeps one volume from mounting by itself
+#       (ext4 by its device, so by UUID; NTFS, which has no UUID, by its label): a plain attach mounts nothing (hdiutil fails
+#       with no mountable file systems), DiskArbitration never runs the mount program for it, and no "not readable" dialog
+#       shows (screenshot); diskutil mount over ssh mounts it; after linuxfs unignore a plain attach mounts it again
+noauto_cycle() {  # TAG IMAGE device|label LABEL
+  tag=$1 img=$2 how=$3 lab=$4
+  if ! da_attach_nomount "$img"; then notok "$tag: hdiutil attach -nomount"; disk=$(image_disk "$img"); cleanup_disk; return 1; fi
+  if [ "$how" = device ]; then arg=$disk; else arg=$lab; fi
+  check "$tag: linuxfs ignore $arg" "$L" ignore "$arg"
+  echo "# $tag: linuxfs ignore lists: $("$L" ignore | tr '\n' '|')"
+  check "$tag: /etc/fstab has linuxfs's noauto entry" sh -c 'grep -q " rw,noauto # linuxfs\$" /etc/fstab'
+  cleanup_disk
   log0=$(wc -l < /var/log/system.log 2> /dev/null | tr -d ' ')
   out=$(bounded 600 hdiutil attach -imagekey diskimage-class=CRawDiskImage "$img" 2>&1); rc=$?
-  bounded 600 "$AQUA" screencapture -x "$OUT/automount-off.png" > /dev/null 2>&1 && ok "automount off: screenshot automount-off.png (read it for a 'not readable' dialog)" || notok "automount off: screencapture"
+  bounded 600 "$AQUA" screencapture -x "$OUT/noauto-$tag.png" > /dev/null 2>&1 && ok "$tag: screenshot noauto-$tag.png (read it for a 'not readable' dialog)" || notok "$tag: screencapture"
   disk=$(image_disk "$img"); disks=$disk
   mounted=
   for d in $(printf '%s\n' "$out" | awk '/^\/dev\/disk/ { print $1 }') $disk; do [ "$(info "$d" Mounted)" != Yes ] || mounted=$d; done
-  if [ $rc -ne 0 ] || [ -z "$mounted" ]; then ok "automount off: a plain attach mounted nothing (exit $rc: $(printf '%s' "$out" | tr '\n' ' '))"
-  else notok "automount off: a plain attach mounted $mounted"; fi
+  if [ $rc -ne 0 ] || [ -z "$mounted" ]; then ok "$tag: a plain attach mounted nothing (exit $rc: $(printf '%s' "$out" | tr '\n' ' '))"
+  else notok "$tag: a plain attach mounted $mounted"; fi
   sleep 3
-  check "automount off: system.log shows the mount refused for the preferences (da-mount exited 3)" sh -c 'tail -n +"$1" /var/log/system.log | grep -q "da-mount exited 3"' _ "$((${log0:-0} + 1))"
+  check "$tag: DiskArbitration never ran the mount program for it (no linuxfs-mount in system.log)" sh -c '! tail -n +"$1" /var/log/system.log | grep -q "linuxfs-mount"' _ "$((${log0:-0} + 1))"
   cleanup_disk
   if da_attach_nomount "$img"; then
-    ok "automount off: attached -nomount as $disk"
-    # spec: tests/smoke-mavericks.sh header -- the observation over ssh, then the check from the console user's session (the
-    #       spike saw -o owners from diskutil, probably from the console); both print the mount program's arguments line
-    log1=$(wc -l < /var/log/system.log 2> /dev/null | tr -d ' ')
-    bounded 600 diskutil mount "$disk" > "$W/dm-ssh.log" 2>&1; rcs=$?
-    sleep 2
-    echo "# observation, diskutil mount over ssh: exit $rcs: $(tr '\n' ' ' < "$W/dm-ssh.log")"
-    tail -n +"$((${log1:-0} + 1))" /var/log/system.log 2> /dev/null | grep 'linuxfs-mount.*\(arguments\|parsed\|exited\)' | sed 's/^/# ssh: /'
-    if [ "$(info "$disk" Mounted)" = Yes ]; then echo "# observation: the ssh diskutil mount mounted it; unmounting for the console attempt"; bounded 600 diskutil unmount "$disk" > /dev/null 2>&1; fi
-    log2=$(wc -l < /var/log/system.log 2> /dev/null | tr -d ' ')
-    check "automount off: diskutil mount, run in the console user's session, mounts it" bounded 600 "$AQUA" diskutil mount "$disk"
-    if da_wait 100; then ok "automount off: mounted at $mp after the console user's diskutil mount"
-    else
-      notok "automount off: mounted within 10 s of the console user's diskutil mount"
-      echo "# system.log since the console diskutil mount:"
-      tail -n +"$((${log2:-0} + 1))" /var/log/system.log 2> /dev/null | grep 'linuxfs\|diskarbitrationd' | sed 's/^/# /'
-    fi
-    tail -n +"$((${log2:-0} + 1))" /var/log/system.log 2> /dev/null | grep 'linuxfs-mount.*\(arguments\|parsed\)' | sed 's/^/# console: /'
-  else notok "automount off: hdiutil attach -nomount"; disk=$(image_disk "$img"); fi
+    check "$tag: diskutil mount over ssh mounts it" bounded 600 diskutil mount "$disk"
+    if da_wait 100; then ok "$tag: mounted at $mp by diskutil mount, the noauto entry notwithstanding"
+    else notok "$tag: mounted within 10 s of diskutil mount"; tail -n 30 /var/log/system.log 2> /dev/null | grep 'linuxfs\|diskarbitrationd' | sed 's/^/# /'; fi
+    [ "$how" != device ] || check "$tag: linuxfs unignore $disk" "$L" unignore "$disk"
+  else notok "$tag: hdiutil attach -nomount, again"; disk=$(image_disk "$img"); fi
+  [ "$how" != label ] || check "$tag: linuxfs unignore $lab" "$L" unignore "$lab"
   cleanup_disk
-else notok "automount off: cannot copy ext4.img"; fi
-"$L" prefs Automount on
+  check "$tag: /etc/fstab has no linuxfs entry left" sh -c '! grep -q "# linuxfs\$" /etc/fstab 2> /dev/null'
+  if da_attach "$img"; then
+    if da_wait 300; then ok "$tag: after unignore, a plain attach mounts it at $mp"
+    else notok "$tag: after unignore, mounted by a plain attach within 30 s"; fi
+  else notok "$tag: after unignore, hdiutil attach"; disk=$(image_disk "$img"); fi
+  cleanup_disk
+}
+# spec: tests/smoke-mavericks.sh header -- an entry a failed step left is taken away (by the device: a UUID= entry has no label)
+noauto_leftover() {  # IMAGE
+  grep -q "# linuxfs\$" /etc/fstab 2> /dev/null || return 0
+  echo "# a linuxfs entry was left in /etc/fstab: $(grep '# linuxfs$' /etc/fstab | tr '\n' '|')"
+  if da_attach_nomount "$1"; then "$L" unignore "$disk" > /dev/null 2>&1; fi
+  cleanup_disk
+}
+if cp "$W/img/ext4.img" "$W/img/da-ext4-noauto.img"; then
+  noauto_cycle "ignore ext4 by device" "$W/img/da-ext4-noauto.img" device "my data"
+  noauto_leftover "$W/img/da-ext4-noauto.img"
+else notok "ignore ext4 by device: cannot copy ext4.img"; fi
+defaults write dev.mavergreen.linuxfs NTFSTakeover -bool true
+if cp "$W/img/ntfs.img" "$W/img/da-ntfs-noauto.img"; then
+  noauto_cycle "ignore ntfs by label" "$W/img/da-ntfs-noauto.img" label Windows
+  "$L" unignore Windows > /dev/null 2>&1
+else notok "ignore ntfs by label: cannot copy ntfs.img"; fi
+defaults delete dev.mavergreen.linuxfs NTFSTakeover
 
 # spec: tests/smoke-mavericks.sh header -- root reads the console user's plist (the seteuid/setgroups drop): ReadOnly in the user's plist, ext4 mounts read-only
 "$L" prefs ReadOnly on

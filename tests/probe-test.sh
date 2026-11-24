@@ -61,7 +61,18 @@ for i in ext4 btrfs xfs apfs; do
   n=$((n + 1)); want_u=$(uuid $i.img | tr a-f A-F); got=$("$D/probe-uuid" "$D/$i.img"); rc=$?
   if [ -n "$want_u" ] && [ "$got" = "$want_u" ] && [ $rc -eq 0 ]; then echo "ok $n - $i.img: UUID $got"
   else echo "not ok $n - $i.img: UUID got '$got' ($rc), want '$want_u'"; bad=1; fi
+  # spec: tools/probe.c main -- linuxfs-probe --uuid PATH prints the same (the CLI's linuxfs ignore writes it as UUID=)
+  n=$((n + 1)); got=$("$D/probe" --uuid "$D/$i.img"); rc=$?
+  if [ "$got" = "$want_u" ] && [ $rc -eq 0 ]; then echo "ok $n - linuxfs-probe --uuid $i.img: $got"
+  else echo "not ok $n - linuxfs-probe --uuid $i.img: got '$got' ($rc), want '$want_u'"; bad=1; fi
 done
+for i in ntfs zero; do
+  n=$((n + 1)); got=$("$D/probe" --uuid "$D/$i.img" 2>/dev/null); rc=$?
+  if [ -z "$got" ] && [ $rc -eq 1 ]; then echo "ok $n - linuxfs-probe --uuid $i.img: none, exit 1"
+  else echo "not ok $n - linuxfs-probe --uuid $i.img: got '$got' ($rc), want none (1)"; bad=1; fi
+done
+n=$((n + 1)); "$D/probe" --uuid "$D/missing" > /dev/null 2>&1; rc=$?
+if [ $rc -eq 2 ]; then echo "ok $n - linuxfs-probe --uuid of an unreadable path exits 2"; else echo "not ok $n - --uuid missing exit $rc, want 2"; bad=1; fi
 for i in ntfs f2fs vfat exfat fat32; do
   n=$((n + 1)); got=$("$D/probe-uuid" "$D/$i.img"); rc=$?
   if [ -z "$got" ] && [ $rc -eq 1 ]; then echo "ok $n - $i.img: no UUID"

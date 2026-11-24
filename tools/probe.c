@@ -1,8 +1,11 @@
 /*
  * linuxfs-probe (and linuxfs_probe_fd, for linuxfs-helper): names the filesystem on a device or image by its superblock, as lklfuse's type= spells it.
  * usage: linuxfs-probe PATH
+ *        linuxfs-probe --uuid PATH
  * Prints "TYPE<TAB>LABEL" (the label empty where none is read) and exits 0; prints "unknown" and exits 1 when
  * no superblock it knows is there; exits 2 when PATH cannot be read. Reads at most the first 68 KiB.
+ * --uuid prints the filesystem's UUID as linuxfs_probe_uuid gives it (what the bundles' util -k tells DiskArbitration)
+ * and exits 0; exits 1, printing nothing, when there is none.
  */
 #include "probe.h"
 #include <errno.h>
@@ -446,24 +449,31 @@ int linuxfs_probe_uuid(char *out, size_t outlen)
 #ifndef LINUXFS_PROBE_NO_MAIN
 int main(int argc, char **argv)
 {
-	char lab[512];
-	const char *type;
-	int fd, err;
+	char lab[512], uuid[40];
+	const char *type, *path;
+	int fd, err, want_uuid = argc == 3 && strcmp(argv[1], "--uuid") == 0;
 
-	if (argc != 2) {
-		fprintf(stderr, "usage: linuxfs-probe PATH\n");
+	if (argc != 2 && !want_uuid) {
+		fprintf(stderr, "usage: linuxfs-probe PATH\n       linuxfs-probe --uuid PATH\n");
 		return 2;
 	}
-	fd = open(argv[1], O_RDONLY);
+	path = argv[argc - 1];
+	fd = open(path, O_RDONLY);
 	if (fd < 0) {
-		fprintf(stderr, "linuxfs-probe: %s: %s\n", argv[1], strerror(errno));
+		fprintf(stderr, "linuxfs-probe: %s: %s\n", path, strerror(errno));
 		return 2;
 	}
 	type = linuxfs_probe_fd(fd, lab, sizeof(lab), &err);
 	close(fd);
 	if (err) {
-		fprintf(stderr, "linuxfs-probe: %s: %s\n", argv[1], strerror(err));
+		fprintf(stderr, "linuxfs-probe: %s: %s\n", path, strerror(err));
 		return 2;
+	}
+	if (want_uuid) {
+		if (!type || linuxfs_probe_uuid(uuid, sizeof(uuid)) != 0)
+			return 1;
+		printf("%s\n", uuid);
+		return 0;
 	}
 	if (!type) {
 		printf("unknown\n");

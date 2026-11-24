@@ -5,8 +5,9 @@
 #          linuxfs mount DEVICE [--ro] [--password-stdin]
 #          linuxfs unmount [--force] MOUNTPOINT|DEVICE|IMAGE
 #          linuxfs status
-#          linuxfs prefs [Automount|ReadOnly|NTFSTakeover|APFSWrite on|off]
-#          linuxfs ignore|unignore LABEL
+#          linuxfs prefs [ReadOnly|NTFSTakeover|APFSWrite on|off]
+#          linuxfs ignore [VOLUME]
+#          linuxfs unignore VOLUME
 #          linuxfs automount DISK
 #   internal: linuxfs da-mount [--asked] [--ro] [--password-stdin] DEVICE MOUNTPOINT   (only with LINUXFS_DA=1: the bundle's mount program)
 #          Mounts a Linux filesystem (ext4, btrfs, xfs, NTFS, exFAT, FAT, f2fs) with Linux's own driver, running in
@@ -17,8 +18,12 @@
 #          prefs), and its volume is open to every user. A dirty NTFS volume mounts read-only. A device the Mac has
 #          mounted is refused. APFS mounts read-only (APFSWrite on: read-write, but never an encrypted or Fusion
 #          volume); an encrypted volume's password is asked for at the terminal, or read from stdin
-#          (--password-stdin; for a device, offered to the login session's agent). Exit 0 on success, 1 on failure,
-#          2 on misuse, 3 when preferences say not to mount, 4 when an encrypted volume's password is missing or wrong.
+#          (--password-stdin; for a device, offered to the login session's agent). ignore VOLUME (a device, or a volume's
+#          name with its disk attached) keeps that volume from mounting by itself when it is attached, as the Mac's own
+#          are kept, by an /etc/fstab noauto entry (UUID=, else LABEL=) the linuxfs helper writes; diskutil mount and Disk
+#          Utility still mount it. unignore VOLUME takes the entry away, and ignore alone lists them. Exit 0 on success,
+#          1 on failure, 2 on misuse, 3 when preferences say not to mount, 4 when an encrypted volume's password is
+#          missing or wrong.
 set -u
 PREFIX=${LINUXFS_PREFIX:-/usr/local/mavergreen/linuxfs}
 LKLFUSE=${LINUXFS_LKLFUSE:-$PREFIX/libexec/lklfuse}
@@ -33,6 +38,7 @@ AGENT=${LINUXFS_AGENT:-$PREFIX/libexec/linuxfs-agent}
 DOMAIN=${LINUXFS_DOMAIN:-dev.mavergreen.linuxfs}
 MACHINE=${LINUXFS_MACHINE_DOMAIN:-/Library/Preferences/dev.mavergreen.linuxfs}
 FUSION_WAIT=${LINUXFS_FUSION_WAIT:-300}   # tenths of a second, as wall-clock time
+FSTAB=${LINUXFS_FSTAB:-/etc/fstab}   # read only: the root helper writes it
 
 die() { echo "linuxfs: $*" >&2; exit 1; }
 usage() { sed -n 's/^#   usage: /usage: /p; s/^#          linuxfs /       linuxfs /p' "$0" >&2; exit 2; }
@@ -359,21 +365,24 @@ EOF
   [ "$(dirname "$mnt")" != "$VOLUMES" ] || rmdir "$mnt" 2>/dev/null || :
 }
 
-# Preferences, in the defaults domain dev.mavergreen.linuxfs: on/off keys, and Ignore:LABEL for each opted-out volume.
-# The user's domain first, then the machine's (/Library/Preferences, which DiskArbitration's mount program reads as root).
+# Preferences, in the defaults domain dev.mavergreen.linuxfs: on/off keys. The user's domain first, then the machine's
+# (/Library/Preferences, which DiskArbitration's mount program reads as root). There is no Automount, and no Ignore:LABEL:
+# DiskArbitration runs the mount program alike for a plug-in and for diskutil mount, so "not by itself" is per volume, in
+# /etc/fstab (linuxfs ignore).
 pref() { # KEY DEFAULT(on|off) -> prints on|off
   for dom in "$DOMAIN" "$MACHINE"; do
     case $(defaults read "$dom" "$1" 2>/dev/null) in 1|true|YES|yes) echo on; return ;; 0|false|NO|no) echo off; return ;; esac
   done
   echo "$2"
 }
-pref_default() { case $1 in Automount) echo on ;; ReadOnly|NTFSTakeover|APFSWrite) echo off ;; *) return 1 ;; esac; }
-ignored() { [ "$(defaults read "$DOMAIN" "Ignore:$1" 2>/dev/null)" = 1 ] || [ "$(defaults read "$MACHINE" "Ignore:$1" 2>/dev/null)" = 1 ]; }
+pref_default() { case $1 in ReadOnly|NTFSTakeover|APFSWrite) echo off ;; *) return 1 ;; esac; }
 
 cmd_prefs() {
+  if [ "${1:-}" = Automount ]; then
+    echo "linuxfs: Automount is gone: to keep one volume from mounting by itself, use linuxfs ignore" >&2; exit 2
+  fi
   case $# in
-    0) for k in Automount ReadOnly NTFSTakeover APFSWrite; do printf '%s\t%s\n' "$k" "$(pref "$k" "$(pref_default "$k")")"; done
-       defaults read "$DOMAIN" 2>/dev/null | sed -n 's/^ *"Ignore:\(.*\)" = 1;$/Ignore	\1/p; s/^ *Ignore:\([^ "]*\) = 1;$/Ignore	\1/p' ;;
+    0) for k in ReadOnly NTFSTakeover APFSWrite; do printf '%s\t%s\n' "$k" "$(pref "$k" "$(pref_default "$k")")"; done ;;
     2) pref_default "$1" > /dev/null || usage
        case $2 in on) v=true ;; off) v=false ;; *) usage ;; esac
        defaults write "$DOMAIN" "$1" -bool "$v" ;;
@@ -381,12 +390,11 @@ cmd_prefs() {
   esac
 }
 
-# For the automount agent: mounts DISK when the preferences say to. Exit 3 when they say not to (or the
-# filesystem is one the Mac mounts itself), so the agent leaves the disk alone.
+# For the agent's login sweep: mounts DISK when the preferences say to. Exit 3 when they say not to (or the filesystem
+# is one the Mac mounts itself), so the agent leaves the disk alone. The sweep itself skips a volume /etc/fstab says noauto.
 cmd_automount() {
   [ $# -eq 1 ] || usage
   device_nodes "$1" || usage
-  [ "$(pref Automount on)" = on ] || exit 3
   probed=$(probe_dev "$raw") || exit 3
   type=${probed%%"$tab"*} rest=${probed#*"$tab"}; label=${rest%%"$tab"*}
   case $rest in
@@ -401,12 +409,13 @@ cmd_automount() {
     exfat|vfat) exit 3 ;;
     ntfs3) [ "$(pref NTFSTakeover off)" = on ] || exit 3 ;;
   esac
-  [ -z "$label" ] || ! ignored "$label" || exit 3
   diskutil mount "$1"
 }
 
-# For the bundle's mount program (LINUXFS_DA=1), on DiskArbitration's existing mount point. Exit 3: preferences say not to
-# (unless --asked: the user said to), or a Fusion second device, or a main device whose second never came.
+# For the bundle's mount program (LINUXFS_DA=1), on DiskArbitration's existing mount point. Exit 3: NTFS without NTFSTakeover
+# (unless --asked), or a Fusion second device, or a main device whose second never came. DiskArbitration passes the same options
+# for a plug-in and for diskutil mount, so nothing else here depends on --asked: a volume that is not to mount by itself has
+# an /etc/fstab noauto entry, and DiskArbitration never runs the mount program for it at plug-in.
 cmd_da_mount() {
   [ "${LINUXFS_DA:-}" = 1 ] || usage
   asked= ro= pws=
@@ -425,8 +434,6 @@ cmd_da_mount() {
   case $type in exfat|vfat) exit 3 ;; esac
   if [ -z "$asked" ]; then
     [ "$type" != ntfs3 ] || [ "$(pref NTFSTakeover off)" = on ] || exit 3
-    [ "$(pref Automount on)" = on ] || exit 3
-    [ -z "$label" ] || ! ignored "$label" || exit 3
   fi
   case $rest in
     *"${tab}fusion-tier2 "*) exit 3 ;;
@@ -448,6 +455,70 @@ cmd_da_mount() {
   else cmd_mount "$@"; fi
 }
 
+# ---- ignore, unignore: /etc/fstab noauto entries, written by the root helper (linuxfs-open asks it) ----
+
+# The UUID DiskArbitration knows a disk by (the bundle's util -k prints the probe's), uppercase; empty when it has none.
+uuid_dev() {
+  if [ -r "$1" ] && [ "${LINUXFS_OPEN_INHERITED:-}" != 1 ]; then "$PROBE" --uuid "$1" 2>/dev/null < /dev/null
+  else "$OPENER" --uuid "$1" 2>/dev/null < /dev/null; fi | tr a-f A-F
+}
+# The bundle that mounts what the probe calls TYPE; fails for what the Mac mounts itself (FAT, exFAT).
+bundle_of() { case $1 in ext4|btrfs|xfs|f2fs|apfs) echo "linuxfs_$1" ;; ntfs3) echo linuxfs_ntfs ;; *) return 1 ;; esac; }
+# A device's type, UUID and name (the volume name DiskArbitration sees: the bundle's util prints the label's safe name,
+# so a LABEL= entry must spell that, not the raw label). A label that leaves no safe name (empty, not UTF-8) gives no name:
+# DiskArbitration would call it Linux, as it calls every such volume. Sets type, uuid and name.
+volume_of() { # RAW
+  probed=$(probe_dev "$1") || die "$1: no filesystem linuxfs knows, or it cannot be read"
+  type=${probed%%"$tab"*} rest=${probed#*"$tab"}; label=${rest%%"$tab"*}
+  uuid=$(uuid_dev "$1"); name=$(safe_name "$label")
+  [ -n "$uuid$name" ] || die "$1 has no UUID or label to name it by in /etc/fstab"
+}
+# The bundle of the attached disk whose volume name is NAME; fails when none is attached.
+bundle_of_name() { # NAME
+  diskutil list | awk '{ print $NF }' | grep -E '^disk[0-9]+(s[0-9]+)?$' | while read -r d; do
+    p=$(probe_dev "/dev/r$d") || continue
+    t=${p%%"$tab"*} r=${p#*"$tab"}; l=${r%%"$tab"*}
+    [ "$(safe_name "$l")" = "$1" ] || continue
+    bundle_of "$t" && break
+  done | grep .
+}
+# Asks the root helper to edit /etc/fstab; its refusal is printed (by linuxfs-open) and is exit 1.
+noauto() { # --noauto-add SPEC BUNDLE | --noauto-remove SPEC
+  [ -x "$OPENER" ] || die "the linuxfs helper is not installed, and /etc/fstab is root's to edit"
+  "$OPENER" "$@" < /dev/null || exit 1
+}
+
+cmd_ignore() {
+  if [ $# -eq 0 ]; then   # the list: linuxfs's entries, their labels unescaped
+    [ ! -f "$FSTAB" ] || awk '/# linuxfs$/ { s = $1; gsub(/\\040/, " ", s); gsub(/\\011/, "\t", s); print s "\t" $3 }' "$FSTAB"
+    return 0
+  fi
+  [ $# -eq 1 ] || usage
+  if device_nodes "$1"; then
+    volume_of "$raw"
+    bundle=$(bundle_of "$type") || die "$1 is $type, which the Mac mounts itself"
+    if [ -n "$uuid" ]; then spec=UUID=$uuid; else spec=LABEL=$name; fi
+  else
+    name=$(safe_name "$1"); [ -n "$name" ] || die "'$1' is not a name a volume can have"
+    bundle=$(bundle_of_name "$name") ||
+      die "no attached disk holds a volume named $name; attach it and give its device (linuxfs ignore /dev/diskNsM)"
+    spec=LABEL=$name
+  fi
+  noauto --noauto-add "$spec" "$bundle"
+}
+
+cmd_unignore() {
+  [ $# -eq 1 ] || usage
+  if device_nodes "$1"; then
+    volume_of "$raw"
+    [ -z "$uuid" ] || noauto --noauto-remove "UUID=$uuid"
+    [ -z "$name" ] || noauto --noauto-remove "LABEL=$name"
+  else
+    name=$(safe_name "$1"); [ -n "$name" ] || die "'$1' is not a name a volume can have"
+    noauto --noauto-remove "LABEL=$name"
+  fi
+}
+
 cmd_status() {
   [ $# -eq 0 ] || usage
   printf 'PID\tSOURCE\tMOUNTPOINT\tTYPE\tMODE\n'
@@ -462,8 +533,8 @@ case $c in
   unmount|umount|eject) cmd_unmount "$@" ;;
   status) cmd_status "$@" ;;
   prefs) cmd_prefs "$@" ;;
-  ignore) [ $# -eq 1 ] || usage; defaults write "$DOMAIN" "Ignore:$1" -bool true ;;
-  unignore) [ $# -eq 1 ] || usage; defaults delete "$DOMAIN" "Ignore:$1" 2>/dev/null || : ;;
+  ignore) cmd_ignore "$@" ;;
+  unignore) cmd_unignore "$@" ;;
   automount) cmd_automount "$@" ;;
   da-mount) cmd_da_mount "$@" ;;
   -h|--help|help) usage ;;

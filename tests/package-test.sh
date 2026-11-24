@@ -153,16 +153,20 @@ case "$*" in
   ". -create"*) [ "$*" != ". -create /Users/_linuxfs" ] || : > "$ds/user"; echo "dscl $*" >> "$PH_DIR/calls" ;;
 esac
 STUB
-for c in mkdir chown chmod touch killall launchctl stat pgrep; do
+for c in mkdir chown chmod touch killall launchctl stat pgrep defaults sudo; do
   printf '#!/bin/sh\necho "%s $*" >> "$PH_DIR/calls"\n' "$c" > "$T/pbin/$c"
 done
+printf '[ "$*" != "-f %%Su /dev/console" ] || echo "${PH_USER:-}"\n' >> "$T/pbin/stat"
+# the root helper's migration: a stub that prints what PH_MIGRATED holds, as DOMAIN<TAB>LABEL lines
+printf '#!/bin/sh\necho "helper $*" >> "$PH_DIR/calls"\n[ "$*" = --migrate-prefs ] && printf "%%b" "${PH_MIGRATED:-}"\n' > "$T/pbin/helper"
 chmod 755 "$T/pbin"/*
 run_post() {  # users groups-file-lines gid-or-empty user-exists(1/0)
   rm -f "$T/ds"/* "$T/calls"; : > "$T/calls"
   printf '%s\n' "$1" > "$T/ds/users"; printf '%s\n' "$2" > "$T/ds/groups"
   [ -z "$3" ] || echo "$3" > "$T/ds/gid"
   [ "$4" != 1 ] || : > "$T/ds/user"
-  PH_DIR="$T" PATH="$T/pbin:$PATH" sh "$REPO_ROOT/packaging/postinstall-hook" > "$T/post.out" 2>&1
+  sed "s|/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper|$T/pbin/helper|g" "$REPO_ROOT/packaging/postinstall-hook" > "$T/post.sh"
+  PH_DIR="$T" PATH="$T/pbin:$PATH" sh "$T/post.sh" > "$T/post.out" 2>&1
 }
 want() { grep -qxF "$1" "$T/calls" || fail "postinstall: $2 (no '$1')"; }
 run_post "root 0
@@ -187,6 +191,20 @@ grep -q 'create /Users' "$T/calls" && fail "postinstall made a user with the ran
 want "killall diskarbitrationd" "the install continues when the range is full"
 run_post "root 0" "wheel 0" 250 1 || fail "postinstall failed with _linuxfs there"
 grep -q 'dscl . -create' "$T/calls" && fail "postinstall changed an existing _linuxfs"
+# spec: packaging/postinstall-hook -- the old Ignore:<LABEL> preferences become /etc/fstab noauto entries through the root
+#       helper (--migrate-prefs: it reads the plists and writes fstab itself); each converted key is deleted from its domain,
+#       the user's as the user, and Automount from both; what the helper did not convert stays
+grep -q 'dev.mavergreen.linuxfs.helper --migrate-prefs' "$REPO_ROOT/packaging/postinstall-hook" || fail "the postinstall does not migrate Ignore:<LABEL> to /etc/fstab"
+PH_USER=alice PH_MIGRATED='user\tmy data\nmachine\told\tone\n' run_post "root 0" "wheel 0" 250 1 || fail "postinstall failed migrating preferences"
+want "helper --migrate-prefs" "the migration runs the helper"
+want "sudo -u alice defaults delete dev.mavergreen.linuxfs Ignore:my data" "a converted user key is deleted as the user"
+want "defaults delete /Library/Preferences/dev.mavergreen.linuxfs Ignore:old	one" "a converted machine key is deleted, whole (a tab in it)"
+want "defaults delete /Library/Preferences/dev.mavergreen.linuxfs Automount" "Automount is deleted from the machine's domain"
+want "sudo -u alice defaults delete dev.mavergreen.linuxfs Automount" "and from the user's"
+[ "$(grep -c 'defaults delete' "$T/calls")" = 4 ] || fail "postinstall deleted keys the helper did not convert: $(grep 'defaults delete' "$T/calls" | tr '\n' '|')"
+[ "$(tail -n 1 "$T/calls")" = "killall diskarbitrationd" ] || fail "postinstall does not restart diskarbitrationd after the migration"
+PH_USER=root run_post "root 0" "wheel 0" 250 1 || fail "postinstall failed with root at the console"
+grep -q 'sudo -u' "$T/calls" && fail "postinstall ran defaults as root for the user's domain"
 
 mkdir -p "$T/bin"
 # pre-uninstall deletes _linuxfs and its home: dscl and rm are stubs that only log, so this never touches the machine it runs on

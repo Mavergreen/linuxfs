@@ -4,7 +4,9 @@
 #          Builds linuxfs-helper and linuxfs-open for 10.9 and runs the policy test, then, with the helper on a
 #          test socket (--test-files: regular files stand in for disks), checks what linuxfs-open gets: the
 #          probe, a read-write or read-only descriptor on fd 3, a refusal for an unknown filesystem, and exit 3
-#          with no helper. Linux makes the ext4 image.
+#          with no helper; the UUID (--uuid), and the /etc/fstab edits (--noauto-add, --noauto-remove) on a file named by
+#          LINUXFS_FSTAB; and the install's migration (--migrate-prefs) of Ignore:<LABEL> preferences to fstab entries.
+#          Linux makes the ext4 image.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 . "$ROOT/build/msc.sh"
@@ -12,10 +14,12 @@ D=$HOME/Library/Caches/mm-build/linuxfs-helper-test; rm -rf "$D"; mkdir -p "$D"
 CL=$(sh "$SHIPYARD_SCRIPTS/fetch_clang22.sh" "$ROOT/components/clang22" 2>/dev/null) || exit 1
 SDK=$(sh "$SHIPYARD_SCRIPTS/fetch_sdk.sh" 2>/dev/null) || exit 1
 cc() { "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld "$@"; }
-cc -DLINUXFS_PROBE_NO_MAIN -o "$D/helper" "$ROOT/tools/helper.c" "$ROOT/tools/probe.c" -framework IOKit -framework CoreFoundation || exit 1
+cc -DLINUXFS_PROBE_NO_MAIN -o "$D/helper" "$ROOT/tools/helper.c" "$ROOT/tools/probe.c" "$ROOT/tools/fstab.c" "$ROOT/tools/fsrules.c" \
+  "$ROOT/tools/plist.c" -framework IOKit -framework CoreFoundation || exit 1
 cc -DLINUXFS_PROBE_NO_MAIN -o "$D/open" "$ROOT/tools/open.c" "$ROOT/tools/probe.c" || exit 1
 cc -o "$D/probe" "$ROOT/tools/probe.c" || exit 1
-cc -DLINUXFS_PROBE_NO_MAIN -o "$D/policy" "$ROOT/tests/helper-policy-test.c" "$ROOT/tools/probe.c" -framework IOKit -framework CoreFoundation || exit 1
+cc -DLINUXFS_PROBE_NO_MAIN -o "$D/policy" "$ROOT/tests/helper-policy-test.c" "$ROOT/tools/probe.c" "$ROOT/tools/fstab.c" "$ROOT/tools/fsrules.c" \
+  "$ROOT/tools/plist.c" -framework IOKit -framework CoreFoundation || exit 1
 "$D/policy" > "$D/policy.tap"; bad=$?
 grep -v '^1\.\.' "$D/policy.tap"
 n=$(grep -c '^ok\|^not ok' "$D/policy.tap")
@@ -23,6 +27,7 @@ sh "$ROOT/build/linux-host.sh" sh -c 'truncate -s 32M "$1/ext4.img" && mkfs.ext4
   truncate -s 64M "$1/ssd.img" && truncate -s 256M "$1/hdd.img" && mkapfs -L Fused -F "$1/hdd.img" "$1/ssd.img" > /dev/null' _ "$D" || exit 1
 head -c 1048576 /dev/zero > "$D/zero.img"
 S=$D/sock; export LINUXFS_HELPER_SOCKET=$S
+F=$D/fstab; export LINUXFS_FSTAB=$F
 "$D/helper" --socket "$S" --test-files --timeout 3 & hp=$!
 att() { hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$D/$1" | awk 'NR == 1 { print $1 }'; }
 e=$(att ext4.img); devs=$e
@@ -77,6 +82,34 @@ env LINUXFS_OPEN_INHERITED=0 LINUXFS_HELPER_SOCKET=$NS "$D/open" --probe "$e" 3<
 $I "$D/open" "$e" /bin/echo 3<"/dev/r${e#/dev/}" > /dev/null 2>&1; rc=$?
 [ $rc -eq 0 ]; ok $? "inherited exec form never touches the helper socket (rc $rc)"
 $I "$D/open" 3<"/dev/r${e#/dev/}" > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "inherited misuse still exits 2"
+# spec: tools/helper.c -- the UUID, through the helper (the CLI's linuxfs ignore, when it cannot read the raw node)
+[ "$("$D/open" --uuid "$D/ext4.img")" = "$("$D/probe" --uuid "$D/ext4.img")" ]; ok $? "linuxfs-open --uuid gets the helper's answer, the probe's UUID"
+"$D/open" --uuid "$D/zero.img" > /dev/null 2>&1; [ $? -eq 1 ]; ok $? "a disk with no filesystem has no UUID: exit 1"
+# spec: tools/helper.c -- /etc/fstab edits over the socket (LINUXFS_FSTAB here), through linuxfs-open
+printf '# the Mac'"'"'s\nLABEL=Backup none hfs ro\n' > "$F"
+"$D/open" --noauto-add "LABEL=my data" linuxfs_ext4; ok $? "linuxfs-open --noauto-add LABEL=<label> BUNDLE exits 0"
+[ "$(cat "$F")" = "# the Mac's
+LABEL=Backup none hfs ro
+LABEL=my\\040data none linuxfs_ext4 rw,noauto # linuxfs" ]; ok $? "the helper appends the escaped entry, keeping the rest ($(tr '\n' '|' < "$F"))"
+out=$("$D/open" --noauto-add "LABEL=a#b" linuxfs_ext4 2>&1); rc=$?
+[ $rc -eq 1 ] && echo "$out" | grep -q "a label with #"; ok $? "a refusal is printed and exits 1 (got $rc: '$out')"
+"$D/open" --noauto-remove "LABEL=my data"; ok $? "linuxfs-open --noauto-remove LABEL=<label> exits 0"
+[ "$(cat "$F")" = "# the Mac's
+LABEL=Backup none hfs ro" ]; ok $? "and the entry is gone"
+"$D/open" --noauto-add "LABEL=x" > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "--noauto-add with no bundle is misuse (exit 2)"
+# spec: tools/helper.c helper_migrate -- the install's migration (the postinstall runs it as root): each Ignore:<LABEL> = true,
+#       in the console user's and the machine's plists, becomes a LABEL= entry when a disk of that name is attached (its bundle
+#       from the probe), printed as DOMAIN<TAB>LABEL for the postinstall to delete; what cannot be converted is left and logged
+plist() { printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>%s</dict></plist>\n' "$2" > "$1"; }
+plist "$D/user.plist" "<key>Automount</key><false/><key>Ignore:helped</key><true/><key>Ignore:nowhere</key><true/><key>Ignore:kept</key><false/>"
+plist "$D/machine.plist" "<key>Ignore:a#b</key><true/><key>ReadOnly</key><true/><key>Ignore:$(printf '%01200d' 0)</key><true/>"
+M=$D/mfstab; : > "$M"
+out=$(LINUXFS_FSTAB=$M LINUXFS_PREFS_USER=$D/user.plist LINUXFS_PREFS_MACHINE=$D/machine.plist "$D/helper" --migrate-prefs 2> "$D/migrate.err"); rc=$?
+[ $rc -eq 0 ] && [ "$out" = "user${T}helped" ]; ok $? "--migrate-prefs converts Ignore:helped (attached as $e) and prints it (got $rc: '$out')"
+[ "$(cat "$M")" = "LABEL=helped none linuxfs_ext4 rw,noauto # linuxfs" ]; ok $? "as a LABEL= entry with the probed disk's bundle ($(cat "$M"))"
+grep -q "nowhere" "$D/migrate.err" && grep -q "a#b" "$D/migrate.err" && grep -q "too long" "$D/migrate.err" && ! grep -q kept "$D/migrate.err"; ok $? "a label with no disk attached, not writable, or too long is logged and left ($(tr '\n' '|' < "$D/migrate.err"))"
+out=$(LINUXFS_FSTAB=$M LINUXFS_PREFS_USER=$D/none.plist LINUXFS_PREFS_MACHINE=$D/none.plist "$D/helper" --migrate-prefs 2>&1); rc=$?
+[ $rc -eq 0 ] && [ -z "$out" ]; ok $? "with no preferences there is nothing to migrate (got $rc: '$out')"
 kill $hp; wait $hp 2>/dev/null
 "$D/open" --probe "$D/ext4.img" > /dev/null 2>&1; [ $? -eq 3 ]; ok $? "with no helper listening, exit 3"
 echo "1..$n"; exit $bad

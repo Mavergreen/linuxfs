@@ -5,6 +5,9 @@
  *                                                        DEVICE2, read-only, on fd 4: an APFS Fusion container's
  *                                                        second device)
  *        linuxfs-open --probe DEVICE                     prints "TYPE<TAB>LABEL", as linuxfs-probe does
+ *        linuxfs-open --uuid DEVICE                      prints the filesystem's UUID, as linuxfs-probe --uuid does
+ *        linuxfs-open --noauto-add SPEC BUNDLE           has the helper add SPEC's noauto entry to /etc/fstab
+ *        linuxfs-open --noauto-remove SPEC               has it take that entry away (SPEC: UUID=... or LABEL=...)
  * DEVICE is /dev/rdiskNsM (or /dev/diskNsM, diskNsM). The helper's refusal is printed and exits 1; no helper
  * listening exits 3; misuse exits 2. LINUXFS_HELPER_SOCKET names another socket (tests).
  *
@@ -28,7 +31,8 @@
 
 static int usage(void)
 {
-	fprintf(stderr, "usage: linuxfs-open [--ro] DEVICE [--also DEVICE2] PROGRAM [ARG...]\n       linuxfs-open --probe DEVICE\n");
+	fprintf(stderr, "usage: linuxfs-open [--ro] DEVICE [--also DEVICE2] PROGRAM [ARG...]\n       linuxfs-open --probe|--uuid DEVICE\n"
+		"       linuxfs-open --noauto-add SPEC BUNDLE\n       linuxfs-open --noauto-remove SPEC\n");
 	return 2;
 }
 
@@ -126,16 +130,29 @@ static int inherited(int argc, char **argv)
 		fprintf(stderr, "linuxfs-open: LINUXFS_OPEN_INHERITED=1 but fd 3 is not open\n");
 		return 1;
 	}
-	if (argc == 3 && strcmp(argv[1], "--probe") == 0) {
-		char label[256];
+	if (argc >= 2 && strncmp(argv[1], "--noauto-", 9) == 0) {
+		fprintf(stderr, "linuxfs-open: /etc/fstab is not edited before login\n");
+		return 1;
+	}
+	if (argc == 3 && (strcmp(argv[1], "--probe") == 0 || strcmp(argv[1], "--uuid") == 0)) {
+		char label[256], uuid[40];
 		const char *type, *extra;
 		int err = 0;
 
 		type = linuxfs_probe_fd(3, label, sizeof(label), &err);
 		if (!type) {
 			fprintf(stderr, "linuxfs-open: fd 3: %s\n", err ? strerror(err) : "no filesystem linuxfs knows");
-			printf("unknown\n");
+			if (argv[1][2] == 'p')
+				printf("unknown\n");
 			return 1;
+		}
+		if (argv[1][2] == 'u') {
+			if (linuxfs_probe_uuid(uuid, sizeof(uuid)) != 0) {
+				fprintf(stderr, "linuxfs-open: fd 3: this filesystem has no UUID\n");
+				return 1;
+			}
+			printf("%s\n", uuid);
+			return 0;
 		}
 		extra = linuxfs_probe_extra();
 		if (extra && *extra)
@@ -167,20 +184,42 @@ int main(int argc, char **argv)
 	if (inh && strcmp(inh, "1") == 0)
 		return inherited(argc, argv);
 
-	if (argc == 3 && strcmp(argv[1], "--probe") == 0) {
+	if (argc == 3 && (strcmp(argv[1], "--probe") == 0 || strcmp(argv[1], "--uuid") == 0)) {
+		int probe = argv[1][2] == 'p';
+
 		raw_path(argv[2], dev, sizeof(dev));
-		snprintf(req, sizeof(req), "probe %s\n", dev);
+		snprintf(req, sizeof(req), "%s %s\n", probe ? "probe" : "uuid", dev);
 		fd = ask(req, answer, sizeof(answer));
 		if (fd >= 0)
 			close(fd);
 		if (strncmp(answer, "ok ", 3) != 0) {
 			fprintf(stderr, "linuxfs-open: %s: %s\n", dev, answer + (strncmp(answer, "no ", 3) ? 0 : 3));
-			printf("unknown\n");
+			if (probe)
+				printf("unknown\n");
 			return 1;
 		}
 		printf("%s\n", answer + 3);
 		return 0;
 	}
+	if ((argc == 4 && strcmp(argv[1], "--noauto-add") == 0) || (argc == 3 && strcmp(argv[1], "--noauto-remove") == 0)) {
+		char line[2048];
+
+		/* the helper checks SPEC and BUNDLE, and refuses a request of more than one line */
+		if (snprintf(line, sizeof(line), "%s %s%s%s\n", argv[1] + 2, argv[2], argc == 4 ? " " : "", argc == 4 ? argv[3] : "") >= (int)sizeof(line)) {
+			fprintf(stderr, "linuxfs-open: the volume's name is too long\n");
+			return 1;
+		}
+		fd = ask(line, answer, sizeof(answer));
+		if (fd >= 0)
+			close(fd);
+		if (strcmp(answer, "ok") != 0) {
+			fprintf(stderr, "linuxfs-open: %s\n", answer + (strncmp(answer, "no ", 3) ? 0 : 3));
+			return 1;
+		}
+		return 0;
+	}
+	if (argc >= 2 && strncmp(argv[1], "--noauto-", 9) == 0)
+		return usage();
 	if (i < argc && strcmp(argv[i], "--ro") == 0) {
 		ro = 1;
 		i++;

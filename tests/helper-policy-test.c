@@ -1,10 +1,13 @@
 /*
  * linuxfs-helper's refusals, called directly: which paths it accepts, which peers, and that it never opens a
- * partition the Mac has mounted (the boot volume here). helper_serve is driven through a socketpair.
+ * partition the Mac has mounted (the boot volume here). helper_serve is driven through a socketpair. Its /etc/fstab
+ * edits (noauto-add, noauto-remove) on files in a temporary directory, named by LINUXFS_FSTAB (the test override,
+ * obeyed only when not root).
  * usage: helper-policy-test
  */
 #define LINUXFS_HELPER_NO_MAIN
 #include "../tools/helper.c"
+#include <dirent.h>
 
 static int tapno, failures;
 
@@ -17,6 +20,55 @@ static void is(int got, int want, const char *what)
 		failures++;
 	}
 	printf("\n");
+}
+
+/* PATH's contents as a string ("(none)" when it cannot be read) */
+static const char *slurp(const char *path)
+{
+	static char buf[FSTAB_MAX + 2];
+	int fd = open(path, O_RDONLY);
+	ssize_t n = fd >= 0 ? read(fd, buf, sizeof(buf) - 1) : -1;
+
+	if (fd >= 0)
+		close(fd);
+	if (n < 0)
+		return "(none)";
+	buf[n] = '\0';
+	return buf;
+}
+
+static void spit(const char *path, const char *text)
+{
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+	write(fd, text, strlen(text));
+	close(fd);
+}
+
+static void iss(const char *got, const char *want, const char *what)
+{
+	int ok = got == want || (got && want && strcmp(got, want) == 0);
+
+	tapno++;
+	printf("%sok %d - %s\n", ok ? "" : "not ", tapno, what);
+	if (!ok) {
+		printf("# got '%s', want '%s'\n", got ? got : "(null)", want ? want : "(null)");
+		failures++;
+	}
+}
+
+/* entries in DIR other than . and .. */
+static int entries(const char *dir)
+{
+	DIR *d = opendir(dir);
+	struct dirent *e;
+	int n = 0;
+
+	while (d && (e = readdir(d)))
+		n += strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0;
+	if (d)
+		closedir(d);
+	return n;
 }
 
 static void answers(const char *req, uid_t peer, uid_t console, const char *want, const char *what)
@@ -104,6 +156,99 @@ int main(void)
 	answers("gimme /dev/rdisk99s9\n", 501, 501, "no request is", "an unknown request is refused");
 	answers("open /dev/rdisk0s1 rw\n", getuid(), getuid(), "no a system partition", "open of this Mac's EFI partition is refused (C1)");
 	answers("open /dev/rdisk0 ro\n", getuid(), getuid(), "no a disk with partitions", "open of the whole boot disk is refused (I3)");
+	answers("uuid /dev/rdisk0s1\n", getuid(), getuid(), "no a system partition", "uuid of this Mac's EFI partition is refused, as probe is");
+
+	/* ---- /etc/fstab: noauto-add SPEC BUNDLE, noauto-remove SPEC ---- */
+	{
+		char dir[] = "/tmp/helper-fstab.XXXXXX", f[256], tmp[300], big[FSTAB_MAX + 16], other[256], link[256];
+		const char *line = "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF none linuxfs_ext4 rw,noauto # linuxfs\n";
+		const char *mac = "# the Mac's\nUUID=0123ABCD-4567-89EF-0123-456789ABCDEF none hfs rw,noauto\nLABEL=Backup none hfs ro";
+		struct stat st, st2;
+
+		unsetenv("LINUXFS_FSTAB");
+		iss(helper_fstab_path(), "/etc/fstab", "the fstab is /etc/fstab");
+		mkdtemp(dir);
+		snprintf(f, sizeof f, "%s/fstab", dir);
+		snprintf(tmp, sizeof tmp, "%s/fstab.linuxfs-new", dir);
+		setenv("LINUXFS_FSTAB", f, 1);
+		iss(helper_fstab_path(), f, "LINUXFS_FSTAB names another, when not root");
+
+		iss(helper_noauto(f, "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF", "linuxfs_ext4"), NULL, "an add with no fstab yet is done");
+		iss(slurp(f), line, "and makes the fstab with the one line");
+		is(stat(f, &st) == 0 && (st.st_mode & 07777) == 0644 && S_ISREG(st.st_mode), 1, "mode 0644, a regular file");
+		iss(helper_noauto(f, "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF", "linuxfs_ext4"), NULL, "adding it again is ok");
+		is(stat(f, &st2) == 0 && st2.st_ino == st.st_ino, 1, "and leaves the file alone (not rewritten)");
+		iss(helper_noauto(f, "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF", NULL), NULL, "a remove is done");
+		iss(slurp(f), "", "and takes the line away");
+		iss(helper_noauto(f, "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF", NULL), NULL, "removing a missing entry is ok");
+		unlink(f);
+		iss(helper_noauto(f, "LABEL=x", NULL), NULL, "so is removing from no fstab at all");
+		is(access(f, F_OK) != 0, 1, "which makes none");
+
+		spit(f, mac);
+		iss(helper_noauto(f, "LABEL=my data\there", "linuxfs_ntfs"), NULL, "an add to an fstab with other lines is done");
+		snprintf(big, sizeof big, "%s\nLABEL=my\\040data\\011here none linuxfs_ntfs rw,noauto # linuxfs\n", mac);
+		iss(slurp(f), big, "every other line is kept byte for byte; the label's space and tab are escaped");
+		iss(helper_noauto(f, "LABEL=my data\there", NULL), NULL, "and removed by the same label");
+		snprintf(big, sizeof big, "%s\n", mac);
+		iss(slurp(f), big, "leaving the others as they were");
+		is(entries(dir), 1, "no temporary file is left behind");
+		spit(tmp, "stale");
+		iss(helper_noauto(f, "LABEL=y", "linuxfs_xfs"), NULL, "a stale temporary file from a crash does not stop an add");
+		is(entries(dir) == 1 && strstr(slurp(f), "LABEL=y none linuxfs_xfs rw,noauto # linuxfs\n") != NULL, 1, "the add is whole, and the stale file gone");
+
+		spit(f, mac);
+		is(helper_noauto(f, "LABEL=a\nb", "linuxfs_ext4") != NULL, 1, "a label with a newline is refused");
+		is(helper_noauto(f, "LABEL=a#b", "linuxfs_ext4") != NULL, 1, "a label with # is refused");
+		is(helper_noauto(f, "LABEL=a\033b", "linuxfs_ext4") != NULL, 1, "a label with a control byte is refused");
+		is(helper_noauto(f, "UUID=0123abcd-4567-89ef-0123-456789abcdef", "linuxfs_ext4") != NULL, 1, "a lowercase UUID is refused");
+		is(helper_noauto(f, "UUID=nope", NULL) != NULL, 1, "a bad UUID is refused for a remove too");
+		is(helper_noauto(f, "LABEL=a", "linuxfs_hfs") != NULL, 1, "a bundle that is not linuxfs's is refused");
+		is(helper_noauto(f, "LABEL=a", "hfs") != NULL, 1, "the Mac's own bundle is refused");
+		iss(slurp(f), mac, "and none of those touched the fstab");
+		memset(big, '#', FSTAB_MAX + 1);
+		big[FSTAB_MAX + 1] = '\0';
+		spit(f, big);
+		is(helper_noauto(f, "LABEL=a", NULL) != NULL, 1, "an fstab over 64 KiB is refused");
+		is(strlen(slurp(f)), FSTAB_MAX + 1, "and left as it was");
+		unlink(f);
+		mkdir(f, 0755);
+		is(helper_noauto(f, "LABEL=a", "linuxfs_ext4") != NULL, 1, "an fstab that is a directory is refused");
+		rmdir(f);
+		mkfifo(f, 0644);
+		is(helper_noauto(f, "LABEL=a", "linuxfs_ext4") != NULL, 1, "an fstab that is a FIFO is refused (and not waited on)");
+		unlink(f);
+		snprintf(other, sizeof other, "%s/elsewhere", dir);
+		spit(other, mac);
+		snprintf(link, sizeof link, "%s", f);
+		symlink(other, link);
+		is(helper_noauto(f, "LABEL=a", "linuxfs_ext4") != NULL, 1, "an fstab that is a symlink is refused");
+		iss(slurp(other), mac, "and what it points at is untouched");
+		is(lstat(f, &st) == 0 && S_ISLNK(st.st_mode), 1, "and the symlink is still a symlink");
+		unlink(f);
+		unlink(other);
+		is(helper_noauto("/etc/hosts", "LABEL=a", NULL) != NULL, 1, "an fstab owned by someone else (root, for this test) is refused");
+
+		/* through the socket's request lines */
+		spit(f, mac);
+		answers("noauto-add LABEL=my data linuxfs_ext4\n", getuid(), getuid(), "ok", "noauto-add LABEL=<label with a space> BUNDLE is done");
+		is(strstr(slurp(f), "\nLABEL=my\\040data none linuxfs_ext4 rw,noauto # linuxfs\n") != NULL, 1, "the bundle is the last word, the rest the spec");
+		answers("noauto-add LABEL=my data linuxfs_ext4\n", getuid(), getuid(), "ok", "noauto-add again is ok");
+		answers("noauto-remove LABEL=my data\n", getuid(), getuid(), "ok", "noauto-remove LABEL=<label> is done");
+		snprintf(big, sizeof big, "%s\n", mac);
+		iss(slurp(f), big, "and the fstab is back to the Mac's lines");
+		answers("noauto-remove LABEL=my data\n", getuid(), getuid(), "ok", "noauto-remove of a missing entry is ok");
+		answers("noauto-add LABEL=x\n", getuid(), getuid(), "no ", "noauto-add with no bundle is refused");
+		answers("noauto-add LABEL=x linuxfs_hfs\n", getuid(), getuid(), "no ", "noauto-add with a bundle not ours is refused");
+		answers("noauto-add LABEL=a#b linuxfs_ext4\n", getuid(), getuid(), "no a label with #", "noauto-add with # in the label is refused, saying why");
+		answers("noauto-add LABEL=a\nb linuxfs_ext4\n", getuid(), getuid(), "no a request is one line", "a request with more after its line is refused");
+		answers("noauto-remove \n", getuid(), getuid(), "no ", "noauto-remove with no spec is refused");
+		answers("noauto-add LABEL=x linuxfs_ext4\n", 502, 501, "no only the user at the console", "noauto-add from another user is refused");
+		iss(slurp(f), big, "and none of the refused requests touched the fstab");
+		unlink(f);
+		rmdir(dir);
+		unsetenv("LINUXFS_FSTAB");
+	}
 	printf("1..%d\n", tapno);
 	return failures ? 1 : 0;
 }

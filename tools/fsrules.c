@@ -50,7 +50,6 @@ const char *fsrules_probe_type(const char *fs)
 
 void fsrules_default_prefs(struct fsprefs *p)
 {
-	p->automount = 1;
 	p->readonly = 0;
 	p->ntfs_takeover = 0;
 	p->apfs_write = 0;
@@ -61,7 +60,7 @@ int fsrules_claims(const char *fs, const char *probed_type, int removable, const
 	if (!fs || !probed_type || !p || !known(fs, strlen(fs)))
 		return 0;
 	if (strcmp(fs, "ntfs") == 0)
-		return strcmp(probed_type, "ntfs3") == 0 && p->ntfs_takeover && p->automount && removable;
+		return strcmp(probed_type, "ntfs3") == 0 && p->ntfs_takeover && removable;
 	return strcmp(fs, probed_type) == 0;
 }
 

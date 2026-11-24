@@ -13,8 +13,8 @@ D=$HOME/Library/Caches/mm-build/linuxfs-agent-test; rm -rf "$D"; mkdir -p "$D"
 CL=$(sh "$SHIPYARD_SCRIPTS/fetch_clang22.sh" "$ROOT/components/clang22" 2>/dev/null) || exit 1
 SDK=$(sh "$SHIPYARD_SCRIPTS/fetch_sdk.sh" 2>/dev/null) || exit 1
 cc() { "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld "$@"; }
-cc -o "$D/agent" "$ROOT/tools/agent.c" -framework DiskArbitration -framework CoreFoundation -framework Security || exit 1
-cc -o "$D/policy" "$ROOT/tests/agent-policy-test.c" -framework DiskArbitration -framework CoreFoundation -framework Security || exit 1
+cc -o "$D/agent" "$ROOT/tools/agent.c" "$ROOT/tools/fstab.c" "$ROOT/tools/fsrules.c" -framework DiskArbitration -framework CoreFoundation -framework Security || exit 1
+cc -o "$D/policy" "$ROOT/tests/agent-policy-test.c" "$ROOT/tools/fstab.c" "$ROOT/tools/fsrules.c" -framework DiskArbitration -framework CoreFoundation -framework Security || exit 1
 "$D/policy" > "$D/policy.tap"; bad=$?
 grep -v '^1\.\.' "$D/policy.tap"
 n=$(grep -c '^ok\|^not ok' "$D/policy.tap")

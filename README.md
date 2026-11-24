@@ -32,12 +32,26 @@ with `linuxfs prefs`.
 
 ### Preferences
 
-`linuxfs prefs` shows them; `linuxfs prefs KEY on|off` sets one for you. Keys: `Automount`, `ReadOnly`, `NTFSTakeover`
-and `APFSWrite`. The mount program runs as root, so it reads your preferences
+`linuxfs prefs` shows them; `linuxfs prefs KEY on|off` sets one for you. Keys: `ReadOnly`, `NTFSTakeover` and
+`APFSWrite`. The mount program runs as root, so it reads your preferences
 (`~/Library/Preferences/dev.mavergreen.linuxfs.plist`, when you are at the console) and then the machine's, in
 `/Library/Preferences/dev.mavergreen.linuxfs.plist`. Set the machine's with `sudo defaults write
 /Library/Preferences/dev.mavergreen.linuxfs KEY -bool true`, for disks mounted before login, when no user's
 preferences apply.
+
+### Keeping a volume from mounting by itself
+
+```sh
+linuxfs ignore /dev/disk2s1      # or the volume's name, with its disk attached: linuxfs ignore "my data"
+linuxfs unignore /dev/disk2s1
+linuxfs ignore                   # lists them
+```
+
+As for the Mac's own volumes, this is an `/etc/fstab` entry with `noauto` (by the volume's UUID, or its name when it has
+none), which the linuxfs helper writes for you: the volume then stays unmounted when its disk is connected, and
+`diskutil mount` or Disk Utility's Mount still mounts it. There is no switch for every volume at once. Installing this
+version turns the old `Ignore:NAME` preferences into such entries for the disks attached at the time, and drops the old
+`Automount` preference.
 
 ### Supported filesystems
 

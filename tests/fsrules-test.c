@@ -70,7 +70,6 @@ int main(void)
 	iss(fsrules_probe_type("apfs"), "apfs", "apfs is probed as apfs");
 
 	fsrules_default_prefs(&p);
-	is(p.automount, 1, "Automount defaults on");
 	is(p.readonly, 0, "ReadOnly defaults off");
 	is(p.ntfs_takeover, 0, "NTFSTakeover defaults off");
 	is(p.apfs_write, 0, "APFSWrite defaults off");
@@ -88,12 +87,10 @@ int main(void)
 	is(fsrules_claims("ntfs", "exfat", 1, &p), 0, "exfat is never claimed");
 	is(fsrules_claims("ntfs", "hfs", 1, &p), 0, "hfs is never claimed");
 	is(fsrules_claims("ntfs", "ntfs3", 1, &p), 0, "ntfs declines by default");
-	p.ntfs_takeover = 1; p.automount = 1;
-	is(fsrules_claims("ntfs", "ntfs3", 1, &p), 1, "ntfs claims ntfs3 with takeover, automount and removable");
+	p.ntfs_takeover = 1;
+	is(fsrules_claims("ntfs", "ntfs3", 1, &p), 1, "ntfs claims ntfs3 with takeover and removable (no Automount: /etc/fstab's noauto is per volume)");
 	is(fsrules_claims("ntfs", "ntfs3", 0, &p), 0, "ntfs declines on internal media");
-	p.automount = 0;
-	is(fsrules_claims("ntfs", "ntfs3", 1, &p), 0, "ntfs declines with Automount off");
-	p.automount = 1; p.ntfs_takeover = 0;
+	p.ntfs_takeover = 0;
 	is(fsrules_claims("ntfs", "ntfs3", 1, &p), 0, "ntfs declines with takeover off");
 	is(fsrules_claims("ntfs", "ext4", 1, &p), 0, "ntfs claims nothing else");
 	is(fsrules_claims("ext4", "ext4", 1, NULL), 0, "no prefs declines");

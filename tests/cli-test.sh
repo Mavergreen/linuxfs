@@ -36,6 +36,7 @@ exit 0
 EOF
 cat > "$T/bin/probe" <<EOF
 #!/bin/sh
+if [ "\$1" = --uuid ]; then [ -n "\${FAKE_UUID:-}" ] || exit 1; echo "\$FAKE_UUID"; exit 0; fi
 echo "\$1" >> "$T/probecalls"
 case "\$1" in */rdisk3) echo unknown; exit 1 ;; esac
 if [ -n "\${FAKE_FUSION:-}" ]; then
@@ -206,7 +207,13 @@ if [ "\$1" = --probe ] && [ -n "\${FAKE_FUSION:-}" ]; then
   echo unknown; exit 1
 fi
 if [ "\$1" = --probe ] && [ -n "\${FAKE_OPEN_EAT:-}" ]; then cat > /dev/null; fi
-if [ "\$1" = --probe ]; then t=\${FAKE_PROBE:-ext4}; [ "\$t" != unreadable ] || t=ext4; printf '%s\t%s\n' "\$t" helped; exit 0; fi
+if [ "\$1" = --probe ]; then t=\${FAKE_PROBE:-ext4}; [ "\$t" != unreadable ] || t=ext4; printf '%s\t%s\n' "\$t" "\${FAKE_OPEN_LABEL-helped}"; exit 0; fi
+if [ "\$1" = --uuid ]; then [ -n "\${FAKE_UUID:-}" ] || { echo "linuxfs-open: \$2: this filesystem has no UUID" >&2; exit 1; }; echo "\$FAKE_UUID"; exit 0; fi
+case "\$1" in --noauto-add|--noauto-remove)
+  printf '%s\n' "\$*" >> "$T/noauto"
+  [ -z "\${FAKE_NOAUTO_NO:-}" ] || { echo "linuxfs-open: \$FAKE_NOAUTO_NO" >&2; exit 1; }
+  exit 0 ;;
+esac
 [ "\$1" != --ro ] || shift
 shift
 [ "\$1" != --also ] || shift 2
@@ -259,20 +266,27 @@ esac
 EOF
 chmod 755 "$T/bin/defaults"
 out=$(sh "$L" prefs)
-echo "$out" | grep -q "^Automount	on\$" && echo "$out" | grep -q "^ReadOnly	off\$" && echo "$out" | grep -q "^NTFSTakeover	off\$"
-ok $? "prefs shows the defaults: Automount on, ReadOnly off, NTFSTakeover off (got: $(echo "$out" | tr '\n' '|'))"
+echo "$out" | grep -q "^ReadOnly	off\$" && echo "$out" | grep -q "^NTFSTakeover	off\$" && ! echo "$out" | grep -q Automount
+ok $? "prefs shows the defaults: ReadOnly off, NTFSTakeover off, and no Automount (got: $(echo "$out" | tr '\n' '|'))"
+# spec: cli/linuxfs -- the global Automount is gone; a volume is kept from mounting by itself with linuxfs ignore (/etc/fstab noauto)
+for v in off on; do
+  out=$(sh "$L" prefs Automount $v 2>&1); rc=$?
+  [ $rc -eq 2 ] && [ "$out" = "linuxfs: Automount is gone: to keep one volume from mounting by itself, use linuxfs ignore" ]
+  ok $? "prefs Automount $v exits 2, pointing at linuxfs ignore (got $rc: '$out')"
+done
+[ "$(sh "$L" prefs Automount 2>&1)" = "linuxfs: Automount is gone: to keep one volume from mounting by itself, use linuxfs ignore" ]; ok $? "so does prefs Automount alone"
+! grep -q Automount "$T/defaults.test.linuxfs" 2>/dev/null; ok $? "and nothing is written"
 sh "$L" prefs NTFSTakeover on && sh "$L" prefs | grep -q "^NTFSTakeover	on\$"; ok $? "prefs KEY on sets it"
 sh "$L" prefs Frobs on > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "an unknown preference is misuse"
 sh "$L" prefs ReadOnly maybe > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "a value other than on or off is misuse"
-sh "$L" ignore "my data" && sh "$L" prefs | grep -q "^Ignore	my data\$"; ok $? "ignore LABEL opts a volume out, and prefs lists it"
 LO="$T/bin/open"
 : > "$T/dcalls"
 out=$(LINUXFS_OPEN=$LO FAKE_PROBE=ext4 sh "$L" automount disk3s1 2>&1); rc=$?
 [ $rc -eq 0 ] && [ "$(cat "$T/dcalls")" = "diskutil mount disk3s1" ]; ok $? "automount asks diskutil to mount a Linux partition (got '$out')"
-sh "$L" ignore helped; : > "$T/dcalls"
+defaults write test.linuxfs Automount -bool false; defaults write test.linuxfs "Ignore:helped" -bool true; : > "$T/dcalls"
 out=$(LINUXFS_OPEN=$LO sh "$L" automount disk3s1 2>&1); rc=$?
-[ $rc -eq 3 ] && [ ! -s "$T/dcalls" ]; ok $? "automount skips an ignored volume (exit 3)"
-sh "$L" unignore helped; sh "$L" prefs | grep -q "^Ignore	helped\$"; [ $? -ne 0 ]; ok $? "unignore takes it back"
+[ $rc -eq 0 ] && [ "$(cat "$T/dcalls")" = "diskutil mount disk3s1" ]; ok $? "automount reads no stale Automount or Ignore:<LABEL> (the agent's sweep checks /etc/fstab) (got $rc)"
+defaults delete test.linuxfs Automount; defaults delete test.linuxfs "Ignore:helped"
 for t in exfat vfat; do
   LINUXFS_OPEN=$LO FAKE_PROBE=$t sh "$L" automount disk3s1 > /dev/null 2>&1; [ $? -eq 3 ]; ok $? "automount leaves $t to the Mac"
 done
@@ -280,9 +294,6 @@ sh "$L" prefs NTFSTakeover off
 LINUXFS_OPEN=$LO FAKE_PROBE=ntfs3 sh "$L" automount disk3s1 > /dev/null 2>&1; [ $? -eq 3 ]; ok $? "automount leaves NTFS to the Mac unless NTFSTakeover is on"
 sh "$L" prefs NTFSTakeover on
 out=$(LINUXFS_OPEN=$LO FAKE_PROBE=ntfs3 sh "$L" automount disk3s1 2>&1); ok $? "with NTFSTakeover on, automount takes NTFS ($out)"
-sh "$L" prefs Automount off
-LINUXFS_OPEN=$LO sh "$L" automount disk3s1 > /dev/null 2>&1; [ $? -eq 3 ]; ok $? "with Automount off, automount does nothing (exit 3)"
-sh "$L" prefs Automount on
 LINUXFS_OPEN=$LO sh "$L" automount "$T/img" > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "automount takes only a disk"
 LINUXFS_OPEN=$LO LINUXFS_DA=1 sh "$L" mount disk3s1 > /dev/null 2>&1
 FAKE_BUSY=1 LINUXFS_OPEN=$LO sh "$L" unmount --force disk3s1 > /dev/null 2>&1; rc=$?
@@ -412,14 +423,13 @@ out=$(printf 's3cret\n' | FAKE_AGENT_RC=1 sh "$L" mount --password-stdin /dev/di
 [ $rc -eq 4 ] && echo "$out" | grep -q "no one is logged in at the console to unlock /dev/disk5" && ! grep -q diskutil "$DU"; ok $? "with no agent answering, --password-stdin exits 4 and diskutil never runs (got $rc: '$out')"
 LINUXFS_OPEN=$LO sh "$L" da-mount --asked /dev/disk3s1 "$T/dam" > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "da-mount without LINUXFS_DA is misuse (exit 2)"
 DA() { LINUXFS_DA=1 LINUXFS_OPEN=$LO sh "$L" da-mount "$@"; }
-sh "$L" prefs Automount off
-DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1; [ $? -eq 3 ]; ok $? "da-mount with Automount off exits 3"
-DA --asked /dev/disk3s1 "$T/dam" > /dev/null 2>&1; ok $? "and with --asked it mounts"
-sh "$L" unmount disk3s1 > /dev/null 2>&1; sh "$L" prefs Automount on
-sh "$L" ignore helped
-DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1; [ $? -eq 3 ]; ok $? "da-mount of an ignored label exits 3"
-DA --asked /dev/disk3s1 "$T/dam" > /dev/null 2>&1; ok $? "and with --asked it mounts"
-sh "$L" unmount disk3s1 > /dev/null 2>&1; sh "$L" unignore helped
+# spec: cli/linuxfs cmd_da_mount -- DiskArbitration runs the mount program alike for a plug-in and for diskutil mount, so
+#       da-mount reads no Automount or Ignore:<LABEL>: /etc/fstab's noauto has kept the plug-in from ever calling it
+for d in test.linuxfs test.machine; do
+  defaults write $d Automount -bool false; defaults write $d "Ignore:helped" -bool true
+  DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1; ok $? "da-mount mounts with a stale Automount=false and Ignore:helped in $d"
+  sh "$L" unmount disk3s1 > /dev/null 2>&1; defaults delete $d Automount; defaults delete $d "Ignore:helped"
+done
 defaults write test.machine ReadOnly -bool true
 DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1
 case $(last) in *,ro\ *) r=0 ;; *) r=1 ;; esac; ok $r "ReadOnly set in the machine domain only mounts read-only"
@@ -459,13 +469,9 @@ out=$(FAKE_INFO=none sh "$L" mount /dev/disk5 2>&1); rc=$?
 : > "$DU"
 out=$(printf 'pw\n' | FAKE_AGENT_RC=127 sh "$L" mount --password-stdin /dev/disk5 2>&1); rc=$?
 [ $rc -eq 1 ] && ! grep -q diskutil "$DU" && ! echo "$out" | grep -q "no one is logged in"; ok $? "an agent that cannot be run is exit 1, not 4 (got $rc: '$out')"
-sh "$L" prefs Automount on
-defaults write test.machine Automount -bool true; sh "$L" prefs Automount off
-DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1; [ $? -eq 3 ]; ok $? "a user-domain off overrides a machine-domain on"
-defaults delete test.machine Automount; sh "$L" prefs Automount on
-defaults write test.machine "Ignore:helped" -bool true
-DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1; [ $? -eq 3 ]; ok $? "an Ignore:LABEL in the machine domain only is honoured"
-defaults delete test.machine "Ignore:helped"
+defaults write test.machine NTFSTakeover -bool true; sh "$L" prefs NTFSTakeover off
+(FAKE_PROBE=ntfs3; export FAKE_PROBE; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); [ $? -eq 3 ]; ok $? "a user-domain off overrides a machine-domain on"
+defaults delete test.machine NTFSTakeover
 : > "$T/probecalls"; : > "$T/openenv"
 (LINUXFS_OPEN_INHERITED=1; export LINUXFS_OPEN_INHERITED; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); ok $? "LINUXFS_OPEN_INHERITED=1 still mounts through the opener"
 [ ! -s "$T/probecalls" ] && [ -s "$T/openenv" ] && ! grep -qv '^1$' "$T/openenv"; ok $? "and only through it: no direct probe, every opener call inherited"
@@ -479,6 +485,55 @@ done
 s0=$(date +%s)
 (FAKE_FUSION=notier2 LINUXFS_FUSION_WAIT=5 FAKE_OPEN_SLEEP=3; export FAKE_FUSION LINUXFS_FUSION_WAIT FAKE_OPEN_SLEEP; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); rc=$?
 [ $rc -eq 3 ] && [ $(( $(date +%s) - s0 )) -lt 8 ]; ok $? "the Fusion wait is wall-clock time, not iterations (took $(( $(date +%s) - s0 )) s)"
+# spec: cli/linuxfs cmd_ignore -- linuxfs ignore|unignore VOLUME: an /etc/fstab noauto entry, written by the root helper
+#       (linuxfs-open --noauto-add SPEC BUNDLE | --noauto-remove SPEC). A device: UUID= when the probe has one, else LABEL= the
+#       volume name DiskArbitration sees (the safe name); a label: LABEL= that safe name, with the bundle of the attached disk
+#       of that name. linuxfs ignore alone lists linuxfs's entries.
+U=0123ABCD-4567-89EF-0123-456789ABCDEF
+NA() { : > "$T/noauto"; LINUXFS_OPEN=$LO sh "$L" "$@"; }
+out=$(FAKE_UUID=$U NA ignore /dev/disk3s1 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-add UUID=$U linuxfs_ext4" ]; ok $? "ignore DEVICE with a UUID asks the helper for UUID= and the probed bundle (got $rc: '$out' $(cat "$T/noauto"))"
+out=$(FAKE_UUID=0123abcd-4567-89ef-0123-456789abcdef NA ignore disk3s1 2>&1)
+[ "$(cat "$T/noauto")" = "--noauto-add UUID=$U linuxfs_ext4" ]; ok $? "a bare diskNsM works too, and the UUID is uppercased ($(cat "$T/noauto"))"
+out=$(FAKE_PROBE=ntfs3 NA ignore disk3s1 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-add LABEL=helped linuxfs_ntfs" ]; ok $? "ignore DEVICE with no UUID (NTFS) asks for LABEL= (got $rc: $(cat "$T/noauto"))"
+out=$(FAKE_PROBE=btrfs FAKE_OPEN_LABEL="a/b:c" NA ignore disk3s1 2>&1)
+[ "$(cat "$T/noauto")" = "--noauto-add LABEL=a-b-c linuxfs_btrfs" ]; ok $? "the label is the safe name DiskArbitration sees, not the raw one ($(cat "$T/noauto"))"
+out=$(FAKE_OPEN_LABEL="" NA ignore disk3s1 2>&1); rc=$?
+[ $rc -eq 1 ] && [ ! -s "$T/noauto" ] && echo "$out" | grep -q "no UUID or label"; ok $? "a device with neither a UUID nor a label is refused (got $rc: '$out')"
+for t in vfat exfat; do
+  out=$(FAKE_PROBE=$t FAKE_UUID=$U NA ignore disk3s1 2>&1); rc=$?
+  [ $rc -eq 1 ] && [ ! -s "$T/noauto" ] && echo "$out" | grep -q "the Mac mounts"; ok $? "ignore of $t is refused: the Mac mounts it (got $rc: '$out')"
+done
+out=$(FAKE_PROBE=none NA ignore disk3s1 2>&1); rc=$?
+[ $rc -eq 1 ] && [ ! -s "$T/noauto" ]; ok $? "ignore of a disk with no filesystem linuxfs knows is refused (got $rc: '$out')"
+out=$(NA ignore helped 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-add LABEL=helped linuxfs_ext4" ]; ok $? "ignore LABEL asks for LABEL= with the bundle of the attached disk of that name (got $rc: '$out' $(cat "$T/noauto"))"
+out=$(FAKE_PROBE=f2fs FAKE_OPEN_LABEL="a/b" NA ignore "a/b" 2>&1)
+[ "$(cat "$T/noauto")" = "--noauto-add LABEL=a-b linuxfs_f2fs" ]; ok $? "a label given raw is matched and written as its safe name ($(cat "$T/noauto"))"
+out=$(NA ignore "no such" 2>&1); rc=$?
+[ $rc -eq 1 ] && [ ! -s "$T/noauto" ] && echo "$out" | grep -q "linuxfs ignore /dev/diskNsM"; ok $? "ignore LABEL with no attached disk of that name is refused, asking for the device (got $rc: '$out')"
+out=$(FAKE_UUID=$U FAKE_NOAUTO_NO="a label with # cannot be written to /etc/fstab" NA ignore disk3s1 2>&1); rc=$?
+[ $rc -eq 1 ] && echo "$out" | grep -q "cannot be written"; ok $? "the helper's refusal is passed through with exit 1 (got $rc: '$out')"
+out=$(FAKE_UUID=$U NA unignore /dev/disk3s1 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-remove UUID=$U
+--noauto-remove LABEL=helped" ]; ok $? "unignore DEVICE removes its UUID= and its LABEL= entries (got $rc: $(tr '\n' '|' < "$T/noauto"))"
+out=$(FAKE_PROBE=ntfs3 NA unignore disk3s1 2>&1)
+[ "$(cat "$T/noauto")" = "--noauto-remove LABEL=helped" ]; ok $? "with no UUID, its LABEL= entry ($(tr '\n' '|' < "$T/noauto"))"
+out=$(NA unignore "my data" 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-remove LABEL=my data" ]; ok $? "unignore LABEL removes LABEL=, with no disk attached (got $rc: $(cat "$T/noauto"))"
+out=$(NA unignore "a/b" 2>&1)
+[ "$(cat "$T/noauto")" = "--noauto-remove LABEL=a-b" ]; ok $? "by its safe name ($(cat "$T/noauto"))"
+NA ignore a b > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "ignore takes one volume"
+NA unignore > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "unignore takes one volume"
+printf '%s\n' "# the Mac's" "UUID=$U none hfs rw,noauto" "UUID=$U none linuxfs_ext4 rw,noauto # linuxfs" "LABEL=my\\040data none linuxfs_ntfs rw,noauto # linuxfs" > "$T/fstab"
+out=$(LINUXFS_FSTAB=$T/fstab sh "$L" ignore); rc=$?
+[ $rc -eq 0 ] && [ "$out" = "UUID=$U	linuxfs_ext4
+LABEL=my data	linuxfs_ntfs" ]; ok $? "ignore alone lists linuxfs's entries, labels unescaped, and no other (got $rc: '$(echo "$out" | tr '\n' '|')')"
+out=$(LINUXFS_FSTAB=$T/no-fstab sh "$L" ignore); rc=$?
+[ $rc -eq 0 ] && [ -z "$out" ]; ok $? "with no /etc/fstab it lists nothing (got $rc)"
+sh "$L" help 2>&1 | grep -q "linuxfs ignore \[VOLUME\]"; ok $? "usage shows ignore [VOLUME]"
+! sh "$L" help 2>&1 | grep -q "Automount"; ok $? "usage no longer offers Automount"
 ! sh "$L" help 2>&1 | grep -q da-mount; ok $? "usage does not list the internal da-mount"
 sh "$L" frobnicate > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "an unknown command is misuse (exit 2)"
 echo "1..$n"; exit $bad
