@@ -1,0 +1,49 @@
+LKL's context switches no longer change a thread's signal mask on Darwin, so SIGTERM ends lklfuse
+
+LKL switches between its kernel contexts with setjmp/longjmp (tools/lkl/lib/jmp_buf.c). On Darwin (BSD) setjmp
+saves the signal mask and longjmp restores it; on Linux they do not (glibc's setjmp, as LKL uses it, saves none). The
+host's timer fires on a libdispatch worker thread (patch 0002: darwin_timer_fire -> lkl_trigger_irq -> lkl_cpu_put ->
+jmp_buf_set), and 10.9's libdispatch blocks every signal on its workers. The context saved there carries a mask with all
+signals blocked; each later switch back to it (sigprocmask(SIG_SETMASK) inside longjmp) blocks them all again on the
+thread that jumps, the FUSE loop's included. libfuse's SIGTERM handler is installed but never runs; lklfuse served
+a /dev/fd/N mountpoint until SIGKILL (macFUSE 5.5.0-mavericks.4's libfuse ends its loop on SIGTERM by looking again
+every second, which does not help when the handler never sets the flag). The same blocked mask made patch 0009's
+pthread_kill(SIGTERM) to the loop thread a no-op. _setjmp/_longjmp on Darwin leave the mask alone, exactly the Linux
+behaviour; the jmp_buf type is the same, so LKL's buffer is large enough as before. tests/lklfuse-sigterm-darwin.sh
+sends SIGTERM to a lklfuse serving a socketpair as /dev/fd/4: it ended in 20 ms with this change, and was still there
+20 s later without it.
+
+Upstreamable: a one-file change to LKL's tools/lkl/lib/jmp_buf.c, wanted by any Darwin host (see .superpowers/QUEUE.md).
+
+diff -ru a/tools/lkl/lib/jmp_buf.c b/tools/lkl/lib/jmp_buf.c
+--- a/tools/lkl/lib/jmp_buf.c
++++ b/tools/lkl/lib/jmp_buf.c
+@@ -1,13 +1,26 @@
+ #include <setjmp.h>
+ #include <lkl_host.h>
+ 
++/*
++ * Not setjmp/longjmp on Darwin: there they save and restore the signal mask, and LKL jumps between threads' contexts
++ * all the time. A jump back to a context saved while a libdispatch worker (the host's timer) had every signal blocked
++ * blocks them all again on the thread that jumps. _setjmp/_longjmp leave the mask alone, as setjmp/longjmp do on Linux.
++ */
++#ifdef __APPLE__
++#define lkl_setjmp(b) _setjmp(b)
++#define lkl_longjmp(b, v) _longjmp(b, v)
++#else
++#define lkl_setjmp(b) setjmp(b)
++#define lkl_longjmp(b, v) longjmp(b, v)
++#endif
++
+ void jmp_buf_set(struct lkl_jmp_buf *jmpb, void (*f)(void))
+ {
+-	if (!setjmp(*((jmp_buf *)jmpb->buf)))
++	if (!lkl_setjmp(*((jmp_buf *)jmpb->buf)))
+ 		f();
+ }
+ 
+ void jmp_buf_longjmp(struct lkl_jmp_buf *jmpb, int val)
+ {
+-	longjmp(*((jmp_buf *)jmpb->buf), val);
++	lkl_longjmp(*((jmp_buf *)jmpb->buf), val);
+ }
