@@ -5,7 +5,7 @@
 #          build-lkl-linux.sh does (sharing its output, $GATE0_LINUX_OUT), converted to a Mach-O relocatable by
 #          build/elf2macho.py, plus the host library and the boot/disk/gate0-rw programs
 #          cross-compiled with clang22 against the pinned 10.9 SDK. Writes OUT/liblkl.a,
-#          OUT/include/, OUT/tests/{boot,disk}, OUT/gate0-rw, OUT/linuxfs-{probe,open,helper,agent} and OUT/lklfuse. lklfuse builds against
+#          OUT/include/, OUT/tests/{boot,disk}, OUT/gate0-rw, OUT/linuxfs-{probe,open,helper,agent,fs} and OUT/lklfuse. lklfuse builds against
 #          the libfuse 3 headers and links the libfuse3.4.dylib (install name /usr/local/lib/libfuse3.4.dylib) of the
 #          Mavergreen macFUSE release components/macfuse/version pins, taken from its pkg by fetch_product_pkg.sh.
 #          Linux only.
@@ -45,10 +45,11 @@ for t in boot disk; do
 done
 cc -c -o "$O/gate0-rw.o" "$ROOT/tests/gate0-rw.c"
 link "$OUT/gate0-rw" "$O/gate0-rw.o"
-cc -g0 -fuse-ld=lld -o "$OUT/linuxfs-probe" "$ROOT/tools/probe.c"
-cc -g0 -fuse-ld=lld -o "$OUT/linuxfs-open" "$ROOT/tools/open.c"
-cc -g0 -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN -o "$OUT/linuxfs-helper" "$ROOT/tools/helper.c" "$ROOT/tools/probe.c" -framework IOKit -framework CoreFoundation
-cc -g0 -fuse-ld=lld -o "$OUT/linuxfs-agent" "$ROOT/tools/agent.c" -framework DiskArbitration -framework CoreFoundation -framework Security
+cc -g0 -fuse-ld=lld -o "$OUT/linuxfs-probe" "$ROOT/tools/probe.c" "$ROOT/tools/fsrules.c"
+cc -g0 -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN -o "$OUT/linuxfs-open" "$ROOT/tools/open.c" "$ROOT/tools/probe.c"
+cc -g0 -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN -o "$OUT/linuxfs-helper" "$ROOT/tools/helper.c" "$ROOT/tools/probe.c" "$ROOT/tools/fstab.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" -framework IOKit -framework CoreFoundation
+cc -g0 -fuse-ld=lld -o "$OUT/linuxfs-agent" "$ROOT/tools/agent.c" "$ROOT/tools/fstab.c" "$ROOT/tools/fsrules.c" -framework DiskArbitration -framework CoreFoundation -framework Security
+cc -g0 -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN -o "$OUT/linuxfs-fs" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" -framework CoreFoundation -framework DiskArbitration
 F=$WORK/macfuse
 sh "$SHIPYARD_SCRIPTS/fetch_product_pkg.sh" macfuse "$(tr -d '[:space:]' < "$ROOT/components/macfuse/version")" "$F" >/dev/null
 cc -I"$F/include" -c -o "$O/lklfuse.o" "$L/lklfuse.c"
