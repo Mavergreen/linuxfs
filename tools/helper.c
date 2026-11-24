@@ -24,8 +24,9 @@
  * --migrate-prefs turns each Ignore:<LABEL> = true preference (the console user's and the machine's: the old way to keep a
  * volume from mounting by itself) into a LABEL= entry, when a disk with a volume of that name is attached to give the
  * bundle; it prints "user|machine<TAB>LABEL" for each it converted, for the postinstall to delete, and logs the others.
- * LINUXFS_FSTAB names another fstab, and LINUXFS_TEST_DISKS (colon-separated files) the attached disks (tests), obeyed only
- * when not root.
+ * The disk scan (noauto-add's, the migration's) probes each disk in a child, and stops at a 10 s deadline, the rest skipped.
+ * LINUXFS_FSTAB names another fstab, LINUXFS_TEST_DISKS (colon-separated files) the attached disks, and LINUXFS_SCAN_SECONDS
+ * the scan's deadline (tests), obeyed only when not root.
  */
 #include "fsrules.h"
 #include "fstab.h"
@@ -49,6 +50,8 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/un.h>
+#include <sys/wait.h>
+#include <poll.h>
 #include <unistd.h>
 
 #define DEFAULT_SOCKET "/var/run/dev.mavergreen.linuxfs.helper.sock"
@@ -316,7 +319,8 @@ static int see_disk(const char *path, struct seen_disk *d)
 
 	if (raw && (helper_media_facts(path + 6, &facts) < 0 || helper_media_refusal(facts.content, facts.leaf, facts.ejectable, NULL, 0)))
 		return -1;
-	fd = open(path, O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+	/* a stand-in opens as a plain file would (a FIFO with no writer blocks: a disk that never answers) */
+	fd = open(path, O_RDONLY | (raw ? O_NONBLOCK : 0) | O_NOCTTY | O_CLOEXEC);
 	if (fd < 0)
 		return -1;
 	type = linuxfs_probe_fd(fd, label, sizeof(label), &err);
@@ -334,35 +338,108 @@ static int see_disk(const char *path, struct seen_disk *d)
 	return 0;
 }
 
+#define SCAN_SECONDS 10	/* the whole scan's deadline: under the 15 s a request may take (main's --timeout) */
+
+static int scan_hung;	/* the last scan stopped at its deadline: a disk did not answer */
+
+static long long now_ms(void)
+{
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+/* see_disk in a child, so that a disk that never answers holds up only the child: 0 or -1 as see_disk; -2 when it gave no
+ * answer by DEADLINE (now_ms), and the child is killed. */
+static int see_disk_bounded(const char *path, struct seen_disk *d, long long deadline)
+{
+	int p[2], r = -1;
+	ssize_t got;
+	pid_t pid;
+	long long left;
+
+	if (pipe(p) != 0)
+		return -1;
+	pid = fork();
+	if (pid < 0) {
+		close(p[0]);
+		close(p[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		close(p[0]);
+		if (see_disk(path, d) == 0)
+			(void)!write(p[1], d, sizeof(*d));
+		_exit(0);
+	}
+	close(p[1]);
+	for (;;) {
+		struct pollfd pf = { p[0], POLLIN, 0 };
+
+		left = deadline - now_ms();
+		if (left <= 0 || poll(&pf, 1, (int)left) == 0) {
+			r = -2;
+			break;
+		}
+		if (pf.revents) {
+			do
+				got = read(p[0], d, sizeof(*d));
+			while (got < 0 && errno == EINTR);
+			r = got == (ssize_t)sizeof(*d) ? 0 : -1;	/* the type pointer is the same literal: a fork of this program */
+			break;
+		}
+	}
+	close(p[0]);
+	if (r == -2)
+		kill(pid, SIGKILL);
+	waitpid(pid, NULL, r == -2 ? WNOHANG : 0);	/* a killed child stuck in the kernel is not waited for */
+	return r;
+}
+
 /* The attached disks linuxfs's bundles would mount: /dev's raw disk nodes, or (tests, only when not root) the files named
- * in LINUXFS_TEST_DISKS, colon-separated. */
+ * in LINUXFS_TEST_DISKS, colon-separated. The whole scan has SCAN_SECONDS (LINUXFS_SCAN_SECONDS when not root); a disk that
+ * does not answer by then ends it, the rest skipped, and sets scan_hung. */
 static int scan_disks(struct seen_disk *d, int max)
 {
 	const char *test = getuid() != 0 ? getenv("LINUXFS_TEST_DISKS") : NULL;
+	const char *secs = getuid() != 0 ? getenv("LINUXFS_SCAN_SECONDS") : NULL;
+	long long deadline = now_ms() + 1000LL * (secs && atoi(secs) > 0 ? atoi(secs) : SCAN_SECONDS);
 	char path[1024];
-	int n = 0;
-
-	if (test) {
-		while (*test && n < max) {
-			size_t len = strcspn(test, ":");
-
-			if (len < sizeof(path)) {
-				memcpy(path, test, len);
-				path[len] = '\0';
-				if (len && see_disk(path, &d[n]) == 0)
-					n++;
-			}
-			test += len + (test[len] == ':');
-		}
-		return n;
-	}
-	DIR *dev = opendir("/dev");
+	int n = 0, r;
+	DIR *dev = NULL;
 	struct dirent *e;
 
-	while (dev && n < max && (e = readdir(dev))) {
-		if (snprintf(path, sizeof(path), "/dev/%s", e->d_name) >= (int)sizeof(path) || !helper_device_ok(path))
-			continue;
-		if (see_disk(path, &d[n]) == 0)
+	scan_hung = 0;
+	if (!test)
+		dev = opendir("/dev");
+	while (n < max) {
+		if (test) {
+			size_t len = strcspn(test, ":");
+
+			if (!*test)
+				break;
+			if (len >= sizeof(path)) {
+				test += len + (test[len] == ':');
+				continue;
+			}
+			memcpy(path, test, len);
+			path[len] = '\0';
+			test += len + (test[len] == ':');
+			if (!len)
+				continue;
+		} else {
+			if (!dev || !(e = readdir(dev)))
+				break;
+			if (snprintf(path, sizeof(path), "/dev/%s", e->d_name) >= (int)sizeof(path) || !helper_device_ok(path))
+				continue;
+		}
+		r = see_disk_bounded(path, &d[n], deadline);
+		if (r == -2) {
+			scan_hung = 1;
+			break;
+		}
+		if (r == 0)
 			n++;
 	}
 	if (dev)
@@ -384,7 +461,7 @@ const char *helper_noauto_attached(const char *spec, const char *bundle)
 						   : (strncmp(spec, "LABEL=", 6) == 0 && disks[i].vol[0] && strcmp(disks[i].vol, spec + 6) == 0))
 			return NULL;
 	}
-	return "no attached linuxfs volume matches";
+	return scan_hung ? "no attached linuxfs volume matches (a disk did not answer)" : "no attached linuxfs volume matches";
 }
 
 /* One Ignore:<RAW> = true from DOM: converted (printed to OUT) or logged. */
@@ -414,8 +491,8 @@ static void migrate_one(FILE *out, const char *dom, const char *raw, struct seen
 		if (strcmp(disks[i].vol, name) == 0)
 			bundle = fstab_bundle_for(disks[i].type);
 	if (!bundle) {
-		fprintf(stderr, "linuxfs-helper: Ignore:%s (%s) left as it is: no disk named %s is attached to give its filesystem; "
-			"attach it and run linuxfs ignore /dev/diskNsM\n", raw, dom, name);
+		fprintf(stderr, "linuxfs-helper: Ignore:%s (%s) left as it is: no disk named %s is attached to give its filesystem%s; "
+			"attach it and run linuxfs ignore /dev/diskNsM\n", raw, dom, name, scan_hung ? " (a disk did not answer)" : "");
 		return;
 	}
 	if ((why = helper_noauto(helper_fstab_path(), spec, bundle))) {

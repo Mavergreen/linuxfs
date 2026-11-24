@@ -159,6 +159,8 @@ int main(void)
 		iss(edit(glued, "LABEL=b", NULL, &ch), glued, "nor removed by its spec");
 		iss(edit("LABEL=c none linuxfs_xfs rw,noauto\t# linuxfs\n", "LABEL=c", NULL, &ch), "", "a tab before # linuxfs is ours");
 		iss(edit("# linuxfs\n", NULL, NULL, &ch), "# linuxfs\n", "a line that is only the tag is not ours");
+		iss(edit(" # linuxfs\n\t# linuxfs\r\n", NULL, NULL, &ch), " # linuxfs\n\t# linuxfs\r\n", "nor is the tag indented, with no first field");
+		iss(edit("  LABEL=d none linuxfs_ext4 rw,noauto # linuxfs\n", "LABEL=d", NULL, &ch), "", "an indented entry of ours is ours");
 	}
 	iss(edit("", "LABEL=a#b", "linuxfs_ext4", &ch), "(refused)", "an edit with a refused spec is refused");
 	iss(edit("", "LABEL=ab", "linuxfs_hfs", &ch), "(refused)", "an edit with a refused bundle is refused");

@@ -110,6 +110,20 @@ out=$("$D/open" --noauto-add "LABEL=helped" linuxfs_btrfs 2>&1); rc=$?
 "$D/open" --noauto-add "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF" linuxfs_ext4 && grep -q "^UUID=0123ABCD-4567-89EF-0123-456789ABCDEF none linuxfs_ext4" "$F"; ok $? "noauto-add by the attached disk's UUID is done"
 "$D/open" --noauto-remove "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF"
 out=$(LINUXFS_TEST_DISKS= "$D/open" --noauto-add "LABEL=helped" linuxfs_ext4 2>&1); [ "$out" = "" ]; ok $? "the helper's disks are its own, not the client's environment (got '$out')"
+# spec: tools/helper.c -- the disk scan (noauto-add's, the migration's) is bounded: each disk is probed in a child, and past the
+#       scan's deadline (10 s; LINUXFS_SCAN_SECONDS when not root) the rest are skipped, "(a disk did not answer)"
+mkfifo "$D/hang"
+HS=$D/hang.sock; LINUXFS_TEST_DISKS="$D/hang:$D/ext4.img" LINUXFS_SCAN_SECONDS=1 "$D/helper" --socket "$HS" --test-files --timeout 5 & hp2=$!
+i=0; while [ ! -S "$HS" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+cp "$F" "$D/fstab.before"
+start=$(date +%s); out=$(LINUXFS_HELPER_SOCKET=$HS LINUXFS_OPEN_TIMEOUT=10 "$D/open" --noauto-add "LABEL=helped" linuxfs_ext4 2>&1); rc=$?; took=$(($(date +%s) - start))
+kill $hp2; wait $hp2 2>/dev/null
+[ $rc -eq 1 ] && [ "$out" = "linuxfs-open: no attached linuxfs volume matches (a disk did not answer)" ] && [ $took -le 3 ]; ok $? "a disk that never answers ends the scan at its deadline, saying so (got $rc in ${took}s: '$out')"
+cmp -s "$F" "$D/fstab.before"; ok $? "and the fstab is untouched"
+printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>Ignore:helped</key><true/></dict></plist>\n' > "$D/hang.plist"
+start=$(date +%s); out=$(LINUXFS_TEST_DISKS="$D/hang:$D/ext4.img" LINUXFS_SCAN_SECONDS=1 LINUXFS_FSTAB=$D/hang-fstab LINUXFS_PREFS_USER=$D/hang.plist \
+  LINUXFS_PREFS_MACHINE=$D/none.plist "$D/helper" --migrate-prefs 2> "$D/hang.err"); rc=$?; took=$(($(date +%s) - start))
+[ $rc -eq 0 ] && [ -z "$out" ] && grep -q "did not answer" "$D/hang.err" && [ $took -le 3 ]; ok $? "the migration's scan too: the label is left, saying a disk did not answer (got $rc in ${took}s: $(tr '\n' '|' < "$D/hang.err"))"
 # spec: tools/helper.c helper_migrate -- the install's migration (the postinstall runs it as root): each Ignore:<LABEL> = true,
 #       in the console user's and the machine's plists, becomes a LABEL= entry when a disk of that name is attached (its bundle
 #       from the probe), printed as DOMAIN<TAB>LABEL for the postinstall to delete; what cannot be converted is left and logged

@@ -96,7 +96,8 @@ int fstab_escape(const char *spec, char *out, size_t outlen)
 	return 0;
 }
 
-/* Whether line [p, e) (no newline) is linuxfs's, with first field ESPEC (NULL: any). */
+/* Whether line [p, e) (no newline) is linuxfs's, with first field ESPEC (NULL: any): a first field that is not a comment,
+ * and the tag after a space or tab at the end, before an optional \r. */
 static int ours(const char *p, const char *e, const char *espec)
 {
 	size_t t = strlen(TAG), n;
@@ -110,6 +111,8 @@ static int ours(const char *p, const char *e, const char *espec)
 		p++;
 	for (f = p; f < e && *f != ' ' && *f != '\t'; f++)
 		;
+	if (f == p || *p == '#')	/* no first field: only the tag, perhaps indented (a comment) */
+		return 0;
 	if (!espec)
 		return 1;
 	n = strlen(espec);
