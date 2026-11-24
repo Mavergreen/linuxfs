@@ -158,7 +158,7 @@ for c in mkdir chown chmod touch killall launchctl stat pgrep defaults sudo; do
 done
 printf '[ "$*" != "-f %%Su /dev/console" ] || echo "${PH_USER:-}"\n' >> "$T/pbin/stat"
 printf '[ -z "${PH_LW:-}" ] || echo "$PH_LW"\n' >> "$T/pbin/pgrep"
-# the root helper's migration: a stub that prints what PH_MIGRATED holds, as DOMAIN<TAB>LABEL lines
+# spec: packaging/postinstall-hook -- the root helper's migration: a stub that prints what PH_MIGRATED holds, as DOMAIN<TAB>LABEL lines
 printf '#!/bin/sh\necho "helper $*" >> "$PH_DIR/calls"\n[ "$*" = --migrate-prefs ] && printf "%%b" "${PH_MIGRATED:-}"\n' > "$T/pbin/helper"
 chmod 755 "$T/pbin"/*
 run_post() {  # users groups-file-lines gid-or-empty user-exists(1/0)
@@ -218,14 +218,14 @@ PH_USER=root run_post "root 0" "wheel 0" 250 1 || fail "postinstall failed with 
 grep -q 'sudo -u' "$T/calls" && fail "postinstall ran defaults as root for the user's domain"
 
 mkdir -p "$T/bin"
-# pre-uninstall deletes _linuxfs and its home: dscl and rm are stubs that only log, so this never touches the machine it runs on
+# spec: packaging/pre-uninstall -- it deletes _linuxfs and its home: dscl and rm are stubs that only log, so this never touches the machine it runs on
 printf '#!/bin/sh\necho "dscl $*" >> "%s/acct.calls"\n' "$T" > "$T/bin/dscl"
 printf '#!/bin/sh\necho "rm $*" >> "%s/acct.calls"\n' "$T" > "$T/bin/rm"
 printf '#!/bin/sh\n[ -f "%s/created-group" ]\n' "$T" > "$T/bin/ls"
 chmod 755 "$T/bin/dscl" "$T/bin/rm" "$T/bin/ls"; : > "$T/acct.calls"
 printf '#!/bin/sh\nprintf "%%s\\n" "  PID COMMAND" "  412 %s/libexec/lklfuse -f -o type=ext4 /dev/fd/3 /Volumes/data"\n' "$LINUXFS_PREFIX" > "$T/bin/ps"
 chmod 755 "$T/bin/ps"
-# the helper's --noauto-remove-all is a stub that logs (the real one would edit this machine's /etc/fstab)
+# spec: packaging/pre-uninstall -- the helper's --noauto-remove-all is a stub that logs (the real one would edit this machine's /etc/fstab)
 printf '#!/bin/sh\necho "helper $*" >> "%s/launchctl.calls"\n' "$T" > "$T/bin/helper"; chmod 755 "$T/bin/helper"
 sed "s|/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper|$T/bin/helper|g" "$REPO_ROOT/packaging/pre-uninstall" > "$T/pre-uninstall"
 h="$T/pre-uninstall"

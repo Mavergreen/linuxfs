@@ -105,10 +105,12 @@ read_back() {  # FS MOUNTPOINT
   fi
   if posix "$1"; then [ "$(stat -f %Lp "$2/d/moved")" = 640 ] || return 1; fi
 }
+# platform: kill -0 on another user's pid (lklfuse as _linuxfs, root's sudo) fails with EPERM for this shell, so a wait on
+#           such a pid asks ps -p instead; kill -0 stays only for this shell's own children (bounded's, the background attach)
 unmount_and_wait() {  # IMAGE MOUNTPOINT
   p=$(pid_of "$1")
   bounded 600 "$L" unmount "$2" || return 1
-  [ -z "$p" ] || bounded 300 sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 0.1; done' _ "$p" || { echo "lklfuse $p did not exit"; return 1; }
+  [ -z "$p" ] || bounded 300 sh -c 'while ps -p "$1" > /dev/null; do sleep 0.1; done' _ "$p" || { echo "lklfuse $p did not exit"; return 1; }
   ! mount | grep -qF " on $2 (" || { echo "$2 is still mounted"; return 1; }
 }
 for fs in $imgfs; do
@@ -168,7 +170,7 @@ no_root_lklfuse() { lklfuses | awk '$1 == "root" { f = 1 } END { exit f }'; }
 da_eject() {  # whole disk, mount point: leaves no lklfuse on it
   pids=$(lklfuse_on "$2" | awk '{ print $2 }')
   bounded 600 diskutil eject "$1" > /dev/null 2>&1 || return 1
-  for p in $pids; do bounded 300 sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 0.1; done' _ "$p" || { echo "lklfuse $p still runs"; return 1; }; done
+  for p in $pids; do bounded 300 sh -c 'while ps -p "$1" > /dev/null; do sleep 0.1; done' _ "$p" || { echo "lklfuse $p still runs"; return 1; }; done
   j=0; while [ -n "$(lklfuse_on "$2")" ]; do
     j=$((j + 1)); [ $j -le 10 ] || { echo "lklfuse still on $2 ten seconds after the eject:"; lklfuses; ps -axww -o user=,pid=,command= | grep -i 'fuse' | grep -v grep; return 1; }
     sleep 1
@@ -270,12 +272,12 @@ noauto_cycle() {  # TAG IMAGE device|label LABEL
   if [ -z "$mounted" ]; then ok "$tag: a plain attach mounted nothing (exit $rc: $(printf '%s' "$out" | tr '\n' ' '))"
   else notok "$tag: a plain attach mounted $mounted"; fi
   sleep 3
-  # DiskArbitration's view of this attach, whatever happened: the UUID it knows the volume by (from the util's -k), and its
-  # and the util's lines since the attach
+  # spec: tests/smoke-mavericks.sh header -- diagnostics only: DiskArbitration's view of this attach, whatever happened (the
+  #       UUID it knows the volume by, from the util's -k; its and the util's lines since the attach)
   echo "# $tag: diskutil info $disk: $(diskutil info "$disk" 2>&1 | grep -i uuid | tr -s ' ' | tr '\n' '|')"
   tail -n +"$((${log0:-0} + 1))" /var/log/system.log 2> /dev/null | grep 'diskarbitrationd\|linuxfs-fs' | sed "s/^/# $tag: /"
-  # anchored: system.log is readable and shows DiskArbitration probing the volume (linuxfs-fs's "claimed", from util -p) since
-  # log0, so the absence of linuxfs-mount after it means something
+  # spec: tests/smoke-mavericks.sh header -- anchored: system.log is readable and shows DiskArbitration probing the volume
+  #       (linuxfs-fs's "claimed", from util -p) since log0, so the absence of linuxfs-mount after it means something
   if [ -r /var/log/system.log ] && [ -n "$log0" ] && tail -n +"$((log0 + 1))" /var/log/system.log | grep "linuxfs-fs" | grep -q "claimed"; then
     ok "$tag: DiskArbitration probed it (a linuxfs-fs claimed line in system.log since the attach)"
     check "$tag: DiskArbitration never ran the mount program for it (no linuxfs-mount in system.log)" sh -c '! tail -n +"$1" /var/log/system.log | grep -q "linuxfs-mount"' _ "$((log0 + 1))"
@@ -425,7 +427,7 @@ diag_try() {  # LABEL USER MNT EXTRA
   sudo -n -u "$du" "$DLK" -f -o "type=ext4,lock=/private/tmp/linuxfs-diag/$dl.lock,local,volname=diag,fsname=linuxfs@diag,noappledouble$dx" "$dimg" "$dm" > "$derr" 2>&1 &
   dp=$!; di=0
   while [ $di -lt 150 ] && ! mount | grep -qF " on $dm ("; do
-    kill -0 "$dp" 2> /dev/null || break
+    ps -p "$dp" > /dev/null || break
     di=$((di + 1)); sleep 0.1
   done
   if mount | grep -qF " on $dm ("; then echo "# diag: $dl: MOUNTED as $du on $dm ($(mount | grep -F " on $dm (" | head -n 1))"

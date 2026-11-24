@@ -23,8 +23,8 @@ cc -DLINUXFS_PROBE_NO_MAIN -o "$D/policy" "$ROOT/tests/helper-policy-test.c" "$R
 sh "$ROOT/build/linux-host.sh" sh -c 'truncate -s 32M "$1/ext4.img" && mkfs.ext4 -q -F -L helped "$1/ext4.img" &&
   truncate -s 32M "$1/mydata.img" && mkfs.ext4 -q -F -L "my data" -U 0123abcd-4567-89ef-0123-456789abcdef "$1/mydata.img" &&
   truncate -s 64M "$1/ssd.img" && truncate -s 256M "$1/hdd.img" && mkapfs -L Fused -F "$1/hdd.img" "$1/ssd.img" > /dev/null' _ "$D" || exit 1
-# the disks attached, for noauto-add (tests only, not root: these files stand in for /dev's raw disks): ext4 "helped", and ext4
-# "my data" with UUID 0123ABCD-4567-89EF-0123-456789ABCDEF
+# spec: tools/helper.c LINUXFS_TEST_DISKS -- the disks attached, for noauto-add (tests only, not root: these files stand in
+#       for /dev's raw disks): ext4 "helped", and ext4 "my data" with UUID 0123ABCD-4567-89EF-0123-456789ABCDEF
 export LINUXFS_TEST_DISKS="$D/ext4.img:$D/mydata.img"
 "$D/policy" > "$D/policy.tap"; bad=$?
 grep -v '^1\.\.' "$D/policy.tap"
