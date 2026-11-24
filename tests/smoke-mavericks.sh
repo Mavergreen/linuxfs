@@ -181,6 +181,16 @@ root_mount_macfuse_gone() {
     sleep 1
   done
 }
+# spec: tools/fs.c mount_by_root -- a daemon that dies leaves the mount unserved (see its use below): SIGTERM through sudo (the
+#       process is _linuxfs's), 5 s; then SIGKILL, 30 s. A SIGTERM that does not end it is said (VM run 45386140589: lklfuse
+#       served on and ignored it for 30 s), not hidden: only the process still being there after SIGKILL fails
+kill_lklfuse() {
+  sudo -n kill "$1" || return 1
+  bounded 50 sh -c 'while ps -p "$1" > /dev/null; do sleep 0.1; done' _ "$1" && return 0
+  echo "# lklfuse ($1) was still running 5 s after SIGTERM while serving; SIGKILL"
+  sudo -n kill -KILL "$1" || return 1
+  bounded 300 sh -c 'while ps -p "$1" > /dev/null; do sleep 0.1; done' _ "$1"
+}
 mounted_by_root() { l=$(mount | grep -F " on $1 ("); echo "$l"; [ -n "$l" ] && ! echo "$l" | grep -q "mounted by"; }
 login_unmount() { bounded 600 sudo -n diskutil unmount "$1" && ! mount | grep -qF " on $1 ("; }
 login_eject() {  # whole disk: ejected, and no _linuxfs lklfuse within 10 s
@@ -516,7 +526,7 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
         # spec: macfuse DETAILS.md "A mount made for you" -- a daemon that dies leaves the mount with nobody serving it: macFUSE
         #       answers it with an error (ENXIO, the dead file system) instead of a hang, and its owner still unmounts it
         lp=$(lklfuse_fd | awk '{ print $2 }' | head -n 1)
-        if [ -n "$lp" ] && sudo -n kill "$lp" && bounded 300 sh -c 'while ps -p "$1" > /dev/null; do sleep 0.1; done' _ "$lp"; then
+        if [ -n "$lp" ] && kill_lklfuse "$lp"; then
           ok "before login: lklfuse ($lp) is killed"
           check "before login: with lklfuse dead, a read of $mp fails at once instead of hanging" bounded 100 sh -c '! ls "$1"' _ "$mp"
           check "before login: with lklfuse dead, diskutil unmount still unmounts $mp" login_unmount "$mp"
