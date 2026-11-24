@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # platform: host-agnostic -- python3 only
-#   usage: python3 -I gpt-wrap.py CONTAINER-IMAGE DISK-IMAGE
-#          Writes DISK-IMAGE: a GPT disk (512-byte sectors) with one APFS partition holding CONTAINER-IMAGE, as an
+#   usage: python3 -I gpt-wrap.py CONTAINER-IMAGE DISK-IMAGE [PARTITION-TYPE-GUID]
+#          The partition type is APFS's unless given (DiskArbitration matches a bundle's media types before it probes).
+#          Writes DISK-IMAGE: a GPT disk (512-byte sectors) with one partition of that type holding CONTAINER-IMAGE, as an
 #          external disk formatted by macOS is laid out (a bare container has no partition, so DiskArbitration
 #          gives it no partition UUID, which the agent's keychain needs). The disk and partition GUIDs are fixed,
 #          so the same container always makes the same disk.
@@ -25,14 +26,14 @@ def header(current, backup, entries_lba, last_usable, entries_crc):
     return h + b"\0" * (S - len(h))
 
 
-def main(src, dst):
+def main(src, dst, ptype=APFS_TYPE):
     with open(src, "rb") as f:
         data = f.read()
     sectors = -(-len(data) // S)
     last = FIRST + sectors - 1
     total = last + 1 + 1 + 33                   # a free sector, then the backup entries and header
     name = "Secret".encode("utf-16-le")
-    entry = struct.pack("<16s16sQQQ72s", APFS_TYPE.bytes_le, PART_GUID.bytes_le, FIRST, last, 0, name)
+    entry = struct.pack("<16s16sQQQ72s", ptype.bytes_le, PART_GUID.bytes_le, FIRST, last, 0, name)
     entries = entry + b"\0" * (ENTRIES * ENTRY_SIZE - len(entry))
     crc = zlib.crc32(entries)
     last_usable = total - 34
@@ -51,6 +52,6 @@ def main(src, dst):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        sys.exit("usage: gpt-wrap.py CONTAINER-IMAGE DISK-IMAGE")
-    main(sys.argv[1], sys.argv[2])
+    if len(sys.argv) not in (3, 4):
+        sys.exit("usage: gpt-wrap.py CONTAINER-IMAGE DISK-IMAGE [PARTITION-TYPE-GUID]")
+    main(sys.argv[1], sys.argv[2], uuid.UUID(sys.argv[3]) if len(sys.argv) == 4 else APFS_TYPE)
