@@ -21,7 +21,8 @@ LINUX_GUID=0FC63DAF-8483-4772-8E79-3D69D8477DE4
 BASIC_GUID=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
 APFS_GUID=7C3457EF-0000-11AA-AA11-00306543ECAC
 
-# media_type NAME: a probe entry; Partitionless is the whole-disk, no-map case, the rest are content hints
+# platform: DiskArbitration probes a bundle for each FSMediaTypes entry: Partitionless is the whole-disk, no-map
+#           case, the rest are content hints (media_type NAME writes one)
 media_type() {
   printf '\t\t<key>%s</key>\n\t\t<dict>\n\t\t\t<key>FSMediaProperties</key>\n\t\t\t<dict>\n' "$1"
   if [ "$1" = Partitionless ]; then printf '\t\t\t\t<key>Leaf</key>\n\t\t\t\t<true/>\n\t\t\t\t<key>Whole</key>\n\t\t\t\t<true/>\n'

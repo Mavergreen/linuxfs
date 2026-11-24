@@ -24,7 +24,6 @@ trap 'for d in $devs; do hdiutil detach -quiet -force "$d" 2>/dev/null; done' EX
 e=$(att ext4.img); b=$(att btrfs.img); t=$(att ntfs.img); devs="$e $b $t"
 echo "# attached $e $b $t"
 E=${e#/dev/}; B=${b#/dev/}; T=${t#/dev/}
-# prefs: user plist and machine plist, as the CLI writes them
 plist() { printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>%s</dict></plist>\n' "$2" > "$1"; }
 plist "$D/empty.plist" ""
 plist "$D/take.plist" "<key>NTFSTakeover</key><true/>"
@@ -99,7 +98,7 @@ out=$(u fsck_linuxfs_ext4 -z "/dev/r$E" 2>&1 >/dev/null); rc=$?
 [ $rc = 8 ] && case $out in usage:*) true ;; *) false ;; esac; ok $? "fsck with an unknown flag exits 8 with a usage line on stderr (rc $rc, '$out')"
 u fsck_linuxfs_ext4 -qn "/dev/r$E" >/dev/null 2>&1; rc=$?
 [ $rc = 8 ]; ok $? "fsck flags are parsed exactly: -qn is not -q (rc $rc)"
-# --- the mount role, as the console user, with stand-ins for the CLI, the keychain keeper and the dialog
+# spec: tools/fs.c mount role -- as the console user, with stand-ins for the CLI, the keychain keeper and the dialog
 M=$D/mount; mkdir -p "$M"; MD=$D/mount_linuxfs_ext4
 PWHOME=$(/usr/bin/python -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')
 cat > "$M/cli" <<'EOS'
@@ -143,7 +142,7 @@ mt "$MD" -o rdonly /dev/disk9 /tmp/m >/dev/null 2>&1
 grep -qx 'args: da-mount --ro /dev/disk9 /tmp/m' "$M/log"; ok $? "-o rdonly adds --ro"
 mt "$MD" -o owners,rdonly /dev/disk9 /tmp/m >/dev/null 2>&1
 grep -qx 'args: da-mount --asked --ro /dev/disk9 /tmp/m' "$M/log"; ok $? "both together: --asked --ro"
-# a CLI exit other than 4 is the mount's exit
+# spec: tools/fs.c -- a CLI exit other than 4 is the mount's exit
 cat > "$M/cli7" <<'EOS'
 #!/bin/sh
 exit 7
@@ -151,7 +150,7 @@ EOS
 chmod +x "$M/cli7"
 env -u HOME LINUXFS_CLI="$M/cli7" "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
 [ $rc = 7 ]; ok $? "the CLI's exit status is the mount's (rc $rc)"
-# encrypted: the keeper has nothing, the dialog gives pw and says remember
+# spec: tools/fs.c -- encrypted: the keeper has nothing, the dialog gives pw and says remember
 kc none
 mt env STUB_PW=pw DLG_PWS=pw "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
 kcstop
@@ -162,42 +161,42 @@ grep -qx 'stdin: pw' "$M/log"; ok $? "the rerun gets pw on stdin"
 [ "$(grep -c '^args:' "$M/log")" = 2 ]; ok $? "the CLI ran twice"
 ! grep '^args:' "$M/log" | grep -q 'pw'; ok $? "no args line holds the password"
 grep -qx 'find disk9' "$M/kc.log" && grep -qx 'save disk9 pw' "$M/kc.log"; ok $? "the keeper got find, then save disk9 pw ($(tr '\n' ';' < "$M/kc.log"))"
-# remembered once only: no save
+# spec: tools/fs.c -- remembered once only: no save
 kc none
 mt env STUB_PW=pw DLG_PWS=pw DLG_MODE=once "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
 kcstop
 [ $rc = 0 ] && ! grep -q '^save' "$M/kc.log"; ok $? "a password given 'once' is not saved"
-# the keeper offers the right password: silent
+# spec: tools/fs.c -- the keeper offers the right password: silent
 kc saved pw
 mt env STUB_PW=pw "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
 kcstop
 [ $rc = 0 ] && ! grep -q '^dialog' "$M/log" && grep -qx 'stdin: pw' "$M/log"; ok $? "a saved right password mounts with no dialog (rc $rc)"
-# the keeper's saved password is wrong: forget, then the dialog
+# spec: tools/fs.c -- the keeper's saved password is wrong: forget, then the dialog
 kc saved old
 mt env STUB_PW=pw DLG_PWS=pw "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
 kcstop
 [ $rc = 0 ] && grep -qx 'forget disk9' "$M/kc.log" && grep -q '^dialog' "$M/log" && grep -qx 'stdin: old' "$M/log"; ok $? "a wrong saved password is forgotten, then the dialog runs (rc $rc; $(tr '\n' ';' < "$M/kc.log"))"
-# an offered wrong password is not forgotten
+# spec: tools/fs.c -- an offered wrong password is not forgotten
 kc offered old
 mt env STUB_PW=pw DLG_PWS=pw DLG_MODE=once "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
 kcstop
 [ $rc = 0 ] && ! grep -q '^forget' "$M/kc.log"; ok $? "a wrong offered password is not forgotten"
-# a wrong dialog password, then a right one: the second message starts Wrong password.
+# spec: tools/fs.c -- a wrong dialog password, then a right one: the second message starts Wrong password.
 kc none
 mt env STUB_PW=pw DLG_PWS="bad pw" DLG_MODE=once "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
 kcstop
 [ $rc = 0 ] && grep 'dialog: ' "$M/log" | sed -n 2p | grep -q '| Wrong password\. Hint: blue'; ok $? "after a wrong try the message starts 'Wrong password.' ($(grep 'dialog: ' "$M/log" | sed -n 2p))"
-# three wrong tries: three dialogs, exit 4
+# spec: tools/fs.c -- three wrong tries: three dialogs, exit 4
 kc none
 mt env STUB_PW=pw DLG_PWS="a b c d" DLG_MODE=once "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
 kcstop
 [ $rc = 4 ] && [ "$(grep -c '^dialog' "$M/log")" = 3 ]; ok $? "three wrong passwords: three dialogs, exit 4 (rc $rc)"
-# Cancel
+# spec: tools/fs.c -- Cancel
 kc none
 mt env STUB_PW=pw DLG_CANCEL=1 "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
 kcstop
 [ $rc = 4 ] && [ "$(grep -c '^args:' "$M/log")" = 1 ]; ok $? "Cancel exits 4 and the CLI ran once (rc $rc)"
-# no keeper at all, and a stale socket: the dialog still runs, quickly
+# spec: tools/fs.c -- no keeper at all, and a stale socket: the dialog still runs, quickly
 rm -f "$SOCK"
 mt env STUB_PW=pw DLG_PWS=pw "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
 [ $rc = 0 ] && grep -q '^dialog' "$M/log"; ok $? "no keeper: the dialog runs (rc $rc)"
@@ -213,7 +212,7 @@ kc hang; t0=$(date +%s)
 mt env STUB_PW=pw DLG_PWS=pw DLG_MODE=remember "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
 t1=$(date +%s); kcstop
 [ $rc = 0 ] && [ $((t1 - t0)) -lt 8 ]; ok $? "a hung keeper and 'remember' ticked: the save is skipped, not a second 5 s wait: $((t1 - t0)) s (rc $rc)"
-# a CLI that leaves a background child behind: the mount returns at once, and the child holds only fds 0-2
+# spec: tools/fs.c -- a CLI that leaves a background child behind: the mount returns at once, and the child holds only fds 0-2
 cat > "$M/clibg" <<'EOS'
 #!/bin/sh
 /usr/bin/python -c 'import os
@@ -234,7 +233,7 @@ t1=$(date +%s)
 [ $rc = 0 ] && [ $((t1 - t0)) -lt 3 ]; ok $? "a CLI that leaves a background child: the mount returns in $((t1 - t0)) s, not when the child ends (rc $rc)"
 fds=$(sed -n 's/^fds: //p' "$M/log" | tr -d '\n'); case " $fds " in *" 255 "*) fds=$(echo " $fds " | sed 's/ 255 / /') ;; esac
 [ -z "$(echo $fds)" ]; ok $? "the CLI holds no fd above 2 but the shell's own script fd ('$fds')"
-# Mount with an empty field asks again, counted among the 3
+# spec: tools/fs.c -- Mount with an empty field asks again, counted among the 3
 kc none
 mt env STUB_PW=pw DLG_PWS="EMPTY pw" DLG_MODE=once "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
 kcstop
@@ -243,7 +242,7 @@ kc none
 mt env STUB_PW=pw DLG_PWS="EMPTY EMPTY EMPTY" DLG_MODE=once "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
 kcstop
 [ $rc = 4 ] && [ "$(grep -c '^dialog' "$M/log")" = 3 ] && [ "$(grep -c '^args:' "$M/log")" = 1 ]; ok $? "three empty answers: three dialogs, exit 4, the CLI ran once (rc $rc)"
-# a hint that is not UTF-8 does not cancel the dialog
+# spec: tools/fs.c -- a hint that is not UTF-8 does not cancel the dialog
 cat > "$M/clibad" <<'EOS'
 #!/bin/sh
 echo "args: $*" >> "$STUB_LOG"
@@ -294,14 +293,14 @@ kc saved pw
 real env FAKE_PROBE=apfs FAKE_ENCRYPTED=pw "$MD" -o owners /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
 kcstop
 [ $rc = 0 ] && grep -q "^pw: pw\$" "$R/lk.log" && grep -q "passfd=5" "$R/lk.log"; ok $? "the real CLI accepts da-mount --password-stdin and lklfuse gets the password on fd 5 (rc $rc: $(tr '\n' '|' < "$R/lk.log" 2>/dev/null))"
-# misuse
+# spec: tools/fs.c -- misuse
 for bad_args in "" "/dev/disk9" "-o /dev/disk9 /tmp/m" "/dev/disk9 /tmp/m extra" "-x /dev/disk9 /tmp/m"; do
   # shellcheck disable=SC2086
   mt "$MD" $bad_args >/dev/null 2>&1; rc=$?
   [ $rc = 1 ] && [ ! -e "$M/log" ]; ok $? "misuse '$bad_args' exits 1 without running the CLI (rc $rc)"
 done
-# --- the mount role as root: it cannot run as root here, so a -DLINUXFS_FS_TEST_DROP build (the same code up to the
-#     drop; it prints the plan instead of dropping and exec'ing) stands in. The shipped build has no such code.
+# platform: the mount role as root cannot run as root here, so a -DLINUXFS_FS_TEST_DROP build (the same code up to
+#           the drop; it prints the plan instead of dropping and exec'ing) stands in. The shipped build has no such code.
 mkdir -p "$D/drop"
 "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN \
   -DLINUXFS_FS_TEST_DROP -o "$D/drop/mount_linuxfs_ext4" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" \
@@ -358,27 +357,27 @@ for bad_mnt in "/tmp/NAME" "$V" "$V/" "$V/NAME/" "$V/NAME/sub" "$V/." "$V/.." "$
   plan "/dev/$E" "$bad_mnt" > "$M/plan" 2>&1; rc=$?
   [ $rc = 1 ] && ! grep -q '^mnt' "$M/plan"; ok $? "root plan: mount point '$bad_mnt' is refused (rc $rc)"
 done
-# a directory under the volumes directory that root does not own (here: that this user does not own)
+# spec: tools/fs.c -- a directory under the volumes directory that root does not own (here: that this user does not own)
 mkdir -p "$D/vols2"
 env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES=/private/var "$DM" "/dev/$E" /private/var/empty > "$M/plan" 2>&1; rc=$?
 [ $rc = 1 ] && ! grep -q '^mnt' "$M/plan"; ok $? "root plan: a mount point not owned by the expected owner is refused (rc $rc)"
-# the mount point must be on the volumes directory's device: /dev (devfs) is not on /'s
+# spec: tools/fs.c -- the mount point must be on the volumes directory's device: /dev (devfs) is not on /'s
 env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES=/ "$DM" "/dev/$E" /dev > "$M/plan" 2>&1; rc=$?
 [ $rc = 1 ] && ! grep -q '^mnt' "$M/plan" && grep -q 'another volume' "$M/plan"; ok $? "root plan: a mount point on another device than the volumes directory is refused (rc $rc: $(tail -1 "$M/plan"))"
 env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" "$DM" "/dev/$E" "$V/NAME" 2>&1 >/dev/null | grep -q .; [ $? -ne 0 ]; ok $? "root plan: a good run writes nothing to stderr"
-# every refusal is on stderr (and syslog) with a reason
+# spec: tools/fs.c -- every refusal is on stderr (and syslog) with a reason
 plan "/dev/disk9;ls" "$V/NAME" 2>&1 >/dev/null | grep -q '^linuxfs-mount: refused: '; ok $? "root plan: a refusal writes its reason to stderr"
 plan "/dev/disk99999" "$V/NAME" 2>&1 >/dev/null | grep -q '^linuxfs-mount: refused: '; ok $? "root plan: a device that cannot be opened is refused on stderr too"
-# every other descriptor is closed; the device is on 3 and stays open across exec
+# spec: tools/fs.c -- every other descriptor is closed; the device is on 3 and stays open across exec
 rcli() { env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_FS_TEST_ROOT_CLI="$M/rootcli" "$DM" "$@"; }
 rcli "/dev/$E" "$V/NAME" 4</dev/null 5</dev/null 9</dev/null 3</dev/null > "$M/plan" 2>&1; rc=$?
 fdl=$(sed -n 's/^fds: //p' "$M/plan" | sed 's/ *255//')
 [ $rc = 5 ] && [ "$fdl" = 3 ] && grep -qx "fd3 /dev/r$E rw" "$M/plan"; ok $? "root: inherited descriptors 3, 4, 5, 9 are gone in the CLI; only the device is open, on 3 (rc $rc, fds '$fdl')"
-# closed standard descriptors do not let the device land on 0-2
+# spec: tools/fs.c -- closed standard descriptors do not let the device land on 0-2
 rcli "/dev/$E" "$V/NAME" <&- >"$M/plan" 2>&1; rc=$?
 fdl=$(sed -n 's/^fds: //p' "$M/plan" | sed 's/ *255//')
 [ $rc = 5 ] && [ "$fdl" = 3 ] && grep -qx "fd3 /dev/r$E rw" "$M/plan"; ok $? "root: with stdin closed the device still lands on fd 3 and nothing else is open (rc $rc, fds '$fdl')"
-# test environment overrides are not honoured by the mount role's environment; the shipped build has no test code at all
+# spec: tools/fs.c -- test environment overrides are not honoured by the mount role's environment; the shipped build has no test code at all
 env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_CLI=/bin/false LINUXFS_OPEN=/bin/false LINUXFS_LKLFUSE=/bin/false "$DM" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1
 grep -qx "env LINUXFS_OPEN=$H/linuxfs-open" "$M/plan" && grep -qx "env LINUXFS_LKLFUSE=$H/lklfuse" "$M/plan"; ok $? "root plan: a caller's LINUXFS_OPEN and LINUXFS_LKLFUSE are not passed on"
 ! strings "$D/linuxfs-fs" | grep -q 'LINUXFS_FS_TEST'; ok $? "the shipped build carries no LINUXFS_FS_TEST_* code"

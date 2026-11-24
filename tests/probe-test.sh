@@ -53,7 +53,7 @@ want apfs-magic.img "apfs${T}" 0
 want ext-bogus.img unknown 1
 n=$((n + 1)); "$D/probe" "$D/missing" > /dev/null 2>&1; rc=$?
 if [ $rc -eq 2 ]; then echo "ok $n - an unreadable path exits 2"; else echo "not ok $n - missing file exit $rc, want 2"; bad=1; fi
-# filesystem UUIDs (-k): equal to blkid's, case-insensitively; none for ntfs, f2fs, vfat, exfat
+# spec: tools/probe.c linuxfs_probe_uuid -- filesystem UUIDs (-k): equal to blkid's, case-insensitively; none for ntfs, f2fs, vfat, exfat
 uuid() { # IMAGE: the expected UUID, from blkid on Linux
   if [ "$(uname -s)" = Linux ]; then blkid -s UUID -o value "$D/$1"; else sh "$ROOT/build/linux-host.sh" blkid -s UUID -o value "$D/$1"; fi
 }
@@ -78,7 +78,7 @@ for i in ntfs f2fs vfat exfat fat32; do
   if [ -z "$got" ] && [ $rc -eq 1 ]; then echo "ok $n - $i.img: no UUID"
   else echo "not ok $n - $i.img: UUID got '$got' ($rc), want none (1)"; bad=1; fi
 done
-# a zeroed UUID is none (as blkid); the Fusion main device has the container's, its tier2 none; edge cases in one process
+# spec: tools/probe.c linuxfs_probe_uuid -- a zeroed UUID is none (as blkid); the Fusion main device has the container's, its tier2 none; edge cases in one process
 cp "$D/ext4.img" "$D/ext4-nouuid.img"; dd if=/dev/zero of="$D/ext4-nouuid.img" bs=1 seek=$((1024 + 0x68)) count=16 conv=notrunc 2>/dev/null
 head -c 2048 "$D/btrfs.img" > "$D/btrfs-cut.img"
 none() { # NAME WHY ARGS...: the driver prints nothing and exits 1

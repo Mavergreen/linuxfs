@@ -22,7 +22,7 @@ ok() { n=$((n + 1)); if [ "$1" = 0 ]; then echo "ok $n - $2"; else echo "not ok 
 # spec: tools/agent.c -- every agent here reads and writes test preferences (an absolute path as the domain), never this Mac's,
 #       and records its notices in a file instead of posting them
 export LINUXFS_PREFS_DOMAIN=$D/prefs-$$ LINUXFS_MACHINE_PLIST=$D/machine.plist LINUXFS_NOTICE_LOG=$D/notices
-# a short HOME: the socket's path must fit sockaddr_un (104 bytes)
+# platform: a socket's path must fit sockaddr_un (104 bytes), so HOME is short
 H=$(mktemp -d /tmp/lfagent.XXXXXX) || exit 1
 SOCK=$H/Library/Caches/dev.mavergreen.linuxfs/keychain.sock
 # spec: tools/agent.c --
@@ -34,7 +34,6 @@ ap=
 trap 'kill $ap 2>/dev/null; [ -z "$dev" ] || hdiutil detach -quiet -force "$dev" 2>/dev/null; rm -rf "$H"' EXIT
 agent() { HOME=$H LINUXFS_CLI=$D/cli LINUXFS_KEYCHAIN=off LINUXFS_SWEEP_DELAY=${SWEEP:-600} "$D/agent" 2>> "$D/agent.log" & ap=$!
   i=0; while [ -z "$(printf 'find\tdisk0\n' | nc -w 1 -U "$SOCK" 2>/dev/null)" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done; }
-# req VERB: one request, as a client sends it (the rest of the lines on stdin), the reply on stdout
 req() { nc -w 5 -U "$SOCK"; }
 find_() { printf 'find\t%s\n' "$1" | req | tr '\n' ' '; }
 agent
@@ -60,14 +59,14 @@ printf 'pw3\n' | HOME=$H "$D/agent" --offer disk9
 ! grep -q 'secret\|pw2\|pw3\|saved1' "$D/agent.log"; ok $? "no password is in the agent's log"
 HOME=$H "$D/agent" 2> "$D/second.log"; rc=$?
 [ $rc = 0 ] && grep -q 'already running' "$D/second.log" && [ "$(find_ disk9)" = "saved saved1 " ]; ok $? "a second agent finds the first answering, says so and exits 0 (rc $rc), leaving its socket be"
-# a client must never hang: an agent that is stopped (accepts into its backlog, never answers)
+# spec: tools/agent.c -- a client must never hang: an agent that is stopped (accepts into its backlog, never answers)
 kill -STOP $ap
 s=$(date +%s)
 printf 'pw\n' | HOME=$H "$D/agent" --offer disk9 2> /dev/null; rc=$?
 e=$(( $(date +%s) - s ))
 [ $rc = 1 ] && [ $e -le 6 ]; ok $? "--offer to a stopped agent exits 1 within about 6 s (rc $rc, $e s)"
 kill -CONT $ap
-# a client that drips bytes is dropped at the 5 s deadline (the agent serves one at a time, so others wait that long at most)
+# spec: tools/agent.c -- a client that drips bytes is dropped at the 5 s deadline (the agent serves one at a time, so others wait that long at most)
 ( printf 'sav'; sleep 2; printf 'e\tdisk6\n'; sleep 6; printf 'x\n' ) | nc -w 10 -U "$SOCK" > "$D/drip.out" 2>/dev/null & dp=$!
 sleep 1
 s=$(date +%s); r=$(printf 'find\tdisk6\n' | nc -w 9 -U "$SOCK" | tr '\n' ' '); e=$(( $(date +%s) - s ))
