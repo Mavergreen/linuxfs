@@ -322,7 +322,7 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
       check "before login: the user can read and write the volume over ssh" rw_works "$mp"
     else notok "before login: the ext4 image mounted within 30 s"; echo "$out" | sed 's/^/# /'; fi
     restore_login
-    # spec: mavericks-vm README -- no re-login without a reboot and no mid-job reboot (shipyard queued both), so the user's return is not asked
+    # platform: 10.9 has no re-login without a reboot, and mavericks-vm has no mid-job reboot, so the user's return is not asked
     echo "# SKIP user return: mavericks-vm cannot re-login without a reboot (shipyard queued it); autoLoginUser is restored"
     [ -z "$disk" ] || { bounded 600 sudo -n diskutil eject "$disk" > /dev/null 2>&1 || notok "before login: eject"; }
     disk=
