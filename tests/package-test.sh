@@ -94,9 +94,10 @@ fi
 S=./System/Library/Filesystems
 D=./Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d
 for fs in ext4 ntfs btrfs xfs f2fs apfs; do
-  b=$S/linuxfs_$fs.fs/Contents
+  nm=linuxfs_$fs; [ "$fs" != ext4 ] || nm=macfuse_ext4
+  b=$S/$nm.fs/Contents
   grep -qxF "$b/Info.plist	100644	0/0" "$T/list" || fail "the payload lacks $b/Info.plist (0644)"
-  for prog in linuxfs_$fs.util mount_linuxfs_$fs fsck_linuxfs_$fs; do
+  for prog in $nm.util mount_$nm fsck_$nm; do
     grep -qxF "$b/Resources/$prog	100755	0/0" "$T/list" || fail "the payload lacks $b/Resources/$prog (0755)"
   done
 done
@@ -107,11 +108,12 @@ n="$(grep -c "^$D/" "$T/list" || :)"
 [ "$n" -eq 4 ] || fail "$D holds $n entries, not four programs"
 mkdir -p "$T/bundles"; (cd "$T/bundles" && gzip -dc < "$comp/Payload" | cpio -id --quiet "$S/*")
 for fs in ext4 ntfs btrfs xfs f2fs apfs; do
-  ip="$T/bundles/System/Library/Filesystems/linuxfs_$fs.fs/Contents/Info.plist"
+  nm=linuxfs_$fs; [ "$fs" != ext4 ] || nm=macfuse_ext4
+  ip="$T/bundles/System/Library/Filesystems/$nm.fs/Contents/Info.plist"
   case $fs in ntfs) pers=NTFS-linuxfs ;; xfs) pers=XFS ;; f2fs) pers=F2FS ;; apfs) pers=APFS ;; *) pers=$fs ;; esac
-  python3 -I - "$ip" "$fs" "$pers" "$V" <<'PY' || fail "linuxfs_$fs.fs/Contents/Info.plist is wrong"
+  python3 -I - "$ip" "$fs" "$pers" "$V" "$nm" <<'PY' || fail "$nm.fs/Contents/Info.plist is wrong"
 import plistlib, sys
-ip, fs, pers, v = sys.argv[1:5]
+ip, fs, pers, v, nm = sys.argv[1:6]
 d = plistlib.load(open(ip, "rb"))
 def need(c, m):
     if not c: print(m, file=sys.stderr); sys.exit(1)
@@ -119,7 +121,7 @@ need(d["CFBundleIdentifier"] == "dev.mavergreen.linuxfs." + fs, "CFBundleIdentif
 need(d["CFBundleShortVersionString"] == v and d["CFBundleVersion"] == v, "version")
 need(list(d["FSPersonalities"]) == [pers], "personality is %r, want %s" % (list(d["FSPersonalities"]), pers))
 p = d["FSPersonalities"][pers]
-need(p["FSMountExecutable"] == "mount_linuxfs_" + fs, "FSMountExecutable")
+need(p["FSMountExecutable"] == "mount_" + nm, "FSMountExecutable")
 for k in p: need(not k.startswith(("FSFormat", "FSVerification", "FSRepair")), "unexpected key " + k)
 mt = d["FSMediaTypes"]
 want = {"ntfs": ["EBD0A0A2-B9E5-4433-87C0-68B6B72699C7", "Windows_NTFS", "Partitionless"],
@@ -127,9 +129,9 @@ want = {"ntfs": ["EBD0A0A2-B9E5-4433-87C0-68B6B72699C7", "Windows_NTFS", "Partit
         ["0FC63DAF-8483-4772-8E79-3D69D8477DE4", "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7", "Linux", "Partitionless"])
 need(sorted(mt) == sorted(want), "FSMediaTypes %r" % sorted(mt))
 for m in mt.values():
-    need(m["FSProbeExecutable"] == "linuxfs_%s.util" % fs and m["FSProbeOrder"] == 900 and m["FSProbeArguments"] == "-p", "probe keys")
+    need(m["FSProbeExecutable"] == "%s.util" % nm and m["FSProbeOrder"] == 900 and m["FSProbeArguments"] == "-p", "probe keys")
 PY
-  if command -v plutil > /dev/null 2>&1; then plutil -lint "$ip" > /dev/null || fail "plutil -lint refuses linuxfs_$fs.fs's Info.plist"; fi
+  if command -v plutil > /dev/null 2>&1; then plutil -lint "$ip" > /dev/null || fail "plutil -lint refuses $nm.fs's Info.plist"; fi
 done
 grep -q 'killall diskarbitrationd' "$comp/Scripts/postinstall" || fail "the postinstall does not restart diskarbitrationd"
 grep -q 'dscl \. -create /Users/_linuxfs' "$comp/Scripts/postinstall" || fail "the postinstall does not create _linuxfs with dscl"

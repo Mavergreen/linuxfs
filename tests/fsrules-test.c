@@ -42,7 +42,7 @@ int main(void)
 	int i, j, claimed_ok, others_ok;
 
 	r = FS_FSCK;
-	iss(fsrules_fs_from_name("/S/L/F/linuxfs_ext4.fs/Contents/Resources/linuxfs_ext4.util", &r), "ext4", "a util path names ext4");
+	iss(fsrules_fs_from_name("/S/L/F/macfuse_ext4.fs/Contents/Resources/macfuse_ext4.util", &r), "ext4", "a util path names ext4");
 	is(r == FS_UTIL, 1, "and its role is FS_UTIL");
 	iss(fsrules_fs_from_name("mount_linuxfs_ntfs", &r), "ntfs", "mount_linuxfs_ntfs names ntfs");
 	is(r == FS_MOUNT, 1, "and its role is FS_MOUNT");
@@ -57,12 +57,12 @@ int main(void)
 	iss(fsrules_fs_from_name("mount_linuxfs_hfs", &r), NULL, "mount_linuxfs_hfs is NULL");
 	iss(fsrules_fs_from_name("fsck_linuxfs_hfs", &r), NULL, "fsck_linuxfs_hfs is NULL");
 	iss(fsrules_fs_from_name("mount_hfs", &r), NULL, "another program is NULL");
-	iss(fsrules_fs_from_name("mount_linuxfs_ext4", NULL), "ext4", "a NULL role is tolerated");
+	iss(fsrules_fs_from_name("mount_macfuse_ext4", NULL), "ext4", "a NULL role is tolerated");
 	r = FS_UTIL;
 	iss(fsrules_fs_from_name("mount_linuxfs_hfs", &r), NULL, "a failed lookup");
 	is(r == FS_UTIL, 1, "leaves the role alone");
-	iss(fsrules_fs_from_name("linuxfs_ext4", &r), NULL, "a util without .util is NULL");
-	iss(fsrules_fs_from_name("linuxfs_ext4.util/", &r), NULL, "a trailing slash is NULL");
+	iss(fsrules_fs_from_name("macfuse_ext4", &r), NULL, "a util without .util is NULL");
+	iss(fsrules_fs_from_name("macfuse_ext4.util/", &r), NULL, "a trailing slash is NULL");
 	iss(fsrules_fs_from_name(NULL, &r), NULL, "no name is NULL");
 
 	iss(fsrules_probe_type("ntfs"), "ntfs3", "ntfs is probed as ntfs3");

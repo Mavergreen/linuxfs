@@ -1081,7 +1081,7 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 	time_t deadline, cli_end = 0;
 
 	fsrules_volname(strrchr(req->mnt, '/') + 1, vol, sizeof vol);
-	snprintf(opts, sizeof opts, "allow_other,local,volname=%s,fsname=linuxfs@%s,noappledouble%s", vol, bsd, ro ? ",rdonly" : "");
+	snprintf(opts, sizeof opts, "allow_other,local,volname=%s,fsname=linuxfs@%s,noappledouble%s%s", vol, bsd, strcmp(fs, "ext4") == 0 ? ",fstypename=ext4,fssubtype=7" : "", ro ? ",rdonly" : "");
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, cs) != 0)
 		return refuse(fs, "cannot make mount_macfuse's socket");
 	if (pipe(hout) != 0 || socketpair(AF_UNIX, SOCK_STREAM, 0, ch) != 0) {

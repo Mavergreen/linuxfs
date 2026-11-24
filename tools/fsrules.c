@@ -27,7 +27,17 @@ const char *fsrules_fs_from_name(const char *argv0, enum fsrole *role)
 	b = strrchr(argv0, '/');
 	b = b ? b + 1 : argv0;
 	n = strlen(b);
-	if (strncmp(b, "mount_linuxfs_", 14) == 0) {
+	/* SPIKE: ext4's programs are named macfuse_ext4 (its bundle's), the rest linuxfs_<fs> */
+	if (strcmp(b, "mount_macfuse_ext4") == 0) {
+		s = known("ext4", 4);
+		r = FS_MOUNT;
+	} else if (strcmp(b, "fsck_macfuse_ext4") == 0) {
+		s = known("ext4", 4);
+		r = FS_FSCK;
+	} else if (strcmp(b, "macfuse_ext4.util") == 0) {
+		s = known("ext4", 4);
+		r = FS_UTIL;
+	} else if (strncmp(b, "mount_linuxfs_", 14) == 0) {
 		s = known(b + 14, n - 14);
 		r = FS_MOUNT;
 	} else if (strncmp(b, "fsck_linuxfs_", 13) == 0) {

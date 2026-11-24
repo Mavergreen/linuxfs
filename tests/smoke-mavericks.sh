@@ -75,68 +75,6 @@ installed=$(awk '/<key>version<\/key>/ { getline; gsub(/.*<string>|<\/string>.*/
 [ "$installed" = "$VERSION" ] && ok "the installed manifest is $VERSION" || die "the installed manifest is '$installed', not $VERSION"
 check "the root helper is running" pgrep -u 0 -f /Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper
 check "linuxfs status runs" "$L" status
-imgfs=
-for fs in ext4 btrfs xfs ntfs exfat f2fs; do
-  if gunzip -c "$IN/$fs.img.gz" > "$W/img/$fs.img" 2> /dev/null; then imgfs="$imgfs $fs"
-  else notok "$fs: no $IN/$fs.img.gz (a required image)"; fi
-done
-dd if=/dev/urandom of="$W/payload" bs=1024 count=4096 2> /dev/null || die "cannot make the payload"
-for fs in $imgfs; do
-  case $fs in ntfs) want=ntfs3 ;; *) want=$fs ;; esac
-  check "linuxfs-probe names $fs" sh -c '[ "$("$1" "$2" | cut -f 1)" = "$3" ]' _ "$P/libexec/linuxfs-probe" "$W/img/$fs.img" "$want"
-done
-
-posix() { case $1 in ext4|btrfs|xfs|f2fs) return 0 ;; *) return 1 ;; esac; }
-links() { [ "$1" != exfat ]; }
-write_through() {  # FS MOUNTPOINT
-  cp "$W/payload" "$2/big" && cmp "$W/payload" "$2/big" &&
-  mkdir "$2/d" && echo one > "$2/d/f1" && mv "$2/d/f1" "$2/d/moved" && [ ! -e "$2/d/f1" ] || return 1
-  if links "$1"; then
-    ln -s moved "$2/d/sym" && [ "$(readlink "$2/d/sym")" = moved ] &&
-    ln "$2/d/moved" "$2/d/hard" && [ "$(stat -f %l "$2/d/moved")" = 2 ] &&
-    xattr -w user.k v "$2/big" && [ "$(xattr -p user.k "$2/big")" = v ] || return 1
-  fi
-  if posix "$1"; then chmod 640 "$2/d/moved" && [ "$(stat -f %Lp "$2/d/moved")" = 640 ] || return 1; fi
-}
-read_back() {  # FS MOUNTPOINT
-  cmp "$W/payload" "$2/big" && [ "$(cat "$2/d/moved")" = one ] && [ ! -e "$2/d/f1" ] || return 1
-  if links "$1"; then
-    [ "$(cat "$2/d/sym")" = one ] && [ "$(cat "$2/d/hard")" = one ] && [ "$(stat -f %l "$2/d/moved")" = 2 ] &&
-    [ "$(xattr -p user.k "$2/big")" = v ] || return 1
-  fi
-  if posix "$1"; then [ "$(stat -f %Lp "$2/d/moved")" = 640 ] || return 1; fi
-}
-# platform: kill -0 on another user's pid (lklfuse as _linuxfs, root's sudo) fails with EPERM for this shell, so a wait on
-#           such a pid asks ps -p instead; kill -0 stays only for this shell's own children (bounded's, the background attach)
-unmount_and_wait() {  # IMAGE MOUNTPOINT
-  p=$(pid_of "$1")
-  bounded 600 "$L" unmount "$2" || return 1
-  [ -z "$p" ] || bounded 300 sh -c 'while ps -p "$1" > /dev/null; do sleep 0.1; done' _ "$p" || { echo "lklfuse $p did not exit"; return 1; }
-  ! mount | grep -qF " on $2 (" || { echo "$2 is still mounted"; return 1; }
-}
-for fs in $imgfs; do
-  img=$W/img/$fs.img m=$W/mnt/$fs
-  mkdir -p "$m"
-  check "$fs: linuxfs mount" bounded 600 "$L" mount "$img" "$m"
-  check "$fs: write, rename, symlink, hard link, chmod and xattr through the mount" write_through "$fs" "$m"
-  check "$fs: linuxfs unmount, and lklfuse exits" unmount_and_wait "$img" "$m"
-  check "$fs: mount again" bounded 600 "$L" mount "$img" "$m"
-  check "$fs: everything reads back" read_back "$fs" "$m"
-  check "$fs: unmount again" unmount_and_wait "$img" "$m"
-done
-# spec: cli/linuxfs --
-#       APFS, which 10.9 cannot read: linuxfs mounts it read-only, unasked, and leaves the image as it found it
-gunzip -c "$IN/apfs.img.gz" > "$W/img/apfs.img" || die "cannot unpack $IN/apfs.img.gz"
-cp "$W/img/apfs.img" "$W/apfs.before"
-img=$W/img/apfs.img m=$W/mnt/apfs; mkdir -p "$m"
-check "apfs: linuxfs-probe names it, by its volume" sh -c '[ "$("$1" "$2")" = "$(printf "apfs\tTime Machine")" ]' _ "$P/libexec/linuxfs-probe" "$img"
-check "apfs: linuxfs mount" bounded 600 "$L" mount "$img" "$m"
-check "apfs: the volume lists" ls -la "$m"
-check "apfs: mounted read-only; a write is refused" sh -c '! ( echo x > "$1/c" ) 2>/dev/null' _ "$m"
-check "apfs: status says ro" sh -c '"$1" status | grep -F "$2" | grep -q "ro\$"' _ "$L" "$m"
-check "apfs: unmount, and lklfuse exits" unmount_and_wait "$img" "$m"
-check "apfs: not one byte of the image changed" cmp "$W/apfs.before" "$img"
-
 # spec: tests/smoke-mavericks.sh header -- ---- DiskArbitration: the six bundles mount attached disks themselves (Mac OS X 10.9, no agent in the loop) ----
 AQUA=/usr/local/bin/guest-macosx-aqua
 UUID_PART=6C696E75-7866-7370-6172-740000000001   # tests/lib/gpt-wrap.py's partition GUID: the keychain account of its volume
@@ -258,6 +196,160 @@ da_cycle() {
   cleanup_disk
 }
 
+
+# ---- SPIKE spike/fstypename: ext4 as f_fstypename macfuse_ext4 (bundle macfuse_ext4.fs, -o fstypename=ext4,fssubtype=7) ----
+# Evidence first: everything is recorded as "# " lines, and what can be a check is one. Early and always (a failing check never ends it).
+rec() { "$@" 2>&1 | sed 's/^/#   /'; }
+fstn_finder_kind() {  # VOLNAME MP: Finder's kind of the disk, by name and by the alias of its mount point
+  k1=$(bounded 300 "$AQUA" osascript -e "tell application \"Finder\" to get kind of disk \"$1\"" 2>&1)
+  k2=$(bounded 300 "$AQUA" osascript -e "tell application \"Finder\" to get kind of (POSIX file \"$2\" as alias)" 2>&1)
+  echo "# Finder: kind of disk \"$1\": $k1"
+  echo "# Finder: kind of the alias of $2: $k2"
+  test "$k1" = "Linux ext4 (linuxfs)"
+}
+fstn_getinfo_shot() {  # VOLNAME
+  bounded 300 "$AQUA" osascript -e "tell application \"Finder\" to activate" -e "tell application \"Finder\" to open information window of disk \"$1\"" > "$W/getinfo.log" 2>&1
+  echo "# Finder: open information window: $(tr '\n' ' ' < "$W/getinfo.log")"
+  sleep 4
+  bounded 300 "$AQUA" screencapture -x "$OUT/fstn-getinfo.png" > /dev/null 2>&1 && ok "fstypename: screenshot fstn-getinfo.png (Get Info: read Format)" || notok "fstypename: screencapture of Get Info"
+  bounded 300 "$AQUA" osascript -e "tell application \"Finder\" to close every information window" > /dev/null 2>&1
+}
+fstn_mount_line() { test -n "$(mount | grep -F " on $1 (" | grep -F '(macfuse_ext4,')"; }
+fstn_info_is() { test "$(info "$1" "$2")" = "$3"; }
+fstn_ignore() {  # DISK: ignore writes the noauto entry with vfstype macfuse_ext4
+  bounded 600 "$L" ignore "$1" || return 1
+  echo "# /etc/fstab after linuxfs ignore:"; sed 's/^/#   /' /etc/fstab
+  grep -q ' none macfuse_ext4 rw,noauto # linuxfs$' /etc/fstab || return 1
+}
+fstn_nested() {  # MP: lklfuse onto a directory inside the macfuse_ext4 volume
+  cp "$W/img/spike-ext4.img" "$W/img/spike-inner.img" || return 1
+  mkdir -p "$1/inner" || return 1
+  out=$(bounded 600 "$L" mount "$W/img/spike-inner.img" "$1/inner" 2>&1); rc=$?
+  echo "# nested: linuxfs mount IMG $1/inner: exit $rc: $(printf '%s' "$out" | tr '\n' ' ')"
+  echo "# nested: mount: $(mount | grep -F "$1/inner" | tr '\n' '|')"
+  bounded 300 "$L" unmount "$1/inner" > /dev/null 2>&1
+  return 0
+}
+fstn_section() {
+  echo "# fstypename: macFUSE tools and versions in this install:"
+  rec ls -la /Library/Filesystems/macfuse.fs/Contents/Resources /usr/local/bin /System/Library/Filesystems/macfuse_ext4.fs/Contents /System/Library/Filesystems/macfuse_ext4.fs/Contents/Resources
+  rec sh -c 'ls /Library/Filesystems /System/Library/Filesystems; ls /usr/local/bin /usr/local/sbin /usr/local/lib 2>/dev/null | grep -i "fuse"'
+  rec sh -c 'plutil -p /System/Library/Filesystems/macfuse_ext4.fs/Contents/Info.plist 2>/dev/null || cat /System/Library/Filesystems/macfuse_ext4.fs/Contents/Info.plist'
+  gunzip -c "$IN/ext4.img.gz" > "$W/img/spike-ext4.img" || { notok "fstypename: no $IN/ext4.img.gz"; return 1; }
+  da_attach "$W/img/spike-ext4.img" || { notok "fstypename: hdiutil attach"; disk=$(image_disk "$W/img/spike-ext4.img"); cleanup_disk; return 1; }
+  da_wait 300 || { notok "fstypename: DiskArbitration mounted a plain attach within 30 s"; diskutil list | sed 's/^/# /'; rec tail -n 60 /var/log/system.log; cleanup_disk; return 1; }
+  ok "fstypename: DiskArbitration mounted a plain attach: $dev at $mp"
+  echo "# mount: $(mount | grep -F " on $mp (")"
+  echo "# stat -f %T $mp: $(stat -f %T "$mp")"
+  echo "# df -T macfuse_ext4: $(df -T macfuse_ext4 2>&1 | tr '\n' '|')"
+  check "fstypename: mount reports macfuse_ext4" fstn_mount_line "$mp"
+  echo "# diskutil info $dev:"; rec diskutil info "$dev"
+  echo "# diskutil list:"; rec diskutil list
+  check "fstypename: diskutil info Type (Bundle) is macfuse_ext4" fstn_info_is "$dev" 'Type (Bundle)' macfuse_ext4
+  check "fstypename: diskutil info File System Personality is ext4" fstn_info_is "$dev" 'File System Personality' ext4
+  check "fstypename: diskutil info Name (User Visible) is Linux ext4 (linuxfs)" fstn_info_is "$dev" 'Name (User Visible)' 'Linux ext4 (linuxfs)'
+  check "fstypename: the volume is writable and reads back" rw_works "$mp"
+  vn=$(info "$dev" "Volume Name"); [ -n "$vn" ] || vn=$(basename "$mp")
+  echo "# volume name: '$vn', mount point $mp"
+  check "fstypename: Finder's kind of the disk is the bundle's FSName" fstn_finder_kind "$vn" "$mp"
+  fstn_getinfo_shot "$vn"
+  bounded 300 "$AQUA" screencapture -x "$OUT/fstn-desktop.png" > /dev/null 2>&1
+  echo "# processes:"; rec sh -c 'ps -axww -o user=,pid=,command= | grep -i "lklfuse\|mount_macfuse" | grep -v grep'
+  fstn_nested "$mp"
+  check "fstypename: diskutil unmount" bounded 600 diskutil unmount "$mp"
+  check "fstypename: it is unmounted" fstn_info_is "$dev" Mounted No
+  check "fstypename: diskutil mount (remount)" bounded 600 diskutil mount "$dev"
+  if da_wait 300; then
+    ok "fstypename: remounted at $mp"
+    echo "# mount after remount: $(mount | grep -F " on $mp (")"
+    check "fstypename: the remount reports macfuse_ext4 too" fstn_mount_line "$mp"
+    check "fstypename: what was written reads back" rw_reads "$mp"
+  else notok "fstypename: remounted within 30 s"; fi
+  check "fstypename: diskutil eject, and no lklfuse is left on it" da_eject "$disk" "$mp"
+  cleanup_disk
+  if da_attach_nomount "$W/img/spike-ext4.img"; then
+    check "fstypename: linuxfs ignore writes a noauto entry with vfstype macfuse_ext4" fstn_ignore "$disk"
+    out=$(bounded 600 diskutil mount "$disk" 2>&1); rc=$?
+    echo "# diskutil mount $disk with the noauto entry: exit $rc: $(printf '%s' "$out" | tr '\n' ' ')"
+    test "$rc" -eq 0 && ok "fstypename: diskutil mount works with the noauto entry" || notok "fstypename: diskutil mount works with the noauto entry"
+    echo "# mount: $(mount | grep -F linuxfs@ | tr '\n' '|')"
+    rec tail -n 20 /var/log/system.log
+    bounded 600 "$L" unignore "$disk" > /dev/null 2>&1
+    echo "# /etc/fstab after unignore:"; sed 's/^/#   /' /etc/fstab
+  else notok "fstypename: hdiutil attach -nomount"; disk=$(image_disk "$W/img/spike-ext4.img"); fi
+  cleanup_disk
+  m=$W/mnt/spike; mkdir -p "$m"
+  check "fstypename: linuxfs mount (the CLI's path)" bounded 600 "$L" mount "$W/img/spike-ext4.img" "$m"
+  echo "# CLI path mount: $(mount | grep -F " on $m (")"
+  echo "# CLI path stat -f %T: $(stat -f %T "$m")"
+  check "fstypename: the CLI's mount reports macfuse_ext4" fstn_mount_line "$m"
+  check "fstypename: the CLI's mount unmounts" unmount_and_wait "$W/img/spike-ext4.img" "$m"
+}
+fstn_section
+disk=
+
+imgfs=
+for fs in ext4 btrfs xfs ntfs exfat f2fs; do
+  if gunzip -c "$IN/$fs.img.gz" > "$W/img/$fs.img" 2> /dev/null; then imgfs="$imgfs $fs"
+  else notok "$fs: no $IN/$fs.img.gz (a required image)"; fi
+done
+dd if=/dev/urandom of="$W/payload" bs=1024 count=4096 2> /dev/null || die "cannot make the payload"
+for fs in $imgfs; do
+  case $fs in ntfs) want=ntfs3 ;; *) want=$fs ;; esac
+  check "linuxfs-probe names $fs" sh -c '[ "$("$1" "$2" | cut -f 1)" = "$3" ]' _ "$P/libexec/linuxfs-probe" "$W/img/$fs.img" "$want"
+done
+
+posix() { case $1 in ext4|btrfs|xfs|f2fs) return 0 ;; *) return 1 ;; esac; }
+links() { [ "$1" != exfat ]; }
+write_through() {  # FS MOUNTPOINT
+  cp "$W/payload" "$2/big" && cmp "$W/payload" "$2/big" &&
+  mkdir "$2/d" && echo one > "$2/d/f1" && mv "$2/d/f1" "$2/d/moved" && [ ! -e "$2/d/f1" ] || return 1
+  if links "$1"; then
+    ln -s moved "$2/d/sym" && [ "$(readlink "$2/d/sym")" = moved ] &&
+    ln "$2/d/moved" "$2/d/hard" && [ "$(stat -f %l "$2/d/moved")" = 2 ] &&
+    xattr -w user.k v "$2/big" && [ "$(xattr -p user.k "$2/big")" = v ] || return 1
+  fi
+  if posix "$1"; then chmod 640 "$2/d/moved" && [ "$(stat -f %Lp "$2/d/moved")" = 640 ] || return 1; fi
+}
+read_back() {  # FS MOUNTPOINT
+  cmp "$W/payload" "$2/big" && [ "$(cat "$2/d/moved")" = one ] && [ ! -e "$2/d/f1" ] || return 1
+  if links "$1"; then
+    [ "$(cat "$2/d/sym")" = one ] && [ "$(cat "$2/d/hard")" = one ] && [ "$(stat -f %l "$2/d/moved")" = 2 ] &&
+    [ "$(xattr -p user.k "$2/big")" = v ] || return 1
+  fi
+  if posix "$1"; then [ "$(stat -f %Lp "$2/d/moved")" = 640 ] || return 1; fi
+}
+# platform: kill -0 on another user's pid (lklfuse as _linuxfs, root's sudo) fails with EPERM for this shell, so a wait on
+#           such a pid asks ps -p instead; kill -0 stays only for this shell's own children (bounded's, the background attach)
+unmount_and_wait() {  # IMAGE MOUNTPOINT
+  p=$(pid_of "$1")
+  bounded 600 "$L" unmount "$2" || return 1
+  [ -z "$p" ] || bounded 300 sh -c 'while ps -p "$1" > /dev/null; do sleep 0.1; done' _ "$p" || { echo "lklfuse $p did not exit"; return 1; }
+  ! mount | grep -qF " on $2 (" || { echo "$2 is still mounted"; return 1; }
+}
+for fs in $imgfs; do
+  img=$W/img/$fs.img m=$W/mnt/$fs
+  mkdir -p "$m"
+  check "$fs: linuxfs mount" bounded 600 "$L" mount "$img" "$m"
+  check "$fs: write, rename, symlink, hard link, chmod and xattr through the mount" write_through "$fs" "$m"
+  check "$fs: linuxfs unmount, and lklfuse exits" unmount_and_wait "$img" "$m"
+  check "$fs: mount again" bounded 600 "$L" mount "$img" "$m"
+  check "$fs: everything reads back" read_back "$fs" "$m"
+  check "$fs: unmount again" unmount_and_wait "$img" "$m"
+done
+# spec: cli/linuxfs --
+#       APFS, which 10.9 cannot read: linuxfs mounts it read-only, unasked, and leaves the image as it found it
+gunzip -c "$IN/apfs.img.gz" > "$W/img/apfs.img" || die "cannot unpack $IN/apfs.img.gz"
+cp "$W/img/apfs.img" "$W/apfs.before"
+img=$W/img/apfs.img m=$W/mnt/apfs; mkdir -p "$m"
+check "apfs: linuxfs-probe names it, by its volume" sh -c '[ "$("$1" "$2")" = "$(printf "apfs\tTime Machine")" ]' _ "$P/libexec/linuxfs-probe" "$img"
+check "apfs: linuxfs mount" bounded 600 "$L" mount "$img" "$m"
+check "apfs: the volume lists" ls -la "$m"
+check "apfs: mounted read-only; a write is refused" sh -c '! ( echo x > "$1/c" ) 2>/dev/null' _ "$m"
+check "apfs: status says ro" sh -c '"$1" status | grep -F "$2" | grep -q "ro\$"' _ "$L" "$m"
+check "apfs: unmount, and lklfuse exits" unmount_and_wait "$img" "$m"
+check "apfs: not one byte of the image changed" cmp "$W/apfs.before" "$img"
+
 # spec: tests/smoke-mavericks.sh header -- `diskutil listFilesystems` lists only formattable personalities, and phase 1 has no
 #       format keys, so the six personalities are not listed there; that check returns with phase 2 (Erase)
 check "the keychain keeper (linuxfs-agent) is running" pgrep -f "$P/libexec/linuxfs-agent"
@@ -300,7 +392,7 @@ noauto_cycle() {  # TAG IMAGE device|label LABEL
   if [ "$how" = spaced ]; then
     # spec: tools/fstab.c -- the entry the helper writes for a label with a space (\040, as fstab spells it), written here by hand
     #       because linuxfs ignore names an ext4 volume by its UUID: DiskArbitration must read \040 as the space and skip the volume
-    check "$tag: an /etc/fstab noauto entry for LABEL=my\\040data" sudo -n sh -c 'printf "%s\n" "$1" >> /etc/fstab' _ 'LABEL=my\040data none linuxfs_ext4 rw,noauto # linuxfs'
+    check "$tag: an /etc/fstab noauto entry for LABEL=my\\040data" sudo -n sh -c 'printf "%s\n" "$1" >> /etc/fstab' _ 'LABEL=my\040data none macfuse_ext4 rw,noauto # linuxfs'
   else
     if [ "$how" = device ]; then arg=$disk; else arg=$lab; fi
     check "$tag: linuxfs ignore $arg" bounded 600 "$L" ignore "$arg"
@@ -507,6 +599,7 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
         lklfuses | sed 's/^/# /'
         mount | grep -F " on $mp (" | sed 's/^/# /'
         check "before login: the mount at $mp is root's (no 'mounted by')" mounted_by_root "$mp"
+        echo "# before login: mount: $(mount | grep -F " on $mp (")"
         check "before login: the lklfuse serving it runs as _linuxfs, on a /dev/fd/N mountpoint" lklfuse_fd_runs
         check "before login: no lklfuse runs as root" no_root_lklfuse
         # spec: tools/open.c fuse_chan -- the opener holds the lock from before "ready" on fd 7, which lklfuse's lock= names

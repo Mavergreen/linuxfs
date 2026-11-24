@@ -50,9 +50,10 @@ fi
 if [ -f "$built/linuxfs-fs" ]; then
   sh "$REPO_ROOT/build/fs-bundles.sh" --version "$ver" --out "$out/System/Library/Filesystems"
   for fs in ext4 ntfs btrfs xfs f2fs apfs; do
-    r="$out/System/Library/Filesystems/linuxfs_$fs.fs/Contents/Resources"
+    b=linuxfs_$fs; [ "$fs" != ext4 ] || b=macfuse_ext4   # SPIKE
+    r="$out/System/Library/Filesystems/$b.fs/Contents/Resources"
     mkdir -p "$r"
-    for n in "linuxfs_$fs.util" "mount_linuxfs_$fs" "fsck_linuxfs_$fs"; do put "$built/linuxfs-fs" "$r/$n" 755; done
+    for n in "$b.util" "mount_$b" "fsck_$b"; do put "$built/linuxfs-fs" "$r/$n" 755; done
   done
 fi
 # spec: tools/fs.c mount_as_root -- the before-login root path execs these (names and directory as it spells them), as _linuxfs

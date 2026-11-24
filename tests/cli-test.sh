@@ -593,9 +593,9 @@ sh "$L" unmount "$T/img" > /dev/null 2>&1
 U=0123ABCD-4567-89EF-0123-456789ABCDEF
 NA() { : > "$T/noauto"; LINUXFS_OPEN=$LO sh "$L" "$@"; }
 out=$(FAKE_UUID=$U NA ignore /dev/disk3s1 2>&1); rc=$?
-[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-add UUID=$U linuxfs_ext4" ]; ok $? "ignore DEVICE with a UUID asks the helper for UUID= and the probed bundle (got $rc: '$out' $(cat "$T/noauto"))"
+[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-add UUID=$U macfuse_ext4" ]; ok $? "ignore DEVICE with a UUID asks the helper for UUID= and the probed bundle (got $rc: '$out' $(cat "$T/noauto"))"
 out=$(FAKE_UUID=0123abcd-4567-89ef-0123-456789abcdef NA ignore disk3s1 2>&1)
-[ "$(cat "$T/noauto")" = "--noauto-add UUID=$U linuxfs_ext4" ]; ok $? "a bare diskNsM works too, and the UUID is uppercased ($(cat "$T/noauto"))"
+[ "$(cat "$T/noauto")" = "--noauto-add UUID=$U macfuse_ext4" ]; ok $? "a bare diskNsM works too, and the UUID is uppercased ($(cat "$T/noauto"))"
 out=$(FAKE_PROBE=ntfs3 NA ignore disk3s1 2>&1); rc=$?
 [ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-add LABEL=helped linuxfs_ntfs" ]; ok $? "ignore DEVICE with no UUID (NTFS) asks for LABEL= (got $rc: $(cat "$T/noauto"))"
 out=$(FAKE_PROBE=btrfs FAKE_OPEN_LABEL="a/b:c" NA ignore disk3s1 2>&1)
@@ -609,7 +609,7 @@ done
 out=$(FAKE_PROBE=none NA ignore disk3s1 2>&1); rc=$?
 [ $rc -eq 1 ] && [ ! -s "$T/noauto" ]; ok $? "ignore of a disk with no filesystem linuxfs knows is refused (got $rc: '$out')"
 out=$(NA ignore helped 2>&1); rc=$?
-[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-add LABEL=helped linuxfs_ext4" ]; ok $? "ignore LABEL asks for LABEL= with the bundle of the attached disk of that name (got $rc: '$out' $(cat "$T/noauto"))"
+[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-add LABEL=helped macfuse_ext4" ]; ok $? "ignore LABEL asks for LABEL= with the bundle of the attached disk of that name (got $rc: '$out' $(cat "$T/noauto"))"
 out=$(FAKE_PROBE=f2fs FAKE_OPEN_LABEL="a/b" NA ignore "a/b" 2>&1)
 [ "$(cat "$T/noauto")" = "--noauto-add LABEL=a-b linuxfs_f2fs" ]; ok $? "a label given raw is matched and written as its safe name ($(cat "$T/noauto"))"
 out=$(NA ignore "no such" 2>&1); rc=$?
@@ -627,9 +627,9 @@ out=$(NA unignore "a/b" 2>&1)
 [ "$(cat "$T/noauto")" = "--noauto-remove LABEL=a-b" ]; ok $? "by its safe name ($(cat "$T/noauto"))"
 NA ignore a b > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "ignore takes one volume"
 NA unignore > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "unignore takes one volume"
-printf '%s\n' "# the Mac's" "UUID=$U none hfs rw,noauto" "UUID=$U none linuxfs_ext4 rw,noauto # linuxfs" "LABEL=my\\040data none linuxfs_ntfs rw,noauto # linuxfs" > "$T/fstab"
+printf '%s\n' "# the Mac's" "UUID=$U none hfs rw,noauto" "UUID=$U none macfuse_ext4 rw,noauto # linuxfs" "LABEL=my\\040data none linuxfs_ntfs rw,noauto # linuxfs" > "$T/fstab"
 out=$(LINUXFS_FSTAB=$T/fstab sh "$L" ignore); rc=$?
-[ $rc -eq 0 ] && [ "$out" = "UUID=$U	linuxfs_ext4
+[ $rc -eq 0 ] && [ "$out" = "UUID=$U	macfuse_ext4
 LABEL=my data	linuxfs_ntfs" ]; ok $? "ignore alone lists linuxfs's entries, labels unescaped, and no other (got $rc: '$(echo "$out" | tr '\n' '|')')"
 # spec: cli/linuxfs cmd_ignore -- as the helper reads them: a linuxfs line ends in a space or tab, then "# linuxfs", then
 #       perhaps a \r (an fstab edited on Windows); "X# linuxfs" is somebody else's

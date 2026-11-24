@@ -338,6 +338,8 @@ cmd_mount() {
   opts="type=$type,lock=$lockopt"
   # the mount's own options (the kernel's): root gave them to mount_macfuse when it made the mount lklfuse serves
   [ -n "$fusefd" ] || opts="$opts,local,volname=$name,fsname=linuxfs@$(safe_name "$(basename "$src")"),noappledouble"
+  # SPIKE: ext4 mounts as f_fstypename macfuse_ext4, subtype 7 (the bundle's FSSubType)
+  [ -n "$fusefd" ] || [ "$type" != ext4 ] || opts="$opts,fstypename=ext4,fssubtype=7"
   if [ -n "$ids" ]; then :
   elif [ "${LINUXFS_ALL_USERS:-}" = 1 ]; then [ -n "$fusefd" ] || opts="$opts,allow_other"; opts="$opts,uid=99,gid=99"
   else opts="$opts,uid=$(id -u),gid=$(id -g),owner=root"; fi
@@ -537,7 +539,7 @@ uuid_dev() {
   else "$OPENER" --uuid "$1" 2>/dev/null < /dev/null; fi | tr a-f A-F
 }
 # The bundle that mounts what the probe calls TYPE; fails for what the Mac mounts itself (FAT, exFAT).
-bundle_of() { case $1 in ext4|btrfs|xfs|f2fs|apfs) echo "linuxfs_$1" ;; ntfs3) echo linuxfs_ntfs ;; *) return 1 ;; esac; }
+bundle_of() { case $1 in ext4) echo macfuse_ext4 ;; btrfs|xfs|f2fs|apfs) echo "linuxfs_$1" ;; ntfs3) echo linuxfs_ntfs ;; *) return 1 ;; esac; }
 # A device's type, UUID and name (the volume name DiskArbitration sees: the bundle's util prints the label's safe name,
 # so a LABEL= entry must spell that, not the raw label). A label that leaves no safe name (empty, not UTF-8) gives no name:
 # DiskArbitration would call it Linux, as it calls every such volume. Sets type, uuid and name.

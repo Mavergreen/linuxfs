@@ -53,7 +53,7 @@ const char *fstab_bundle_refusal(const char *bundle)
 	char util[64];
 
 	/* fsrules knows the filesystems: linuxfs_<fs>.util names one exactly when <fs> is ours */
-	if (!bundle || strncmp(bundle, "linuxfs_", 8) != 0 || strchr(bundle, '/') ||
+	if (!bundle || (strncmp(bundle, "linuxfs_", 8) != 0 && strcmp(bundle, "macfuse_ext4") != 0) || strchr(bundle, '/') ||
 	    snprintf(util, sizeof util, "%s.util", bundle) >= (int)sizeof util || !fsrules_fs_from_name(util, NULL))
 		return "not a linuxfs bundle (linuxfs_ext4, _btrfs, _xfs, _f2fs, _apfs or _ntfs)";
 	return NULL;
@@ -62,7 +62,7 @@ const char *fstab_bundle_refusal(const char *bundle)
 const char *fstab_bundle_for(const char *probe_type)
 {
 	static const struct { const char *type, *bundle; } map[] = {
-		{ "ext4", "linuxfs_ext4" }, { "btrfs", "linuxfs_btrfs" }, { "xfs", "linuxfs_xfs" },
+		{ "ext4", "macfuse_ext4" }, { "btrfs", "linuxfs_btrfs" }, { "xfs", "linuxfs_xfs" },
 		{ "f2fs", "linuxfs_f2fs" }, { "apfs", "linuxfs_apfs" }, { "ntfs3", "linuxfs_ntfs" },
 	};
 	size_t i;

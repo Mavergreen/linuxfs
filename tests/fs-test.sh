@@ -14,7 +14,7 @@ SDK=$(sh "$SHIPYARD_SCRIPTS/fetch_sdk.sh" 2>/dev/null) || exit 1
 "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN \
   -o "$D/linuxfs-fs" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" \
   -framework CoreFoundation -framework DiskArbitration || exit 1
-for n in linuxfs_ext4.util linuxfs_ntfs.util linuxfs_btrfs.util fsck_linuxfs_ext4 mount_linuxfs_ext4 bogus.util; do cp "$D/linuxfs-fs" "$D/$n"; done
+for n in macfuse_ext4.util linuxfs_ntfs.util linuxfs_btrfs.util fsck_macfuse_ext4 mount_macfuse_ext4 bogus.util; do cp "$D/linuxfs-fs" "$D/$n"; done
 sh "$ROOT/build/linux-host.sh" sh -c "cd '$D' && sh '$ROOT/tests/lib/probe-images.sh' '$D' && blkid -s UUID -o value ext4.img > ext4.uuid && blkid -s UUID -o value btrfs.img > btrfs.uuid" || exit 1
 n=0 bad=0
 ok() { n=$((n + 1)); if [ "$1" = 0 ]; then echo "ok $n - $2"; else echo "not ok $n - $2"; bad=1; fi; }
@@ -32,9 +32,9 @@ plist "$D/takeoff.plist" "<key>NTFSTakeover</key><true/><key>Automount</key><fal
 printf 'this is not a plist' > "$D/corrupt.plist"
 u() { # BIN ARGS... : the util with the test prefs (USERP, MACHP)
   x=$1; shift; LINUXFS_PREFS_USER=${USERP:-$D/none.plist} LINUXFS_PREFS_MACHINE=${MACHP:-$D/none2.plist} "$D/$x" "$@"; }
-out=$(u linuxfs_ext4.util -p "$E" removable writable); rc=$?
+out=$(u macfuse_ext4.util -p "$E" removable writable); rc=$?
 [ $rc = 255 ] && [ "$out" = "my data" ]; ok $? "ext4 util -p on the ext4 disk prints the label and exits 255 (rc $rc, '$out')"
-out=$(u linuxfs_ext4.util -p "$E" fixed readonly); rc=$?
+out=$(u macfuse_ext4.util -p "$E" fixed readonly); rc=$?
 [ $rc = 255 ] && [ "$out" = "my data" ]; ok $? "ext4 is claimed fixed and readonly too (rc $rc)"
 out=$(u linuxfs_btrfs.util -p "$E" removable writable); rc=$?
 [ $rc = 254 ] && [ -z "$out" ]; ok $? "btrfs util on the ext4 disk exits 254 and prints nothing (rc $rc)"
@@ -42,10 +42,10 @@ out=$(u linuxfs_btrfs.util -p "$B" removable writable); rc=$?
 [ $rc = 255 ] && [ "$out" = backup ]; ok $? "btrfs util on the btrfs disk exits 255 (rc $rc, '$out')"
 # spec: tools/fs.c -- -k as 10.9's hfs.util does it, which DiskArbitration reads (its fstab UUID= lookup needs it): the UUID,
 #       uppercase, with no newline, and exit 253 (FSUR_IO_SUCCESS, not -p's 255: DiskArbitration drops the UUID otherwise)
-out=$(u linuxfs_ext4.util -k "$E"); rc=$?
+out=$(u macfuse_ext4.util -k "$E"); rc=$?
 want=$(tr a-f A-F < "$D/ext4.uuid")
 [ $rc = 253 ] && [ "$out" = "$want" ]; ok $? "-k prints the UUID blkid gave, exit 253 (rc $rc, '$out', want '$want')"
-[ "$(u linuxfs_ext4.util -k "$E" | wc -c | tr -d ' ')" = 36 ]; ok $? "-k prints the 36 characters alone, no newline"
+[ "$(u macfuse_ext4.util -k "$E" | wc -c | tr -d ' ')" = 36 ]; ok $? "-k prints the 36 characters alone, no newline"
 out=$(u linuxfs_btrfs.util -k "$B"); rc=$?
 [ $rc = 253 ] && [ "$out" = "$(tr a-f A-F < "$D/btrfs.uuid")" ]; ok $? "-k on btrfs prints its UUID too"
 out=$(u linuxfs_btrfs.util -k "$E"); rc=$?
@@ -68,38 +68,38 @@ USERP=$D/corrupt.plist MACHP=$D/take.plist u linuxfs_ntfs.util -p "$T" removable
 [ $rc = 255 ]; ok $? "a corrupt user plist counts as absent: the machine's NTFSTakeover=true holds (rc $rc)"
 USERP=$D/empty.plist MACHP=$D/take.plist u linuxfs_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
 [ $rc = 255 ]; ok $? "prefs fall back key by key: a user plist lacking the key leaves the machine's NTFSTakeover=true (rc $rc)"
-USERP=$D/missing.plist MACHP=$D/missing2.plist u linuxfs_ext4.util -p "$E" removable writable >/dev/null; rc=$?
+USERP=$D/missing.plist MACHP=$D/missing2.plist u macfuse_ext4.util -p "$E" removable writable >/dev/null; rc=$?
 [ $rc = 255 ]; ok $? "missing plists use the defaults: ext4 still claimed (rc $rc)"
 ln -sf "$D/take.plist" "$D/link.plist"
 USERP=$D/link.plist u linuxfs_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
 [ $rc = 254 ]; ok $? "a symlinked user plist is refused, as absent (rc $rc)"
 # spec: tools/fs.c util -- a stale Ignore:<LABEL> is not read: DiskArbitration applies /etc/fstab's noauto, per volume
 plist "$D/ign.plist" "<key>Ignore:my data</key><true/>"
-out=$(USERP=$D/ign.plist MACHP=$D/ign.plist u linuxfs_ext4.util -p "$E" removable writable); rc=$?
+out=$(USERP=$D/ign.plist MACHP=$D/ign.plist u macfuse_ext4.util -p "$E" removable writable); rc=$?
 [ $rc = 255 ] && [ "$out" = "my data" ]; ok $? "the probe does not consult Ignore:<LABEL>: still claimed (rc $rc, '$out')"
 for bad_args in "-p diskX removable writable" "-p ../disk2 removable writable" "-p ${E}s removable writable" "-p $E sometimes writable" "-p $E" "-z" ""; do
   # shellcheck disable=SC2086
-  u linuxfs_ext4.util $bad_args >/dev/null 2>&1; rc=$?
+  u macfuse_ext4.util $bad_args >/dev/null 2>&1; rc=$?
   [ $rc = 254 ]; ok $? "bad arguments '$bad_args' exit 254 (rc $rc)"
 done
-u linuxfs_ext4.util -p disk99999 removable writable >/dev/null 2>&1; rc=$?
+u macfuse_ext4.util -p disk99999 removable writable >/dev/null 2>&1; rc=$?
 [ $rc = 254 ]; ok $? "a disk that does not exist exits 254 (rc $rc)"
 u bogus.util -p "$E" removable writable >/dev/null 2>&1; rc=$?
 [ $rc = 254 ]; ok $? "an unknown program name exits 254 (rc $rc)"
-u fsck_linuxfs_ext4 -q "/dev/r$E" >/dev/null 2>&1; rc=$?
+u fsck_macfuse_ext4 -q "/dev/r$E" >/dev/null 2>&1; rc=$?
 [ $rc = 0 ]; ok $? "fsck -q exits 0 (rc $rc)"
-out=$(u fsck_linuxfs_ext4 -n "/dev/r$E" 2>&1); rc=$?
+out=$(u fsck_macfuse_ext4 -n "/dev/r$E" 2>&1); rc=$?
 [ $rc = 8 ] && [ "$out" = "Verify and Repair for ext4 come with its tools" ]; ok $? "fsck -n exits 8 and says why (rc $rc, '$out')"
-u fsck_linuxfs_ext4 -y "/dev/r$E" >/dev/null 2>&1; rc=$?
+u fsck_macfuse_ext4 -y "/dev/r$E" >/dev/null 2>&1; rc=$?
 [ $rc = 8 ]; ok $? "fsck -y exits 8 (rc $rc)"
-u fsck_linuxfs_ext4 >/dev/null 2>&1; rc=$?
+u fsck_macfuse_ext4 >/dev/null 2>&1; rc=$?
 [ $rc = 8 ]; ok $? "fsck with no flag exits 8 (rc $rc)"
-out=$(u fsck_linuxfs_ext4 -z "/dev/r$E" 2>&1 >/dev/null); rc=$?
+out=$(u fsck_macfuse_ext4 -z "/dev/r$E" 2>&1 >/dev/null); rc=$?
 [ $rc = 8 ] && case $out in usage:*) true ;; *) false ;; esac; ok $? "fsck with an unknown flag exits 8 with a usage line on stderr (rc $rc, '$out')"
-u fsck_linuxfs_ext4 -qn "/dev/r$E" >/dev/null 2>&1; rc=$?
+u fsck_macfuse_ext4 -qn "/dev/r$E" >/dev/null 2>&1; rc=$?
 [ $rc = 8 ]; ok $? "fsck flags are parsed exactly: -qn is not -q (rc $rc)"
 # spec: tools/fs.c mount role -- as the console user, with stand-ins for the CLI, the keychain keeper and the dialog
-M=$D/mount; mkdir -p "$M"; MD=$D/mount_linuxfs_ext4
+M=$D/mount; mkdir -p "$M"; MD=$D/mount_macfuse_ext4
 PWHOME=$(/usr/bin/python -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')
 cat > "$M/cli" <<'EOS'
 #!/bin/sh
@@ -306,9 +306,9 @@ done
 #           the drop; it prints the plan instead of dropping and exec'ing) stands in. The shipped build has no such code.
 mkdir -p "$D/drop"
 "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN \
-  -DLINUXFS_FS_TEST_DROP -o "$D/drop/mount_linuxfs_ext4" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" \
+  -DLINUXFS_FS_TEST_DROP -o "$D/drop/mount_macfuse_ext4" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" \
   -framework CoreFoundation -framework DiskArbitration || exit 1
-DM=$D/drop/mount_linuxfs_ext4
+DM=$D/drop/mount_macfuse_ext4
 V=$D/vols; rm -rf "$V"; mkdir -p "$V/NAME" "$V/other"; : > "$V/file"; ln -s "$V/NAME" "$V/link"
 H=/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d
 UID_D=$(id -u daemon)

@@ -94,7 +94,7 @@ int agent_parse_request(char *line, char **verb, char **bsd)
 /* Whether the login sweep mounts a disk: DiskArbitration gave it a linuxfs_ volume kind and no volume path. */
 int agent_sweeps(const char *kind, int has_path)
 {
-	return kind && strncmp(kind, "linuxfs_", 8) == 0 && !has_path;
+	return kind && (strncmp(kind, "linuxfs_", 8) == 0 || strcmp(kind, "macfuse_ext4") == 0) && !has_path;
 }
 
 /* And when FSTAB (LEN bytes of /etc/fstab) has no linuxfs noauto entry for the volume's UUID or name (either may be NULL). */

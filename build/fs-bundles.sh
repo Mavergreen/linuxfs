@@ -28,9 +28,11 @@ media_type() {
   if [ "$1" = Partitionless ]; then printf '\t\t\t\t<key>Leaf</key>\n\t\t\t\t<true/>\n\t\t\t\t<key>Whole</key>\n\t\t\t\t<true/>\n'
   else printf '\t\t\t\t<key>Content Hint</key>\n\t\t\t\t<string>%s</string>\n\t\t\t\t<key>Leaf</key>\n\t\t\t\t<true/>\n' "$1"; fi
   printf '\t\t\t</dict>\n\t\t\t<key>FSProbeArguments</key>\n\t\t\t<string>-p</string>\n\t\t\t<key>FSProbeExecutable</key>\n'
-  printf '\t\t\t<string>linuxfs_%s.util</string>\n\t\t\t<key>FSProbeOrder</key>\n\t\t\t<integer>900</integer>\n\t\t</dict>\n' "$fs"
+  printf '\t\t\t<string>%s.util</string>\n\t\t\t<key>FSProbeOrder</key>\n\t\t\t<integer>900</integer>\n\t\t</dict>\n' "$(base "$fs")"
 }
 
+# SPIKE: ext4's bundle is macfuse_ext4 (the kernel's f_fstypename for -o fstypename=ext4), its personality FSSubType 7 (-o fssubtype=7)
+base() { if [ "$1" = ext4 ]; then echo macfuse_ext4; else echo "linuxfs_$1"; fi; }
 mkdir -p "$out"
 sub=0
 for fs in ext4 ntfs btrfs xfs f2fs apfs; do
@@ -42,20 +44,21 @@ for fs in ext4 ntfs btrfs xfs f2fs apfs; do
     apfs) pers=APFS; label="APFS (linuxfs)"; types="$APFS_GUID Partitionless" ;;
     *) pers=$fs; label="Linux $fs (linuxfs)"; types="$LINUX_GUID $BASIC_GUID Linux Partitionless" ;;
   esac
-  d="$out/linuxfs_$fs.fs/Contents"
-  rm -rf "$out/linuxfs_$fs.fs"
+  d="$out/$(base "$fs").fs/Contents"
+  rm -rf "$out/$(base "$fs").fs"
+  psub=$sub; [ "$fs" != ext4 ] || psub=7
   mkdir -p "$d"
   {
     printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n'
     printf '\t<key>CFBundleIdentifier</key>\n\t<string>dev.mavergreen.linuxfs.%s</string>\n' "$fs"
-    printf '\t<key>CFBundleName</key>\n\t<string>linuxfs_%s</string>\n' "$fs"
+    printf '\t<key>CFBundleName</key>\n\t<string>%s</string>\n' "$(base "$fs")"
     printf '\t<key>CFBundlePackageType</key>\n\t<string>fs  </string>\n'
     printf '\t<key>CFBundleShortVersionString</key>\n\t<string>%s</string>\n\t<key>CFBundleVersion</key>\n\t<string>%s</string>\n' "$V" "$V"
     printf '\t<key>FSMediaTypes</key>\n\t<dict>\n'
     for t in $(printf '%s\n' $types | sort); do media_type "$t"; done
     printf '\t</dict>\n\t<key>FSPersonalities</key>\n\t<dict>\n\t\t<key>%s</key>\n\t\t<dict>\n' "$pers"
-    printf '\t\t\t<key>FSMountArguments</key>\n\t\t\t<string></string>\n\t\t\t<key>FSMountExecutable</key>\n\t\t\t<string>mount_linuxfs_%s</string>\n' "$fs"
-    printf '\t\t\t<key>FSName</key>\n\t\t\t<string>%s</string>\n\t\t\t<key>FSSubType</key>\n\t\t\t<integer>%s</integer>\n' "$label" "$sub"
+    printf '\t\t\t<key>FSMountArguments</key>\n\t\t\t<string></string>\n\t\t\t<key>FSMountExecutable</key>\n\t\t\t<string>mount_%s</string>\n' "$(base "$fs")"
+    printf '\t\t\t<key>FSName</key>\n\t\t\t<string>%s</string>\n\t\t\t<key>FSSubType</key>\n\t\t\t<integer>%s</integer>\n' "$label" "$psub"
     printf '\t\t</dict>\n\t</dict>\n</dict>\n</plist>\n'
   } > "$d/Info.plist"
   chmod 644 "$d/Info.plist"
