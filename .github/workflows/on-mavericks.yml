@@ -2,7 +2,7 @@ name: on-mavericks
 
 # spec: mavergreen-conventions SKILL.md "Acceptance on real 10.9" -- the 10.9 acceptance job: Linux makes ext4, btrfs, xfs,
 #       NTFS, exFAT and APFS images (tests/lib/probe-images.sh); a fresh Mac OS X 10.9.5 guest (Mavergreen/mavericks-vm), logged in
-#       to its console so the automount agent runs, installs the pinned Mavergreen macFUSE (and the Recaulk that release was
+#       to its console (the session DiskArbitration mounts for), installs the pinned Mavergreen macFUSE (and the Recaulk that release was
 #       tested with) and the run's pkg, and runs tests/smoke-mavericks.sh, which mounts, writes, unmounts and reads back each
 #       image through `linuxfs mount`, checks DiskArbitration mounts attached disks (raw and GPT-wrapped) through the six
 #       bundles, the password dialog and keychain for encrypted APFS, and the before-login mount (root mounts, lklfuse as _linuxfs serves); then Linux checks every image

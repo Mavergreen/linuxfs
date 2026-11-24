@@ -28,8 +28,10 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$stage" ] && [ -n "$V" ] && [ -n "$out" ] || usage
 short=$LINUXFS_SHORT
-# spec: tests/package-test.sh -- the first macfuse release whose lklfuse, serving a /dev/fd/N mountpoint (the before-login mount;
-#       tools/fs.c MACFUSE_FD_MOUNTPOINT_SINCE, 5.5.0-mavericks.2, serves it but ignores SIGTERM) ends cleanly on SIGTERM. A floor, not the build's pin (components/macfuse/version):
+# spec: tests/package-test.sh -- the macfuse release this linuxfs is tested with: it carries the single-threaded-loop fix, and lklfuse
+#       ends on SIGTERM over /dev/fd/N (the before-login mount; tools/fs.c MACFUSE_FD_MOUNTPOINT_SINCE, 5.5.0-mavericks.2, is the
+#       gate for mounting then at all). The 10.9 cause of lklfuse ignoring SIGTERM was LKL's setjmp saving the signal mask
+#       (patches/0011), not macFUSE: .2 and .3 with that patch are untested. A floor, not the build's pin (components/macfuse/version):
 #       linuxfs and macfuse update separately, so a floor that followed the pin would fail a linuxfs update until macfuse's
 #       own updater had run. Raise it only when linuxfs needs a newer one.
 MACFUSE_MIN=5.5.0-mavericks.4
