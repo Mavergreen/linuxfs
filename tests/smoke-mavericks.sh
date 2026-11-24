@@ -314,18 +314,24 @@ fstn_try() {  # TAG IMG: a plain attach of a copy; on failure, what DA and disku
   echo "# $1: diskutil mount $d: $(bounded 600 diskutil mount "$d" 2>&1 | tr '\n' ' ')"
   disk=$d; cleanup_disk; return 1
 }
-fstn_exp() {  # TAG IMG VFSTYPE mount|nomount
-  tag=$1 simg=$2 vfs=$3 var=$4
-  da_restart; da_mark "exp $tag"
+fstn_exp() {  # TAG IMG VFSTYPE mount|nomount helper|manual restart|keep
+  tag=$1 simg=$2 vfs=$3 var=$4 mode=$5
+  [ "$6" != restart ] || da_restart
+  da_mark "exp $tag"
   da_attach_nomount "$simg" || { notok "exp $tag: attach -nomount"; disk=$(image_disk "$simg"); cleanup_disk; return 1; }
   sleep 6
   if mount | grep -qF "linuxfs@"; then bounded 600 diskutil unmount "$disk" > /dev/null 2>&1; fi
   u=$(info "$disk" "Volume UUID")
   echo "# exp $tag ($(date +%s)): UUID '$u', vfstype $vfs, variant $var; diskutil info before:"; rec diskutil info "$disk"
-  sudo -n sh -c 'printf "%s\n" "$1" >> /etc/fstab' _ "UUID=$u none $vfs rw,noauto # linuxfs"
+  if [ "$mode" = helper ]; then
+    echo "# exp $tag: linuxfs ignore: $(bounded 600 "$L" ignore "$disk" 2>&1 | tr '\n' ' ')"
+    [ "$vfs" = macfuse_ext4 ] || sudo -n sed -i '' "s/ none macfuse_ext4 / none $vfs /" /etc/fstab
+  else sudo -n sh -c 'printf "%s\n" "$1" >> /etc/fstab' _ "UUID=$u none $vfs rw,noauto # linuxfs"; fi
+  echo "# exp $tag: fstab with the entry: $(tr '\n' '|' < /etc/fstab)"
   da_mark "exp $tag: fstab entry written"
   if [ "$var" = mount ]; then echo "# exp $tag: diskutil mount: $(bounded 600 diskutil mount "$disk" 2>&1 | tr '\n' ' ')"; echo "# exp $tag: mount: $(mount | grep -F linuxfs@ | tr '\n' '|')"; fi
-  sudo -n sed -i '' '/# linuxfs$/d' /etc/fstab
+  if [ "$mode" = helper ]; then echo "# exp $tag: linuxfs unignore: $(bounded 600 "$L" unignore "$disk" 2>&1 | tr '\n' ' ')"
+  else sudo -n sed -i '' '/# linuxfs$/d' /etc/fstab; fi
   da_mark "exp $tag: fstab entry removed"
   echo "# exp $tag ($(date +%s)): fstab now: $(tr '\n' '|' < /etc/fstab)"
   cleanup_disk
@@ -345,12 +351,12 @@ fstn_baseline_nested() {  # today's bundle: DA mounts a plain attach; nested lkl
 fstn_experiments() {
   gunzip -c "$IN/ext4-slash.img.gz" > "$W/img/spike-other.img" || { notok "no ext4-slash.img.gz"; return 1; }
   da_debug_on || { echo "# no debug DA (plist '$DAPL'): going on without"; DEBUGDA=; }
-  fstn_exp macfuse-ignore-mount-unignore "$W/img/spike-ext4.img" macfuse_ext4 mount
-  fstn_exp macfuse-ignore-unignore-only "$W/img/spike-ext4.img" macfuse_ext4 nomount
+  fstn_exp macfuse-helper-mount "$W/img/spike-ext4.img" macfuse_ext4 mount helper keep
+  fstn_exp macfuse-helper-nomount "$W/img/spike-ext4.img" macfuse_ext4 nomount helper restart
   if fstn_use_baseline; then
     fstn_baseline_nested
-    fstn_exp baseline-ignore-mount-unignore "$W/img/spike-ext4.img" linuxfs_ext4 mount
-    fstn_exp baseline-ignore-unignore-only "$W/img/spike-ext4.img" linuxfs_ext4 nomount
+    fstn_exp baseline-helper-mount "$W/img/spike-ext4.img" linuxfs_ext4 mount helper keep
+    fstn_exp baseline-helper-nomount "$W/img/spike-ext4.img" linuxfs_ext4 nomount helper restart
   else notok "baseline bundle setup"; fi
   fstn_use_macfuse
   da_debug_off

@@ -1519,6 +1519,10 @@ static int mount_role(const char *fs, int argc, char **argv)
 	setenv("HOME", pw->pw_dir, 1);
 	setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin", 1);
 	setenv("LINUXFS_DA", "1", 1);
+	if (g_fstypename)
+		setenv("LINUXFS_FSTYPENAME", "1", 1);
+	else
+		unsetenv("LINUXFS_FSTYPENAME");
 	signal(SIGPIPE, SIG_IGN);
 	cli = test_env("LINUXFS_CLI");
 	if (!cli || !*cli)
