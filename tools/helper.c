@@ -9,7 +9,10 @@
  *   "probe /dev/rdiskNsM"       ->  "ok TYPE<TAB>LABEL", or "no REASON"
  *   "uuid /dev/rdiskNsM"        ->  "ok UUID" (the probe's, as the bundles' util -k gives it), or "no REASON"
  *   "noauto-add SPEC BUNDLE"    ->  "ok", or "no REASON": /etc/fstab gets SPEC's linuxfs noauto entry (fstab.h); SPEC is
- *                                   UUID=... or LABEL=<label>, which may hold spaces: BUNDLE is the line's last word
+ *                                   UUID=... or LABEL=<label>, which may hold spaces: BUNDLE is the line's last word. Only
+ *                                   for a volume attached now: the helper probes the disks for one of BUNDLE's type with
+ *                                   that UUID or volume name, else the reason "no attached linuxfs
+ *                                   volume matches"
  *   "noauto-remove SPEC"        ->  "ok", or "no REASON": SPEC's linuxfs entry goes
  *   "noauto-remove-all"         ->  "ok", or "no REASON": every linuxfs entry goes, and no other line
  * It refuses a peer other than root or the console user (before reading its request), a request of more than one line,
@@ -21,7 +24,8 @@
  * --migrate-prefs turns each Ignore:<LABEL> = true preference (the console user's and the machine's: the old way to keep a
  * volume from mounting by itself) into a LABEL= entry, when a disk with a volume of that name is attached to give the
  * bundle; it prints "user|machine<TAB>LABEL" for each it converted, for the postinstall to delete, and logs the others.
- * LINUXFS_FSTAB names another fstab (tests), obeyed only when not root.
+ * LINUXFS_FSTAB names another fstab, and LINUXFS_TEST_DISKS (colon-separated files) the attached disks (tests), obeyed only
+ * when not root.
  */
 #include "fsrules.h"
 #include "fstab.h"
@@ -297,34 +301,90 @@ done:
 
 #define MIGRATE_DISKS 64
 
-struct seen_disk { const char *type; char vol[256]; };
+/* an attached disk a bundle would mount: its type, the volume name DiskArbitration gives it (the util's -p; empty when that
+ * is only the Linux every unnamed volume gets), and its UUID (the util's -k; empty when none) */
+struct seen_disk { const char *type; char vol[256]; char uuid[40]; };
 
-/* The attached disks linuxfs's bundles would mount, with the volume name DiskArbitration gives each (the util's -p). */
+/* PATH's disk, through the same checks as a probe request (helper_media_refusal before and after the probe), when one of
+ * linuxfs's bundles would mount it; 0, or -1. A path that is not a raw disk node is a test's stand-in (no IOKit facts). */
+static int see_disk(const char *path, struct seen_disk *d)
+{
+	struct media_facts facts = { "", 1, 1 };
+	char label[512];
+	const char *type;
+	int fd, err, raw = helper_device_ok(path);
+
+	if (raw && (helper_media_facts(path + 6, &facts) < 0 || helper_media_refusal(facts.content, facts.leaf, facts.ejectable, NULL, 0)))
+		return -1;
+	fd = open(path, O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	type = linuxfs_probe_fd(fd, label, sizeof(label), &err);
+	if (!type || !fstab_bundle_for(type) || helper_media_refusal(facts.content, facts.leaf, facts.ejectable, type, 0)) {
+		close(fd);
+		return -1;
+	}
+	d->type = type;	/* probe.c's names are literals */
+	fsrules_volname(label, d->vol, sizeof(d->vol));
+	if (strcmp(d->vol, "Linux") == 0 && strcmp(label, "Linux") != 0)
+		d->vol[0] = '\0';
+	if (linuxfs_probe_uuid(d->uuid, sizeof(d->uuid)) != 0)
+		d->uuid[0] = '\0';
+	close(fd);
+	return 0;
+}
+
+/* The attached disks linuxfs's bundles would mount: /dev's raw disk nodes, or (tests, only when not root) the files named
+ * in LINUXFS_TEST_DISKS, colon-separated. */
 static int scan_disks(struct seen_disk *d, int max)
 {
+	const char *test = getuid() != 0 ? getenv("LINUXFS_TEST_DISKS") : NULL;
+	char path[1024];
+	int n = 0;
+
+	if (test) {
+		while (*test && n < max) {
+			size_t len = strcspn(test, ":");
+
+			if (len < sizeof(path)) {
+				memcpy(path, test, len);
+				path[len] = '\0';
+				if (len && see_disk(path, &d[n]) == 0)
+					n++;
+			}
+			test += len + (test[len] == ':');
+		}
+		return n;
+	}
 	DIR *dev = opendir("/dev");
 	struct dirent *e;
-	char path[300], label[512];
-	const char *type;
-	int n = 0, fd, err;
 
 	while (dev && n < max && (e = readdir(dev))) {
 		if (snprintf(path, sizeof(path), "/dev/%s", e->d_name) >= (int)sizeof(path) || !helper_device_ok(path))
 			continue;
-		fd = open(path, O_RDONLY | O_NONBLOCK | O_NOCTTY);
-		if (fd < 0)
-			continue;
-		type = linuxfs_probe_fd(fd, label, sizeof(label), &err);
-		close(fd);
-		if (!type || !fstab_bundle_for(type))
-			continue;
-		d[n].type = type;	/* probe.c's names are literals */
-		fsrules_volname(label, d[n].vol, sizeof(d[n].vol));
-		n++;
+		if (see_disk(path, &d[n]) == 0)
+			n++;
 	}
 	if (dev)
 		closedir(dev);
 	return n;
+}
+
+/* NULL when an attached disk is SPEC's volume (UUID=, or LABEL= its volume name) of BUNDLE's type; else why not. A console
+ * user may keep only a volume attached now from mounting by itself, never name any volume at all. */
+const char *helper_noauto_attached(const char *spec, const char *bundle)
+{
+	static struct seen_disk disks[MIGRATE_DISKS];
+	int i, n = scan_disks(disks, MIGRATE_DISKS);
+
+	for (i = 0; i < n; i++) {
+		if (strcmp(fstab_bundle_for(disks[i].type), bundle) != 0)
+			continue;
+		if (strncmp(spec, "UUID=", 5) == 0 ? (disks[i].uuid[0] && strcasecmp(disks[i].uuid, spec + 5) == 0)
+						   : (strncmp(spec, "LABEL=", 6) == 0 && disks[i].vol[0] && strcmp(disks[i].vol, spec + 6) == 0))
+			return NULL;
+	}
+	return "no attached linuxfs volume matches";
 }
 
 /* One Ignore:<RAW> = true from DOM: converted (printed to OUT) or logged. */
@@ -488,7 +548,9 @@ void helper_serve(int c, uid_t peer, uid_t console, int test_files)
 			}
 			*bundle++ = '\0';
 		}
-		why = helper_noauto(helper_fstab_path(), spec, bundle);
+		why = bundle && !fstab_spec_refusal(spec) && !fstab_bundle_refusal(bundle) ? helper_noauto_attached(spec, bundle) : NULL;
+		if (!why)
+			why = helper_noauto(helper_fstab_path(), spec, bundle);
 		if (why)
 			snprintf(msg, sizeof(msg), "no %s\n", why);
 		reply(c, why ? msg : "ok\n", -1);

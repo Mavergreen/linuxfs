@@ -20,11 +20,15 @@ cc -DLINUXFS_PROBE_NO_MAIN -o "$D/open" "$ROOT/tools/open.c" "$ROOT/tools/probe.
 cc -o "$D/probe" "$ROOT/tools/probe.c" || exit 1
 cc -DLINUXFS_PROBE_NO_MAIN -o "$D/policy" "$ROOT/tests/helper-policy-test.c" "$ROOT/tools/probe.c" "$ROOT/tools/fstab.c" "$ROOT/tools/fsrules.c" \
   "$ROOT/tools/plist.c" -framework IOKit -framework CoreFoundation || exit 1
+sh "$ROOT/build/linux-host.sh" sh -c 'truncate -s 32M "$1/ext4.img" && mkfs.ext4 -q -F -L helped "$1/ext4.img" &&
+  truncate -s 32M "$1/mydata.img" && mkfs.ext4 -q -F -L "my data" -U 0123abcd-4567-89ef-0123-456789abcdef "$1/mydata.img" &&
+  truncate -s 64M "$1/ssd.img" && truncate -s 256M "$1/hdd.img" && mkapfs -L Fused -F "$1/hdd.img" "$1/ssd.img" > /dev/null' _ "$D" || exit 1
+# the disks attached, for noauto-add (tests only, not root: these files stand in for /dev's raw disks): ext4 "helped", and ext4
+# "my data" with UUID 0123ABCD-4567-89EF-0123-456789ABCDEF
+export LINUXFS_TEST_DISKS="$D/ext4.img:$D/mydata.img"
 "$D/policy" > "$D/policy.tap"; bad=$?
 grep -v '^1\.\.' "$D/policy.tap"
 n=$(grep -c '^ok\|^not ok' "$D/policy.tap")
-sh "$ROOT/build/linux-host.sh" sh -c 'truncate -s 32M "$1/ext4.img" && mkfs.ext4 -q -F -L helped "$1/ext4.img" &&
-  truncate -s 64M "$1/ssd.img" && truncate -s 256M "$1/hdd.img" && mkapfs -L Fused -F "$1/hdd.img" "$1/ssd.img" > /dev/null' _ "$D" || exit 1
 head -c 1048576 /dev/zero > "$D/zero.img"
 S=$D/sock; export LINUXFS_HELPER_SOCKET=$S
 F=$D/fstab; export LINUXFS_FSTAB=$F
@@ -97,6 +101,15 @@ out=$("$D/open" --noauto-add "LABEL=a#b" linuxfs_ext4 2>&1); rc=$?
 [ "$(cat "$F")" = "# the Mac's
 LABEL=Backup none hfs ro" ]; ok $? "and the entry is gone"
 "$D/open" --noauto-add "LABEL=x" > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "--noauto-add with no bundle is misuse (exit 2)"
+# spec: tools/helper.c -- noauto-add only for a volume attached now: the helper itself (root) probes the attached disks for one of
+#       the stated bundle's type with that UUID or volume name; a console user cannot keep any other volume from mounting
+out=$("$D/open" --noauto-add "LABEL=nowhere" linuxfs_ext4 2>&1); rc=$?
+[ $rc -eq 1 ] && echo "$out" | grep -q "no attached linuxfs volume matches" && ! grep -q nowhere "$F"; ok $? "noauto-add for a volume not attached is refused (got $rc: '$out')"
+out=$("$D/open" --noauto-add "LABEL=helped" linuxfs_btrfs 2>&1); rc=$?
+[ $rc -eq 1 ] && echo "$out" | grep -q "no attached linuxfs volume matches"; ok $? "noauto-add with another filesystem's bundle is refused (got $rc: '$out')"
+"$D/open" --noauto-add "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF" linuxfs_ext4 && grep -q "^UUID=0123ABCD-4567-89EF-0123-456789ABCDEF none linuxfs_ext4" "$F"; ok $? "noauto-add by the attached disk's UUID is done"
+"$D/open" --noauto-remove "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF"
+out=$(LINUXFS_TEST_DISKS= "$D/open" --noauto-add "LABEL=helped" linuxfs_ext4 2>&1); [ "$out" = "" ]; ok $? "the helper's disks are its own, not the client's environment (got '$out')"
 # spec: tools/helper.c helper_migrate -- the install's migration (the postinstall runs it as root): each Ignore:<LABEL> = true,
 #       in the console user's and the machine's plists, becomes a LABEL= entry when a disk of that name is attached (its bundle
 #       from the probe), printed as DOMAIN<TAB>LABEL for the postinstall to delete; what cannot be converted is left and logged
@@ -112,12 +125,12 @@ out=$(LINUXFS_FSTAB=$M LINUXFS_PREFS_USER=$D/none.plist LINUXFS_PREFS_MACHINE=$D
 [ $rc -eq 0 ] && [ -z "$out" ]; ok $? "with no preferences there is nothing to migrate (got $rc: '$out')"
 # spec: tools/helper.c -- noauto-remove-all (pre-uninstall runs --noauto-remove-all as root): every linuxfs line goes, no other
 printf '# the Mac'"'"'s\nLABEL=Backup none hfs ro\n' > "$F"
-"$D/open" --noauto-add "LABEL=my data" linuxfs_ext4 && "$D/open" --noauto-add "LABEL=b" linuxfs_xfs && echo "LABEL=after none hfs ro" >> "$F"
+"$D/open" --noauto-add "LABEL=my data" linuxfs_ext4 && "$D/open" --noauto-add "LABEL=helped" linuxfs_ext4 && echo "LABEL=after none hfs ro" >> "$F"
 "$D/open" --noauto-remove-all; ok $? "linuxfs-open --noauto-remove-all exits 0"
 [ "$(cat "$F")" = "# the Mac's
 LABEL=Backup none hfs ro
 LABEL=after none hfs ro" ]; ok $? "every linuxfs line is gone, the others kept in order ($(tr '\n' '|' < "$F"))"
-"$D/open" --noauto-add "LABEL=c" linuxfs_f2fs
+"$D/open" --noauto-add "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF" linuxfs_ext4
 "$D/helper" --noauto-remove-all; rc=$?
 [ $rc -eq 0 ] && ! grep -q linuxfs "$F" && grep -q "LABEL=after none hfs ro" "$F"; ok $? "linuxfs-helper --noauto-remove-all does the same, without the socket (rc $rc)"
 LINUXFS_FSTAB=$D/no-fstab "$D/helper" --noauto-remove-all; rc=$?

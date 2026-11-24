@@ -143,6 +143,23 @@ int main(void)
 		is(ch, 0, "and nothing changed");
 		iss(edit(other, NULL, "linuxfs_ext4", &ch), "(refused)", "a bundle with no spec is refused");
 	}
+	{
+		/* spec: tools/fstab.c -- a linuxfs line ends in whitespace then "# linuxfs", before an optional \r (an fstab edited
+		 * on Windows); "X# linuxfs" is somebody else's */
+		const char *crlf = "LABEL=a none linuxfs_ext4 rw,noauto # linuxfs\r\n";
+		const char *glued = "LABEL=a none hfs rw,noauto#   # linuxfs\nLABEL=b none hfs rw,noauto,x# linuxfs\n";
+
+		iss(edit(crlf, "LABEL=a", NULL, &ch), "", "a CRLF linuxfs line is ours: removed by its spec");
+		iss(edit(crlf, NULL, NULL, &ch), "", "and by noauto-remove-all");
+		iss(edit(crlf, "LABEL=a", "linuxfs_ext4", &ch), crlf, "and adding it again keeps it, not doubled");
+		is(ch, 0, "unchanged");
+		iss(edit("LABEL=b none hfs ro\r\n", NULL, NULL, &ch), "LABEL=b none hfs ro\r\n", "another CRLF line is kept as it is");
+		iss(edit("LABEL=b none hfs rw,noauto,x# linuxfs\n", NULL, NULL, &ch), "LABEL=b none hfs rw,noauto,x# linuxfs\n",
+		    "a line with no space or tab before # linuxfs is not ours");
+		iss(edit(glued, "LABEL=b", NULL, &ch), glued, "nor removed by its spec");
+		iss(edit("LABEL=c none linuxfs_xfs rw,noauto\t# linuxfs\n", "LABEL=c", NULL, &ch), "", "a tab before # linuxfs is ours");
+		iss(edit("# linuxfs\n", NULL, NULL, &ch), "# linuxfs\n", "a line that is only the tag is not ours");
+	}
 	iss(edit("", "LABEL=a#b", "linuxfs_ext4", &ch), "(refused)", "an edit with a refused spec is refused");
 	iss(edit("", "LABEL=ab", "linuxfs_hfs", &ch), "(refused)", "an edit with a refused bundle is refused");
 	memset(big, '#', FSTAB_MAX - 10);

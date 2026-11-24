@@ -37,6 +37,32 @@ if [ "${3:-/}" = / ]; then
   launchctl unload /Library/LaunchDaemons/dev.mavergreen.linuxfs.helper.plist 2>/dev/null || :
   launchctl load -w /Library/LaunchDaemons/dev.mavergreen.linuxfs.helper.plist
 fi
+# linuxfs: "do not mount by itself" is per volume now, Apple's way: an /etc/fstab noauto entry. The root helper turns each old
+# Ignore:<LABEL> = true preference (the console user's and the machine's) into one, reading both plists and writing fstab
+# itself, and prints DOMAIN<TAB>LABEL for each it converted; those keys go, and so does the global Automount, which nothing
+# reads now. A label it could not convert (no disk of that name attached to give its filesystem) is logged and its key kept.
+# The user's keys go through their session (as the agent is loaded below), so their cfprefsd sees it; with no loginwindow,
+# plain sudo. This runs before the agent is (re)loaded: its start tells of the Ignore:<LABEL> keys still there.
+# Only on the running system.
+if [ "${3:-/}" = / ] && [ -x /Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper ]; then
+  user=$(stat -f %Su /dev/console 2>/dev/null)
+  lw=$(pgrep -x -u "$user" loginwindow 2>/dev/null | head -n 1)
+  user_defaults_delete() {
+    [ -n "$user" ] && [ "$user" != root ] || return 0
+    if [ -n "$lw" ]; then launchctl bsexec "$lw" sudo -u "$user" defaults delete dev.mavergreen.linuxfs "$1" 2>/dev/null || :
+    else sudo -u "$user" defaults delete dev.mavergreen.linuxfs "$1" 2>/dev/null || :; fi
+  }
+  tab=$(printf '\t')
+  /Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper --migrate-prefs | while IFS= read -r line; do
+    label=${line#*"$tab"}
+    case ${line%%"$tab"*} in
+      machine) defaults delete /Library/Preferences/dev.mavergreen.linuxfs "Ignore:$label" 2>/dev/null || : ;;
+      user) user_defaults_delete "Ignore:$label" ;;
+    esac
+  done
+  defaults delete /Library/Preferences/dev.mavergreen.linuxfs Automount 2>/dev/null || :
+  user_defaults_delete Automount
+fi
 # linuxfs: (re)load the automount agent in the console user's session; otherwise it starts at the next login.
 if [ "${3:-/}" = / ]; then
   user=$(stat -f %Su /dev/console 2>/dev/null)
@@ -45,24 +71,6 @@ if [ "${3:-/}" = / ]; then
     launchctl bsexec "$lw" sudo -u "$user" launchctl unload -S Aqua /Library/LaunchAgents/dev.mavergreen.linuxfs.agent.plist 2>/dev/null || :
     launchctl bsexec "$lw" sudo -u "$user" launchctl load -S Aqua /Library/LaunchAgents/dev.mavergreen.linuxfs.agent.plist || :
   fi
-fi
-# linuxfs: "do not mount by itself" is per volume now, Apple's way: an /etc/fstab noauto entry. The root helper turns each old
-# Ignore:<LABEL> = true preference (the console user's and the machine's) into one, reading both plists and writing fstab
-# itself, and prints DOMAIN<TAB>LABEL for each it converted; those keys go, and so does the global Automount, which nothing
-# reads now. A label it could not convert (no disk of that name attached to give its filesystem) is logged and its key kept.
-# Only on the running system.
-if [ "${3:-/}" = / ] && [ -x /Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper ]; then
-  user=$(stat -f %Su /dev/console 2>/dev/null)
-  tab=$(printf '\t')
-  /Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper --migrate-prefs | while IFS= read -r line; do
-    label=${line#*"$tab"}
-    case ${line%%"$tab"*} in
-      machine) defaults delete /Library/Preferences/dev.mavergreen.linuxfs "Ignore:$label" 2>/dev/null || : ;;
-      user) [ -z "$user" ] || [ "$user" = root ] || sudo -u "$user" defaults delete dev.mavergreen.linuxfs "Ignore:$label" 2>/dev/null || : ;;
-    esac
-  done
-  defaults delete /Library/Preferences/dev.mavergreen.linuxfs Automount 2>/dev/null || :
-  [ -z "$user" ] || [ "$user" = root ] || sudo -u "$user" defaults delete dev.mavergreen.linuxfs Automount 2>/dev/null || :
 fi
 # linuxfs: DiskArbitration reads the bundles when it starts, so restart it last, once the helper and agent are loaded; launchd brings it back.
 if [ "${3:-/}" = / ]; then

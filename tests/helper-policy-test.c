@@ -229,7 +229,22 @@ int main(void)
 		unlink(other);
 		is(helper_noauto("/etc/hosts", "LABEL=a", NULL) != NULL, 1, "an fstab owned by someone else (root, for this test) is refused");
 
-		/* through the socket's request lines */
+		/* through the socket's request lines; the attached disks are LINUXFS_TEST_DISKS (helper-test.sh): ext4 "helped" and ext4
+		 * "my data" with UUID 0123ABCD-4567-89EF-0123-456789ABCDEF */
+		spit(f, mac);
+		if (!getenv("LINUXFS_TEST_DISKS"))
+			printf("# LINUXFS_TEST_DISKS is not set: run me from helper-test.sh\n");
+		/* noauto-add only for an attached volume of the bundle's type, by its UUID or volume name */
+		answers("noauto-add LABEL=nowhere linuxfs_ext4\n", getuid(), getuid(), "no no attached linuxfs volume matches", "noauto-add with no such disk attached is refused");
+		answers("noauto-add LABEL=helped linuxfs_btrfs\n", getuid(), getuid(), "no no attached linuxfs volume matches", "noauto-add for a disk of another type is refused");
+		answers("noauto-add UUID=0123ABCD-4567-89EF-0123-456789ABCDEE linuxfs_ext4\n", getuid(), getuid(), "no no attached linuxfs volume matches", "noauto-add by a UUID no disk has is refused");
+		answers("noauto-add LABEL=Linux linuxfs_ext4\n", getuid(), getuid(), "no no attached linuxfs volume matches", "LABEL=Linux matches no volume that has another label");
+		iss(slurp(f), mac, "and none of them touched the fstab");
+		answers("noauto-add LABEL=helped linuxfs_ext4\n", getuid(), getuid(), "ok", "noauto-add for the attached disk's volume name and type is done");
+		answers("noauto-add UUID=0123abcd-4567-89EF-0123-456789ABCDEF linuxfs_ext4\n", getuid(), getuid(), "no ", "a lowercase UUID is still refused");
+		answers("noauto-remove LABEL=helped\n", getuid(), getuid(), "ok", "and removed");
+		snprintf(big, sizeof big, "%s\n", mac);
+		iss(slurp(f), big, "the fstab is the Mac's again (ended by a newline)");
 		spit(f, mac);
 		answers("noauto-add LABEL=my data linuxfs_ext4\n", getuid(), getuid(), "ok", "noauto-add LABEL=<label with a space> BUNDLE is done");
 		is(strstr(slurp(f), "\nLABEL=my\\040data none linuxfs_ext4 rw,noauto # linuxfs\n") != NULL, 1, "the bundle is the last word, the rest the spec");
@@ -246,8 +261,8 @@ int main(void)
 		answers("noauto-add LABEL=x linuxfs_ext4\n", 502, 501, "no only the user at the console", "noauto-add from another user is refused");
 		iss(slurp(f), big, "and none of the refused requests touched the fstab");
 		/* noauto-remove-all (uninstall): every linuxfs line goes, no other */
-		answers("noauto-add LABEL=a linuxfs_ext4\n", getuid(), getuid(), "ok", "an entry to remove");
-		answers("noauto-add UUID=0123ABCD-4567-89EF-0123-456789ABCDEF linuxfs_btrfs\n", getuid(), getuid(), "ok", "and another");
+		answers("noauto-add LABEL=helped linuxfs_ext4\n", getuid(), getuid(), "ok", "an entry to remove");
+		answers("noauto-add UUID=0123ABCD-4567-89EF-0123-456789ABCDEF linuxfs_ext4\n", getuid(), getuid(), "ok", "and another");
 		answers("noauto-remove-all extra\n", getuid(), getuid(), "no ", "noauto-remove-all takes nothing after it");
 		answers("noauto-remove-all\n", 502, 501, "no only the user at the console", "noauto-remove-all from another user is refused");
 		answers("noauto-remove-all\n", getuid(), getuid(), "ok", "noauto-remove-all is done");

@@ -102,7 +102,9 @@ static int ours(const char *p, const char *e, const char *espec)
 	size_t t = strlen(TAG), n;
 	const char *f;
 
-	if ((size_t)(e - p) < t || memcmp(e - t, TAG, t) != 0)
+	if (e > p && e[-1] == '\r')	/* an fstab edited on Windows */
+		e--;
+	if ((size_t)(e - p) < t + 1 || memcmp(e - t, TAG, t) != 0 || (e[-t - 1] != ' ' && e[-t - 1] != '\t'))
 		return 0;
 	while (p < e && (*p == ' ' || *p == '\t'))
 		p++;
@@ -154,7 +156,8 @@ long fstab_edit(const char *in, size_t len, const char *spec, const char *bundle
 		if (!e)
 			e = end;
 		if (ours(p, e, spec ? espec : NULL)) {
-			if (bundle && !have && (size_t)(e - p) == elen && memcmp(p, entry, elen) == 0) {
+			if (bundle && !have && ((size_t)(e - p) == elen || ((size_t)(e - p) == elen + 1 && e[-1] == '\r')) &&
+			    memcmp(p, entry, elen) == 0) {
 				have = 1;	/* the very line: kept where it is */
 			} else {
 				removed = 1;

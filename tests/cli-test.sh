@@ -530,6 +530,13 @@ printf '%s\n' "# the Mac's" "UUID=$U none hfs rw,noauto" "UUID=$U none linuxfs_e
 out=$(LINUXFS_FSTAB=$T/fstab sh "$L" ignore); rc=$?
 [ $rc -eq 0 ] && [ "$out" = "UUID=$U	linuxfs_ext4
 LABEL=my data	linuxfs_ntfs" ]; ok $? "ignore alone lists linuxfs's entries, labels unescaped, and no other (got $rc: '$(echo "$out" | tr '\n' '|')')"
+# spec: cli/linuxfs cmd_ignore -- as the helper reads them: a linuxfs line ends in a space or tab, then "# linuxfs", then
+#       perhaps a \r (an fstab edited on Windows); "X# linuxfs" is somebody else's
+printf '%s\r\n' "LABEL=crlf none linuxfs_xfs rw,noauto # linuxfs" > "$T/fstab"
+printf '%s\n' "LABEL=glued none hfs rw,noauto,x# linuxfs" "LABEL=tabbed none linuxfs_f2fs rw,noauto	# linuxfs" >> "$T/fstab"
+out=$(LINUXFS_FSTAB=$T/fstab sh "$L" ignore); rc=$?
+[ $rc -eq 0 ] && [ "$out" = "LABEL=crlf	linuxfs_xfs
+LABEL=tabbed	linuxfs_f2fs" ]; ok $? "a CRLF line is listed, a line with # linuxfs glued on is not (got $rc: '$(echo "$out" | od -c | tr -s ' ' | tr '\n' '|')')"
 out=$(LINUXFS_FSTAB=$T/no-fstab sh "$L" ignore); rc=$?
 [ $rc -eq 0 ] && [ -z "$out" ]; ok $? "with no /etc/fstab it lists nothing (got $rc)"
 sh "$L" help 2>&1 | grep -q "linuxfs ignore \[VOLUME\]"; ok $? "usage shows ignore [VOLUME]"

@@ -257,8 +257,8 @@ noauto_cycle() {  # TAG IMAGE device|label LABEL
   tag=$1 img=$2 how=$3 lab=$4
   if ! da_attach_nomount "$img"; then notok "$tag: hdiutil attach -nomount"; disk=$(image_disk "$img"); cleanup_disk; return 1; fi
   if [ "$how" = device ]; then arg=$disk; else arg=$lab; fi
-  check "$tag: linuxfs ignore $arg" "$L" ignore "$arg"
-  echo "# $tag: linuxfs ignore lists: $("$L" ignore | tr '\n' '|')"
+  check "$tag: linuxfs ignore $arg" bounded 600 "$L" ignore "$arg"
+  echo "# $tag: linuxfs ignore lists: $(bounded 600 "$L" ignore | tr '\n' '|')"
   check "$tag: /etc/fstab has linuxfs's noauto entry" sh -c 'grep -q " rw,noauto # linuxfs\$" /etc/fstab'
   cleanup_disk
   log0=$(wc -l < /var/log/system.log 2> /dev/null | tr -d ' ')
@@ -267,18 +267,23 @@ noauto_cycle() {  # TAG IMAGE device|label LABEL
   disk=$(image_disk "$img"); disks=$disk
   mounted=
   for d in $(printf '%s\n' "$out" | awk '/^\/dev\/disk/ { print $1 }') $disk; do [ "$(info "$d" Mounted)" != Yes ] || mounted=$d; done
-  if [ $rc -ne 0 ] || [ -z "$mounted" ]; then ok "$tag: a plain attach mounted nothing (exit $rc: $(printf '%s' "$out" | tr '\n' ' '))"
+  if [ -z "$mounted" ]; then ok "$tag: a plain attach mounted nothing (exit $rc: $(printf '%s' "$out" | tr '\n' ' '))"
   else notok "$tag: a plain attach mounted $mounted"; fi
   sleep 3
-  check "$tag: DiskArbitration never ran the mount program for it (no linuxfs-mount in system.log)" sh -c '! tail -n +"$1" /var/log/system.log | grep -q "linuxfs-mount"' _ "$((${log0:-0} + 1))"
+  # anchored: system.log is readable and shows DiskArbitration probing the volume (linuxfs-fs's "claimed", from util -p) since
+  # log0, so the absence of linuxfs-mount after it means something
+  if [ -r /var/log/system.log ] && [ -n "$log0" ] && tail -n +"$((log0 + 1))" /var/log/system.log | grep "linuxfs-fs" | grep -q "claimed"; then
+    ok "$tag: DiskArbitration probed it (a linuxfs-fs claimed line in system.log since the attach)"
+    check "$tag: DiskArbitration never ran the mount program for it (no linuxfs-mount in system.log)" sh -c '! tail -n +"$1" /var/log/system.log | grep -q "linuxfs-mount"' _ "$((log0 + 1))"
+  else notok "$tag: system.log readable, with a linuxfs-fs claimed line since the attach (so the mount program's absence can be read)"; fi
   cleanup_disk
   if da_attach_nomount "$img"; then
     check "$tag: diskutil mount over ssh mounts it" bounded 600 diskutil mount "$disk"
     if da_wait 100; then ok "$tag: mounted at $mp by diskutil mount, the noauto entry notwithstanding"
     else notok "$tag: mounted within 10 s of diskutil mount"; tail -n 30 /var/log/system.log 2> /dev/null | grep 'linuxfs\|diskarbitrationd' | sed 's/^/# /'; fi
-    [ "$how" != device ] || check "$tag: linuxfs unignore $disk" "$L" unignore "$disk"
+    [ "$how" != device ] || check "$tag: linuxfs unignore $disk" bounded 600 "$L" unignore "$disk"
   else notok "$tag: hdiutil attach -nomount, again"; disk=$(image_disk "$img"); fi
-  [ "$how" != label ] || check "$tag: linuxfs unignore $lab" "$L" unignore "$lab"
+  [ "$how" != label ] || check "$tag: linuxfs unignore $lab" bounded 600 "$L" unignore "$lab"
   cleanup_disk
   check "$tag: /etc/fstab has no linuxfs entry left" sh -c '! grep -q "# linuxfs\$" /etc/fstab 2> /dev/null'
   if da_attach "$img"; then
@@ -291,7 +296,7 @@ noauto_cycle() {  # TAG IMAGE device|label LABEL
 noauto_leftover() {  # IMAGE
   grep -q "# linuxfs\$" /etc/fstab 2> /dev/null || return 0
   echo "# a linuxfs entry was left in /etc/fstab: $(grep '# linuxfs$' /etc/fstab | tr '\n' '|')"
-  if da_attach_nomount "$1"; then "$L" unignore "$disk" > /dev/null 2>&1; fi
+  if da_attach_nomount "$1"; then bounded 600 "$L" unignore "$disk" > /dev/null 2>&1; fi
   cleanup_disk
 }
 if cp "$W/img/ext4.img" "$W/img/da-ext4-noauto.img"; then
@@ -301,7 +306,7 @@ else notok "ignore ext4 by device: cannot copy ext4.img"; fi
 defaults write dev.mavergreen.linuxfs NTFSTakeover -bool true
 if cp "$W/img/ntfs.img" "$W/img/da-ntfs-noauto.img"; then
   noauto_cycle "ignore ntfs by label" "$W/img/da-ntfs-noauto.img" label Windows
-  "$L" unignore Windows > /dev/null 2>&1
+  bounded 600 "$L" unignore Windows > /dev/null 2>&1
 else notok "ignore ntfs by label: cannot copy ntfs.img"; fi
 defaults delete dev.mavergreen.linuxfs NTFSTakeover
 

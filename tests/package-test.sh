@@ -157,6 +157,7 @@ for c in mkdir chown chmod touch killall launchctl stat pgrep defaults sudo; do
   printf '#!/bin/sh\necho "%s $*" >> "$PH_DIR/calls"\n' "$c" > "$T/pbin/$c"
 done
 printf '[ "$*" != "-f %%Su /dev/console" ] || echo "${PH_USER:-}"\n' >> "$T/pbin/stat"
+printf '[ -z "${PH_LW:-}" ] || echo "$PH_LW"\n' >> "$T/pbin/pgrep"
 # the root helper's migration: a stub that prints what PH_MIGRATED holds, as DOMAIN<TAB>LABEL lines
 printf '#!/bin/sh\necho "helper $*" >> "$PH_DIR/calls"\n[ "$*" = --migrate-prefs ] && printf "%%b" "${PH_MIGRATED:-}"\n' > "$T/pbin/helper"
 chmod 755 "$T/pbin"/*
@@ -203,6 +204,16 @@ want "defaults delete /Library/Preferences/dev.mavergreen.linuxfs Automount" "Au
 want "sudo -u alice defaults delete dev.mavergreen.linuxfs Automount" "and from the user's"
 [ "$(grep -c 'defaults delete' "$T/calls")" = 4 ] || fail "postinstall deleted keys the helper did not convert: $(grep 'defaults delete' "$T/calls" | tr '\n' '|')"
 [ "$(tail -n 1 "$T/calls")" = "killall diskarbitrationd" ] || fail "postinstall does not restart diskarbitrationd after the migration"
+# spec: packaging/postinstall-hook -- with the user logged in, their keys go through their session (launchctl bsexec to the
+#       loginwindow, as for the agent), so their cfprefsd sees it; and the migration runs before the agent is (re)loaded, whose
+#       start tells of the Ignore:<LABEL> keys still there
+PH_LW=88 PH_USER=alice PH_MIGRATED='user\tmy data\n' run_post "root 0" "wheel 0" 250 1 || fail "postinstall failed migrating in a session"
+want "launchctl bsexec 88 sudo -u alice defaults delete dev.mavergreen.linuxfs Ignore:my data" "a converted user key is deleted in the user's session"
+want "launchctl bsexec 88 sudo -u alice defaults delete dev.mavergreen.linuxfs Automount" "and Automount in the user's session"
+! grep -q '^sudo -u alice defaults' "$T/calls" || fail "postinstall deleted the user's keys outside their session: $(grep '^sudo' "$T/calls" | tr '\n' '|')"
+mig=$(grep -n 'helper --migrate-prefs' "$T/calls" | cut -d: -f1); agl=$(grep -n 'launchctl bsexec 88 .*launchctl load .*agent.plist' "$T/calls" | cut -d: -f1)
+[ -n "$mig" ] && [ -n "$agl" ] && [ "$mig" -lt "$agl" ] || fail "postinstall loads the agent before the migration (migrate line $mig, agent load line $agl)"
+[ "$(grep -n 'Ignore:my data' "$T/calls" | cut -d: -f1)" -lt "$agl" ] || fail "postinstall loads the agent before deleting the converted keys"
 PH_USER=root run_post "root 0" "wheel 0" 250 1 || fail "postinstall failed with root at the console"
 grep -q 'sudo -u' "$T/calls" && fail "postinstall ran defaults as root for the user's domain"
 

@@ -489,8 +489,8 @@ noauto() { # --noauto-add SPEC BUNDLE | --noauto-remove SPEC
 }
 
 cmd_ignore() {
-  if [ $# -eq 0 ]; then   # the list: linuxfs's entries, their labels unescaped
-    [ ! -f "$FSTAB" ] || awk '/# linuxfs$/ { s = $1; gsub(/\\040/, " ", s); gsub(/\\011/, "\t", s); print s "\t" $3 }' "$FSTAB"
+  if [ $# -eq 0 ]; then   # the list: linuxfs's entries (as the helper reads them: see fstab.c), their labels unescaped
+    [ ! -f "$FSTAB" ] || awk '{ sub(/\r$/, "") } /[ \t]# linuxfs$/ { s = $1; gsub(/\\040/, " ", s); gsub(/\\011/, "\t", s); print s "\t" $3 }' "$FSTAB"
     return 0
   fi
   [ $# -eq 1 ] || usage
