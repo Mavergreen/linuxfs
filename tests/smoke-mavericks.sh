@@ -258,8 +258,14 @@ if cp "$W/img/ext4.img" "$W/img/da-ext4-off.img"; then
   cleanup_disk
   if da_attach_nomount "$img"; then
     ok "automount off: attached -nomount as $disk"
+    log1=$(wc -l < /var/log/system.log 2> /dev/null | tr -d ' ')
     check "automount off: diskutil mount mounts it" bounded 600 diskutil mount "$disk"
-    if da_wait 100; then ok "automount off: mounted at $mp after diskutil mount"; else notok "automount off: mounted within 10 s of diskutil mount"; fi
+    if da_wait 100; then ok "automount off: mounted at $mp after diskutil mount"
+    else
+      notok "automount off: mounted within 10 s of diskutil mount"
+      echo "# system.log since the diskutil mount (what DiskArbitration passed the mount program):"
+      tail -n +"$((${log1:-0} + 1))" /var/log/system.log 2> /dev/null | grep 'linuxfs\|diskarbitrationd' | sed 's/^/# /'
+    fi
   else notok "automount off: hdiutil attach -nomount"; disk=$(image_disk "$img"); fi
   cleanup_disk
 else notok "automount off: cannot copy ext4.img"; fi
@@ -289,14 +295,21 @@ for c in slash ctl; do
 done
 
 # spec: tests/smoke-mavericks.sh header -- the encrypted APFS fixture (password linuxfs-test), in its GPT wrapper (the keychain wants the partition's UUID)
-if gunzip -c "$IN/gpt-enc.img.gz" > "$W/gpt-enc.img" && da_attach "$W/gpt-enc.img"; then
-  ok "encrypted apfs: attached plainly as $disks"
+if gunzip -c "$IN/gpt-enc.img.gz" > "$W/gpt-enc.img"; then
+  # platform: 10.9 hdiutil attach blocks until the mount program returns, and the dialog takes up to 120 s, so the plain attach waits on the mount program's dialog, so it runs in the background while the screenshot is taken
+  hdiutil attach -imagekey diskimage-class=CRawDiskImage "$W/gpt-enc.img" > "$W/enc-attach.out" 2>&1 &
+  ap=$!
   sleep 5
   "$AQUA" screencapture -x "$OUT/apfs-dialog.png" > /dev/null 2>&1 && ok "encrypted apfs: screenshot apfs-dialog.png 5 s after the attach (the mount program's password dialog)" || notok "encrypted apfs: screencapture"
-  check "encrypted apfs: the mount program is waiting on its dialog, nothing mounted yet" sh -c 'pgrep -f mount_linuxfs_apfs > /dev/null && for d in $1; do [ "$(diskutil info "$d" 2>/dev/null | sed -n "s/^ *Mounted: *//p")" != Yes ] || exit 1; done' _ "$disks"
+  echo "# the dialog's process, if any: $(ps -axww -o user=,pid=,command= | grep -i 'UserNotificationCenter\|CFUserNotification' | grep -v grep | tr '\n' '|')"
+  check "encrypted apfs: the mount program is waiting on its dialog" pgrep -f mount_linuxfs_apfs
+  disk=$(image_disk "$W/gpt-enc.img")
+  disks="$disk $(diskutil list "$disk" 2> /dev/null | awk '{ print $NF }' | grep -E '^disk[0-9]+s[0-9]+$' | sed 's|^|/dev/|' | tr '\n' ' ')"
   # spec: tools/fs.c DIALOG_SECONDS -- the dialog times out after 120 s: exit 4, no mount
-  i=0; while pgrep -f mount_linuxfs_apfs > /dev/null && [ $i -lt 170 ]; do i=$((i + 1)); sleep 1; done
-  check "encrypted apfs: the dialog's timeout ended the mount program (after about ${i} s)" sh -c '! pgrep -f mount_linuxfs_apfs > /dev/null'
+  i=5; while kill -0 "$ap" 2> /dev/null && [ $i -lt 170 ]; do i=$((i + 1)); sleep 1; done
+  if kill -0 "$ap" 2> /dev/null; then notok "encrypted apfs: the attach was still waiting after 170 s"; kill "$ap" 2> /dev/null
+  else ok "encrypted apfs: the attach finished after about ${i} s ($(tr '\n' ' ' < "$W/enc-attach.out"))"; fi
+  check "encrypted apfs: the dialog's timeout ended the mount program" sh -c '! pgrep -f mount_linuxfs_apfs > /dev/null'
   check "encrypted apfs: and left nothing mounted (exit 4, no mount)" sh -c 'for d in $1; do [ "$(diskutil info "$d" 2>/dev/null | sed -n "s/^ *Mounted: *//p")" != Yes ] || exit 1; done' _ "$disks"
   echo "# system.log, linuxfs lines:"; grep -i 'linuxfs' /var/log/system.log 2> /dev/null | tail -n 8 | sed 's/^/# /'
   part=; for d in $disks; do case $(info "$d" 'File System Personality') in APFS) part=$d ;; esac; done
@@ -318,7 +331,7 @@ if gunzip -c "$IN/gpt-enc.img.gz" > "$W/gpt-enc.img" && da_attach "$W/gpt-enc.im
   else notok "encrypted apfs: attach again"; disk=$(image_disk "$W/gpt-enc.img"); fi
   cleanup_disk
   "$AQUA" security delete-generic-password -s dev.mavergreen.linuxfs -a "$UUID_PART" > /dev/null 2>&1
-else notok "encrypted apfs: unpack and attach the fixture"; disk=$(image_disk "$W/gpt-enc.img"); cleanup_disk; fi
+else notok "encrypted apfs: unpack the fixture"; fi
 rm -f "$W/gpt-enc.img"
 check "the keychain keeper is still running" pgrep -f "$P/libexec/linuxfs-agent"
 check "no lklfuse runs as root, after everything" no_root_lklfuse
@@ -341,26 +354,25 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
   sudo -n defaults write "$AD" AutomountDisksWithoutUserLogin -bool true
   sudo -n defaults delete "$LW" autoLoginUser
   sudo -n killall loginwindow
-  i=0; until [ "$(console)" != "$me" ]; do i=$((i + 1)); [ $i -le 60 ] || break; sleep 1; done
-  if [ "$(console)" != "$me" ]; then notok "before login: $me left the console (loginwindow was restarted)"; restore_login
-  else
-    ok "before login: the console is $(console), not $me"
-    out=$(sudo -n hdiutil attach -imagekey diskimage-class=CRawDiskImage "$W/img/login-ext4.img" 2>&1)
-    disks=$(printf '%s\n' "$out" | awk '/^\/dev\/disk/ { print $1 }' | tr '\n' ' '); disk=${disks%% *}
-    if [ -n "$disk" ] && da_wait 300; then
-      ok "before login: $dev mounted at $mp"
-      echo "# before login: $(stat -f '%Sp %Su' "$mp") is the mount's mode and owner (right after the mount); lklfuse:"
-      lklfuses | sed 's/^/# /'
-      check "before login: lklfuse runs as _linuxfs" sh -c '! [ -z "$(ps -axww -o user=,command= | awk "\$1 == \"_linuxfs\" && /lklfuse/")" ]'
-      check "before login: lklfuse mounted with allow_other" sh -c 'ps -axww -o command= | grep lklfuse | grep -F "$1" | grep -q allow_other' _ "$mp"
-      check "before login: no lklfuse runs as root" no_root_lklfuse
-      check "before login: the user can read and write the volume over ssh" rw_works "$mp"
-    else notok "before login: the ext4 image mounted within 30 s"; echo "$out" | sed 's/^/# /'; fi
+  i=0; until [ "$(console)" = root ]; do i=$((i + 1)); [ $i -le 30 ] || break; sleep 1; done
+  if [ "$(console)" = root ]; then ok "before login: the console is root's (the login window), after about $i s"
+  else notok "before login: /dev/console is still owned by $(console) after 30 s (loginwindow restarted; the checks below may not be before-login)"; fi
+  sudo -n screencapture -x "$OUT/before-login.png" > /dev/null 2>&1 && echo "# before-login.png taken as root" || echo "# NOTE: screencapture as root over ssh failed; no before-login.png"
+  out=$(sudo -n hdiutil attach -imagekey diskimage-class=CRawDiskImage "$W/img/login-ext4.img" 2>&1)
+  disks=$(printf '%s\n' "$out" | awk '/^\/dev\/disk/ { print $1 }' | tr '\n' ' '); disk=${disks%% *}
+  if [ -n "$disk" ] && da_wait 300; then
+    ok "before login: $dev mounted at $mp"
+    echo "# before login: $(stat -f '%Sp %Su' "$mp") is the mount's mode and owner (right after the mount); lklfuse:"
+    lklfuses | sed 's/^/# /'
+    check "before login: lklfuse runs as _linuxfs" sh -c '! [ -z "$(ps -axww -o user=,command= | awk "\$1 == \"_linuxfs\" && /lklfuse/")" ]'
+    check "before login: lklfuse mounted with allow_other" sh -c 'ps -axww -o command= | grep lklfuse | grep -F "$1" | grep -q allow_other' _ "$mp"
+    check "before login: no lklfuse runs as root" no_root_lklfuse
+    check "before login: the user can read and write the volume over ssh" rw_works "$mp"
+  else notok "before login: the ext4 image mounted within 30 s"; echo "$out" | sed 's/^/# /'; fi
     restore_login
     # platform: 10.9 has no re-login without a reboot, and mavericks-vm has no mid-job reboot, so the user's return is not asked
     echo "# SKIP user return: mavericks-vm cannot re-login without a reboot (shipyard queued it); autoLoginUser is restored"
     [ -z "$disk" ] || { bounded 600 sudo -n diskutil eject "$disk" > /dev/null 2>&1 || notok "before login: eject"; }
     disk=
-  fi
 else notok "before login: no autoLoginUser to restore, or no sudo; the before-login checks cannot run safely"; fi
 finish

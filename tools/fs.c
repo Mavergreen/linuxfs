@@ -940,6 +940,28 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 #endif
 }
 
+/* What DiskArbitration passed: the arguments after the program name, joined by spaces and cut at 200 bytes. They hold the device,
+ * the mount point and the -o options, and never a password. */
+static void log_request(const char *fs, int argc, char **argv)
+{
+	char line[208];
+	size_t n = 0;
+	int i;
+
+	line[0] = '\0';
+	for (i = 1; i < argc && n < 200; i++) {
+		int w = snprintf(line + n, 201 - n, "%s%s", i > 1 ? " " : "", argv[i]);
+
+		if (w < 0)
+			break;
+		n += (size_t)w;
+	}
+	if (n > 200)
+		n = 200;
+	line[n] = '\0';
+	syslog(LOG_NOTICE, "mount_%s: arguments: %s", fs, line);
+}
+
 static int mount_role(const char *fs, int argc, char **argv)
 {
 	struct mountreq req;
@@ -949,11 +971,13 @@ static int mount_role(const char *fs, int argc, char **argv)
 	int rc, wrong = 0, tries, saved = 0, remember;
 
 	openlog("linuxfs-mount", LOG_PID, LOG_DAEMON);
+	log_request(fs, argc, argv);
 	if (fsrules_parse_mount(argc - 1, argv + 1, &req) != 0) {
 		fprintf(stderr, "usage: mount_linuxfs_%s [-o options] device mountpoint\n", fs);
 		syslog(LOG_NOTICE, "mount_%s: bad arguments", fs);
 		return 1;
 	}
+	syslog(LOG_NOTICE, "mount_%s: parsed asked=%d ro=%d", fs, req.asked, req.ro);
 #ifdef LINUXFS_FS_TEST_DROP
 	if (1)
 #else
