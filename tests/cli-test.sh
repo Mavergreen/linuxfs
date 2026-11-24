@@ -7,6 +7,17 @@ set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d "${TMPDIR:-/tmp}/cli-test.XXXXXX"); T=$(cd "$T" && pwd); trap 'pkill -f "$T/bin/lklfuse" 2>/dev/null; rm -rf "$T"' EXIT
 mkdir -p "$T/bin" "$T/Volumes"; : > "$T/mtab"
+# spec: tools/fsrules.h fsrules_access -- the stand-in prober answers --access with the real one (tools/probe.c and fsrules.c),
+#       so the rule the CLI follows here is the one the root mount program follows
+if [ "$(uname -s)" = Linux ]; then
+  cc -O2 -Wall -Werror -o "$T/realprobe" "$ROOT/tools/probe.c" "$ROOT/tools/fsrules.c" || exit 1
+else
+  . "$ROOT/build/msc.sh"
+  CL=$(sh "$SHIPYARD_SCRIPTS/fetch_clang22.sh" "$ROOT/components/clang22" 2>/dev/null) || exit 1
+  SDK=$(sh "$SHIPYARD_SCRIPTS/fetch_sdk.sh" 2>/dev/null) || exit 1
+  "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld \
+    -o "$T/realprobe" "$ROOT/tools/probe.c" "$ROOT/tools/fsrules.c" || exit 1
+fi
 cat > "$T/bin/mount" <<EOF
 #!/bin/sh
 cat "$T/mtab"
@@ -15,6 +26,7 @@ cat > "$T/bin/lklfuse" <<EOF
 #!/bin/sh
 echo "\$*" >> "$T/calls"
 mnt=\$(eval echo "\\\${\$#}")
+case "\$mnt" in /dev/fd/*) fdn=\${mnt#/dev/fd/}; if { true >&"\$fdn"; } 2>/dev/null; then echo "fd \$fdn open" >> "$T/fdcalls"; else echo "fd \$fdn closed" >> "$T/fdcalls"; fi; mnt=\$FAKE_FD_MNT ;; esac
 case "\${FAKE_MODE:-ok}" in
   dirty) case "\$*" in *,ro\ *|*,ro) ;; *) echo "ntfs3: volume is dirty and \"force\" flag is not set!"; exit 1 ;; esac ;;
   locked) echo "unable to exclusively lock /tmp/x.lock: Resource temporarily unavailable"; exit 2 ;;
@@ -23,19 +35,25 @@ if [ -n "\${FAKE_ENCRYPTED:-}" ]; then
   case "\$*" in
     *passfd=5*) IFS= read -r got <&5 || got=; printf '%s\n' "\$got" > "$T/pwgot"
       [ "\$got" = "\$FAKE_ENCRYPTED" ] || { echo "APFS: wrong password for the encrypted volume (hint: test)"; echo "can't mount disk: Key was rejected by service"; exit 1; } ;;
-    *) echo "APFS: volume is encrypted: mount it with its password"; echo "can't mount disk: Required key not available"; exit 1 ;;
+    *) echo "APFS: volume is encrypted: mount it with its password (hint: test)"; echo "can't mount disk: Required key not available"; exit 1 ;;
   esac
   case "\$*" in *opts=readwrite*) echo "APFS: an encrypted volume can only be mounted read-only"; echo "can't mount disk: Read-only file system"; exit 1 ;; esac
 fi
 lock=\$(echo "\$*" | tr , "\\n" | sed -n "s/^lock=//p")
-mkdir "\$lock.held" 2>/dev/null || { echo "unable to exclusively lock \$lock: Resource temporarily unavailable"; exit 2; }
-trap 'rmdir "\$lock.held"' EXIT
+case "\$lock" in
+  /dev/fd/*) ;;   # the opener holds it, as its own descriptor
+  *) mkdir "\$lock.held" 2>/dev/null || { echo "unable to exclusively lock \$lock: Resource temporarily unavailable"; exit 2; }
+     trap 'rmdir "\$lock.held"' EXIT ;;
+esac
 echo "linuxfs@x on \$mnt (macfuse, local, nodev, nosuid, synchronous, mounted by me)" >> "$T/mtab"
 while grep -qF " on \$mnt (" "$T/mtab"; do sleep 0.1; done
 exit 0
 EOF
 cat > "$T/bin/probe" <<EOF
 #!/bin/sh
+if [ "\$1" = --access ]; then echo "\$*" >> "$T/accesscalls"; exec "$T/realprobe" "\$@"; fi
+if [ "\$1" = --uuid ]; then [ -n "\${FAKE_UUID:-}" ] || exit 1; echo "\$FAKE_UUID"; exit 0; fi
+echo "\$1" >> "$T/probecalls"
 case "\$1" in */rdisk3) echo unknown; exit 1 ;; esac
 if [ -n "\${FAKE_FUSION:-}" ]; then
   case "\$1" in
@@ -46,7 +64,7 @@ fi
 case "\${FAKE_PROBE:-ext4}" in
   none) echo unknown; exit 1 ;;
   unreadable) exit 2 ;;
-  *) printf '%s\t%s\n' "\${FAKE_PROBE:-ext4}" "\${FAKE_LABEL-my data}" ;;
+  *) printf '%s\t%s%s\n' "\${FAKE_PROBE:-ext4}" "\${FAKE_LABEL-my data}" "\${FAKE_FLAGS:+\$(printf '\t\t%s' "\$FAKE_FLAGS")}" ;;
 esac
 EOF
 cat > "$T/bin/diskutil" <<EOF
@@ -54,6 +72,12 @@ cat > "$T/bin/diskutil" <<EOF
 case "\$1" in
   unmount) if [ "\$2" = force ]; then echo "diskutil unmount force \$3" >> "$T/calls"; shift; else [ -z "\${FAKE_BUSY:-}" ] || exit 1; fi
            grep -vF " on \$2 (" "$T/mtab" > "$T/mtab.new"; mv "$T/mtab.new" "$T/mtab"; echo "Unmount successful for \$2" ;;
+  mount) shift; echo "diskutil mount \$*" >> "$T/dcalls"
+         if [ "\${FAKE_DISKUTIL:-}" = busy ]; then echo "Volume on disk5 failed to mount: resource busy" >&2; exit 1; fi
+         if [ "\${FAKE_DISKUTIL:-}" = already ]; then echo "Volume on disk5 failed to mount; it is already mounted" >&2; exit 1; fi
+         echo "Volume NAME on \${2:-\$1} mounted" ;;
+  info) printf '%s\n' "   Device Identifier:         \$2"
+        case "\${FAKE_INFO:-}" in none) echo "   Mount Point:" ;; space) echo "   Mount Point:               /Volumes/My Disk" ;; *) echo "   Mount Point:               /Volumes/Fresh" ;; esac ;;
   list) printf '%s\n' "/dev/disk3" "   #:  TYPE NAME  SIZE  IDENTIFIER" "   0:  GUID_partition_scheme  *16 GB  disk3" "   1:  Linux  data  8.0 GB  disk3s1" "   2:  Microsoft Basic Data  win  8.0 GB  disk3s2" "/dev/disk4" "   #:  TYPE NAME  SIZE  IDENTIFIER" "   0:  stick  *4.0 GB  disk4" ;;
 esac
 EOF
@@ -75,6 +99,12 @@ cat > "$T/bin/lsof" <<EOF
 #!/bin/sh
 echo "Finder 187 me cwd DIR 1,5 0 1 \$(tail -n 1 "$T/mtab" | sed 's/^.* on \(.*\) (.*/\1/')/d"
 EOF
+cat > "$T/bin/agent" <<EOF
+#!/bin/sh
+echo "agent \$*" >> "$T/dcalls"
+cat > "$T/agent.pw"
+exit \${FAKE_AGENT_RC:-0}
+EOF
 chmod 755 "$T/bin"/*
 # platform: cli/linuxfs is macOS-only and leans on two BSD behaviours GNU coreutils lacks: stat -f FORMAT, and cut -c
 #           counting characters, not bytes, in a UTF-8 locale. Off macOS these stand-ins supply both (stat's two formats
@@ -94,6 +124,7 @@ EOF2
   chmod +x "$T/bin/stat" "$T/bin/cut"
 fi
 export PATH="$T/bin:$PATH" LINUXFS_LKLFUSE="$T/bin/lklfuse" LINUXFS_PROBE="$T/bin/probe" LINUXFS_OPEN="$T/none"
+export LINUXFS_MACHINE_DOMAIN=test.machine LINUXFS_AGENT="$T/bin/agent"
 export LINUXFS_DOMAIN=test.linuxfs LINUXFS_STATE="$T/state" LINUXFS_LOGS="$T/logs" LINUXFS_VOLUMES="$T/Volumes" LINUXFS_LOCKS="$T/locks" LINUXFS_WAIT=50
 L=$ROOT/cli/linuxfs
 n=0 bad=0
@@ -149,6 +180,10 @@ case $c in *allow_other,*|*,allow_other\ *|*'\'*) r=1 ;; *) r=0 ;; esac; ok $r "
 case $c in *"volname=x-allow_other-,"*) r=0 ;; *) r=1 ;; esac; ok $r "commas, equals signs and backslashes in the label become -"
 case $c in *"fsname=linuxfs@a-b-c.img,"*) r=0 ;; *) r=1 ;; esac; ok $r "and in the image's name"
 sh "$L" unmount "$T/a,b=c.img" > /dev/null 2>&1
+out=$(FAKE_LABEL="$(printf 'a\033b\177c\rd')" sh "$L" mount "$T/img" 2>&1)
+c=$(last)
+case $c in *"volname=a-b-c-d,"*) r=0 ;; *) r=1 ;; esac; ok $r "control characters in the label become - (got: $c)"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
 mkdir -p "$T/home"
 (unset LINUXFS_LOCKS; HOME=$T/home sh "$L" mount "$T/img" > /dev/null 2>&1)
 case $(last) in *"lock=$T/home/Library/Caches/dev.mavergreen.linuxfs/locks/linuxfs-image-"*) r=0 ;; *) r=1 ;; esac
@@ -164,6 +199,13 @@ out=$(FAKE_PROBE=ntfs3 FAKE_LABEL=Win FAKE_MODE=dirty sh "$L" mount "$T/img" 2>&
 ok $? "a dirty NTFS volume mounts read-only, and says so"
 case $(last) in *,ro\ *) r=0 ;; *) r=1 ;; esac; ok $r "the retry passes ro"
 sh "$L" unmount "$T/img" > /dev/null 2>&1
+# spec: tools/fsrules.h fsrules_access -- what the probe says (its fourth field) decides at once, by the root mount program's rule
+: > "$T/calls"; : > "$T/accesscalls"
+out=$(FAKE_PROBE=ntfs3 FAKE_LABEL=Win FAKE_FLAGS=dirty FAKE_MODE=dirty sh "$L" mount "$T/img" 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(grep -c . "$T/calls")" = 1 ] && echo "$out" | grep -q "dirty NTFS volume" && case $(last) in *,ro\ *) true ;; *) false ;; esac
+ok $? "a volume the probe calls dirty mounts read-only at once: one lklfuse, with ro, and it says why (rc $rc: $(tr '\n' '|' < "$T/calls"))"
+grep -qx -- "--access ntfs3  dirty" "$T/accesscalls"; ok $? "the CLI asks linuxfs-probe --access with the probe's type, Fusion role and flags ($(tr '\n' '|' < "$T/accesscalls"))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
 
 out=$(FAKE_MODE=locked sh "$L" mount "$T/img" 2>&1); rc=$?
 [ $rc -eq 1 ] && echo "$out" | grep -q "already mounted by linuxfs" && [ ! -e "$T/Volumes/my data" ]
@@ -171,28 +213,37 @@ ok $? "a locked source is refused as already mounted, and the made mount point i
 out=$(FAKE_PROBE=none sh "$L" mount "$T/img" 2>&1); rc=$?
 [ $rc -eq 1 ] && echo "$out" | grep -q "no filesystem linuxfs knows"; ok $? "an unknown filesystem is refused"
 echo "/dev/disk3s2 on /Volumes/win (ntfs, local, read-only)" >> "$T/mtab"
-out=$(sh "$L" mount disk3s2 2>&1); rc=$?
+out=$(LINUXFS_DA=1 sh "$L" mount disk3s2 2>&1); rc=$?
 [ $rc -eq 1 ] && echo "$out" | grep -q "mounted by the Mac at /Volumes/win"; ok $? "a device the Mac has mounted is refused"
-out=$(sh "$L" mount /dev/disk3s1 2>&1); rc=$?
+out=$(LINUXFS_DA=1 sh "$L" mount /dev/disk3s1 2>&1); rc=$?
 [ $rc -eq 1 ] && echo "$out" | grep -q "helper"; ok $? "an unreadable device without the helper is refused, naming the helper"
 cat > "$T/bin/open" <<EOF
 #!/bin/sh
 echo "open \$*" >> "$T/calls"
+echo "\${LINUXFS_OPEN_INHERITED:-0}" >> "$T/openenv"
+case "\$1:\$2" in --probe:*/rdisk4) [ -z "\${FAKE_OPEN_SLEEP:-}" ] || sleep "\$FAKE_OPEN_SLEEP" ;; esac
 if [ "\$1" = --probe ] && [ -n "\${FAKE_FUSION:-}" ]; then
   case "\$2" in
     */rdisk3s1) printf 'apfs\tFused\tfusion-main 00112233445566778899aabbccddeeff\n'; exit 0 ;;
-    */rdisk4) [ "\$FAKE_FUSION" = notier2 ] || { printf 'apfs\t\tfusion-tier2 00112233445566778899aabbccddeeff\n'; exit 0; } ;;
+    */rdisk4) { [ "\$FAKE_FUSION" = notier2 ] && [ ! -e "$T/tier2here" ]; } || { printf 'apfs\t\tfusion-tier2 00112233445566778899aabbccddeeff\n'; exit 0; } ;;
   esac
   echo unknown; exit 1
 fi
-if [ "\$1" = --probe ]; then t=\${FAKE_PROBE:-ext4}; [ "\$t" != unreadable ] || t=ext4; printf '%s\t%s\n' "\$t" helped; exit 0; fi
-[ "\$1" != --ro ] || shift
+if [ "\$1" = --probe ] && [ -n "\${FAKE_OPEN_EAT:-}" ]; then cat > /dev/null; fi
+if [ "\$1" = --probe ]; then t=\${FAKE_PROBE:-ext4}; [ "\$t" != unreadable ] || t=ext4; printf '%s\t%s%s\n' "\$t" "\${FAKE_OPEN_LABEL-helped}" "\${FAKE_FLAGS:+\$(printf '\t\t%s' "\$FAKE_FLAGS")}"; exit 0; fi
+if [ "\$1" = --uuid ]; then [ -n "\${FAKE_UUID:-}" ] || { echo "linuxfs-open: \$2: this filesystem has no UUID" >&2; exit 1; }; echo "\$FAKE_UUID"; exit 0; fi
+case "\$1" in --noauto-add|--noauto-remove)
+  printf '%s\n' "\$*" >> "$T/noauto"
+  [ -z "\${FAKE_NOAUTO_NO:-}" ] || { echo "linuxfs-open: \$FAKE_NOAUTO_NO" >&2; exit 1; }
+  exit 0 ;;
+esac
+while :; do case "\$1" in --fuse-chan|--lock) shift 2 ;; --ro) shift ;; *) break ;; esac; done
 shift
 [ "\$1" != --also ] || shift 2
 exec "\$@"
 EOF
 chmod 755 "$T/bin/open"
-out=$(LINUXFS_OPEN="$T/bin/open" sh "$L" mount /dev/disk3s1 2>&1); rc=$?
+out=$(LINUXFS_OPEN="$T/bin/open" LINUXFS_DA=1 sh "$L" mount /dev/disk3s1 2>&1); rc=$?
 [ $rc -eq 0 ] && [ "$out" = "$T/Volumes/helped" ]; ok $? "a device mounts through the helper's linuxfs-open (got '$out')"
 grep -q "^open /dev/rdisk3s1 $T/bin/lklfuse -f -o .* /dev/fd/3 $T/Volumes/helped\$" "$T/calls"
 ok $? "lklfuse gets the raw device's descriptor as /dev/fd/3"
@@ -200,7 +251,7 @@ grep -q "lock=$T/locks/linuxfs-rdisk3s1.lock" "$T/calls"; ok $? "the lock is nam
 LINUXFS_OPEN="$T/bin/open" sh "$L" unmount disk3s1 > /dev/null 2>&1; ok $? "unmount by device name"
 # spec: cli/linuxfs --
 #       a whole disk being ejected (the agent, P3-2): what linuxfs mounted from its partitions is unmounted
-mnt=$(LINUXFS_OPEN="$T/bin/open" sh "$L" mount /dev/disk3s1 2>/dev/null)
+mnt=$(LINUXFS_OPEN="$T/bin/open" LINUXFS_DA=1 sh "$L" mount /dev/disk3s1 2>/dev/null)
 LINUXFS_OPEN="$T/bin/open" sh "$L" unmount --force disk3 > /dev/null 2>&1; rc=$?
 [ $rc -eq 0 ] && ! grep -qF "on $mnt (" "$T/mtab" && [ "$(sh "$L" status | grep -c "/dev/rdisk3s1")" = 0 ]
 ok $? "unmount of a whole disk unmounts its partitions' volumes ($rc)"
@@ -209,13 +260,13 @@ sh "$L" unmount --force disk3 > /dev/null 2>&1; [ $? -ne 0 ]; ok $? "and with no
 #       review M6: an image attached with hdiutil is the same disk as the image file, so both take the image's lock
 imglock=image-$(ls -i "$T/img" | awk '{ print $1 }')-$(stat -f %d "$T/img")
 : > "$T/calls"
-out=$(FAKE_HDIUTIL_IMAGE="$T/img" LINUXFS_OPEN="$T/bin/open" sh "$L" mount /dev/disk7 2>&1)
+out=$(FAKE_HDIUTIL_IMAGE="$T/img" LINUXFS_OPEN="$T/bin/open" LINUXFS_DA=1 sh "$L" mount /dev/disk7 2>&1)
 grep -q "lock=$T/locks/linuxfs-$imglock.lock" "$T/calls"; ok $? "an attached image's device takes the image file's lock (M6)"
 LINUXFS_OPEN="$T/bin/open" sh "$L" unmount disk7 > /dev/null 2>&1; : > "$T/calls"
-out=$(FAKE_HDIUTIL_IMAGE="$T/img" LINUXFS_OPEN="$T/bin/open" sh "$L" mount /dev/disk7s2 2>&1)
+out=$(FAKE_HDIUTIL_IMAGE="$T/img" LINUXFS_OPEN="$T/bin/open" LINUXFS_DA=1 sh "$L" mount /dev/disk7s2 2>&1)
 grep -q "lock=$T/locks/linuxfs-$imglock-s2.lock" "$T/calls"; ok $? "and its partition, that lock with the partition's number"
 LINUXFS_OPEN="$T/bin/open" sh "$L" unmount disk7s2 > /dev/null 2>&1
-out=$(LINUXFS_OPEN="$T/bin/open" FAKE_PROBE=ntfs3 FAKE_MODE=dirty sh "$L" mount /dev/disk3s1 2>&1); rc=$?
+out=$(LINUXFS_OPEN="$T/bin/open" FAKE_PROBE=ntfs3 FAKE_MODE=dirty LINUXFS_DA=1 sh "$L" mount /dev/disk3s1 2>&1); rc=$?
 [ $rc -eq 0 ] && grep -q "^open --ro /dev/rdisk3s1 " "$T/calls"; ok $? "a dirty NTFS device is opened read-only for the retry"
 LINUXFS_OPEN="$T/bin/open" sh "$L" unmount /dev/rdisk3s1 > /dev/null 2>&1
 out=$(FAKE_PROBE=unreadable LINUXFS_OPEN="$T/bin/open" sh "$L" list 2>&1)
@@ -225,6 +276,8 @@ echo "$out" | grep -q "^/dev/disk4	ext4	data	-\$" && ! echo "$out" | grep -q "^/
 ok $? "list shows a disk with no partition table (a superfloppy, an attached image), not a partitioned one"
 echo "$out" | grep -q "^/dev/disk3s1	ext4	data	-\$" && echo "$out" | grep -q "^/dev/disk3s2	ext4	data	/Volumes/win\$"
 ok $? "list probes each partition and shows the Mac's mount (got: $(echo "$out" | tr '\n' '|'))"
+out=$(FAKE_PROBE=ntfs3 FAKE_LABEL=data FAKE_FLAGS=dirty sh "$L" list 2>&1)
+echo "$out" | grep -q "^/dev/disk3s1	ntfs3	data	-\$"; ok $? "list shows the type and label only, not the probe's flags (got: $(echo "$out" | grep disk3s1 | tr '\t' ' '))"
 cat > "$T/bin/defaults" <<EOF
 #!/bin/sh
 f="$T/defaults.\$2"; touch "\$f"
@@ -238,20 +291,27 @@ esac
 EOF
 chmod 755 "$T/bin/defaults"
 out=$(sh "$L" prefs)
-echo "$out" | grep -q "^Automount	on\$" && echo "$out" | grep -q "^ReadOnly	off\$" && echo "$out" | grep -q "^NTFSTakeover	off\$"
-ok $? "prefs shows the defaults: Automount on, ReadOnly off, NTFSTakeover off (got: $(echo "$out" | tr '\n' '|'))"
+echo "$out" | grep -q "^ReadOnly	off\$" && echo "$out" | grep -q "^NTFSTakeover	off\$" && ! echo "$out" | grep -q Automount
+ok $? "prefs shows the defaults: ReadOnly off, NTFSTakeover off, and no Automount (got: $(echo "$out" | tr '\n' '|'))"
+# spec: cli/linuxfs -- the global Automount is gone; a volume is kept from mounting by itself with linuxfs ignore (/etc/fstab noauto)
+for v in off on; do
+  out=$(sh "$L" prefs Automount $v 2>&1); rc=$?
+  [ $rc -eq 2 ] && [ "$out" = "linuxfs: Automount is gone: to keep one volume from mounting by itself, use linuxfs ignore" ]
+  ok $? "prefs Automount $v exits 2, pointing at linuxfs ignore (got $rc: '$out')"
+done
+[ "$(sh "$L" prefs Automount 2>&1)" = "linuxfs: Automount is gone: to keep one volume from mounting by itself, use linuxfs ignore" ]; ok $? "so does prefs Automount alone"
+! grep -q Automount "$T/defaults.test.linuxfs" 2>/dev/null; ok $? "and nothing is written"
 sh "$L" prefs NTFSTakeover on && sh "$L" prefs | grep -q "^NTFSTakeover	on\$"; ok $? "prefs KEY on sets it"
 sh "$L" prefs Frobs on > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "an unknown preference is misuse"
 sh "$L" prefs ReadOnly maybe > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "a value other than on or off is misuse"
-sh "$L" ignore "my data" && sh "$L" prefs | grep -q "^Ignore	my data\$"; ok $? "ignore LABEL opts a volume out, and prefs lists it"
 LO="$T/bin/open"
+: > "$T/dcalls"
 out=$(LINUXFS_OPEN=$LO FAKE_PROBE=ext4 sh "$L" automount disk3s1 2>&1); rc=$?
-[ $rc -eq 0 ] && [ "$out" = "$T/Volumes/helped" ]; ok $? "automount mounts a Linux partition (got '$out')"
-LINUXFS_OPEN=$LO sh "$L" unmount disk3s1 > /dev/null 2>&1
-sh "$L" ignore helped
+[ $rc -eq 0 ] && [ "$(cat "$T/dcalls")" = "diskutil mount disk3s1" ]; ok $? "automount asks diskutil to mount a Linux partition (got '$out')"
+defaults write test.linuxfs Automount -bool false; defaults write test.linuxfs "Ignore:helped" -bool true; : > "$T/dcalls"
 out=$(LINUXFS_OPEN=$LO sh "$L" automount disk3s1 2>&1); rc=$?
-[ $rc -eq 3 ] && ! grep -qF " on $T/Volumes/helped (" "$T/mtab"; ok $? "automount skips an ignored volume (exit 3)"
-sh "$L" unignore helped; sh "$L" prefs | grep -q "^Ignore	helped\$"; [ $? -ne 0 ]; ok $? "unignore takes it back"
+[ $rc -eq 0 ] && [ "$(cat "$T/dcalls")" = "diskutil mount disk3s1" ]; ok $? "automount reads no stale Automount or Ignore:<LABEL> (the agent's sweep checks /etc/fstab) (got $rc)"
+defaults delete test.linuxfs Automount; defaults delete test.linuxfs "Ignore:helped"
 for t in exfat vfat; do
   LINUXFS_OPEN=$LO FAKE_PROBE=$t sh "$L" automount disk3s1 > /dev/null 2>&1; [ $? -eq 3 ]; ok $? "automount leaves $t to the Mac"
 done
@@ -259,16 +319,8 @@ sh "$L" prefs NTFSTakeover off
 LINUXFS_OPEN=$LO FAKE_PROBE=ntfs3 sh "$L" automount disk3s1 > /dev/null 2>&1; [ $? -eq 3 ]; ok $? "automount leaves NTFS to the Mac unless NTFSTakeover is on"
 sh "$L" prefs NTFSTakeover on
 out=$(LINUXFS_OPEN=$LO FAKE_PROBE=ntfs3 sh "$L" automount disk3s1 2>&1); ok $? "with NTFSTakeover on, automount takes NTFS ($out)"
-LINUXFS_OPEN=$LO sh "$L" unmount disk3s1 > /dev/null 2>&1
-sh "$L" prefs ReadOnly on
-LINUXFS_OPEN=$LO sh "$L" automount disk3s1 > /dev/null 2>&1
-case $(last) in *,ro\ *) r=0 ;; *) r=1 ;; esac; ok $r "with ReadOnly on, automount mounts read-only"
-LINUXFS_OPEN=$LO sh "$L" unmount disk3s1 > /dev/null 2>&1
-sh "$L" prefs ReadOnly off; sh "$L" prefs Automount off
-LINUXFS_OPEN=$LO sh "$L" automount disk3s1 > /dev/null 2>&1; [ $? -eq 3 ]; ok $? "with Automount off, automount does nothing (exit 3)"
-sh "$L" prefs Automount on
 LINUXFS_OPEN=$LO sh "$L" automount "$T/img" > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "automount takes only a disk"
-LINUXFS_OPEN=$LO sh "$L" mount disk3s1 > /dev/null 2>&1
+LINUXFS_OPEN=$LO LINUXFS_DA=1 sh "$L" mount disk3s1 > /dev/null 2>&1
 FAKE_BUSY=1 LINUXFS_OPEN=$LO sh "$L" unmount --force disk3s1 > /dev/null 2>&1; rc=$?
 [ $rc -eq 0 ] && grep -q "^umount -f $T/Volumes/helped\$" "$T/calls" && ! grep -q "^diskutil unmount force" "$T/calls" && [ ! -e "$T/Volumes/helped" ]
 ok $? "unmount --force unmounts a busy volume (a yanked disk) with umount -f, not through DiskArbitration (P3-3)"
@@ -290,8 +342,13 @@ sh "$L" unmount "$T/img" > /dev/null 2>&1
 FAKE_PROBE=apfs sh "$L" mount --ro "$T/img" > /dev/null 2>&1
 case $(last) in *opts=readwrite*) r=1 ;; *,ro\ *) r=0 ;; *) r=1 ;; esac; ok $r "--ro still mounts APFS read-only, without readwrite"
 sh "$L" unmount "$T/img" > /dev/null 2>&1
+: > "$T/calls"
+out=$(printf 's3cret\n' | FAKE_PROBE=apfs FAKE_FLAGS=encrypted FAKE_ENCRYPTED=s3cret sh "$L" mount "$T/img" --password-stdin 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(grep -c . "$T/calls")" = 1 ] && ! grep -q readwrite "$T/calls" && echo "$out" | grep -q "encrypted APFS volume, which linuxfs mounts read-only" && ! echo "$out" | grep -qi experimental
+ok $? "with APFSWrite on, a volume the probe calls encrypted mounts read-only at once, saying why (rc $rc: $(tr '\n' '|' < "$T/calls"))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
 sh "$L" prefs APFSWrite off
-LINUXFS_OPEN=$LO FAKE_PROBE=apfs sh "$L" automount disk3s1 > /dev/null 2>&1; ok $? "automount takes APFS"
+LINUXFS_DA=1 LINUXFS_OPEN=$LO FAKE_PROBE=apfs sh "$L" mount disk3s1 > /dev/null 2>&1; ok $? "a device mount takes APFS"
 grep "^open " "$T/calls" | grep -v -- "--probe" | tail -n 1 | grep -q "^open --ro /dev/rdisk3s1 "; ok $? "and asks the helper for a read-only descriptor"
 LINUXFS_OPEN=$LO sh "$L" unmount disk3s1 > /dev/null 2>&1
 # spec: cli/linuxfs --
@@ -306,12 +363,13 @@ out=$(FAKE_FUSION=1 sh "$L" mount "$T/ssd.img" 2>&1); rc=$?
 out=$(FAKE_FUSION=1 sh "$L" mount "$T/hdd.img" 2>&1); rc=$?
 [ $rc -ne 0 ] && echo "$out" | grep -q "second device of an APFS Fusion container"; ok $? "the second device alone is refused, saying what it is"
 : > "$T/calls"
-out=$(FAKE_FUSION=1 LINUXFS_OPEN="$T/bin/open" sh "$L" mount /dev/disk3s1 2>&1); rc=$?
+out=$(FAKE_FUSION=1 LINUXFS_OPEN="$T/bin/open" LINUXFS_DA=1 sh "$L" mount /dev/disk3s1 2>&1); rc=$?
 grep "^open " "$T/calls" | grep -v -- --probe | grep -q "^open --ro /dev/rdisk3s1 --also /dev/rdisk4 $T/bin/lklfuse -f -o .*tier2file=/dev/fd/4.* /dev/fd/3 "
 ok $? "a Fusion disk finds its second device among the attached disks, and the helper opens both (got '$out')"
 LINUXFS_OPEN="$T/bin/open" sh "$L" unmount disk3s1 > /dev/null 2>&1; : > "$T/calls"
+: > "$T/dcalls"
 FAKE_FUSION=1 LINUXFS_OPEN="$T/bin/open" sh "$L" automount disk4 > /dev/null 2>&1
-grep "^open " "$T/calls" | grep -v -- --probe | grep -q "^open --ro /dev/rdisk3s1 --also /dev/rdisk4 "; ok $? "automount of the second device mounts the container from its main device"
+[ "$(cat "$T/dcalls")" = "diskutil mount disk3s1" ]; ok $? "automount of the second device mounts the container from its main device"
 LINUXFS_OPEN="$T/bin/open" sh "$L" unmount disk3s1 > /dev/null 2>&1
 FAKE_FUSION=notier2 LINUXFS_OPEN="$T/bin/open" sh "$L" automount disk3s1 > /dev/null 2>&1; [ $? -eq 3 ]; ok $? "automount of a main device whose second is not attached yet waits (exit 3)"
 # spec: cli/linuxfs --
@@ -319,6 +377,7 @@ FAKE_FUSION=notier2 LINUXFS_OPEN="$T/bin/open" sh "$L" automount disk3s1 > /dev/
 : > "$T/enc.img"; : > "$T/calls"
 out=$(FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret sh "$L" mount "$T/enc.img" < /dev/null 2>&1); rc=$?
 [ $rc -eq 4 ] && echo "$out" | grep -q -- "--password-stdin"; ok $? "an encrypted volume with no terminal to ask at exits 4, saying how to give the password (got $rc: '$out')"
+echo "$out" | grep -q "(hint: test)\$"; ok $? "and the first exit 4 carries the volume's hint, as the wrong-password message does ('$out')"
 out=$(printf 's3cret\n' | FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret sh "$L" mount "$T/enc.img" --password-stdin 2>&1); rc=$?
 [ $rc -eq 0 ] && [ "$(cat "$T/pwgot")" = s3cret ] && last | grep -q 'passfd=5'; ok $? "--password-stdin: the password reaches lklfuse on fd 5 (got $rc: '$out')"
 ! grep -q s3cret "$T/calls" || false; ok $? "and is on no command line"
@@ -333,7 +392,22 @@ sh "$L" unmount "$T/enc.img" > /dev/null 2>&1; sh "$L" prefs APFSWrite off > /de
 out=$(echo x | FAKE_PROBE=ext4 sh "$L" mount "$T/enc.img" --password-stdin 2>&1); rc=$?
 [ $rc -eq 2 ] || { [ $rc -eq 1 ] && echo "$out" | grep -q "encrypted APFS"; }; ok $? "--password-stdin on a volume that is not APFS is refused (got $rc: '$out')"
 sh "$L" unmount "$T/enc.img" > /dev/null 2>&1
-FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret LINUXFS_OPEN="$T/bin/open" sh "$L" automount disk2s1 < /dev/null > /dev/null 2>&1; [ $? -eq 4 ]; ok $? "automount of an encrypted volume exits 4, for the agent to ask"
+mkdir -p "$T/dam"
+LINUXFS_DA=1 FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret LINUXFS_OPEN="$T/bin/open" sh "$L" da-mount /dev/disk2s1 "$T/dam" < /dev/null > /dev/null 2>&1; [ $? -eq 4 ]; ok $? "da-mount of an encrypted volume exits 4, for the bundle's mount program to ask"
+# spec: tools/fs.c run_cli -- the mount program passes --password-stdin to da-mount, in any order with --ro
+for order in "--password-stdin" "--ro --password-stdin" "--password-stdin --ro"; do
+  rm -f "$T/pwgot"
+  out=$(printf 's3cret\n' | LINUXFS_DA=1 FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret LINUXFS_OPEN="$T/bin/open" sh "$L" da-mount $order /dev/disk2s1 "$T/dam" 2>&1); rc=$?
+  [ $rc -eq 0 ] && [ "$(cat "$T/pwgot" 2>/dev/null)" = s3cret ]; ok $? "da-mount $order mounts an encrypted volume with the password from stdin (got $rc: '$out')"
+  sh "$L" unmount "$T/dam" > /dev/null 2>&1; sh "$L" unmount disk2s1 > /dev/null 2>&1
+done
+# spec: cli/linuxfs cmd_da_mount -- the password is read before any helper can inherit and drain stdin
+rm -f "$T/pwgot"
+out=$(printf 's3cret\n' | LINUXFS_DA=1 FAKE_OPEN_EAT=1 FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret LINUXFS_OPEN="$T/bin/open" sh "$L" da-mount --password-stdin /dev/disk2s1 "$T/dam" 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(cat "$T/pwgot" 2>/dev/null)" = s3cret ]; ok $? "a probe that reads stdin does not eat the da-mount password (got $rc: '$out')"
+sh "$L" unmount "$T/dam" > /dev/null 2>&1; sh "$L" unmount disk2s1 > /dev/null 2>&1
+out=$(printf 'nope\n' | LINUXFS_DA=1 FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret LINUXFS_OPEN="$T/bin/open" sh "$L" da-mount --password-stdin /dev/disk2s1 "$T/dam" 2>&1); rc=$?
+[ $rc -eq 4 ] && echo "$out" | grep -q "wrong password"; ok $? "da-mount --password-stdin with a wrong password exits 4 (got $rc: '$out')"
 # spec: cli/linuxfs --
 #       review M7: after a reboot a record's pid may belong to some other process; it is not a mount
 sleep 60 & sp=$!
@@ -354,5 +428,220 @@ sh "$L" status > /dev/null
 [ ! -e "$T/Volumes/pulled" ]; ok $? "a stale record's empty folder in /Volumes is removed with it (a pulled disk)"
 [ -d "$T/mine" ] && [ -f "$T/Volumes/full/keep" ]; ok $? "but not a mount point the user chose, nor a folder with something in it"
 rmdir "$T/mine"; rm -rf "$T/Volumes/full"
+# spec: cli/linuxfs --
+#       a device mounts through DiskArbitration (diskutil mount); the bundle's mount program calls back as da-mount
+DU=$T/dcalls; : > "$DU"
+out=$(sh "$L" mount /dev/disk5 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$out" = /Volumes/Fresh ] && [ "$(cat "$DU")" = "diskutil mount disk5" ]; ok $? "mount DEVICE runs diskutil mount and prints the mount point (got '$out')"
+: > "$DU"; sh "$L" mount --ro /dev/disk5 > /dev/null 2>&1
+[ "$(cat "$DU")" = "diskutil mount readOnly disk5" ]; ok $? "mount --ro DEVICE runs diskutil mount readOnly"
+for a in "-o x" --linux-ids "--tier2 $T/img" "$T/Volumes"; do
+  : > "$DU"; out=$(sh "$L" mount /dev/disk5 $a 2>&1); rc=$?
+  [ $rc -eq 2 ] && [ ! -s "$DU" ] && echo "$out" | grep -q "for a device, use linuxfs prefs; these options are for image files"; ok $? "mount DEVICE $a is misuse (exit 2)"
+done
+out=$(sh "$L" mount "$T/img" 2>&1); rc=$?
+[ $rc -eq 0 ] && last | grep -q "$T/img "; ok $? "an image still mounts directly with lklfuse"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+out=$(FAKE_DISKUTIL=already sh "$L" mount /dev/disk5 2>&1); rc=$?
+[ $rc -ne 0 ] && echo "$out" | grep -q "already mounted"; ok $? "diskutil's 'already mounted' is passed through with a failure (got $rc: '$out')"
+: > "$DU"; rm -f "$T/agent.pw"
+out=$(printf 's3cret\n' | sh "$L" mount --password-stdin /dev/disk5 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(cat "$DU")" = "agent --offer disk5
+diskutil mount disk5" ] && [ "$(cat "$T/agent.pw")" = s3cret ]; ok $? "--password-stdin offers the password to the agent, then mounts (got $rc)"
+: > "$DU"
+out=$(printf 's3cret\n' | FAKE_AGENT_RC=1 sh "$L" mount --password-stdin /dev/disk5 2>&1); rc=$?
+[ $rc -eq 4 ] && echo "$out" | grep -q "no one is logged in at the console to unlock /dev/disk5" && ! grep -q diskutil "$DU"; ok $? "with no agent answering, --password-stdin exits 4 and diskutil never runs (got $rc: '$out')"
+LINUXFS_OPEN=$LO sh "$L" da-mount /dev/disk3s1 "$T/dam" > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "da-mount without LINUXFS_DA is misuse (exit 2)"
+DA() { LINUXFS_DA=1 LINUXFS_OPEN=$LO sh "$L" da-mount "$@"; }
+# spec: cli/linuxfs cmd_da_mount -- DiskArbitration runs the mount program alike for a plug-in and for diskutil mount, so
+#       da-mount reads no Automount or Ignore:<LABEL>: /etc/fstab's noauto has kept the plug-in from ever calling it
+for d in test.linuxfs test.machine; do
+  defaults write $d Automount -bool false; defaults write $d "Ignore:helped" -bool true
+  DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1; ok $? "da-mount mounts with a stale Automount=false and Ignore:helped in $d"
+  sh "$L" unmount disk3s1 > /dev/null 2>&1; defaults delete $d Automount; defaults delete $d "Ignore:helped"
+done
+defaults write test.machine ReadOnly -bool true
+DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1
+case $(last) in *,ro\ *) r=0 ;; *) r=1 ;; esac; ok $r "ReadOnly set in the machine domain only mounts read-only"
+sh "$L" unmount disk3s1 > /dev/null 2>&1; defaults delete test.machine ReadOnly
+DA --ro /dev/disk3s1 "$T/dam" > /dev/null 2>&1
+case $(last) in *,ro\ *) r=0 ;; *) r=1 ;; esac; ok $r "da-mount --ro mounts read-only"
+sh "$L" unmount disk3s1 > /dev/null 2>&1
+DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1
+case $(last) in *,ro\ *|*,ro) r=1 ;; *) r=0 ;; esac; ok $r "and without either it is read-write"
+sh "$L" unmount disk3s1 > /dev/null 2>&1
+(FAKE_FUSION=1; export FAKE_FUSION; DA /dev/disk4 "$T/dam" > /dev/null 2>&1); [ $? -eq 3 ]; ok $? "da-mount of a Fusion tier2 device exits 3"
+rm -f "$T/tier2here"; (sleep 1; touch "$T/tier2here") &
+(FAKE_FUSION=notier2; export FAKE_FUSION; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); ok $? "a Fusion main device waits for its partner, then mounts"
+wait; sh "$L" unmount disk3s1 > /dev/null 2>&1; rm -f "$T/tier2here"
+(FAKE_FUSION=notier2 LINUXFS_FUSION_WAIT=5; export FAKE_FUSION LINUXFS_FUSION_WAIT; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); [ $? -eq 3 ]; ok $? "and without its partner it exits 3 after the wait"
+(LINUXFS_ALL_USERS=1; export LINUXFS_ALL_USERS; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1)
+case $(last) in *allow_other,uid=99,gid=99*) r=0 ;; *) r=1 ;; esac; case $(last) in *owner=root*) r=1 ;; esac
+ok $r "LINUXFS_ALL_USERS=1 mounts allow_other,uid=99,gid=99, without owner=root"
+sh "$L" unmount disk3s1 > /dev/null 2>&1
+sh "$L" unmount disk3s1 > /dev/null 2>&1
+for t in exfat vfat; do
+  (FAKE_PROBE=$t; export FAKE_PROBE; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); [ $? -eq 3 ]; ok $? "da-mount leaves $t to the Mac"
+done
+sh "$L" prefs NTFSTakeover off
+(FAKE_PROBE=ntfs3; export FAKE_PROBE; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); [ $? -eq 3 ]; ok $? "da-mount leaves NTFS to the Mac unless NTFSTakeover is on"
+(FAKE_PROBE=ntfs3; export FAKE_PROBE; DA --asked /dev/disk3s1 "$T/dam" > /dev/null 2>&1); [ $? -eq 2 ]; ok $? "da-mount takes no --asked: no mount is ever \"asked for\" by that name, so NTFS cannot bypass NTFSTakeover (exit 2)"
+sh "$L" prefs NTFSTakeover on
+(FAKE_PROBE=ntfs3; export FAKE_PROBE; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); ok $? "with NTFSTakeover on, da-mount takes NTFS"
+sh "$L" unmount disk3s1 > /dev/null 2>&1; sh "$L" prefs NTFSTakeover off
+(FAKE_DISKUTIL=busy; export FAKE_DISKUTIL; sh "$L" mount /dev/disk5 > "$T/out" 2>&1); rc=$?
+[ $rc -ne 0 ] && grep -q "resource busy" "$T/out"; ok $? "a diskutil failure other than 'already mounted' passes its message through with a failure"
+out=$(FAKE_INFO=space sh "$L" mount /dev/disk5 2>&1)
+[ "$out" = "/Volumes/My Disk" ]; ok $? "a mount point with a space is printed whole (got '$out')"
+out=$(FAKE_INFO=none sh "$L" mount /dev/disk5 2>&1); rc=$?
+[ $rc -ne 0 ] && [ -n "$out" ] && ! echo "$out" | grep -q '^/Volumes'; ok $? "a mount with no Mount Point afterwards fails, saying so (got $rc: '$out')"
+: > "$DU"
+out=$(printf 'pw\n' | FAKE_AGENT_RC=127 sh "$L" mount --password-stdin /dev/disk5 2>&1); rc=$?
+[ $rc -eq 1 ] && ! grep -q diskutil "$DU" && ! echo "$out" | grep -q "no one is logged in"; ok $? "an agent that cannot be run is exit 1, not 4 (got $rc: '$out')"
+defaults write test.machine NTFSTakeover -bool true; sh "$L" prefs NTFSTakeover off
+(FAKE_PROBE=ntfs3; export FAKE_PROBE; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); [ $? -eq 3 ]; ok $? "a user-domain off overrides a machine-domain on"
+defaults delete test.machine NTFSTakeover
+: > "$T/probecalls"; : > "$T/openenv"
+(LINUXFS_OPEN_INHERITED=1; export LINUXFS_OPEN_INHERITED; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); ok $? "LINUXFS_OPEN_INHERITED=1 still mounts through the opener"
+[ ! -s "$T/probecalls" ] && [ -s "$T/openenv" ] && ! grep -qv '^1$' "$T/openenv"; ok $? "and only through it: no direct probe, every opener call inherited"
+sh "$L" unmount disk3s1 > /dev/null 2>&1
+for f in 1 notier2; do
+  s0=$(date +%s)
+  (FAKE_FUSION=$f LINUXFS_OPEN_INHERITED=1; export FAKE_FUSION LINUXFS_OPEN_INHERITED; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); rc=$?
+  (FAKE_FUSION=$f LINUXFS_OPEN_INHERITED=1; export FAKE_FUSION LINUXFS_OPEN_INHERITED; DA /dev/disk4 "$T/dam" > /dev/null 2>&1); rc2=$?
+  [ $rc -eq 3 ] && [ $rc2 -eq 3 ] && [ $(( $(date +%s) - s0 )) -lt 5 ]; ok $? "inherited, da-mount of a Fusion main or tier2 device exits 3 at once ($f)"
+done
+s0=$(date +%s)
+(FAKE_FUSION=notier2 LINUXFS_FUSION_WAIT=5 FAKE_OPEN_SLEEP=3; export FAKE_FUSION LINUXFS_FUSION_WAIT FAKE_OPEN_SLEEP; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); rc=$?
+[ $rc -eq 3 ] && [ $(( $(date +%s) - s0 )) -lt 8 ]; ok $? "the Fusion wait is wall-clock time, not iterations (took $(( $(date +%s) - s0 )) s)"
+# spec: tools/fs.c mount_as_root -- before login root mounts macFUSE and hands the device on as LINUXFS_FUSE_FD: da-mount
+#       (inherited only) gives lklfuse /dev/fd/N as its mount point and leaves the kernel's options (allow_other) to root
+: > "$T/fdcalls"
+(LINUXFS_OPEN_INHERITED=1 LINUXFS_ALL_USERS=1 LINUXFS_FUSE_FD=4 FAKE_FD_MNT=$T/dam; export LINUXFS_OPEN_INHERITED LINUXFS_ALL_USERS LINUXFS_FUSE_FD FAKE_FD_MNT
+ DA /dev/disk3s1 "$T/dam" 4</dev/null > "$T/out" 2>&1); rc=$?
+c=$(last)
+[ $rc -eq 0 ] && case $c in *" /dev/fd/3 /dev/fd/4") true ;; *) false ;; esac; ok $? "with LINUXFS_FUSE_FD=4, lklfuse's mount point is /dev/fd/4 (got $rc: '$c')"
+grep -qx 'fd 4 open' "$T/fdcalls"; ok $? "and lklfuse holds fd 4 ($(cat "$T/fdcalls"))"
+case $c in *uid=99,gid=99*) r=0 ;; *) r=1 ;; esac; case $c in *allow_other*|*volname=*|*noappledouble*) r=1 ;; esac
+ok $r "lklfuse gets uid=99,gid=99 and none of the mount's own options (allow_other, volname, noappledouble): root gave them to mount_macfuse"
+sh "$L" unmount "$T/dam" > /dev/null 2>&1
+: > "$T/calls"
+(LINUXFS_FUSE_FD=4; export LINUXFS_FUSE_FD; DA /dev/disk3s1 "$T/dam" 4</dev/null > "$T/out" 2>&1); rc=$?
+[ $rc -eq 2 ] && ! grep -q lklfuse "$T/calls"; ok $? "LINUXFS_FUSE_FD without LINUXFS_OPEN_INHERITED is refused, exit 2, no lklfuse (got $rc)"
+for v in abc 3 5 2 04x; do
+  : > "$T/calls"
+  (LINUXFS_OPEN_INHERITED=1 LINUXFS_FUSE_FD=$v; export LINUXFS_OPEN_INHERITED LINUXFS_FUSE_FD; DA /dev/disk3s1 "$T/dam" 4</dev/null 5</dev/null > "$T/out" 2>&1); rc=$?
+  [ $rc -eq 2 ] && ! grep -q lklfuse "$T/calls"; ok $? "LINUXFS_FUSE_FD='$v' is refused, exit 2 (got $rc)"
+done
+# spec: cli/linuxfs run_lklfuse -- with root's channel (LINUXFS_FUSE_CHAN=C, beside LINUXFS_FUSE_FD) the opener is told to check
+#       the lock, say "ready" on C and put the device root sends on FUSE_FD: --fuse-chan C:FD --lock FILE, before the device
+: > "$T/calls"; : > "$T/fdcalls"
+(LINUXFS_OPEN_INHERITED=1 LINUXFS_ALL_USERS=1 LINUXFS_FUSE_FD=4 LINUXFS_FUSE_CHAN=6 FAKE_FD_MNT=$T/dam; export LINUXFS_OPEN_INHERITED LINUXFS_ALL_USERS LINUXFS_FUSE_FD LINUXFS_FUSE_CHAN FAKE_FD_MNT
+ DA /dev/disk3s1 "$T/dam" 4</dev/null 6</dev/null > "$T/out" 2>&1); rc=$?
+grep -q "^open --fuse-chan 6:4 --lock $T/locks/linuxfs-rdisk3s1.lock /dev/rdisk3s1 $T/bin/lklfuse .* /dev/fd/3 /dev/fd/4\$" "$T/calls"
+ok $? "with LINUXFS_FUSE_CHAN=6 the opener gets --fuse-chan 6:4 and the lock file, and lklfuse still serves /dev/fd/4 (got $rc: $(grep '^open ' "$T/calls" | tail -n 1))"
+grep -q "^open --fuse-chan .*lock=/dev/fd/7[, ]" "$T/calls"; ok $? "and lklfuse's lock= is /dev/fd/7, the lock the opener holds"
+sh "$L" unmount "$T/dam" > /dev/null 2>&1
+sh "$L" prefs NTFSTakeover on   # (the dirty NTFS cases below)
+# spec: cli/linuxfs cmd_mount -- before login no second try is possible (root's one device went to the lklfuse that failed): what the
+#       probe's flags cannot show (a dirty NTFS volume ntfs3 refuses for its own reason) ends with "mount it again read-only"
+: > "$T/calls"
+(LINUXFS_OPEN_INHERITED=1 LINUXFS_ALL_USERS=1 LINUXFS_FUSE_FD=4 LINUXFS_FUSE_CHAN=6 FAKE_PROBE=ntfs3 FAKE_MODE=dirty FAKE_FD_MNT=$T/dam
+ export LINUXFS_OPEN_INHERITED LINUXFS_ALL_USERS LINUXFS_FUSE_FD LINUXFS_FUSE_CHAN FAKE_PROBE FAKE_MODE FAKE_FD_MNT
+ DA /dev/disk3s1 "$T/dam" 4</dev/null 6</dev/null > "$T/out" 2>&1); rc=$?
+[ $rc -eq 1 ] && grep -q "dirty NTFS volume the check did not see; mount it again read-only (linuxfs mount --ro /dev/disk3s1)" "$T/out" && [ "$(grep -c '^open .*bin/lklfuse' "$T/calls")" = 1 ]
+ok $? "with root's channel, a dirty NTFS volume the probe missed is not retried: one lklfuse, and it says to mount it again read-only (rc $rc: $(tail -n 2 "$T/out" | tr '\n' '|'))"
+sh "$L" unmount "$T/dam" > /dev/null 2>&1
+# spec: cli/linuxfs cmd_mount -- with root's channel root is authoritative on read-only: ro only from --ro, no preference read, never ro
+#       under a rw mount; where root said rw and the CLI's facts say ro it refuses before the opener ("ready"), so no mount happens
+chanrun() { # ENV... -- ARGS...: da-mount with root's channel and device descriptor
+  : > "$T/calls"
+  (LINUXFS_OPEN_INHERITED=1 LINUXFS_ALL_USERS=1 LINUXFS_FUSE_FD=4 LINUXFS_FUSE_CHAN=6 FAKE_FD_MNT=$T/dam; export LINUXFS_OPEN_INHERITED LINUXFS_ALL_USERS LINUXFS_FUSE_FD LINUXFS_FUSE_CHAN FAKE_FD_MNT
+   while [ "$1" != -- ]; do export "$1"; shift; done; shift
+   DA "$@" 4</dev/null 6</dev/null > "$T/out" 2>&1); rc=$?
+}
+chanrun FAKE_PROBE=apfs -- /dev/disk3s1 "$T/dam"
+[ $rc -eq 0 ] && grep -q "opts=readwrite" "$T/calls" && ! grep -q ",ro " "$T/calls"; ok $? "root said rw (no --ro) for APFS: the CLI mounts read-write though its own APFSWrite preference is off (rc $rc)"
+sh "$L" unmount "$T/dam" > /dev/null 2>&1
+defaults write test.linuxfs ReadOnly -bool true
+chanrun FAKE_PROBE=ext4 -- /dev/disk3s1 "$T/dam"
+defaults delete test.linuxfs ReadOnly
+[ $rc -eq 0 ] && ! grep -q ",ro " "$T/calls"; ok $? "root said rw: the CLI's own ReadOnly preference is not read, so it never serves read-only under a rw mount (rc $rc)"
+sh "$L" unmount "$T/dam" > /dev/null 2>&1
+chanrun FAKE_PROBE=ntfs3 FAKE_FLAGS=dirty -- /dev/disk3s1 "$T/dam"
+[ $rc -eq 1 ] && grep -q "root mounted macFUSE read-write, but this volume would be read-only" "$T/out" && ! grep -q "fuse-chan" "$T/calls"
+ok $? "root said rw but the volume probes dirty: the CLI refuses before the opener, so no mount (rc $rc: $(head -n 2 "$T/out" | tr '\n' '|'))"
+chanrun FAKE_PROBE=ntfs3 FAKE_FLAGS=dirty -- --ro /dev/disk3s1 "$T/dam"
+[ $rc -eq 0 ] && grep -q "^open --fuse-chan .*,ro " "$T/calls"; ok $? "root said ro for the same dirty volume: it mounts read-only on the first try (rc $rc)"
+sh "$L" unmount "$T/dam" > /dev/null 2>&1
+sh "$L" prefs NTFSTakeover off
+(LINUXFS_OPEN_INHERITED=1 LINUXFS_FUSE_CHAN=6; export LINUXFS_OPEN_INHERITED LINUXFS_FUSE_CHAN; : > "$T/calls"; DA /dev/disk3s1 "$T/dam" 6</dev/null > "$T/out" 2>&1); rc=$?
+[ $rc -eq 2 ] && ! grep -q lklfuse "$T/calls"; ok $? "LINUXFS_FUSE_CHAN without LINUXFS_FUSE_FD is refused, exit 2 (got $rc)"
+for v in abc 3 5 4 04x; do
+  : > "$T/calls"
+  (LINUXFS_OPEN_INHERITED=1 LINUXFS_FUSE_FD=4 LINUXFS_FUSE_CHAN=$v; export LINUXFS_OPEN_INHERITED LINUXFS_FUSE_FD LINUXFS_FUSE_CHAN; DA /dev/disk3s1 "$T/dam" 4</dev/null > "$T/out" 2>&1); rc=$?
+  [ $rc -eq 2 ] && ! grep -q lklfuse "$T/calls"; ok $? "LINUXFS_FUSE_CHAN='$v' is refused, exit 2 (got $rc)"
+done
+out=$(LINUXFS_FUSE_FD=4 LINUXFS_OPEN_INHERITED=1 sh "$L" mount "$T/img" 4</dev/null 2>&1); rc=$?
+c=$(last)
+[ $rc -eq 0 ] && case $c in *" $T/img $out") true ;; *) false ;; esac; ok $? "linuxfs mount IMAGE ignores LINUXFS_FUSE_FD: only da-mount honours it (got $rc: '$c')"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+# spec: cli/linuxfs cmd_ignore -- linuxfs ignore|unignore VOLUME: an /etc/fstab noauto entry, written by the root helper
+#       (linuxfs-open --noauto-add SPEC BUNDLE | --noauto-remove SPEC). A device: UUID= when the probe has one, else LABEL= the
+#       volume name DiskArbitration sees (the safe name); a label: LABEL= that safe name, with the bundle of the attached disk
+#       of that name. linuxfs ignore alone lists linuxfs's entries.
+U=0123ABCD-4567-89EF-0123-456789ABCDEF
+NA() { : > "$T/noauto"; LINUXFS_OPEN=$LO sh "$L" "$@"; }
+out=$(FAKE_UUID=$U NA ignore /dev/disk3s1 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-add UUID=$U linuxfs_ext4" ]; ok $? "ignore DEVICE with a UUID asks the helper for UUID= and the probed bundle (got $rc: '$out' $(cat "$T/noauto"))"
+out=$(FAKE_UUID=0123abcd-4567-89ef-0123-456789abcdef NA ignore disk3s1 2>&1)
+[ "$(cat "$T/noauto")" = "--noauto-add UUID=$U linuxfs_ext4" ]; ok $? "a bare diskNsM works too, and the UUID is uppercased ($(cat "$T/noauto"))"
+out=$(FAKE_PROBE=ntfs3 NA ignore disk3s1 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-add LABEL=helped linuxfs_ntfs" ]; ok $? "ignore DEVICE with no UUID (NTFS) asks for LABEL= (got $rc: $(cat "$T/noauto"))"
+out=$(FAKE_PROBE=btrfs FAKE_OPEN_LABEL="a/b:c" NA ignore disk3s1 2>&1)
+[ "$(cat "$T/noauto")" = "--noauto-add LABEL=a-b-c linuxfs_btrfs" ]; ok $? "the label is the safe name DiskArbitration sees, not the raw one ($(cat "$T/noauto"))"
+out=$(FAKE_OPEN_LABEL="" NA ignore disk3s1 2>&1); rc=$?
+[ $rc -eq 1 ] && [ ! -s "$T/noauto" ] && echo "$out" | grep -q "no UUID or label"; ok $? "a device with neither a UUID nor a label is refused (got $rc: '$out')"
+for t in vfat exfat; do
+  out=$(FAKE_PROBE=$t FAKE_UUID=$U NA ignore disk3s1 2>&1); rc=$?
+  [ $rc -eq 1 ] && [ ! -s "$T/noauto" ] && echo "$out" | grep -q "the Mac mounts"; ok $? "ignore of $t is refused: the Mac mounts it (got $rc: '$out')"
+done
+out=$(FAKE_PROBE=none NA ignore disk3s1 2>&1); rc=$?
+[ $rc -eq 1 ] && [ ! -s "$T/noauto" ]; ok $? "ignore of a disk with no filesystem linuxfs knows is refused (got $rc: '$out')"
+out=$(NA ignore helped 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-add LABEL=helped linuxfs_ext4" ]; ok $? "ignore LABEL asks for LABEL= with the bundle of the attached disk of that name (got $rc: '$out' $(cat "$T/noauto"))"
+out=$(FAKE_PROBE=f2fs FAKE_OPEN_LABEL="a/b" NA ignore "a/b" 2>&1)
+[ "$(cat "$T/noauto")" = "--noauto-add LABEL=a-b linuxfs_f2fs" ]; ok $? "a label given raw is matched and written as its safe name ($(cat "$T/noauto"))"
+out=$(NA ignore "no such" 2>&1); rc=$?
+[ $rc -eq 1 ] && [ ! -s "$T/noauto" ] && echo "$out" | grep -q "linuxfs ignore /dev/diskNsM"; ok $? "ignore LABEL with no attached disk of that name is refused, asking for the device (got $rc: '$out')"
+out=$(FAKE_UUID=$U FAKE_NOAUTO_NO="a label with # cannot be written to /etc/fstab" NA ignore disk3s1 2>&1); rc=$?
+[ $rc -eq 1 ] && echo "$out" | grep -q "cannot be written"; ok $? "the helper's refusal is passed through with exit 1 (got $rc: '$out')"
+out=$(FAKE_UUID=$U NA unignore /dev/disk3s1 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-remove UUID=$U
+--noauto-remove LABEL=helped" ]; ok $? "unignore DEVICE removes its UUID= and its LABEL= entries (got $rc: $(tr '\n' '|' < "$T/noauto"))"
+out=$(FAKE_PROBE=ntfs3 NA unignore disk3s1 2>&1)
+[ "$(cat "$T/noauto")" = "--noauto-remove LABEL=helped" ]; ok $? "with no UUID, its LABEL= entry ($(tr '\n' '|' < "$T/noauto"))"
+out=$(NA unignore "my data" 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-remove LABEL=my data" ]; ok $? "unignore LABEL removes LABEL=, with no disk attached (got $rc: $(cat "$T/noauto"))"
+out=$(NA unignore "a/b" 2>&1)
+[ "$(cat "$T/noauto")" = "--noauto-remove LABEL=a-b" ]; ok $? "by its safe name ($(cat "$T/noauto"))"
+NA ignore a b > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "ignore takes one volume"
+NA unignore > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "unignore takes one volume"
+printf '%s\n' "# the Mac's" "UUID=$U none hfs rw,noauto" "UUID=$U none linuxfs_ext4 rw,noauto # linuxfs" "LABEL=my\\040data none linuxfs_ntfs rw,noauto # linuxfs" > "$T/fstab"
+out=$(LINUXFS_FSTAB=$T/fstab sh "$L" ignore); rc=$?
+[ $rc -eq 0 ] && [ "$out" = "UUID=$U	linuxfs_ext4
+LABEL=my data	linuxfs_ntfs" ]; ok $? "ignore alone lists linuxfs's entries, labels unescaped, and no other (got $rc: '$(echo "$out" | tr '\n' '|')')"
+# spec: cli/linuxfs cmd_ignore -- as the helper reads them: a linuxfs line ends in a space or tab, then "# linuxfs", then
+#       perhaps a \r (an fstab edited on Windows); "X# linuxfs" is somebody else's
+printf '%s\r\n' "LABEL=crlf none linuxfs_xfs rw,noauto # linuxfs" > "$T/fstab"
+printf '%s\n' "LABEL=glued none hfs rw,noauto,x# linuxfs" "LABEL=tabbed none linuxfs_f2fs rw,noauto	# linuxfs" >> "$T/fstab"
+out=$(LINUXFS_FSTAB=$T/fstab sh "$L" ignore); rc=$?
+[ $rc -eq 0 ] && [ "$out" = "LABEL=crlf	linuxfs_xfs
+LABEL=tabbed	linuxfs_f2fs" ]; ok $? "a CRLF line is listed, a line with # linuxfs glued on is not (got $rc: '$(echo "$out" | od -c | tr -s ' ' | tr '\n' '|')')"
+out=$(LINUXFS_FSTAB=$T/no-fstab sh "$L" ignore); rc=$?
+[ $rc -eq 0 ] && [ -z "$out" ]; ok $? "with no /etc/fstab it lists nothing (got $rc)"
+sh "$L" help 2>&1 | grep -q "linuxfs ignore \[VOLUME\]"; ok $? "usage shows ignore [VOLUME]"
+! sh "$L" help 2>&1 | grep -q "Automount"; ok $? "usage no longer offers Automount"
+! sh "$L" help 2>&1 | grep -q da-mount; ok $? "usage does not list the internal da-mount"
 sh "$L" frobnicate > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "an unknown command is misuse (exit 2)"
 echo "1..$n"; exit $bad
