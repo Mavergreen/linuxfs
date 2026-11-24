@@ -263,7 +263,7 @@ da_debug_on() {  # diskarbitrationd with -d, its stderr in /private/tmp/da-debug
   sudo -n rm -f /private/tmp/da-debug.log "$DADL"
   sudo -n cp "$DAPL" "$DADL" || return 1
   echo "# original DA plist:"; rec sudo -n plutil -p "$DAPL"
-  sudo -n /usr/libexec/PlistBuddy -c 'Add :ProgramArguments: string -d' -c 'Add :StandardErrorPath string /private/tmp/da-debug.log' -c 'Add :StandardOutPath string /private/tmp/da-debug.log' "$DADL" 2>&1 | sed 's/^/# PlistBuddy: /'
+  sudo -n /usr/libexec/PlistBuddy -c 'Add :ProgramArguments array' -c 'Add :ProgramArguments: string /usr/libexec/diskarbitrationd' -c 'Add :ProgramArguments: string -d' -c 'Add :StandardErrorPath string /private/tmp/da-debug.log' -c 'Add :StandardOutPath string /private/tmp/da-debug.log' "$DADL" 2>&1 | sed 's/^/# PlistBuddy: /'
   sudo -n launchctl unload "$DAPL" 2>&1 | sed 's/^/# unload: /'
   sudo -n killall diskarbitrationd > /dev/null 2>&1; sleep 1
   sudo -n launchctl load "$DADL" 2>&1 | sed 's/^/# load: /'
