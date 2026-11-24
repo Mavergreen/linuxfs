@@ -5,7 +5,7 @@
  * and nothing is ever executed. Decisions come from fsrules.c; superblocks from probe.c.
  *
  * util -p BSD removable|fixed readonly|writable   recognised: the volume name on stdout, exit 255; else exit 254
- * util -k BSD                                     the filesystem's UUID on stdout, exit 255; else exit 254
+ * util -k BSD                                     the filesystem's UUID on stdout (no newline), exit 253; else exit 254
  * fsck -q DEV                                     exit 0 (a quick check has nothing to do); -n or -y exit 8
  * mount [-o OPT]... DEV MNT                       as the console user: runs the CLI's da-mount and, for an encrypted volume,
  *                                                  asks for the password (the keychain keeper first, then Apple's dialog);
@@ -39,6 +39,7 @@
 #include "probe.h"
 
 #define FSUR_RECOGNIZED 255
+#define FSUR_IO_SUCCESS 253	/* sys/loadable_fs.h's (-3), as an exit status */
 #define FSUR_UNRECOGNIZED 254
 
 /* Fills p from the console user's plist, then the machine's, then the defaults, key by key. A plist that cannot be read
@@ -161,8 +162,11 @@ static int util(const char *fs, int argc, char **argv)
 			syslog(LOG_NOTICE, "%s: no UUID for the %s bundle", argv[2], fs);
 			return FSUR_UNRECOGNIZED;
 		}
-		printf("%s\n", uuid);
-		return FSUR_RECOGNIZED;
+		/* as hfs.util: no newline, and FSUR_IO_SUCCESS, which is the status DiskArbitration takes a -k answer on (any other,
+		 * FSUR_RECOGNIZED included, and the volume has no UUID to it, so a UUID= fstab entry never matches) */
+		printf("%s", uuid);
+		syslog(LOG_NOTICE, "%s: UUID %s for the %s bundle", argv[2], uuid, fs);
+		return FSUR_IO_SUCCESS;
 	}
 	syslog(LOG_NOTICE, "%s util: unknown arguments", fs);
 	return FSUR_UNRECOGNIZED;

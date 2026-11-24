@@ -41,11 +41,14 @@ out=$(u linuxfs_btrfs.util -p "$E" removable writable); rc=$?
 [ $rc = 254 ] && [ -z "$out" ]; ok $? "btrfs util on the ext4 disk exits 254 and prints nothing (rc $rc)"
 out=$(u linuxfs_btrfs.util -p "$B" removable writable); rc=$?
 [ $rc = 255 ] && [ "$out" = backup ]; ok $? "btrfs util on the btrfs disk exits 255 (rc $rc, '$out')"
+# spec: tools/fs.c -- -k as 10.9's hfs.util does it, which DiskArbitration reads (its fstab UUID= lookup needs it): the UUID,
+#       uppercase, with no newline, and exit 253 (FSUR_IO_SUCCESS, not -p's 255: DiskArbitration drops the UUID otherwise)
 out=$(u linuxfs_ext4.util -k "$E"); rc=$?
 want=$(tr a-f A-F < "$D/ext4.uuid")
-[ $rc = 255 ] && [ "$out" = "$want" ]; ok $? "-k prints the UUID blkid gave (rc $rc, '$out', want '$want')"
+[ $rc = 253 ] && [ "$out" = "$want" ]; ok $? "-k prints the UUID blkid gave, exit 253 (rc $rc, '$out', want '$want')"
+[ "$(u linuxfs_ext4.util -k "$E" | wc -c | tr -d ' ')" = 36 ]; ok $? "-k prints the 36 characters alone, no newline"
 out=$(u linuxfs_btrfs.util -k "$B"); rc=$?
-[ $rc = 255 ] && [ "$out" = "$(tr a-f A-F < "$D/btrfs.uuid")" ]; ok $? "-k on btrfs prints its UUID too"
+[ $rc = 253 ] && [ "$out" = "$(tr a-f A-F < "$D/btrfs.uuid")" ]; ok $? "-k on btrfs prints its UUID too"
 out=$(u linuxfs_btrfs.util -k "$E"); rc=$?
 [ $rc = 254 ] && [ -z "$out" ]; ok $? "-k for another filesystem's disk exits 254"
 out=$(u linuxfs_ntfs.util -k "$T"); rc=$?

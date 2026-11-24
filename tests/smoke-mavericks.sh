@@ -270,6 +270,10 @@ noauto_cycle() {  # TAG IMAGE device|label LABEL
   if [ -z "$mounted" ]; then ok "$tag: a plain attach mounted nothing (exit $rc: $(printf '%s' "$out" | tr '\n' ' '))"
   else notok "$tag: a plain attach mounted $mounted"; fi
   sleep 3
+  # DiskArbitration's view of this attach, whatever happened: the UUID it knows the volume by (from the util's -k), and its
+  # and the util's lines since the attach
+  echo "# $tag: diskutil info $disk: $(diskutil info "$disk" 2>&1 | grep -i uuid | tr -s ' ' | tr '\n' '|')"
+  tail -n +"$((${log0:-0} + 1))" /var/log/system.log 2> /dev/null | grep 'diskarbitrationd\|linuxfs-fs' | sed "s/^/# $tag: /"
   # anchored: system.log is readable and shows DiskArbitration probing the volume (linuxfs-fs's "claimed", from util -p) since
   # log0, so the absence of linuxfs-mount after it means something
   if [ -r /var/log/system.log ] && [ -n "$log0" ] && tail -n +"$((log0 + 1))" /var/log/system.log | grep "linuxfs-fs" | grep -q "claimed"; then
