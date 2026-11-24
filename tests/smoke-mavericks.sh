@@ -1,16 +1,24 @@
 #!/bin/sh
 # platform: macOS-only -- mounts Linux filesystems through Mavergreen macFUSE on a real Mac OS X 10.9 box (the acceptance job's guest)
-# spec: .github/workflows/on-mavericks.yml -- the installed product on 10.9: the manifest is the run's version; the helper
-#       daemon and the console user's agent are running; `linuxfs mount` mounts ext4, btrfs, xfs, NTFS (ntfs3) and exFAT
-#       images, writes through each (a file, a directory, rename, symlink, hard link, chmod, xattr), unmounts, mounts again
-#       and reads it all back; then an ext4 image attached as a disk (hdiutil -nomount) is mounted by the agent under
-#       /Volumes without being asked. exFAT keeps no symlinks, hard links, modes or xattrs, and ntfs3 keeps no POSIX mode
-#       without its acl option, so those are not asked of them. Any hang, new panic or new lklfuse crash report fails it.
-#       Linux checks every image afterwards (on-mavericks.yml's fsck job).
+# spec: .github/workflows/on-mavericks.yml -- the installed product on 10.9: the manifest is the run's version; the root
+#       helper and the keychain keeper (linuxfs-agent) are running; `linuxfs mount` mounts ext4, btrfs, xfs, NTFS (ntfs3),
+#       exFAT and f2fs images, writes through each, unmounts, mounts again and reads it all back. Then DiskArbitration's six
+#       bundles: `diskutil listFilesystems` lists their personalities; ext4, btrfs, xfs, f2fs, NTFS (NTFSTakeover on) and APFS,
+#       raw and GPT-wrapped, are mounted by an attach within 30 s (personality, reads, writes, unmount and mount, eject
+#       leaves no lklfuse); NTFS with NTFSTakeover off is Apple's; Automount off leaves an ext4 disk to `diskutil mount`;
+#       ReadOnly in the user's plist (read by the root mount program) mounts read-only; a label with a slash or a control
+#       character gets a safe /Volumes name; the encrypted APFS fixture shows the password dialog (screenshot), times out
+#       with no mount, mounts through --password-stdin and the keeper's --offer, then from the login keychain with no dialog;
+#       last, before login (the user's console session ended), an attached ext4 disk is mounted by lklfuse as _linuxfs with
+#       allow_other. No lklfuse ever runs as root. exFAT keeps no symlinks, hard links, modes or xattrs, and ntfs3 keeps no
+#       POSIX mode without its acl option, so those are not asked of them. Any hang, new panic or new lklfuse crash report
+#       fails it. Linux checks the images afterwards (on-mavericks.yml's fsck job).
 #   usage: smoke-mavericks.sh VERSION IN OUT
-#          VERSION is the run's version (the pkg installed). IN holds ext4, btrfs, xfs, ntfs and exfat .img.gz from
-#          tests/lib/probe-images.sh. OUT receives every image as it is after the run, gzipped, plus ext4-auto.img.gz (the
-#          automounted copy). Run as the guest's user in its console (Aqua) session, not root.
+#          VERSION is the run's version (the pkg installed). IN holds ext4, btrfs, xfs, ntfs, exfat, f2fs and apfs .img.gz
+#          from tests/lib/probe-images.sh, gpt-<fs>.img.gz and gpt-enc.img.gz (tests/lib/gpt-wrap.py), and ext4-slash and
+#          ext4-ctl .img.gz (tests/lib/label-images.sh). OUT receives every image as it is after the run, gzipped (da-*.img.gz
+#          are the disks DiskArbitration mounted), and the screenshots. Run as the guest's user over ssh, not root and not in
+#          the console session: the steps that need it go through /usr/local/bin/guest-macosx-aqua.
 #          Exits 77 where it cannot run (not 10.9, product not installed, wrong arguments); the job treats 77 as failure.
 set -u
 case "$(sw_vers -productVersion 2>/dev/null)" in 10.9*) ;; *) echo "not Mac OS X 10.9 -- skipping"; exit 77 ;; esac
@@ -48,6 +56,7 @@ pid_of() { "$L" status | awk -F"$tab" -v s="$1" '$2 == s { print $1; exit }'; }
 finish() {
   for m in "$W"/mnt/*; do mount | grep -qF " on $m (" && { umount -f "$m" || diskutil unmount force "$m"; } > /dev/null 2>&1; done
   [ -z "$disk" ] || hdiutil detach -force "$disk" > /dev/null 2>&1
+  defaults delete dev.mavergreen.linuxfs > /dev/null 2>&1
   [ "$(crashes)" = "$CRASH0" ] || { notok "no new panic or lklfuse crash report"; ls -l "$HOME"/Library/Logs/DiagnosticReports /Library/Logs/DiagnosticReports 2>&1 | sed 's/^/# /'; }
   for f in "$W"/img/*.img; do [ -f "$f" ] && gzip -c "$f" > "$OUT/$(basename "$f").gz"; done
   echo "1..$n"
@@ -60,12 +69,10 @@ CRASH0=$(crashes)
 installed=$(awk '/<key>version<\/key>/ { getline; gsub(/.*<string>|<\/string>.*/, ""); print; exit }' "$P/mavergreen.plist")
 [ "$installed" = "$VERSION" ] && ok "the installed manifest is $VERSION" || die "the installed manifest is '$installed', not $VERSION"
 check "the root helper is running" pgrep -u 0 -f /Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper
-check "the automount agent is running for this user" pgrep -u "$(id -u)" -f "$P/libexec/linuxfs-agent"
 check "linuxfs status runs" "$L" status
-for fs in ext4 btrfs xfs ntfs exfat; do
+for fs in ext4 btrfs xfs ntfs exfat f2fs; do
   gunzip -c "$IN/$fs.img.gz" > "$W/img/$fs.img" || die "cannot unpack $IN/$fs.img.gz"
 done
-cp "$W/img/ext4.img" "$W/img/ext4-auto.img" || die "cannot copy the ext4 image"
 dd if=/dev/urandom of="$W/payload" bs=1024 count=4096 2> /dev/null || die "cannot make the payload"
 for fs in ext4 btrfs xfs ntfs exfat; do
   case $fs in ntfs) want=ntfs3 ;; *) want=$fs ;; esac
@@ -121,34 +128,204 @@ check "apfs: status says ro" sh -c '"$1" status | grep -F "$2" | grep -q "ro\$"'
 check "apfs: unmount, and lklfuse exits" unmount_and_wait "$img" "$m"
 check "apfs: not one byte of the image changed" cmp "$W/apfs.before" "$img"
 
-disk=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$W/img/ext4-auto.img" | awk '/^\/dev\/disk/ { print $1; exit }')
-[ -n "$disk" ] && ok "the ext4 image is attached as $disk, unmounted" || die "hdiutil cannot attach the ext4 image"
-raw=/dev/r${disk#/dev/}
-automounted() { i=0; until mp=$(mountpoint_of "$raw") && [ -n "$mp" ]; do i=$((i + 1)); [ $i -le 600 ] || return 1; sleep 0.1; done; }
-if automounted; then
-  case $mp in /Volumes/*) ok "the agent mounted $disk at $mp" ;; *) notok "the agent mounted $disk at $mp, not under /Volumes" ;; esac
-  check "the automounted volume is the image's filesystem, writable" sh -c 'ls "$1/lost+found" > /dev/null && echo auto > "$1/auto" && [ "$(cat "$1/auto")" = auto ]' _ "$mp"
-  check "linuxfs unmount of the automounted volume, and lklfuse exits" unmount_and_wait "$raw" "$mp"
-else
-  notok "the agent mounted $disk under /Volumes within 60 s"
-  sed 's/^/# /' /var/log/dev.mavergreen.linuxfs.helper.log 2>/dev/null | tail -20
-fi
-check "the disk detaches" hdiutil detach "$disk" && disk=
+# spec: tests/smoke-mavericks.sh header -- ---- DiskArbitration: the six bundles mount attached disks themselves (Mac OS X 10.9, no agent in the loop) ----
+AQUA=/usr/local/bin/guest-macosx-aqua
+UUID_PART=6C696E75-7866-7370-6172-740000000001   # tests/lib/gpt-wrap.py's partition GUID: the keychain account of its volume
+info() { diskutil info "$1" 2> /dev/null | sed -n "s/^ *$2: *//p" | head -n 1; }
+# spec: tests/smoke-mavericks.sh header -- attach IMAGE with automount (no -nomount); disks = every /dev/disk node it made, disk = the whole disk
+da_attach() {
+  out=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage "$1" 2>&1) || { echo "$out" | sed 's/^/# /'; return 1; }
+  disks=$(printf '%s\n' "$out" | awk '/^\/dev\/disk/ { print $1 }' | tr '\n' ' ')
+  disk=${disks%% *}; [ -n "$disk" ]
+}
+# spec: tests/smoke-mavericks.sh header -- the mounted node of disks within T tenths of a second: dev and mp
+da_wait() {
+  i=0; while :; do
+    for d in $disks; do
+      if [ "$(info "$d" Mounted)" = Yes ]; then dev=$d; mp=$(info "$d" "Mount Point"); [ -n "$mp" ] && return 0; fi
+    done
+    i=$((i + 10)); [ $i -le "$1" ] || return 1; sleep 1
+  done
+}
+# spec: tests/smoke-mavericks.sh header -- lklfuse processes, as "USER PID COMMAND"
+lklfuses() { ps -axww -o user=,pid=,command= | awk '/lklfuse/ && !/awk/'; }
+no_root_lklfuse() { lklfuses | awk '$1 == "root" { f = 1 } END { exit f }'; }
+da_eject() {  # whole disk, mount point: leaves no lklfuse on it
+  pids=$(lklfuses | awk -v m="$2" 'index($0, m) { print $2 }')
+  bounded 600 diskutil eject "$1" > /dev/null 2>&1 || return 1
+  for p in $pids; do bounded 300 sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 0.1; done' _ "$p" || { echo "lklfuse $p still runs"; return 1; }; done
+  if lklfuses | grep -qF "$2"; then return 1; fi
+}
+rw_works() { echo da > "$1/da-file" && [ "$(cat "$1/da-file")" = da ] && mkdir "$1/da-dir" && echo two > "$1/da-dir/f" && [ "$(cat "$1/da-dir/f")" = two ]; }
+rw_reads() { [ "$(cat "$1/da-file")" = da ] && [ "$(cat "$1/da-dir/f")" = two ]; }
 
-# platform: review I6: a disk the user owns (as hdiutil makes it) never reaches the helper, so make one root-only, like a real
-#           disk, with automount off so the agent leaves it to the CLI, and check lklfuse got the helper's descriptor.
-defaults write dev.mavergreen.linuxfs Automount -bool false
-cp "$W/img/ext4.img" "$W/img/ext4-helper.img" || die "cannot copy the ext4 image"
-disk=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$W/img/ext4-helper.img" | awk '/^\/dev\/disk/ { print $1; exit }')
-raw=/dev/r${disk#/dev/}
-sudo chown root:operator "$disk" "$raw" && sudo chmod 640 "$disk" "$raw"
-check "$raw is root-only, so the CLI must go through the helper" sh -c '! [ -r "$1" ]' _ "$raw"
-mkdir -p "$W/mnt/helper"
-check "linuxfs mount $disk, through the helper" bounded 600 "$L" mount "$disk" "$W/mnt/helper"
-check "lklfuse was given the helper's descriptor (/dev/fd/3)" sh -c 'ps -axww -o command= | grep -F "/dev/fd/3 $1" | grep -q lklfuse' _ "$W/mnt/helper"
-check "write and read through it" sh -c 'echo helped > "$1/h" && [ "$(cat "$1/h")" = helped ]' _ "$W/mnt/helper"
-check "unmount, and lklfuse exits" unmount_and_wait "$raw" "$W/mnt/helper"
-check "the helper refuses the boot partition" sh -c '! "$1" --probe "$(df / | awk "NR == 2 { print \$1 }")" 2>/dev/null' _ "$P/libexec/linuxfs-open"
-check "the disk detaches" hdiutil detach "$disk" && disk=
-defaults delete dev.mavergreen.linuxfs Automount
+# spec: tests/smoke-mavericks.sh header -- NAME IMAGE PERSONALITY KIND(rw|ro) VIA(raw|GPT): attach, mounted within 30 s, personality, reads and writes,
+#       unmount then mount, eject leaves no lklfuse
+da_cycle() {
+  nm=$1 img=$2 want=$3 kind=$4 via=$5 tag="$1 ($5)"
+  da_attach "$img" || { notok "$tag: hdiutil attach"; return 1; }
+  if ! da_wait 300; then
+    notok "$tag: mounted by DiskArbitration within 30 s"; diskutil list | sed 's/^/# /'; da_eject "$disk" x > /dev/null 2>&1; disk=; return 1
+  fi
+  ok "$tag: $dev mounted at $mp within 30 s"
+  check "$tag: diskutil info shows the personality $want and Mounted: Yes" sh -c '[ "$1" = "$2" ] && [ "$3" = Yes ]' _ "$(info "$dev" 'File System Personality')" "$want" "$(info "$dev" Mounted)"
+  check "$tag: no lklfuse runs as root" no_root_lklfuse
+  if [ "$kind" = rw ]; then
+    check "$tag: reads and writes work" rw_works "$mp"
+  else
+    check "$tag: it lists, and a write is refused (read-only)" sh -c 'ls "$1" > /dev/null && ! ( echo x > "$1/c" ) 2> /dev/null' _ "$mp"
+  fi
+  oldmp=$mp
+  check "$tag: diskutil unmount" bounded 600 diskutil unmount "$mp"
+  check "$tag: it is unmounted" sh -c '[ "$(diskutil info "$1" 2> /dev/null | sed -n "s/^ *Mounted: *//p")" = No ]' _ "$dev"
+  check "$tag: diskutil mount" bounded 600 diskutil mount "$dev"
+  if da_wait 300; then
+    ok "$tag: mounted again at $mp"
+    [ "$kind" != rw ] || check "$tag: what was written reads back after remount" rw_reads "$mp"
+  else notok "$tag: mounted again within 30 s"; fi
+  check "$tag: diskutil eject leaves no lklfuse" da_eject "$disk" "$mp"
+  disk=
+}
+
+check "diskutil listFilesystems lists the six personalities" sh -c 'o=$(diskutil listFilesystems 2>&1) && for p in ext4 NTFS-linuxfs btrfs XFS F2FS APFS; do printf "%s\n" "$o" | grep -q "$p" || { echo "no $p in:"; printf "%s\n" "$o"; exit 1; }; done'
+check "the keychain keeper (linuxfs-agent) is running" pgrep -f "$P/libexec/linuxfs-agent"
+check "no lklfuse runs as root before the disks" no_root_lklfuse
+[ -x "$AQUA" ] && ok "the guest has $AQUA for the console user's session" || notok "no $AQUA: the dialog, screenshot and keychain checks cannot run"
+USERPLIST=$HOME/Library/Preferences/dev.mavergreen.linuxfs.plist
+defaults delete dev.mavergreen.linuxfs 2> /dev/null
+
+# spec: tests/smoke-mavericks.sh header -- a raw image, and the same in a GPT wrapper (tests/lib/gpt-wrap.py, made on Linux), for each filesystem; NTFS has NTFSTakeover on
+defaults write dev.mavergreen.linuxfs NTFSTakeover -bool true
+for c in ext4:ext4:rw btrfs:btrfs:rw xfs:xfs:rw f2fs:f2fs:rw ntfs:NTFS-linuxfs:rw apfs:APFS:ro; do
+  fs=${c%%:*} rest=${c#*:} pers=${rest%%:*} kind=${rest#*:}
+  [ -f "$W/img/$fs.img" ] || { gunzip -c "$IN/$fs.img.gz" > "$W/img/$fs.img" || die "cannot unpack $IN/$fs.img.gz"; }
+  cp "$W/img/$fs.img" "$W/img/da-$fs.img" || die "cannot copy $fs.img"
+  da_cycle "$fs" "$W/img/da-$fs.img" "$pers" "$kind" raw
+  gunzip -c "$IN/gpt-$fs.img.gz" > "$W/gpt-$fs.img" || die "cannot unpack $IN/gpt-$fs.img.gz"
+  da_cycle "$fs" "$W/gpt-$fs.img" "$pers" "$kind" GPT
+  rm -f "$W/gpt-$fs.img"
+done
+defaults delete dev.mavergreen.linuxfs NTFSTakeover
+
+# spec: tests/smoke-mavericks.sh header -- NTFSTakeover off (the default): Apple's own ntfs mounts it
+da_attach "$W/img/ntfs.img" && ok "ntfs: attached as $disk" || die "cannot attach the NTFS image"
+if da_wait 300; then
+  check "ntfs, NTFSTakeover off: the Mac's own ntfs mounted it" sh -c 'mount | grep -F " on $1 (" | grep -q "(ntfs"' _ "$mp"
+  da_eject "$disk" "$mp" > /dev/null 2>&1
+else notok "ntfs, NTFSTakeover off: mounted within 30 s"; fi
+disk=
+
+# spec: tests/smoke-mavericks.sh header -- Automount off: an attached ext4 image is left alone, and diskutil mount mounts it
+"$L" prefs Automount off
+cp "$W/img/ext4.img" "$W/img/da-ext4-off.img" || die "cannot copy ext4.img"
+da_attach "$W/img/da-ext4-off.img" && ok "automount off: ext4 attached as $disk" || die "cannot attach the ext4 image"
+"$AQUA" screencapture -x "$OUT/automount-off.png" > /dev/null 2>&1 && ok "automount off: screenshot automount-off.png (read it for a 'not readable' dialog)" || notok "automount off: screencapture"
+sleep 8
+check "automount off: not mounted" sh -c '[ "$(diskutil info "$1" 2> /dev/null | sed -n "s/^ *Mounted: *//p")" != Yes ]' _ "$disk"
+check "automount off: diskutil mount mounts it" bounded 600 diskutil mount "$disk"
+if da_wait 300; then ok "automount off: mounted at $mp after diskutil mount"; da_eject "$disk" "$mp" > /dev/null 2>&1
+else notok "automount off: mounted within 30 s of diskutil mount"; fi
+disk=
+"$L" prefs Automount on
+
+# spec: tests/smoke-mavericks.sh header -- root reads the console user's plist (the seteuid/setgroups drop): ReadOnly in the user's plist, ext4 mounts read-only
+"$L" prefs ReadOnly on
+cp "$W/img/ext4.img" "$W/img/da-ext4-ro.img" || die "cannot copy ext4.img"
+da_attach "$W/img/da-ext4-ro.img" && ok "ReadOnly on: ext4 attached as $disk" || die "cannot attach the ext4 image"
+if da_wait 300; then
+  check "ReadOnly in the user's plist reaches the root mount program: mounted read-only" sh -c 'mount | grep -F " on $1 (" | grep -q "read-only" && ! ( echo x > "$1/c" ) 2> /dev/null' _ "$mp"
+  da_eject "$disk" "$mp" > /dev/null 2>&1
+else notok "ReadOnly on: mounted within 30 s"; fi
+disk=
+"$L" prefs ReadOnly off
+
+# spec: tests/smoke-mavericks.sh header -- a control character or a slash in the label gets a safe /Volumes name
+for c in slash ctl; do
+  [ -f "$W/img/ext4-$c.img" ] || gunzip -c "$IN/ext4-$c.img.gz" > "$W/img/ext4-$c.img" 2> /dev/null || { echo "ok $((n + 1)) - SKIP ext4-$c.img: the image tools made no such label"; n=$((n + 1)); continue; }
+  da_attach "$W/img/ext4-$c.img" || { notok "label $c: attach"; continue; }
+  if da_wait 300; then
+    check "label $c: the volume's name is one safe component under /Volumes (mounted at $mp)" sh -c 'case $1 in /Volumes/*/*) exit 1 ;; /Volumes/?*) ;; *) exit 1 ;; esac; [ -z "$(printf "%s" "$1" | LC_ALL=C tr -d "[:print:]")" ]' _ "$mp"
+    da_eject "$disk" "$mp" > /dev/null 2>&1
+  else notok "label $c: mounted within 30 s"; fi
+  disk=
+done
+
+# spec: tests/smoke-mavericks.sh header -- the encrypted APFS fixture (password linuxfs-test), in its GPT wrapper (the keychain wants the partition's UUID)
+gunzip -c "$IN/gpt-enc.img.gz" > "$W/gpt-enc.img" || die "cannot unpack $IN/gpt-enc.img.gz"
+da_attach "$W/gpt-enc.img" && ok "encrypted apfs: attached plainly as $disks" || die "cannot attach the encrypted APFS image"
+sleep 5
+"$AQUA" screencapture -x "$OUT/apfs-dialog.png" > /dev/null 2>&1 && ok "encrypted apfs: screenshot apfs-dialog.png 5 s after the attach (the mount program's password dialog)" || notok "encrypted apfs: screencapture"
+check "encrypted apfs: the mount program is waiting on its dialog, nothing mounted yet" sh -c 'pgrep -f mount_linuxfs_apfs > /dev/null && for d in $1; do [ "$(diskutil info "$d" 2>/dev/null | sed -n "s/^ *Mounted: *//p")" != Yes ] || exit 1; done' _ "$disks"
+# spec: tests/smoke-mavericks.sh header -- the dialog times out (120 s): exit 4, no mount
+i=0; while pgrep -f mount_linuxfs_apfs > /dev/null && [ $i -lt 170 ]; do i=$((i + 1)); sleep 1; done
+check "encrypted apfs: the dialog's timeout ended the mount program (after about ${i} s)" sh -c '! pgrep -f mount_linuxfs_apfs > /dev/null'
+check "encrypted apfs: and left nothing mounted (exit 4, no mount)" sh -c 'for d in $1; do [ "$(diskutil info "$d" 2>/dev/null | sed -n "s/^ *Mounted: *//p")" != Yes ] || exit 1; done' _ "$disks"
+echo "# system.log, linuxfs lines:"; grep -i 'linuxfs' /var/log/system.log 2> /dev/null | tail -n 8 | sed 's/^/# /'
+part=; for d in $disks; do case $(info "$d" 'File System Personality') in APFS) part=$d ;; esac; done
+[ -n "$part" ] || part=${disk}s1
+check "encrypted apfs: linuxfs mount --password-stdin mounts it read-only, through the keeper's --offer" sh -c 'printf linuxfs-test | "$1" mount --password-stdin "$2"' _ "$L" "$part"
+if disks=$part da_wait 100; then
+  check "encrypted apfs: it is mounted read-only at $mp" sh -c 'mount | grep -F " on $1 (" | grep -q "read-only"' _ "$mp"
+  check "encrypted apfs: no lklfuse runs as root" no_root_lklfuse
+  da_eject "$disk" "$mp" > /dev/null 2>&1
+else notok "encrypted apfs: mounted after --password-stdin"; fi
+disk=
+# spec: tests/smoke-mavericks.sh header -- the password in the login keychain (the keeper's item: service dev.mavergreen.linuxfs, account the partition's UUID)
+check "encrypted apfs: the password goes into the login keychain" "$AQUA" security add-generic-password -U -s dev.mavergreen.linuxfs -a "$UUID_PART" -w linuxfs-test -T "$P/libexec/linuxfs-agent" login.keychain
+da_attach "$W/gpt-enc.img" || die "cannot attach the encrypted APFS image again"
+if da_wait 300; then
+  ok "encrypted apfs: a plain attach mounts it at $mp with the keychain's password"
+  "$AQUA" screencapture -x "$OUT/apfs-keychain.png" > /dev/null 2>&1
+  check "encrypted apfs: no mount program is left waiting on a dialog" sh -c '! pgrep -f mount_linuxfs_apfs > /dev/null'
+  da_eject "$disk" "$mp" > /dev/null 2>&1
+else notok "encrypted apfs: mounted within 30 s from the keychain, with no dialog"; fi
+disk=
+"$AQUA" security delete-generic-password -s dev.mavergreen.linuxfs -a "$UUID_PART" > /dev/null 2>&1
+rm -f "$W/gpt-enc.img"
+check "the keychain keeper is still running" pgrep -f "$P/libexec/linuxfs-agent"
+check "no lklfuse runs as root, after everything" no_root_lklfuse
+
+# spec: tests/smoke-mavericks.sh header -- ---- before login: nobody at the console, ssh the only way in. Last, because the console session does not come back by itself ----
+# platform: mavericks-vm README -- on 10.9 loginwindow logs in by itself only at boot, so after killall loginwindow with autologin
+#           restored the user may not return; that is reported (a failed check), and nothing is rebooted.
+LW=/Library/Preferences/com.apple.loginwindow
+AD=/Library/Preferences/SystemConfiguration/autodiskmount
+me=$(id -un)
+console() { stat -f %Su /dev/console; }
+oldauto=$(sudo -n defaults read "$LW" autoLoginUser 2> /dev/null) olddisks=$(sudo -n defaults read "$AD" AutomountDisksWithoutUserLogin 2> /dev/null)
+restore_login() {
+  if [ -n "$oldauto" ]; then sudo -n defaults write "$LW" autoLoginUser "$oldauto"; fi
+  if [ -n "$olddisks" ]; then sudo -n defaults write "$AD" AutomountDisksWithoutUserLogin -bool "$( [ "$olddisks" = 1 ] && echo true || echo false )"
+  else sudo -n defaults delete "$AD" AutomountDisksWithoutUserLogin 2> /dev/null; fi
+}
+if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
+  cp "$W/img/ext4.img" "$W/img/login-ext4.img" || die "cannot copy ext4.img"
+  sudo -n defaults write "$AD" AutomountDisksWithoutUserLogin -bool true
+  sudo -n defaults delete "$LW" autoLoginUser
+  sudo -n killall loginwindow
+  i=0; until [ "$(console)" != "$me" ]; do i=$((i + 1)); [ $i -le 60 ] || break; sleep 1; done
+  if [ "$(console)" != "$me" ]; then notok "before login: $me left the console (loginwindow was restarted)"; restore_login
+  else
+    ok "before login: the console is $(console), not $me"
+    out=$(sudo -n hdiutil attach -imagekey diskimage-class=CRawDiskImage "$W/img/login-ext4.img" 2>&1)
+    disks=$(printf '%s\n' "$out" | awk '/^\/dev\/disk/ { print $1 }' | tr '\n' ' '); disk=${disks%% *}
+    if [ -n "$disk" ] && da_wait 300; then
+      ok "before login: $dev mounted at $mp"
+      echo "# before login: $(stat -f '%Sp %Su' "$mp") is the mount's mode and owner (right after the mount); lklfuse:"
+      lklfuses | sed 's/^/# /'
+      check "before login: lklfuse runs as _linuxfs" sh -c '! [ -z "$(ps -axww -o user=,command= | awk "\$1 == \"_linuxfs\" && /lklfuse/")" ]'
+      check "before login: lklfuse mounted with allow_other" sh -c 'ps -axww -o command= | grep lklfuse | grep -F "$1" | grep -q allow_other' _ "$mp"
+      check "before login: no lklfuse runs as root" no_root_lklfuse
+      check "before login: the user can read and write the volume over ssh" rw_works "$mp"
+    else notok "before login: the ext4 image mounted within 30 s"; echo "$out" | sed 's/^/# /'; fi
+    restore_login
+    sudo -n killall loginwindow
+    i=0; until [ "$(console)" = "$me" ]; do i=$((i + 1)); [ $i -le 120 ] || break; sleep 1; done
+    if [ "$(console)" = "$me" ]; then ok "before login: $me is back at the console"
+    else notok "before login: $me did not come back at the console within 120 s (10.9 auto-logs in only at boot; autoLoginUser is restored for the next one)"; fi
+    if [ -n "${mp:-}" ] && [ "$(console)" = "$me" ]; then check "after login: the user reads and writes the volume" rw_reads "$mp"; fi
+    [ -z "$disk" ] || { bounded 600 sudo -n diskutil eject "$disk" > /dev/null 2>&1 || notok "before login: eject"; }
+    disk=
+  fi
+else notok "before login: no autoLoginUser to restore, or no sudo; the before-login checks cannot run safely"; fi
 finish

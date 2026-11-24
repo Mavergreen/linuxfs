@@ -14,11 +14,29 @@ and FUSE.
 2. Install this
 3. Connect any supported filesystem, use normally, eject normally
 
+Disks are recognised and mounted by the Mac itself (DiskArbitration), through filesystem bundles this installs in
+`/System/Library/Filesystems`, so they appear in Disk Utility and `diskutil` like any other, and they mount even
+before anyone logs in (with "Automount disks without user login" on, they are mounted by an unprivileged `_linuxfs`
+user and are open to every user). `diskutil mount`, `diskutil unmount` and `diskutil eject` work as usual.
+
 General CLI options:
 
 ```sh
 linuxfs help
 ```
+
+For a disk, `linuxfs mount DEVICE` is `diskutil mount` plus the options `--ro` and `--password-stdin`; the options for
+image files (a mount point, `--linux-ids`, `--tier2`, `-o`) are not for disks. Everything else about a disk is set
+with `linuxfs prefs`.
+
+### Preferences
+
+`linuxfs prefs` shows them; `linuxfs prefs KEY on|off` sets one for you. Keys: `Automount`, `ReadOnly`, `NTFSTakeover`
+and `APFSWrite`. The mount program runs as root, so it reads your preferences
+(`~/Library/Preferences/dev.mavergreen.linuxfs.plist`, when you are at the console) and then the machine's, in
+`/Library/Preferences/dev.mavergreen.linuxfs.plist`. Set the machine's with `sudo defaults write
+/Library/Preferences/dev.mavergreen.linuxfs KEY -bool true`, for disks mounted before login, when no user's
+preferences apply.
 
 ### Supported filesystems
 
@@ -28,6 +46,11 @@ linuxfs help
 - btrfs
 - xfs
 - f2fs
+
+### Encrypted APFS
+
+Connecting one shows the Mac's own password dialog (with a checkbox to keep the password in your login keychain). From
+a terminal, `printf PASSWORD | linuxfs mount --password-stdin /dev/diskNsM` does it without the dialog.
 
 ### APFS write support
 

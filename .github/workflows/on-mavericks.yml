@@ -4,7 +4,8 @@ name: on-mavericks
 #       NTFS, exFAT and APFS images (tests/lib/probe-images.sh); a fresh Mac OS X 10.9.5 guest (Mavergreen/mavericks-vm), logged in
 #       to its console so the automount agent runs, installs the pinned Mavergreen macFUSE (and the Recaulk that release was
 #       tested with) and the run's pkg, and runs tests/smoke-mavericks.sh, which mounts, writes, unmounts and reads back each
-#       image through `linuxfs mount` and checks the agent automounts an attached ext4 disk; then Linux checks every image
+#       image through `linuxfs mount`, checks DiskArbitration mounts attached disks (raw and GPT-wrapped) through the six
+#       bundles, the password dialog and keychain for encrypted APFS, and the before-login mount as _linuxfs; then Linux checks every image
 #       the guest wrote with its own fsck (tests/lib/check-fs.sh). Any panic, hang, skip (77) or failed fsck fails.
 #       release.yml calls it, and its publish job needs it.
 on:
@@ -34,14 +35,29 @@ jobs:
       - uses: actions/checkout@v7
         with: { persist-credentials: false }
       - uses: Mavergreen/shipyard/.github/actions/install@v1
-      - name: ext4, btrfs, xfs, NTFS, exFAT and APFS images, labelled, in the build container
+      - name: ext4, btrfs, xfs, f2fs, NTFS, exFAT and APFS images, labelled, in the build container
         run: |
           set -eu
           d="$RUNNER_TEMP/images"
           mkdir -p "$d"
           LINUX_HOST_SHARE="$HOME" sh build/linux-host.sh sh tests/lib/probe-images.sh "$d"
+          LINUX_HOST_SHARE="$HOME" sh build/linux-host.sh sh tests/lib/label-images.sh "$d"
           mkdir -p "$RUNNER_TEMP/up"
-          for fs in ext4 btrfs xfs ntfs exfat apfs; do gzip -c "$d/$fs.img" > "$RUNNER_TEMP/up/$fs.img.gz"; done
+          for fs in ext4 btrfs xfs f2fs ntfs exfat apfs; do gzip -c "$d/$fs.img" > "$RUNNER_TEMP/up/$fs.img.gz"; done
+          for l in slash ctl; do [ ! -f "$d/ext4-$l.img" ] || gzip -c "$d/ext4-$l.img" > "$RUNNER_TEMP/up/ext4-$l.img.gz"; done
+      # spec: tests/lib/gpt-wrap.py -- the same images in a GPT wrapper, as an external disk formatted by macOS is laid out,
+      #       and the encrypted APFS fixture (password linuxfs-test) in one too: its partition UUID is the keychain's account
+      - name: GPT-wrapped copies and the encrypted APFS fixture
+        run: |
+          set -eu
+          d="$RUNNER_TEMP/images"
+          for fs in ext4 btrfs xfs f2fs ntfs apfs; do
+            python3 -I tests/lib/gpt-wrap.py "$d/$fs.img" "$d/gpt-$fs.img"
+            gzip -c "$d/gpt-$fs.img" > "$RUNNER_TEMP/up/gpt-$fs.img.gz"
+          done
+          gzip -dc tests/fixtures/apfs/enc.img.gz > "$d/enc.img"
+          python3 -I tests/lib/gpt-wrap.py "$d/enc.img" "$d/gpt-enc.img"
+          gzip -c "$d/gpt-enc.img" > "$RUNNER_TEMP/up/gpt-enc.img.gz"
       - uses: actions/upload-artifact@v7
         with:
           name: linuxfs-images-before
@@ -52,7 +68,7 @@ jobs:
     name: Mount, write, read back and automount on Mac OS X 10.9 (mavericks-vm)
     needs: [images]
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write
@@ -100,6 +116,8 @@ jobs:
             sudo installer -pkg deps/recaulk-*.pkg -target /
             sudo installer -pkg deps/macfuse-*.pkg -target /
             sudo installer -pkg "dist/linuxfs-$LINUXFS_VERSION.pkg" -target /
+            # spec: tests/smoke-mavericks.sh header -- over ssh, as the guest's user: the smoke goes through guest-macosx-aqua for what needs the console session, and
+            #       ends with the before-login checks (it logs the console user out and does not bring the session back)
             status=0; sh tests/smoke-mavericks.sh "$LINUXFS_VERSION" images images-after || status=$?
             [ "$status" -eq 0 ] || { echo "tests/smoke-mavericks.sh exited $status (77 is a skip, a failure here)"; exit 1; }
       - uses: actions/upload-artifact@v7
@@ -127,7 +145,7 @@ jobs:
           for z in "$d"/*.img.gz; do gunzip "$z"; done
           LINUX_HOST_SHARE="$HOME" sh build/linux-host.sh sh -c '
             rc=0
-            for c in ext4:ext4 btrfs:btrfs xfs:xfs ntfs:ntfs exfat:exfat ext4:ext4-auto; do
+            for c in ext4:ext4 btrfs:btrfs xfs:xfs ntfs:ntfs exfat:exfat ext4:da-ext4 btrfs:da-btrfs xfs:da-xfs ntfs:da-ntfs ext4:login-ext4; do
               fs=${c%%:*} img=$1/${c#*:}.img
               if [ ! -f "$img" ]; then echo "not ok - $img: the guest returned no such image"; rc=1
               elif sh tests/lib/check-fs.sh "$fs" "$img"; then echo "ok - $img is clean ($fs)"
