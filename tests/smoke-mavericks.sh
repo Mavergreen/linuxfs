@@ -5,13 +5,13 @@
 #       exFAT and f2fs images, writes through each, unmounts, mounts again and reads it all back. Then DiskArbitration's six
 #       bundles: ext4, btrfs, xfs, f2fs, NTFS (NTFSTakeover on) and APFS, raw and GPT-wrapped, are mounted by an attach within 30 s (personality, reads, writes, unmount and mount, eject
 #       leaves no lklfuse); NTFS with NTFSTakeover off is Apple's; `linuxfs ignore` (an /etc/fstab noauto entry: ext4 by device, NTFS by
-#       label) mounts nothing on a plain attach and never runs the mount program, `diskutil mount` mounts it, and after `linuxfs unignore` a plain attach does;
+#       label; ext4 by a label with a space, written as LABEL=my\040data) mounts nothing on a plain attach and never runs the mount program, `diskutil mount` mounts it, and after `linuxfs unignore` a plain attach does;
 #       ReadOnly in the user's plist (read by the root mount program) mounts read-only; a label with a slash or a control
 #       character gets a safe /Volumes name; the encrypted APFS fixture shows the password dialog (screenshot), times out
 #       with no mount, mounts through --password-stdin and the keeper's --offer, then from the login keychain with no dialog;
 #       last, before login (the user's console session ended), an attached ext4 disk is mounted by root with allow_other and
-#       served by lklfuse as _linuxfs (a SKIP, with the reason, when the guest's macFUSE cannot serve /dev/fd/N); with that
-#       lklfuse killed, diskutil unmount still works. No lklfuse ever runs as root. exFAT keeps no symlinks, hard links, modes or xattrs, and ntfs3 keeps no
+#       served by lklfuse as _linuxfs (with a macFUSE that cannot serve /dev/fd/N the mount program refuses, and that is what is
+#       checked: nothing mounted, the reason in system.log); with that lklfuse killed, diskutil unmount still works. No lklfuse ever runs as root. exFAT keeps no symlinks, hard links, modes or xattrs, and ntfs3 keeps no
 #       POSIX mode without its acl option, so those are not asked of them. Any hang, new panic or new lklfuse crash report
 #       fails it. Linux checks the images afterwards (on-mavericks.yml's fsck job).
 #   usage: smoke-mavericks.sh VERSION IN OUT
@@ -181,8 +181,9 @@ root_mount_macfuse_gone() {
     sleep 1
   done
 }
-# spec: components/macfuse/version -- macFUSE 5.5.0-mavericks.4's lklfuse ends on SIGTERM over /dev/fd/N (.2 and .3 serve it but ignore
-#       SIGTERM): the version in the guest's manifest, as 0 when it is at least that
+# spec: components/macfuse/version -- macFUSE 5.5.0-mavericks.4 is the tested combination (build/package.sh's MACFUSE_MIN) and carries the
+#       single-threaded-loop fix; lklfuse's ending on SIGTERM on 10.9 is LKL's (patches/0011), .2 and .3 with it untested: the version
+#       in the guest's manifest, as 0 when it is at least .4
 macfuse_term_fixed() {
   mfv=$(/usr/libexec/PlistBuddy -c 'Print :version' /usr/local/mavergreen/macfuse/mavergreen.plist 2> /dev/null) || return 1
   echo "$mfv" | sed 's/-mavericks[.]/./' | awk -F. 'NF == 4 { for (i = 1; i <= 4; i++) { split("5 5 0 4", t, " "); if ($i + 0 != t[i] + 0) exit !($i + 0 > t[i] + 0) } exit 0 } { exit 1 }'
@@ -296,8 +297,14 @@ cleanup_disk
 noauto_cycle() {  # TAG IMAGE device|label LABEL
   tag=$1 img=$2 how=$3 lab=$4
   if ! da_attach_nomount "$img"; then notok "$tag: hdiutil attach -nomount"; disk=$(image_disk "$img"); cleanup_disk; return 1; fi
-  if [ "$how" = device ]; then arg=$disk; else arg=$lab; fi
-  check "$tag: linuxfs ignore $arg" bounded 600 "$L" ignore "$arg"
+  if [ "$how" = spaced ]; then
+    # spec: tools/fstab.c -- the entry the helper writes for a label with a space (\040, as fstab spells it), written here by hand
+    #       because linuxfs ignore names an ext4 volume by its UUID: DiskArbitration must read \040 as the space and skip the volume
+    check "$tag: an /etc/fstab noauto entry for LABEL=my\\040data" sudo -n sh -c 'printf "%s\n" "$1" >> /etc/fstab' _ 'LABEL=my\040data none linuxfs_ext4 rw,noauto # linuxfs'
+  else
+    if [ "$how" = device ]; then arg=$disk; else arg=$lab; fi
+    check "$tag: linuxfs ignore $arg" bounded 600 "$L" ignore "$arg"
+  fi
   echo "# $tag: linuxfs ignore lists: $(bounded 600 "$L" ignore | tr '\n' '|')"
   check "$tag: /etc/fstab has linuxfs's noauto entry" sh -c 'grep -q " rw,noauto # linuxfs\$" /etc/fstab'
   cleanup_disk
@@ -327,7 +334,7 @@ noauto_cycle() {  # TAG IMAGE device|label LABEL
     else notok "$tag: mounted within 10 s of diskutil mount"; tail -n 30 /var/log/system.log 2> /dev/null | grep 'linuxfs\|diskarbitrationd' | sed 's/^/# /'; fi
     [ "$how" != device ] || check "$tag: linuxfs unignore $disk" bounded 600 "$L" unignore "$disk"
   else notok "$tag: hdiutil attach -nomount, again"; disk=$(image_disk "$img"); fi
-  [ "$how" != label ] || check "$tag: linuxfs unignore $lab" bounded 600 "$L" unignore "$lab"
+  case $how in label|spaced) check "$tag: linuxfs unignore $lab" bounded 600 "$L" unignore "$lab" ;; esac
   cleanup_disk
   check "$tag: /etc/fstab has no linuxfs entry left" sh -c '! grep -q "# linuxfs\$" /etc/fstab 2> /dev/null'
   if da_attach "$img"; then
@@ -342,11 +349,17 @@ noauto_leftover() {  # IMAGE
   echo "# a linuxfs entry was left in /etc/fstab: $(grep '# linuxfs$' /etc/fstab | tr '\n' '|')"
   if da_attach_nomount "$1"; then bounded 600 "$L" unignore "$disk" > /dev/null 2>&1; fi
   cleanup_disk
+  # spec: tests/smoke-mavericks.sh header -- the by-hand entry of the label-with-a-space case, if unignore did not take it away
+  if grep -q "# linuxfs\$" /etc/fstab 2> /dev/null; then sudo -n sed -i '' '/# linuxfs$/d' /etc/fstab 2> /dev/null; fi
 }
 if cp "$W/img/ext4.img" "$W/img/da-ext4-noauto.img"; then
   noauto_cycle "ignore ext4 by device" "$W/img/da-ext4-noauto.img" device "my data"
   noauto_leftover "$W/img/da-ext4-noauto.img"
 else notok "ignore ext4 by device: cannot copy ext4.img"; fi
+if cp "$W/img/ext4.img" "$W/img/da-ext4-space.img"; then
+  noauto_cycle "ignore ext4 by a label with a space" "$W/img/da-ext4-space.img" spaced "my data"
+  noauto_leftover "$W/img/da-ext4-space.img"
+else notok "ignore ext4 by a label with a space: cannot copy ext4.img"; fi
 defaults write dev.mavergreen.linuxfs NTFSTakeover -bool true
 if cp "$W/img/ntfs.img" "$W/img/da-ntfs-noauto.img"; then
   noauto_cycle "ignore ntfs by label" "$W/img/da-ntfs-noauto.img" label Windows
@@ -455,45 +468,6 @@ restore_login() {
   if [ -n "$olddisks" ]; then sudo -n defaults write "$AD" AutomountDisksWithoutUserLogin -bool "$( [ "$olddisks" = 1 ] && echo true || echo false )"
   else sudo -n defaults delete "$AD" AutomountDisksWithoutUserLogin 2> /dev/null; fi
 }
-# spec: tests/smoke-mavericks.sh header -- diagnostics only (never ok or not ok): why macFUSE refused the before-login mount for _linuxfs
-#       ("mount_macfuse: ... Operation not permitted"). Each experiment mounts the bundled lklfuse on an ext4 image file as USER,
-#       with the options cli/linuxfs gives an image (type, lock, local, volname, fsname, noappledouble) plus EXTRA.
-diag_try() {  # LABEL USER MNT EXTRA
-  dl=$1 du=$2 dm=$3 dx=$4
-  dimg=/private/tmp/linuxfs-diag/$dl.img; derr=/private/tmp/linuxfs-diag/$dl.err
-  cp "$W/img/ext4.img" "$dimg" && chmod 666 "$dimg" || { echo "# diag: $dl: cannot make its image"; return 0; }
-  sudo -n -u "$du" "$DLK" -f -o "type=ext4,lock=/private/tmp/linuxfs-diag/$dl.lock,local,volname=diag,fsname=linuxfs@diag,noappledouble$dx" "$dimg" "$dm" > "$derr" 2>&1 &
-  dp=$!; di=0
-  while [ $di -lt 150 ] && ! mount | grep -qF " on $dm ("; do
-    ps -p "$dp" > /dev/null || break
-    di=$((di + 1)); sleep 0.1
-  done
-  if mount | grep -qF " on $dm ("; then echo "# diag: $dl: MOUNTED as $du on $dm ($(mount | grep -F " on $dm (" | head -n 1))"
-  else echo "# diag: $dl: NOT mounted as $du on $dm, options '$dx'"; fi
-  sed "s|^|# diag: $dl stderr: |" "$derr"
-  sudo -n pkill -f "lklfuse.*$dl.img" 2> /dev/null
-  wait "$dp" 2> /dev/null
-  if mount | grep -qF " on $dm ("; then sudo -n umount "$dm" 2>&1 | sed "s|^|# diag: $dl umount: |"; fi
-  return 0
-}
-diag_before_login() {
-  DLK=/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d/lklfuse
-  echo "# diag: (a) sysctl fuse:"; sysctl -a 2> /dev/null | grep -i fuse | sed 's/^/# diag: /'
-  for h in $(find /usr/local/mavergreen/macfuse /Library/Filesystems/macfuse.fs -name 'mount_macfuse*' 2> /dev/null); do ls -l "$h" | sed 's/^/# diag: helper: /'; done
-  ls -ld "$DLK" | sed 's/^/# diag: /'
-  mkdir -p /private/tmp/linuxfs-diag; chmod 1777 /private/tmp/linuxfs-diag
-  sudo -n mkdir -p /private/tmp/linuxfs-diag/mnt-b1 /private/tmp/linuxfs-diag/mnt-b2 && sudo -n chown _linuxfs /private/tmp/linuxfs-diag/mnt-b1 /private/tmp/linuxfs-diag/mnt-b2 && sudo -n chmod 0755 /private/tmp/linuxfs-diag/mnt-b1 /private/tmp/linuxfs-diag/mnt-b2
-  bounded 600 diag_try b-allow-other _linuxfs /private/tmp/linuxfs-diag/mnt-b1 ,allow_other
-  bounded 600 diag_try b-plain _linuxfs /private/tmp/linuxfs-diag/mnt-b2 ""
-  sudo -n mkdir /Volumes/linuxfs-diag-c && sudo -n chown _linuxfs /Volumes/linuxfs-diag-c && sudo -n chmod 0111 /Volumes/linuxfs-diag-c
-  bounded 600 diag_try c-volumes-0111-allow-other _linuxfs /Volumes/linuxfs-diag-c ,allow_other
-  bounded 600 diag_try c-volumes-0111-plain _linuxfs /Volumes/linuxfs-diag-c ""
-  mkdir -p /private/tmp/linuxfs-diag/mnt-d
-  bounded 600 diag_try d-control-vagrant "$me" /private/tmp/linuxfs-diag/mnt-d ,allow_other
-  sudo -n rmdir /Volumes/linuxfs-diag-c 2> /dev/null
-  sudo -n rm -rf /private/tmp/linuxfs-diag 2> /dev/null
-  return 0
-}
 if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
   cp "$W/img/ext4.img" "$W/img/login-ext4.img" || notok "before login: cannot copy ext4.img"
   sudo -n defaults write "$AD" AutomountDisksWithoutUserLogin -bool true
@@ -516,8 +490,13 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
   echo "# before login: ${gate:-the mount program logged no macFUSE gate within 30 s}"
   case $gate in
     *"is before"*)
-      n=$((n + 1)); echo "ok $n - # SKIP before login: root's mount and _linuxfs's lklfuse: $gate"
-      # spec: tools/fs.c mount_as_root -- the older path (_linuxfs mounts) still runs no lklfuse as root, and ejects clean
+      # spec: tools/fs.c mount_as_root -- an older macFUSE cannot mount before login at all (_linuxfs with allow_other is always refused,
+      #       VM-proven): the mount program refuses with a fixed reason, and nothing is mounted and no lklfuse runs
+      j=0; until tail -n +"$((${loglog:-0} + 1))" /var/log/system.log 2> /dev/null | grep -q "refused: macFUSE is too old to mount before login; update macFUSE"; do
+        j=$((j + 1)); [ $j -le 30 ] || break; sleep 1
+      done
+      check "before login (older macFUSE): the mount program refused, saying macFUSE is too old ($gate)" sh -c 'tail -n +"$1" /var/log/system.log | grep -q "refused: macFUSE is too old to mount before login; update macFUSE"' _ "$((${loglog:-0} + 1))"
+      check "before login (older macFUSE): nothing is mounted from $disk" sh -c '! mount | grep -qF "linuxfs@$1 "' _ "${disk#/dev/}"
       check "before login (older macFUSE): no lklfuse runs as root" no_root_lklfuse
       if [ -n "$disk" ]; then check "before login (older macFUSE): eject leaves no lklfuse" login_eject "$disk" && disk=; fi
       check "before login (older macFUSE): no lklfuse runs as root, after the eject" no_root_lklfuse ;;
@@ -538,8 +517,8 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
         lp=$(lklfuse_fd | awk '{ print $2 }' | head -n 1)
         if [ -n "$lp" ] && kill_lklfuse "$lp"; then
           ok "before login: lklfuse ($lp) is killed"
-          if macfuse_term_fixed; then check "before login: with macFUSE's fix, SIGTERM ends lklfuse within 5 s, no SIGKILL" test "$term_clean" = 1
-          else echo "# before login: this macFUSE predates 5.5.0-mavericks.4: SIGTERM may be ignored ($([ "$term_clean" = 1 ] && echo ended || echo ignored))"; fi
+          if macfuse_term_fixed; then check "before login: with macFUSE 5.5.0-mavericks.4 or later, SIGTERM ends lklfuse within 5 s, no SIGKILL" test "$term_clean" = 1
+          else echo "# before login: this macFUSE predates 5.5.0-mavericks.4, the tested one: SIGTERM may be ignored ($([ "$term_clean" = 1 ] && echo ended || echo ignored))"; fi
           check "before login: with lklfuse dead, a read of $mp fails at once instead of hanging" bounded 100 sh -c '! ls "$1"' _ "$mp"
           check "before login: with lklfuse dead, diskutil unmount still unmounts $mp" login_unmount "$mp"
           if bounded 600 sudo -n diskutil mount "$dev" > /dev/null 2>&1 && da_wait 300; then
@@ -576,7 +555,6 @@ f = open(sys.argv[1], "a"); fcntl.flock(f, fcntl.LOCK_EX); sys.stdout.write("hel
     tail -n +"$((${loglog:-0} + 1))" /var/log/system.log 2> /dev/null | grep -i 'linuxfs\|diskarbitrationd\|fuse' | sed 's/^/# /'
     for f in $(sudo -n find /private/var/db/linuxfs -type f 2> /dev/null | head -n 8); do echo "# --- $f"; sudo -n head -c 4000 "$f" 2>&1 | sed 's/^/# /'; done
   fi
-  bounded 3000 diag_before_login
   restore_login
   # platform: 10.9 has no re-login without a reboot, and mavericks-vm has no mid-job reboot, so the user's return is not asked
   echo "# SKIP user return: mavericks-vm cannot re-login without a reboot (shipyard queued it); autoLoginUser is restored"
