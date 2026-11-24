@@ -181,12 +181,20 @@ root_mount_macfuse_gone() {
     sleep 1
   done
 }
+# spec: components/macfuse/version -- macFUSE 5.5.0-mavericks.4's lklfuse ends on SIGTERM over /dev/fd/N (.2 and .3 serve it but ignore
+#       SIGTERM): the version in the guest's manifest, as 0 when it is at least that
+macfuse_term_fixed() {
+  v=$(/usr/libexec/PlistBuddy -c 'Print :version' /usr/local/mavergreen/macfuse/mavergreen.plist 2> /dev/null) || return 1
+  echo "$v" | sed 's/-mavericks[.]/./' | awk -F. 'NF == 4 { for (i = 1; i <= 4; i++) { split("5 5 0 4", t, " "); if ($i + 0 != t[i] + 0) exit !($i + 0 > t[i] + 0) } exit 0 } { exit 1 }'
+}
 # spec: tools/fs.c mount_by_root -- a daemon that dies leaves the mount unserved (see its use below): SIGTERM through sudo (the
-#       process is _linuxfs's), 5 s; then SIGKILL, 30 s. A SIGTERM that does not end it is said (VM run 45386140589: lklfuse
-#       served on and ignored it for 30 s), not hidden: only the process still being there after SIGKILL fails
+#       process is _linuxfs's), 5 s; where macFUSE has the fix (macfuse_term_fixed) that must end it, and term_clean says so; else
+#       (or if it does not) it is said and SIGKILL follows, 30 s: only a process still there after SIGKILL fails this function
+term_clean=
 kill_lklfuse() {
+  term_clean=
   sudo -n kill "$1" || return 1
-  bounded 50 sh -c 'while ps -p "$1" > /dev/null; do sleep 0.1; done' _ "$1" && return 0
+  bounded 50 sh -c 'while ps -p "$1" > /dev/null; do sleep 0.1; done' _ "$1" && { term_clean=1; return 0; }
   echo "# lklfuse ($1) was still running 5 s after SIGTERM while serving; SIGKILL"
   sudo -n kill -KILL "$1" || return 1
   bounded 300 sh -c 'while ps -p "$1" > /dev/null; do sleep 0.1; done' _ "$1"
@@ -530,6 +538,8 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
         lp=$(lklfuse_fd | awk '{ print $2 }' | head -n 1)
         if [ -n "$lp" ] && kill_lklfuse "$lp"; then
           ok "before login: lklfuse ($lp) is killed"
+          if macfuse_term_fixed; then check "before login: with macFUSE's fix, SIGTERM ends lklfuse within 5 s, no SIGKILL" [ "$term_clean" = 1 ]
+          else echo "# before login: this macFUSE predates 5.5.0-mavericks.4: SIGTERM may be ignored ($([ "$term_clean" = 1 ] && echo ended || echo ignored))"; fi
           check "before login: with lklfuse dead, a read of $mp fails at once instead of hanging" bounded 100 sh -c '! ls "$1"' _ "$mp"
           check "before login: with lklfuse dead, diskutil unmount still unmounts $mp" login_unmount "$mp"
           if bounded 600 sudo -n diskutil mount "$dev" > /dev/null 2>&1 && da_wait 300; then

@@ -549,8 +549,30 @@ sh "$L" unmount "$T/dam" > /dev/null 2>&1
 (LINUXFS_OPEN_INHERITED=1 LINUXFS_ALL_USERS=1 LINUXFS_FUSE_FD=4 LINUXFS_FUSE_CHAN=6 FAKE_PROBE=ntfs3 FAKE_MODE=dirty FAKE_FD_MNT=$T/dam
  export LINUXFS_OPEN_INHERITED LINUXFS_ALL_USERS LINUXFS_FUSE_FD LINUXFS_FUSE_CHAN FAKE_PROBE FAKE_MODE FAKE_FD_MNT
  DA --asked /dev/disk3s1 "$T/dam" 4</dev/null 6</dev/null > "$T/out" 2>&1); rc=$?
-[ $rc -eq 1 ] && grep -q "dirty NTFS volume the check did not see; mount it again read-only" "$T/out" && [ "$(grep -c '^open .*bin/lklfuse' "$T/calls")" = 1 ]
+[ $rc -eq 1 ] && grep -q "dirty NTFS volume the check did not see; mount it again read-only (linuxfs mount --ro /dev/disk3s1)" "$T/out" && [ "$(grep -c '^open .*bin/lklfuse' "$T/calls")" = 1 ]
 ok $? "with root's channel, a dirty NTFS volume the probe missed is not retried: one lklfuse, and it says to mount it again read-only (rc $rc: $(tail -n 2 "$T/out" | tr '\n' '|'))"
+sh "$L" unmount "$T/dam" > /dev/null 2>&1
+# spec: cli/linuxfs cmd_mount -- with root's channel root is authoritative on read-only: ro only from --ro, no preference read, never ro
+#       under a rw mount; where root said rw and the CLI's facts say ro it refuses before the opener ("ready"), so no mount happens
+chanrun() { # ENV... -- ARGS...: da-mount with root's channel and device descriptor
+  : > "$T/calls"
+  (LINUXFS_OPEN_INHERITED=1 LINUXFS_ALL_USERS=1 LINUXFS_FUSE_FD=4 LINUXFS_FUSE_CHAN=6 FAKE_FD_MNT=$T/dam; export LINUXFS_OPEN_INHERITED LINUXFS_ALL_USERS LINUXFS_FUSE_FD LINUXFS_FUSE_CHAN FAKE_FD_MNT
+   while [ "$1" != -- ]; do export "$1"; shift; done; shift
+   DA "$@" 4</dev/null 6</dev/null > "$T/out" 2>&1); rc=$?
+}
+chanrun FAKE_PROBE=apfs -- /dev/disk3s1 "$T/dam"
+[ $rc -eq 0 ] && grep -q "opts=readwrite" "$T/calls" && ! grep -q ",ro " "$T/calls"; ok $? "root said rw (no --ro) for APFS: the CLI mounts read-write though its own APFSWrite preference is off (rc $rc)"
+sh "$L" unmount "$T/dam" > /dev/null 2>&1
+defaults write test.linuxfs ReadOnly -bool true
+chanrun FAKE_PROBE=ext4 -- /dev/disk3s1 "$T/dam"
+defaults delete test.linuxfs ReadOnly
+[ $rc -eq 0 ] && ! grep -q ",ro " "$T/calls"; ok $? "root said rw: the CLI's own ReadOnly preference is not read, so it never serves read-only under a rw mount (rc $rc)"
+sh "$L" unmount "$T/dam" > /dev/null 2>&1
+chanrun FAKE_PROBE=ntfs3 FAKE_FLAGS=dirty -- --asked /dev/disk3s1 "$T/dam"
+[ $rc -eq 1 ] && grep -q "root mounted macFUSE read-write, but this volume would be read-only" "$T/out" && ! grep -q "fuse-chan" "$T/calls"
+ok $? "root said rw but the volume probes dirty: the CLI refuses before the opener, so no mount (rc $rc: $(head -n 2 "$T/out" | tr '\n' '|'))"
+chanrun FAKE_PROBE=ntfs3 FAKE_FLAGS=dirty -- --asked --ro /dev/disk3s1 "$T/dam"
+[ $rc -eq 0 ] && grep -q "^open --fuse-chan .*,ro " "$T/calls"; ok $? "root said ro for the same dirty volume: it mounts read-only on the first try (rc $rc)"
 sh "$L" unmount "$T/dam" > /dev/null 2>&1
 (LINUXFS_OPEN_INHERITED=1 LINUXFS_FUSE_CHAN=6; export LINUXFS_OPEN_INHERITED LINUXFS_FUSE_CHAN; : > "$T/calls"; DA /dev/disk3s1 "$T/dam" 6</dev/null > "$T/out" 2>&1); rc=$?
 [ $rc -eq 2 ] && ! grep -q lklfuse "$T/calls"; ok $? "LINUXFS_FUSE_CHAN without LINUXFS_FUSE_FD is refused, exit 2 (got $rc)"

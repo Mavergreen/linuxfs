@@ -145,7 +145,7 @@ static int chan_wait_s(void)
 {
 #ifdef LINUXFS_OPEN_TEST
 	const char *t = getenv("LINUXFS_OPEN_CHAN_TIMEOUT");
-	char *end;
+	char *end = NULL;
 	long v = t ? strtol(t, &end, 10) : 0;
 
 	if (t && end != t && !*end && v > 0 && v < CHAN_WAIT_S)

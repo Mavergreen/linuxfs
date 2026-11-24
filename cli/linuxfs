@@ -296,9 +296,22 @@ cmd_mount() {
   # read-only or not by the root mount program's own rule (tools/fsrules.h fsrules_access, through linuxfs-probe --access):
   # asked, an encrypted volume, an APFS Fusion container, APFS unless the user opted in (APFSWrite: linux-apfs-rw's write
   # support is experimental, so read-write through its readwrite option, with a warning), a dirty NTFS volume
-  apfs_rw= aw=
-  [ "$type" != apfs ] || [ "$(pref APFSWrite off)" != on ] || aw=apfs-write
+  # With root's channel (before login) root is authoritative: it decided read-only before mounting macFUSE (its --ro; APFSWrite and
+  # ReadOnly are its reading), and the mount it makes is that, for good. So here ro comes only from --ro, no preference is read, and
+  # the facts this CLI sees are only checked against it: where root said read-write and they say read-only (the time-of-check window
+  # between root's probe and ours: a dirty flag set meanwhile, or a changed preference) the CLI refuses before "ready", so no mount
+  # happens; it never serves read-only under a read-write mount.
+  apfs_rw= aw= rootrw=
+  if [ -n "$fusechan" ]; then
+    [ -n "$ro" ] || rootrw=1
+    [ "$type" != apfs ] || [ -n "$ro" ] || aw=apfs-write
+  else
+    [ "$type" != apfs ] || [ "$(pref APFSWrite off)" != on ] || aw=apfs-write
+  fi
   access=$("$PROBE" --access "$type" "$fusion" "$flags" ${ro:+ro} $aw < /dev/null) || die "$target: cannot tell how to mount it"
+  if [ -n "$rootrw" ]; then
+    case $access in rw) ;; *) die "$target: root mounted macFUSE read-write, but this volume would be read-only ($access); not mounting, so nothing is left half-served. Mount it again" ;; esac
+  fi
   case $access in
     rw) if [ "$type" = apfs ]; then
           apfs_rw=1
@@ -344,8 +357,8 @@ cmd_mount() {
       grep -q 'unable to exclusively lock\|failed to open .*linuxfs-.*\.lock' "$log" && die "$target is already mounted by linuxfs"
       # what linuxfs's own check (the probe's flags, the access rule root also applies) could not see, and a retry read-only would
       # have mended: said, not retried (before login the one device went to the lklfuse that failed)
-      grep -q 'volume is dirty' "$log" && die "$target is a dirty NTFS volume the check did not see; mount it again read-only"
-      grep -q 'can only be mounted read-only' "$log" && die "$target is an encrypted APFS volume, which mounts read-only only; mount it again read-only"
+      grep -q 'volume is dirty' "$log" && die "$target is a dirty NTFS volume the check did not see; mount it again read-only (linuxfs mount --ro $target)"
+      grep -q 'can only be mounted read-only' "$log" && die "$target is an encrypted APFS volume, which mounts read-only only; mount it again read-only (linuxfs mount --ro $target)"
       die "cannot mount $target"
     fi
     if [ "$type" = ntfs3 ] && [ -z "$ro" ] && grep -q 'volume is dirty' "$log"; then
@@ -508,7 +521,7 @@ cmd_da_mount() {
         sleep 0.1
       done ;;
   esac
-  [ "$(pref ReadOnly off)" != on ] || ro=1
+  [ -n "$fusechan" ] || [ "$(pref ReadOnly off)" != on ] || ro=1   # (with root's channel, root has read it already: --ro)
   set -- "$1" "$mp"
   [ -z "$ro" ] || set -- "$@" --ro
   if [ -n "$pws" ]; then

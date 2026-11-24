@@ -613,7 +613,8 @@ static int run_cli(const char *cli, const struct mountreq *req, const char *pw, 
 #define MOUNT_MACFUSE "/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse"
 #define MACFUSE_MANIFEST "/usr/local/mavergreen/macfuse/mavergreen.plist"
 /* The first Mavergreen macFUSE release that ships the fd-mountpoint patch (its libfuse 3 serves a /dev/fd/N mountpoint
- * another process mounted: macfuse's DETAILS.md, "A mount made for you"), as build/package.sh's MACFUSE_MIN. Dev builds
+ * another process mounted: macfuse's DETAILS.md, "A mount made for you"). build/package.sh's MACFUSE_MIN is later (5.5.0-mavericks.4, where lklfuse also ends on
+ * SIGTERM); .2 and .3 serve it fine and only stop slowly, so the gate stays here. Dev builds
  * labelled 5.5.0-mavericks.2 that predate the patch exist: on those the gate passes, lklfuse cannot serve /dev/fd/N, and
  * root's mount fails, bounded, after STATUS_WAIT_S. */
 #define MACFUSE_FD_MOUNTPOINT_SINCE "5.5.0-mavericks.2"
@@ -1137,13 +1138,16 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 	if (devfd < 0 || !send_device(ch[0], devfd)) {
 		if (devfd >= 0)
 			close(devfd);
-		if (devfd == -2 || devfd == -3)
+		if (devfd == -2 || devfd == -3) {
 			syslog(LOG_NOTICE, "mount_%s: %s: the CLI's channel %s while waiting for the device; stopping mount_macfuse", fs, bsd,
 			       devfd == -2 ? "closed" : "sent unexpected data");
-		else
+			fprintf(stderr, "linuxfs-mount: the CLI's channel %s while waiting for the device\n",
+				devfd == -2 ? "closed" : "sent unexpected data");
+		} else {
 			syslog(LOG_NOTICE, "mount_%s: %s: no macFUSE device from mount_macfuse within %d s, or none to hand the CLI", fs, bsd,
 			       wait_s(DEVICE_WAIT_S));
-		fprintf(stderr, "linuxfs-mount: mount_macfuse sent no macFUSE device\n");
+			fprintf(stderr, "linuxfs-mount: mount_macfuse sent no macFUSE device\n");
+		}
 		goto failed;
 	}
 	close(devfd);	/* the CLI's lklfuse and mount_macfuse hold it; root's copy would only keep it open */

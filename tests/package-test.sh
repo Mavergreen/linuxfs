@@ -68,11 +68,11 @@ grep -q "launchctl load.*/Library/LaunchAgents/$A.plist" "$comp/Scripts/postinst
 grep -q "launchctl load.*/Library/LaunchDaemons/$H.plist" "$comp/Scripts/postinstall" 2>/dev/null || fail "the postinstall does not load the helper"
 grep -q 'needs macfuse\|macfuse.*not installed\|requires macfuse\|macfuse' "$comp/Scripts/preinstall" ||
   fail "the preinstall does not mention macfuse"
-grep -q "'5\.5\.0-mavericks\.2'" "$comp/Scripts/preinstall" ||
-  fail "the preinstall does not require macfuse 5.5.0-mavericks.2 (the first that serves /dev/fd/N) or later"
+grep -q "'5\.5\.0-mavericks\.4'" "$comp/Scripts/preinstall" ||
+  fail "the preinstall does not require macfuse 5.5.0-mavericks.4 (the first whose lklfuse ends on SIGTERM over /dev/fd/N) or later"
 # platform: the preinstall reads macfuse's version with PlistBuddy, which only macOS has
 if [ -x /usr/libexec/PlistBuddy ]; then
-  for mv in 5.4.9-mavericks.3:refused 5.5.0-mavericks.1:refused 5.5.0-mavericks.2:accepted 5.5.0-mavericks.10:accepted; do
+  for mv in 5.4.9-mavericks.3:refused 5.5.0-mavericks.3:refused 5.5.0-mavericks.4:accepted 5.5.0-mavericks.10:accepted; do
     ver=${mv%%:*} want=${mv#*:} r="$T/mf-$ver"
     mkdir -p "$r/usr/local/mavergreen/macfuse"
     printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>version</key><string>%s</string></dict></plist>\n' \

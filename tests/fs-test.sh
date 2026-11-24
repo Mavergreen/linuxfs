@@ -452,6 +452,7 @@ fro "$TD" "a dirty NTFS volume"
 frw "$T" "a clean NTFS volume"
 fro "$A" "APFS without APFSWrite"
 frw "$A" "APFS with APFSWrite" "$D/apfswrite.plist"
+! grep -q 'rdonly\|^argv --ro$' "$M/plan"; ok $? "and with APFSWrite set the plan has no rdonly for mount_macfuse and no --ro for the CLI: root is authoritative, the CLI takes ro from it alone"
 fro "$E" "the ReadOnly preference" "$D/readonly.plist"
 MACHP=$D/apfswrite.plist fplan "$F2" "/dev/$AE" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc=$?
 [ $rc = 1 ] && ! grep -q '^helper' "$M/plan" && ! grep -q '^argv' "$M/plan" && grep -q '^linuxfs-mount: refused: .*encrypted' "$M/plan.err"
