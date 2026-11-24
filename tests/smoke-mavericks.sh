@@ -230,12 +230,30 @@ fstn_nested() {  # MP: lklfuse onto a directory inside the macfuse_ext4 volume
   bounded 300 "$L" unmount "$1/inner" > /dev/null 2>&1
   return 0
 }
-fstn_probe() {  # TAG: does a plain attach of a fresh copy still automount? (which step poisons the later ext4 attaches)
-  cp "$W/img/spike-ext4.img" "$W/img/spike-probe.img" || return 1
+fstn_probe() {  # TAG [IMG]: does a plain attach of a fresh copy still automount? (which step poisons the later ext4 attaches)
+  cp "${2:-$W/img/spike-ext4.img}" "$W/img/spike-probe.img" || return 1
   if da_attach "$W/img/spike-probe.img"; then
     if da_wait 150; then ok "fstypename probe $1: a plain attach automounts ($mp)"; else notok "fstypename probe $1: a plain attach automounts"; echo "# probe $1: diskutil info:"; rec diskutil info "$disk"; echo "# probe $1: diskutil mount $disk: $(diskutil mount "$disk" 2>&1 | tr '\n' ' ')"; rec mount; fi
   else notok "fstypename probe $1: hdiutil attach"; disk=$(image_disk "$W/img/spike-probe.img"); fi
   cleanup_disk
+}
+fstn_seq() {  # TAG IMG: ignore, diskutil mount, unignore, eject; then how long until a plain attach of a copy automounts again
+  tag=$1 simg=$2
+  da_attach_nomount "$simg" || { notok "fstypename seq $tag: attach -nomount"; disk=$(image_disk "$simg"); cleanup_disk; return 1; }
+  sleep 6
+  if mount | grep -qF "linuxfs@"; then bounded 600 diskutil unmount "$disk" > /dev/null 2>&1; fi
+  bounded 600 "$L" ignore "$disk" > /dev/null 2>&1
+  echo "# seq $tag: diskutil mount: $(bounded 600 diskutil mount "$disk" 2>&1 | tr '\n' ' ')"
+  echo "# seq $tag: unignore: $(bounded 600 "$L" unignore "$disk" 2>&1 | tr '\n' ' ')"
+  echo "# seq $tag: /etc/fstab linuxfs lines: $(grep -c '# linuxfs$' /etc/fstab)"
+  cleanup_disk
+  t=0
+  while [ $t -lt 8 ]; do
+    t=$((t + 1)); cp "$simg" "$W/img/spike-probe.img"
+    if da_attach "$W/img/spike-probe.img" && da_wait 100; then ok "fstypename seq $tag: a plain attach automounts again at try $t ($((t * 15 - 15)) s)"; cleanup_disk; return 0; fi
+    echo "# seq $tag: try $t: no automount"; [ -n "$disk" ] || disk=$(image_disk "$W/img/spike-probe.img"); cleanup_disk; sleep 10
+  done
+  notok "fstypename seq $tag: a plain attach never automounted again in 8 tries"
 }
 fstn_section() {
   echo "# fstypename: macFUSE tools and versions in this install:"
@@ -289,6 +307,8 @@ fstn_section() {
   else notok "fstypename: hdiutil attach -nomount"; disk=$(image_disk "$W/img/spike-ext4.img"); fi
   cleanup_disk
   fstn_probe B-after-ignore-unignore
+  fstn_seq ext4-recovery "$W/img/spike-ext4.img"
+  if gunzip -c "$IN/btrfs.img.gz" > "$W/img/spike-btrfs.img"; then fstn_seq btrfs-control "$W/img/spike-btrfs.img"; fi
   m=$W/mnt/spike; mkdir -p "$m"
   check "fstypename: linuxfs mount (the CLI's path)" bounded 600 "$L" mount "$W/img/spike-ext4.img" "$m"
   echo "# CLI path mount: $(mount | grep -F " on $m (")"
