@@ -153,14 +153,14 @@ jobs:
       - uses: Mavergreen/shipyard/.github/actions/install@v1
       - uses: actions/download-artifact@v8
         with: { name: linuxfs-images-after, path: "${{ runner.temp }}/after" }
-      - name: e2fsck -fn, btrfs check, xfs_repair -n, ntfsfix -n and fsck.exfat -n, in the build container
+      - name: e2fsck -fn, btrfs check, xfs_repair -n, ntfsfix -n, fsck.exfat -n and fsck.f2fs --dry-run, in the build container
         run: |
           set -eu
           d="$RUNNER_TEMP/after"
           for z in "$d"/*.img.gz; do gunzip "$z"; done
           LINUX_HOST_SHARE="$HOME" sh build/linux-host.sh sh -c '
             rc=0
-            for c in ext4:ext4 btrfs:btrfs xfs:xfs ntfs:ntfs exfat:exfat ext4:da-ext4 btrfs:da-btrfs xfs:da-xfs ntfs:da-ntfs ext4:login-ext4; do
+            for c in ext4:ext4 btrfs:btrfs xfs:xfs ntfs:ntfs exfat:exfat f2fs:f2fs ext4:da-ext4 btrfs:da-btrfs xfs:da-xfs ntfs:da-ntfs f2fs:da-f2fs ext4:da-ext4-off ext4:da-ext4-ro ext4:login-ext4; do
               fs=${c%%:*} img=$1/${c#*:}.img
               if [ ! -f "$img" ]; then echo "not ok - $img: the guest returned no such image"; rc=1
               elif sh tests/lib/check-fs.sh "$fs" "$img"; then echo "ok - $img is clean ($fs)"

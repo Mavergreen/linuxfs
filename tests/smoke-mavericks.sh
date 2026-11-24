@@ -59,7 +59,8 @@ finish() {
   [ "$(crashes)" = "$CRASH0" ] || { notok "no new panic or lklfuse crash report"; ls -l "$HOME"/Library/Logs/DiagnosticReports /Library/Logs/DiagnosticReports 2>&1 | sed 's/^/# /'; }
   for f in "$W"/img/*.img; do [ -f "$f" ] && gzip -c "$f" > "$OUT/$(basename "$f").gz"; done
   # spec: .github/workflows/on-mavericks.yml -- the run's evidence comes back in OUT (copyback), uploaded even when this fails
-  tail -n 3000 /var/log/system.log > "$OUT/system.log" 2> /dev/null
+  # platform: sudo logs every COMMAND= line to system.log, and OUT is uploaded publicly: nothing that names the keychain unlock or kcpassword goes in
+  grep -v 'unlock-keychain\|kcpassword\|security -i' /var/log/system.log 2> /dev/null | tail -n 3000 > "$OUT/system.log"
   echo "# OUT: $(ls -l "$OUT" | awk 'NR > 1 { printf "%s (%s) ", $NF, $5 }')"
   echo "1..$n"
   exit "$bad"
@@ -75,7 +76,7 @@ check "linuxfs status runs" "$L" status
 imgfs=
 for fs in ext4 btrfs xfs ntfs exfat f2fs; do
   if gunzip -c "$IN/$fs.img.gz" > "$W/img/$fs.img" 2> /dev/null; then imgfs="$imgfs $fs"
-  else n=$((n + 1)); echo "ok $n - # SKIP $fs: no $IN/$fs.img.gz"; fi
+  else notok "$fs: no $IN/$fs.img.gz (a required image)"; fi
 done
 dd if=/dev/urandom of="$W/payload" bs=1024 count=4096 2> /dev/null || die "cannot make the payload"
 for fs in $imgfs; do
@@ -138,13 +139,13 @@ UUID_PART=6C696E75-7866-7370-6172-740000000001   # tests/lib/gpt-wrap.py's parti
 info() { diskutil info "$1" 2> /dev/null | sed -n "s/^ *$2: *//p" | head -n 1; }
 # spec: tests/smoke-mavericks.sh header -- attach IMAGE with automount (no -nomount); disks = every /dev/disk node it made, disk = the whole disk
 da_attach() {
-  out=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage "$1" 2>&1) || { echo "$out" | sed 's/^/# /'; return 1; }
+  out=$(bounded 3000 hdiutil attach -imagekey diskimage-class=CRawDiskImage "$1" 2>&1) || { echo "$out" | sed 's/^/# /'; return 1; }
   disks=$(printf '%s\n' "$out" | awk '/^\/dev\/disk/ { print $1 }' | tr '\n' ' ')
   disk=${disks%% *}; [ -n "$disk" ]
 }
 # spec: tests/smoke-mavericks.sh header -- the mounted node of disks within T tenths of a second: dev and mp
 da_attach_nomount() {
-  out=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$1" 2>&1) || { echo "$out" | sed 's/^/# /'; return 1; }
+  out=$(bounded 3000 hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$1" 2>&1) || { echo "$out" | sed 's/^/# /'; return 1; }
   disks=$(printf '%s\n' "$out" | awk '/^\/dev\/disk/ { print $1 }' | tr '\n' ' ')
   disk=${disks%% *}; [ -n "$disk" ]
 }
@@ -157,13 +158,17 @@ da_wait() {
   done
 }
 # spec: tests/smoke-mavericks.sh header -- lklfuse processes, as "USER PID COMMAND"
+# spec: tests/smoke-mavericks.sh header -- the lklfuse lines whose command ends in exactly MNT as its last argument (a mount point may hold spaces)
+lklfuse_on() { lklfuses | awk -v m=" $1" 'length($0) > length(m) && substr($0, length($0) - length(m) + 1) == m'; }
 lklfuses() { ps -axww -o user=,pid=,command= | awk '/lklfuse/ && !/awk/'; }
+lklfuse_user_is() { lklfuse_on "$2" | awk -v u="$1" '$1 == u { f = 1 } END { exit !f }'; }
+lklfuse_has() { lklfuse_on "$2" | grep -q "$1"; }
 no_root_lklfuse() { lklfuses | awk '$1 == "root" { f = 1 } END { exit f }'; }
 da_eject() {  # whole disk, mount point: leaves no lklfuse on it
-  pids=$(lklfuses | awk -v m="$2" 'index($0, m) { print $2 }')
+  pids=$(lklfuse_on "$2" | awk '{ print $2 }')
   bounded 600 diskutil eject "$1" > /dev/null 2>&1 || return 1
   for p in $pids; do bounded 300 sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 0.1; done' _ "$p" || { echo "lklfuse $p still runs"; return 1; }; done
-  j=0; while lklfuses | grep -qF "$2"; do
+  j=0; while [ -n "$(lklfuse_on "$2")" ]; do
     j=$((j + 1)); [ $j -le 10 ] || { echo "lklfuse still on $2 ten seconds after the eject:"; lklfuses; ps -axww -o user=,pid=,command= | grep -i 'fuse' | grep -v grep; return 1; }
     sleep 1
   done
@@ -224,7 +229,7 @@ defaults write dev.mavergreen.linuxfs NTFSTakeover -bool true
 for c in ext4:ext4:rw btrfs:btrfs:rw xfs:XFS:rw f2fs:F2FS:rw ntfs:NTFS-linuxfs:rw apfs:APFS:ro; do
   fs=${c%%:*} rest=${c#*:} pers=${rest%%:*} kind=${rest#*:}
   if [ ! -f "$W/img/$fs.img" ] && ! gunzip -c "$IN/$fs.img.gz" > "$W/img/$fs.img" 2> /dev/null; then
-    n=$((n + 1)); echo "ok $n - # SKIP $fs: no $IN/$fs.img.gz"; continue
+    notok "$fs: no $IN/$fs.img.gz (a required image)"; continue
   fi
   if cp "$W/img/$fs.img" "$W/img/da-$fs.img"; then da_cycle "$fs" "$W/img/da-$fs.img" "$pers" "$kind" raw; else notok "$fs: cannot copy $fs.img"; fi
   if gunzip -c "$IN/gpt-$fs.img.gz" > "$W/gpt-$fs.img"; then da_cycle "$fs" "$W/gpt-$fs.img" "$pers" "$kind" GPT; else notok "$fs: cannot unpack $IN/gpt-$fs.img.gz"; fi
@@ -250,7 +255,7 @@ if cp "$W/img/ext4.img" "$W/img/da-ext4-off.img"; then
   img=$W/img/da-ext4-off.img
   log0=$(wc -l < /var/log/system.log 2> /dev/null | tr -d ' ')
   out=$(bounded 600 hdiutil attach -imagekey diskimage-class=CRawDiskImage "$img" 2>&1); rc=$?
-  "$AQUA" screencapture -x "$OUT/automount-off.png" > /dev/null 2>&1 && ok "automount off: screenshot automount-off.png (read it for a 'not readable' dialog)" || notok "automount off: screencapture"
+  bounded 600 "$AQUA" screencapture -x "$OUT/automount-off.png" > /dev/null 2>&1 && ok "automount off: screenshot automount-off.png (read it for a 'not readable' dialog)" || notok "automount off: screencapture"
   disk=$(image_disk "$img"); disks=$disk
   mounted=
   for d in $(printf '%s\n' "$out" | awk '/^\/dev\/disk/ { print $1 }') $disk; do [ "$(info "$d" Mounted)" != Yes ] || mounted=$d; done
@@ -312,7 +317,7 @@ if gunzip -c "$IN/gpt-enc.img.gz" > "$W/gpt-enc.img"; then
   hdiutil attach -imagekey diskimage-class=CRawDiskImage "$W/gpt-enc.img" > "$W/enc-attach.out" 2>&1 &
   ap=$!
   sleep 5
-  "$AQUA" screencapture -x "$OUT/apfs-dialog.png" > /dev/null 2>&1 && ok "encrypted apfs: screenshot apfs-dialog.png 5 s after the attach (the mount program's password dialog)" || notok "encrypted apfs: screencapture"
+  bounded 600 "$AQUA" screencapture -x "$OUT/apfs-dialog.png" > /dev/null 2>&1 && ok "encrypted apfs: screenshot apfs-dialog.png 5 s after the attach (the mount program's password dialog)" || notok "encrypted apfs: screencapture"
   echo "# the dialog's process, if any: $(ps -axww -o user=,pid=,command= | grep -i 'UserNotificationCenter\|CFUserNotification' | grep -v grep | tr '\n' '|')"
   check "encrypted apfs: the mount program is waiting on its dialog" pgrep -f mount_linuxfs_apfs
   disk=$(image_disk "$W/gpt-enc.img")
@@ -338,26 +343,34 @@ if gunzip -c "$IN/gpt-enc.img.gz" > "$W/gpt-enc.img"; then
   # spec: tools/agent.c -- the keeper's item: service dev.mavergreen.linuxfs, account the partition's UUID, in the login keychain
   # platform: through guest-macosx-aqua the login keychain is locked ("User interaction is not allowed"); the account's password
   #           is the one mavericks-vm's guest-aqua.sh made and put in /etc/kcpassword, which root can decode
-  kcpw=$(sudo -n perl -e 'my @k = (0x7D,0x89,0x52,0x23,0xD2,0xBC,0xDD,0xEA,0xA3,0xB9,0x1F); local $/; my $d = <STDIN>; my $o = ""; for my $i (0 .. length($d) - 1) { my $c = ord(substr($d, $i, 1)) ^ $k[$i % 11]; last if $c == 0; $o .= chr($c); } print $o;' < /etc/kcpassword 2> /dev/null)
+  # platform: 10.9 sudo logs COMMAND= to system.log, so root opens /etc/kcpassword itself (an ssh shell cannot); the password is never on an argv, in the log or in OUT
+  kcpw=$(sudo -n perl -e 'open(F, "<", "/etc/kcpassword") or exit 1; binmode F; local $/; my $d = <F>; my @k = (0x7D,0x89,0x52,0x23,0xD2,0xBC,0xDD,0xEA,0xA3,0xB9,0x1F); my $o = ""; for my $i (0 .. length($d) - 1) { my $c = ord(substr($d, $i, 1)) ^ $k[$i % 11]; last if $c == 0; $o .= chr($c); } print $o;' 2> /dev/null)
   kc_ok=
-  if [ -n "$kcpw" ] && "$AQUA" security unlock-keychain -p "$kcpw" "$HOME/Library/Keychains/login.keychain" > "$W/kc-unlock.log" 2>&1; then
+  # spec: tests/smoke-mavericks.sh header -- the unlock goes to `security -i` on stdin through the aqua helper (sudo -E keeps stdin), from a 0600 file
+  #       removed at once; sudo's COMMAND= lines in system.log never carry the password
+  if [ -n "$kcpw" ] && ( umask 077; printf 'unlock-keychain -p %s %s\n' "$kcpw" "$HOME/Library/Keychains/login.keychain" > "$W/kc.in" ) &&
+     KCIN=$W/kc.in bounded 600 sh -c 'exec "$@" < "$KCIN"' _ "$AQUA" security -i > "$W/kc-unlock.log" 2>&1; then
+    rm -f "$W/kc.in"
     ok "encrypted apfs: the login keychain is unlocked in the console session"
-    if "$AQUA" security add-generic-password -U -s dev.mavergreen.linuxfs -a "$UUID_PART" -w linuxfs-test -T "$P/libexec/linuxfs-agent" login.keychain > "$W/kc-add.log" 2>&1; then
+    if bounded 600 "$AQUA" security add-generic-password -U -s dev.mavergreen.linuxfs -a "$UUID_PART" -w linuxfs-test -T "$P/libexec/linuxfs-agent" login.keychain > "$W/kc-add.log" 2>&1; then
       ok "encrypted apfs: the password goes into the login keychain"; kc_ok=1
     else notok "encrypted apfs: the password goes into the login keychain"; sed 's/^/# /' "$W/kc-add.log"; fi
-  else echo "ok $((n + 1)) - # SKIP the keychain checks: the login keychain cannot be unlocked through the harness ($(tr '\n' ' ' < "$W/kc-unlock.log" 2> /dev/null))"; n=$((n + 1)); fi
+  else
+    rm -f "$W/kc.in"
+    n=$((n + 1)); echo "ok $n - # SKIP the keychain checks: the login keychain cannot be unlocked through the harness ($(KCPW=$kcpw awk 'length(ENVIRON["KCPW"]) == 0 || index($0, ENVIRON["KCPW"]) == 0' "$W/kc-unlock.log" 2> /dev/null | tr '\n' ' '))"
+  fi
   kcpw=
   if [ -n "$kc_ok" ]; then
     if da_attach "$W/gpt-enc.img"; then
       if da_wait 300; then
         ok "encrypted apfs: a plain attach mounts it at $mp with the keychain's password"
-        "$AQUA" screencapture -x "$OUT/apfs-keychain.png" > /dev/null 2>&1
+        bounded 600 "$AQUA" screencapture -x "$OUT/apfs-keychain.png" > /dev/null 2>&1
         check "encrypted apfs: no mount program is left waiting on a dialog" sh -c '! pgrep -f mount_linuxfs_apfs > /dev/null'
       else notok "encrypted apfs: mounted within 30 s from the keychain, with no dialog"; fi
     else notok "encrypted apfs: attach again"; disk=$(image_disk "$W/gpt-enc.img"); fi
     cleanup_disk
   fi
-  "$AQUA" security delete-generic-password -s dev.mavergreen.linuxfs -a "$UUID_PART" > /dev/null 2>&1
+  bounded 600 "$AQUA" security delete-generic-password -s dev.mavergreen.linuxfs -a "$UUID_PART" > /dev/null 2>&1
 else notok "encrypted apfs: unpack the fixture"; fi
 rm -f "$W/gpt-enc.img"
 check "the keychain keeper is still running" pgrep -f "$P/libexec/linuxfs-agent"
@@ -384,30 +397,31 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
   i=0; until [ "$(console)" = root ]; do i=$((i + 1)); [ $i -le 30 ] || break; sleep 1; done
   if [ "$(console)" = root ]; then ok "before login: the console is root's (the login window), after about $i s"
   else notok "before login: /dev/console is still owned by $(console) after 30 s (loginwindow restarted; the checks below may not be before-login)"; fi
-  sudo -n screencapture -x "$OUT/before-login.png" > /dev/null 2>&1 && echo "# before-login.png taken as root" || echo "# NOTE: screencapture as root over ssh failed; no before-login.png"
+  bounded 600 sudo -n screencapture -x "$OUT/before-login.png" > /dev/null 2>&1 && echo "# before-login.png taken as root" || echo "# NOTE: screencapture as root over ssh failed; no before-login.png"
   bad0=$bad; loglog=$(wc -l < /var/log/system.log 2> /dev/null | tr -d ' ')
-  out=$(sudo -n hdiutil attach -imagekey diskimage-class=CRawDiskImage "$W/img/login-ext4.img" 2>&1)
+  out=$(bounded 3000 sudo -n hdiutil attach -imagekey diskimage-class=CRawDiskImage "$W/img/login-ext4.img" 2>&1)
   disks=$(printf '%s\n' "$out" | awk '/^\/dev\/disk/ { print $1 }' | tr '\n' ' '); disk=${disks%% *}
   if [ -n "$disk" ] && da_wait 300; then
     ok "before login: $dev mounted at $mp"
     echo "# before login: $(stat -f '%Sp %Su' "$mp") is the mount's mode and owner (right after the mount); lklfuse:"
     lklfuses | sed 's/^/# /'
-    check "before login: lklfuse runs as _linuxfs" sh -c '! [ -z "$(ps -axww -o user=,command= | awk "\$1 == \"_linuxfs\" && /lklfuse/")" ]'
-    check "before login: lklfuse mounted with allow_other" sh -c 'ps -axww -o command= | grep lklfuse | grep -F "$1" | grep -q allow_other' _ "$mp"
+    check "before login: the mount at $mp is mounted by _linuxfs" sh -c 'mount | grep -F " on $1 (" | grep -q "mounted by _linuxfs"' _ "$mp"
+    check "before login: the lklfuse on $mp runs as _linuxfs" lklfuse_user_is _linuxfs "$mp"
+    check "before login: the lklfuse on $mp was given allow_other" lklfuse_has allow_other "$mp"
     check "before login: no lklfuse runs as root" no_root_lklfuse
     check "before login: the user can read and write the volume over ssh" rw_works "$mp"
   else notok "before login: the ext4 image mounted within 30 s"; echo "$out" | sed 's/^/# /'; fi
-    if [ "$bad" != "$bad0" ]; then
-      echo "# before login, what is left, to find why:"
-      sudo -n ls -la /Volumes 2>&1 | sed 's/^/# /'; for m in /Volumes/*; do sudo -n ls -lad "$m" 2>&1 | sed 's/^/# /'; done
-      ps -axo user,pid,command | grep -i fuse | grep -v grep | sed 's/^/# /'
-      tail -n +"$((${loglog:-0} + 1))" /var/log/system.log 2> /dev/null | grep -i 'linuxfs\|diskarbitrationd\|fuse' | sed 's/^/# /'
-      for f in $(sudo -n find /private/var/db/linuxfs -type f 2> /dev/null | head -n 8); do echo "# --- $f"; sudo -n head -c 4000 "$f" 2>&1 | sed 's/^/# /'; done
-    fi
-    restore_login
-    # platform: 10.9 has no re-login without a reboot, and mavericks-vm has no mid-job reboot, so the user's return is not asked
-    echo "# SKIP user return: mavericks-vm cannot re-login without a reboot (shipyard queued it); autoLoginUser is restored"
-    [ -z "$disk" ] || { bounded 600 sudo -n diskutil eject "$disk" > /dev/null 2>&1 || notok "before login: eject"; }
-    disk=
+  if [ "$bad" != "$bad0" ]; then
+    echo "# before login, what is left, to find why:"
+    sudo -n ls -la /Volumes 2>&1 | sed 's/^/# /'; for m in /Volumes/*; do sudo -n ls -lad "$m" 2>&1 | sed 's/^/# /'; done
+    ps -axo user,pid,command | grep -i fuse | grep -v grep | sed 's/^/# /'
+    tail -n +"$((${loglog:-0} + 1))" /var/log/system.log 2> /dev/null | grep -i 'linuxfs\|diskarbitrationd\|fuse' | sed 's/^/# /'
+    for f in $(sudo -n find /private/var/db/linuxfs -type f 2> /dev/null | head -n 8); do echo "# --- $f"; sudo -n head -c 4000 "$f" 2>&1 | sed 's/^/# /'; done
+  fi
+  restore_login
+  # platform: 10.9 has no re-login without a reboot, and mavericks-vm has no mid-job reboot, so the user's return is not asked
+  echo "# SKIP user return: mavericks-vm cannot re-login without a reboot (shipyard queued it); autoLoginUser is restored"
+  [ -z "$disk" ] || { bounded 600 sudo -n diskutil eject "$disk" > /dev/null 2>&1 || notok "before login: eject"; }
+  disk=
 else notok "before login: no autoLoginUser to restore, or no sudo; the before-login checks cannot run safely"; fi
 finish

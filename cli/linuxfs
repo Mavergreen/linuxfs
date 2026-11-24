@@ -148,7 +148,7 @@ run_lklfuse() { # SOURCE MOUNTPOINT OPTIONS [OPENER-DEVICE [SECOND-OPENER-DEVICE
 }
 
 # A disk's "TYPE<TAB>LABEL[<TAB>EXTRA]": from the probe when the raw node is readable, else through the helper.
-probe_dev() { if [ -r "$1" ] && [ "${LINUXFS_OPEN_INHERITED:-}" != 1 ]; then "$PROBE" "$1" 2>/dev/null; else "$OPENER" --probe "$1" 2>/dev/null; fi; }
+probe_dev() { if [ -r "$1" ] && [ "${LINUXFS_OPEN_INHERITED:-}" != 1 ]; then "$PROBE" "$1" 2>/dev/null < /dev/null; else "$OPENER" --probe "$1" 2>/dev/null < /dev/null; fi; }
 
 # The attached disk (/dev/rdiskN...) whose probe names it ROLE (main|tier2) of APFS Fusion container UUID.
 fusion_partner() { # ROLE UUID
@@ -228,8 +228,8 @@ cmd_mount() {
     src=$(cd "$(dirname "$target")" && pwd)/$(basename "$target")
     lockname=$(image_lock "$src")
   fi
-  if [ -n "$open_dev" ]; then probed=$("$OPENER" --probe "$open_dev"); rc=$?
-  else probed=$("$PROBE" "$src"); rc=$?; fi
+  if [ -n "$open_dev" ]; then probed=$("$OPENER" --probe "$open_dev" < /dev/null); rc=$?
+  else probed=$("$PROBE" "$src" < /dev/null); rc=$?; fi
   case $rc in
     0) ;;
     1) die "$target: no filesystem linuxfs knows (ext4, btrfs, xfs, NTFS, exFAT, FAT, f2fs)" ;;
@@ -414,9 +414,12 @@ cmd_da_mount() {
     case $1 in --asked) asked=1 ;; --ro) ro=1 ;; --password-stdin) pws=1 ;; esac; shift
   done
   [ $# -eq 2 ] || usage
+  # the password first, before the probe, the prefs or the opener can inherit stdin and drain it; they get /dev/null
+  dapw=
+  if [ -n "$pws" ]; then IFS= read -r dapw || [ -n "$dapw" ] || die "no password on stdin"; fi
   device_nodes "$1" || usage
   mp=$2
-  probed=$(probe_dev "$raw") || exit 3
+  probed=$(probe_dev "$raw" < /dev/null) || exit 3
   type=${probed%%"$tab"*} rest=${probed#*"$tab"}; label=${rest%%"$tab"*}
   # defence in depth: the bundles never claim these, so refuse them here too
   case $type in exfat|vfat) exit 3 ;; esac
@@ -431,7 +434,7 @@ cmd_da_mount() {
       # with the device inherited on fd 3 only it can be probed, so its partner can never be found
       [ "${LINUXFS_OPEN_INHERITED:-}" != 1 ] || exit 3
       uuid=${rest##*fusion-main } deadline=$(( $(date +%s) + (FUSION_WAIT + 9) / 10 ))
-      while [ -z "$(fusion_partner tier2 "$uuid")" ]; do
+      while [ -z "$(fusion_partner tier2 "$uuid" < /dev/null)" ]; do
         [ "$(date +%s)" -lt "$deadline" ] || exit 3
         sleep 0.1
       done ;;
@@ -439,8 +442,10 @@ cmd_da_mount() {
   [ "$(pref ReadOnly off)" != on ] || ro=1
   set -- "$1" "$mp"
   [ -z "$ro" ] || set -- "$@" --ro
-  [ -z "$pws" ] || set -- "$@" --password-stdin
-  cmd_mount "$@"
+  if [ -n "$pws" ]; then
+    set -- "$@" --password-stdin
+    printf '%s\n' "$dapw" | cmd_mount "$@"
+  else cmd_mount "$@"; fi
 }
 
 cmd_status() {

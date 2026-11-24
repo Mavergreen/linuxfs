@@ -16,8 +16,9 @@ and FUSE.
 
 Disks are recognised and mounted by the Mac itself (DiskArbitration), through filesystem bundles this installs in
 `/System/Library/Filesystems`, so they appear in Disk Utility and `diskutil` like any other, and they mount even
-before anyone logs in (with "Automount disks without user login" on, they are mounted by an unprivileged `_linuxfs`
-user and are open to every user). `diskutil mount`, `diskutil unmount` and `diskutil eject` work as usual.
+before anyone logs in, once the Mac is told to mount disks without a login (10.9 has no setting for it in the
+interface: `sudo defaults write /Library/Preferences/SystemConfiguration/autodiskmount AutomountDisksWithoutUserLogin
+-bool true`); such a disk is mounted by an unprivileged `_linuxfs` user and is open to every user. `diskutil mount`, `diskutil unmount` and `diskutil eject` work as usual.
 
 General CLI options:
 

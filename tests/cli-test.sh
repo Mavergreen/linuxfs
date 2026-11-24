@@ -205,6 +205,7 @@ if [ "\$1" = --probe ] && [ -n "\${FAKE_FUSION:-}" ]; then
   esac
   echo unknown; exit 1
 fi
+if [ "\$1" = --probe ] && [ -n "\${FAKE_OPEN_EAT:-}" ]; then cat > /dev/null; fi
 if [ "\$1" = --probe ]; then t=\${FAKE_PROBE:-ext4}; [ "\$t" != unreadable ] || t=ext4; printf '%s\t%s\n' "\$t" helped; exit 0; fi
 [ "\$1" != --ro ] || shift
 shift
@@ -359,6 +360,11 @@ for order in "--asked --password-stdin" "--password-stdin --asked" "--ro --passw
   [ $rc -eq 0 ] && [ "$(cat "$T/pwgot" 2>/dev/null)" = s3cret ]; ok $? "da-mount $order mounts an encrypted volume with the password from stdin (got $rc: '$out')"
   sh "$L" unmount "$T/dam" > /dev/null 2>&1; sh "$L" unmount disk2s1 > /dev/null 2>&1
 done
+# spec: cli/linuxfs cmd_da_mount -- the password is read before any helper can inherit and drain stdin
+rm -f "$T/pwgot"
+out=$(printf 's3cret\n' | LINUXFS_DA=1 FAKE_OPEN_EAT=1 FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret LINUXFS_OPEN="$T/bin/open" sh "$L" da-mount --asked --password-stdin /dev/disk2s1 "$T/dam" 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$(cat "$T/pwgot" 2>/dev/null)" = s3cret ]; ok $? "a probe that reads stdin does not eat the da-mount password (got $rc: '$out')"
+sh "$L" unmount "$T/dam" > /dev/null 2>&1; sh "$L" unmount disk2s1 > /dev/null 2>&1
 out=$(printf 'nope\n' | LINUXFS_DA=1 FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret LINUXFS_OPEN="$T/bin/open" sh "$L" da-mount --asked --password-stdin /dev/disk2s1 "$T/dam" 2>&1); rc=$?
 [ $rc -eq 4 ] && echo "$out" | grep -q "wrong password"; ok $? "da-mount --password-stdin with a wrong password exits 4 (got $rc: '$out')"
 # spec: cli/linuxfs --

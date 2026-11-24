@@ -1,13 +1,13 @@
 #!/bin/sh
 # platform: host-agnostic
-#   usage: check-fs.sh ext4|btrfs|xfs|ntfs|exfat|apfs IMAGE
+#   usage: check-fs.sh ext4|btrfs|xfs|ntfs|exfat|f2fs|apfs IMAGE
 #          Checks IMAGE with Linux's own checker, read-only. For ext4 it also fails a journal that
 #          still needs replaying, which `e2fsck -fn` lets through (it skips the replay and exits 0);
 #          for btrfs, a log tree still to replay (log_root), which `btrfs check` lets through. xfs's
 #          `xfs_repair -n` already fails a dirty log.
 #          Linux only.
 set -u
-[ "$#" -eq 2 ] || { echo "usage: check-fs.sh ext4|btrfs|xfs|ntfs|exfat|apfs IMAGE" >&2; exit 2; }
+[ "$#" -eq 2 ] || { echo "usage: check-fs.sh ext4|btrfs|xfs|ntfs|exfat|f2fs|apfs IMAGE" >&2; exit 2; }
 [ "$(uname -s)" = Linux ] || { echo "check-fs.sh: needs Linux's fsck tools" >&2; exit 77; }
 case $1 in
 ext4)
@@ -24,6 +24,7 @@ btrfs)
 xfs) xfs_repair -n "$2" ;;
 ntfs) ntfsfix -n "$2" ;;
 exfat) fsck.exfat -n "$2" ;;
+f2fs) fsck.f2fs -f --dry-run "$2" ;;
 apfs) apfsck "$2" ;;
 *) echo "check-fs.sh: unknown filesystem $1" >&2; exit 2 ;;
 esac

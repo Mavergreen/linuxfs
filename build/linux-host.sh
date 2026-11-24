@@ -20,8 +20,8 @@ fam=
 [ "$(uname -s)" = Linux ] && where="$SHARE or $FAMILY" || { where=$SHARE; FAMILY=/nonexistent; }
 case ${SHIPYARD_SCRIPTS:-}/ in
   "$SHARE"/?*) sy=$SHIPYARD_SCRIPTS ;;
-  # shipyard's install action puts it in the family prefix on every host (CI included); the container sees that prefix
-  # read-only at the same path
+  # platform: shipyard's install action puts it in the family prefix on every host (CI included); on a Linux host the container sees
+  #           that prefix read-only at the same path (on a Mac host nothing is mounted: FAMILY is /nonexistent there)
   "$FAMILY"/?*) [ -d "$SHIPYARD_SCRIPTS" ] || { echo "linux-host.sh: no $SHIPYARD_SCRIPTS" >&2; exit 2; }
                 sy=$SHIPYARD_SCRIPTS; fam="-v $FAMILY:$FAMILY:ro" ;;
   *) sy=$(cd "$ROOT/../mavergreen-shipyard/scripts" 2>/dev/null && pwd) ||

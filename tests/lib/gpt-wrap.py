@@ -2,7 +2,7 @@
 # platform: host-agnostic -- python3 only
 #   usage: python3 -I gpt-wrap.py CONTAINER-IMAGE DISK-IMAGE [PARTITION-TYPE-GUID]
 #          The partition type is APFS's unless given (DiskArbitration matches a bundle's media types before it probes).
-#          Writes DISK-IMAGE: a GPT disk (512-byte sectors) with one APFS partition holding CONTAINER-IMAGE, as an
+#          Writes DISK-IMAGE: a GPT disk (512-byte sectors) with one partition of that type holding CONTAINER-IMAGE, as an
 #          external disk formatted by macOS is laid out (a bare container has no partition, so DiskArbitration
 #          gives it no partition UUID, which the agent's keychain needs). The disk and partition GUIDs are fixed,
 #          so the same container always makes the same disk.

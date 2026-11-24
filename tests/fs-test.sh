@@ -319,7 +319,7 @@ want() { # RW [ARGV-FLAGS] DEV MNT: the plan the brief prescribes
   printf 'env LINUXFS_LKLFUSE=%s/lklfuse\nenv LINUXFS_PROBE=%s/linuxfs-probe\nenv LINUXFS_OPEN=%s/linuxfs-open\n' "$H" "$H" "$H"
   printf 'argv %s/linuxfs\nargv da-mount\n' "$H"
   for a in "$@"; do printf 'argv %s\n' "$a"; done
-  printf 'argv /dev/%s\nargv %s\nfds 3\n' "$dv" "$mn"
+  printf 'argv /dev/%s\nargv %s\n' "$dv" "$mn"
 }
 plan -o nodev -o noowners -o nosuid "/dev/$E" "$V/NAME" > "$M/plan" 2>"$M/plan.err"; rc=$?
 want rw "$E" "$V/NAME" > "$M/want"
@@ -342,7 +342,7 @@ print("fds: " + " ".join(o))'
 exit 5
 EOS
 chmod +x "$M/rootcli"
-env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_FS_TEST_ROOT_CLI="$M/rootcli" "$DM" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
+env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_FS_TEST_ROOT_CLI="$M/rootcli" "$DM" "/dev/$E" "$V/NAME" 7</dev/null > "$M/plan" 2>&1; rc=$?
 fdl=$(sed -n 's/^fds: //p' "$M/plan" | sed 's/ *255//'); [ -n "$fdl" ] || fdl=none
 [ $rc = 5 ] && grep -q '^cli-rc 5' "$M/plan" && grep -q 'to stdout' "$M/plan" && grep -q 'to stderr' "$M/plan" && [ "$fdl" = 3 ]; ok $? "root: the CLI's output is captured and its status 5 returned, and it holds only fd 3 (rc $rc, fds '$fdl')"
 plan "$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
@@ -370,11 +370,14 @@ env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" "$DM" "/dev/$E" 
 plan "/dev/disk9;ls" "$V/NAME" 2>&1 >/dev/null | grep -q '^linuxfs-mount: refused: '; ok $? "root plan: a refusal writes its reason to stderr"
 plan "/dev/disk99999" "$V/NAME" 2>&1 >/dev/null | grep -q '^linuxfs-mount: refused: '; ok $? "root plan: a device that cannot be opened is refused on stderr too"
 # every other descriptor is closed; the device is on 3 and stays open across exec
-plan "/dev/$E" "$V/NAME" 4</dev/null 5</dev/null 9</dev/null 3</dev/null > "$M/plan" 2>&1; rc=$?
-[ $rc = 0 ] && grep -qx 'fds 3' "$M/plan" && grep -qx "fd3 /dev/r$E rw" "$M/plan"; ok $? "root plan: inherited descriptors 3, 4, 5, 9 are gone; only the device is open, on 3 (rc $rc: $(grep fds "$M/plan"))"
+rcli() { env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_FS_TEST_ROOT_CLI="$M/rootcli" "$DM" "$@"; }
+rcli "/dev/$E" "$V/NAME" 4</dev/null 5</dev/null 9</dev/null 3</dev/null > "$M/plan" 2>&1; rc=$?
+fdl=$(sed -n 's/^fds: //p' "$M/plan" | sed 's/ *255//')
+[ $rc = 5 ] && [ "$fdl" = 3 ] && grep -qx "fd3 /dev/r$E rw" "$M/plan"; ok $? "root: inherited descriptors 3, 4, 5, 9 are gone in the CLI; only the device is open, on 3 (rc $rc, fds '$fdl')"
 # closed standard descriptors do not let the device land on 0-2
-plan "/dev/$E" "$V/NAME" <&- >"$M/plan" 2>&1; rc=$?
-[ $rc = 0 ] && grep -qx 'fds 3' "$M/plan"; ok $? "root plan: with stdin closed the device still lands on fd 3 (rc $rc)"
+rcli "/dev/$E" "$V/NAME" <&- >"$M/plan" 2>&1; rc=$?
+fdl=$(sed -n 's/^fds: //p' "$M/plan" | sed 's/ *255//')
+[ $rc = 5 ] && [ "$fdl" = 3 ] && grep -qx "fd3 /dev/r$E rw" "$M/plan"; ok $? "root: with stdin closed the device still lands on fd 3 and nothing else is open (rc $rc, fds '$fdl')"
 # test environment overrides are not honoured by the mount role's environment; the shipped build has no test code at all
 env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_CLI=/bin/false LINUXFS_OPEN=/bin/false LINUXFS_LKLFUSE=/bin/false "$DM" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1
 grep -qx "env LINUXFS_OPEN=$H/linuxfs-open" "$M/plan" && grep -qx "env LINUXFS_LKLFUSE=$H/lklfuse" "$M/plan"; ok $? "root plan: a caller's LINUXFS_OPEN and LINUXFS_LKLFUSE are not passed on"

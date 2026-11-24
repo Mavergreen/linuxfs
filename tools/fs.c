@@ -904,20 +904,12 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 
 #ifdef LINUXFS_FS_TEST_DROP
 	{
-		int i, max = getdtablesize();
+		int i;
 
 		for (i = 0; vars[i]; i++)
 			printf("env %s\n", vars[i]);
 		for (i = 0; args[i]; i++)
 			printf("argv %s\n", args[i]);
-
-		for (i = 4; i < max; i++)
-			close(i);
-		printf("fds");
-		for (i = 3; i < max; i++)
-			if (fcntl(i, F_GETFD) >= 0 && !(fcntl(i, F_GETFD) & FD_CLOEXEC))
-				printf(" %d", i);
-		printf("\n");
 	}
 	fflush(stdout);
 	/* a stand-in for the bundled CLI, to see what run_capture hands it (fd 3 only) and what comes back */
