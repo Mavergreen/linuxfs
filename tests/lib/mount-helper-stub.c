@@ -9,6 +9,7 @@
  *   linger     status 0, then sleep 30 s           stubborn   the same, ignoring SIGTERM
  *   hold       keep its own copy of the device and send no status, as mount_macfuse blocked in mount(2) on INIT may; sleep 30 s
  *   holdstubborn   the same, ignoring SIGTERM (with LINUXFS_FS_TEST_NOKILL root's SIGKILL is a no-op: one that outlives it)
+ *   delay      as normal, but 4 s before the device is sent
  *   partial    2 of the status's 4 bytes, then nothing; sleep 30 s
  *   twofds     two descriptors in one message, ignoring SIGTERM; logs "closed by root N" for how many root closed within 1.5 s
  *   foreign    attach ARGV0.img (hdiutil) on MNT, then status 5: a volume on MNT that is not this mount
@@ -66,6 +67,8 @@ int main(int argc, char **argv)
 	}
 	if (strcmp(mode, "holdstubborn") == 0 || strcmp(mode, "twofds") == 0)
 		signal(SIGTERM, SIG_IGN);
+	if (strcmp(mode, "delay") == 0)
+		sleep(4);
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, dev) != 0)
 		return 73;
 	if (strcmp(mode, "twofds") == 0) {

@@ -10,6 +10,8 @@
  *   garble        "X" instead of "R", then sleep 30 s
  *   rr            "RR" and trailing bytes in one write, then sleep 30 s: more than "ready"
  *   diesAfterR N  "R", then exit N at once, without waiting for the device
+ *   forkchan      "R", then, as the CLI's shell and the opener are two processes: this one closes fd 6 and waits for a child that
+ *                 still holds it and takes the device (so the channel never reads closed while the mount is slow), then as ok
  *   afterready N  "R", take the device, and exit N without answering INIT (lklfuse died at startup)
  *   (otherwise)   "R", take the device, answer INIT, print "answered INIT", exit 0
  */
@@ -22,6 +24,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -83,6 +86,17 @@ int main(int argc, char **argv)
 		return 2;
 	if (strncmp(mode, "diesAfterR", 10) == 0)
 		return atoi(mode + 10);
+	if (strcmp(mode, "forkchan") == 0) {
+		pid_t k = fork();
+
+		if (k > 0) {
+			int ws;
+
+			close(6);
+			waitpid(k, &ws, 0);
+			return WIFEXITED(ws) ? WEXITSTATUS(ws) : 1;
+		}
+	}
 	p.fd = 6;
 	p.events = POLLIN;
 	if (poll(&p, 1, 10000) != 1)

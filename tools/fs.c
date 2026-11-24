@@ -796,9 +796,10 @@ static void print_cli_plan(const char *const *envp, char **args)
 }
 #endif
 
-/* The descriptor mount_macfuse sends over sock (SCM_RIGHTS, one byte) within secs; -1 when none, or when watch (the CLI's
- * channel, from which nothing more is due) hangs up first: a CLI that has gone needs no mount_macfuse waiting for it. A message
- * with anything but one descriptor is refused, and every descriptor it carried is closed. */
+/* The descriptor mount_macfuse sends over sock (SCM_RIGHTS, one byte) within secs; -1 when none; -2 when watch (the CLI's channel,
+ * from which nothing more is due) hung up (POLLHUP) first, -3 when it became readable (POLLIN: unexpected data) first: a CLI
+ * that has gone, or gone wrong, needs no mount_macfuse waiting for it. A message with anything but one descriptor is refused,
+ * and every descriptor it carried is closed. */
 static int recv_device(int sock, int secs, int watch)
 {
 	struct pollfd p[2] = { { sock, POLLIN, 0 }, { watch, POLLIN, 0 } };
@@ -820,7 +821,7 @@ static int recv_device(int sock, int secs, int watch)
 		p[0].revents = p[1].revents = 0;
 		r = poll(p, 2, (int)left);
 		if (r > 0 && p[1].revents)
-			return -1;
+			return (p[1].revents & POLLHUP) ? -2 : -3;
 		if (r > 0)
 			break;
 		if (r < 0 && errno != EINTR)
@@ -1136,8 +1137,12 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 	if (devfd < 0 || !send_device(ch[0], devfd)) {
 		if (devfd >= 0)
 			close(devfd);
-		syslog(LOG_NOTICE, "mount_%s: %s: no macFUSE device from mount_macfuse within %d s, or none to hand the CLI", fs, bsd,
-		       wait_s(DEVICE_WAIT_S));
+		if (devfd == -2 || devfd == -3)
+			syslog(LOG_NOTICE, "mount_%s: %s: the CLI's channel %s while waiting for the device; stopping mount_macfuse", fs, bsd,
+			       devfd == -2 ? "closed" : "sent unexpected data");
+		else
+			syslog(LOG_NOTICE, "mount_%s: %s: no macFUSE device from mount_macfuse within %d s, or none to hand the CLI", fs, bsd,
+			       wait_s(DEVICE_WAIT_S));
 		fprintf(stderr, "linuxfs-mount: mount_macfuse sent no macFUSE device\n");
 		goto failed;
 	}

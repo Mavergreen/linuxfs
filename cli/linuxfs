@@ -150,7 +150,6 @@ run_lklfuse() { # SOURCE MOUNTPOINT OPTIONS [OPENER-DEVICE [SECOND-OPENER-DEVICE
     # (the lock stays held by the opener, on fd 7, from before "ready": lklfuse's lock= is that descriptor, never a path another
     # mount could take in between)
     chan=; [ -z "$fusechan" ] || chan="--fuse-chan $fusechan:$fusefd --lock $lockfile"
-    [ -z "$fusechan" ] || set -- "$1" "$2" "$(printf '%s\n' "$3" | sed "s|lock=[^,]*|lock=/dev/fd/7|")" "$4" "${5:-}"
     if [ -n "${5:-}" ]; then launch "$OPENER" $chan $rof "$4" --also "$5" "$LKLFUSE" -f -o "$3" /dev/fd/3 "$lkm"
     else launch "$OPENER" $chan $rof "$4" "$LKLFUSE" -f -o "$3" /dev/fd/3 "$lkm"
     fi
@@ -321,7 +320,9 @@ cmd_mount() {
     made=1
   else made=; [ -d "$mnt" ] || die "$mnt: no such directory"; ! is_mounted "$mnt" || die "$mnt already has a volume mounted"; fi
   lockfile=$LOCKS/linuxfs-$lockname.lock
-  opts="type=$type,lock=$lockfile"
+  # with root's channel, linuxfs-open holds the lock (--lock $lockfile) and lklfuse takes it from its descriptor 7
+  lockopt=$lockfile; [ -z "$fusechan" ] || lockopt=/dev/fd/7
+  opts="type=$type,lock=$lockopt"
   # the mount's own options (the kernel's): root gave them to mount_macfuse when it made the mount lklfuse serves
   [ -n "$fusefd" ] || opts="$opts,local,volname=$name,fsname=linuxfs@$(safe_name "$(basename "$src")"),noappledouble"
   if [ -n "$ids" ]; then :
@@ -341,6 +342,10 @@ cmd_mount() {
       [ -z "$made" ] || rmdir "$mnt" 2>/dev/null
       cat "$log" >&2
       grep -q 'unable to exclusively lock\|failed to open .*linuxfs-.*\.lock' "$log" && die "$target is already mounted by linuxfs"
+      # what linuxfs's own check (the probe's flags, the access rule root also applies) could not see, and a retry read-only would
+      # have mended: said, not retried (before login the one device went to the lklfuse that failed)
+      grep -q 'volume is dirty' "$log" && die "$target is a dirty NTFS volume the check did not see; mount it again read-only"
+      grep -q 'can only be mounted read-only' "$log" && die "$target is an encrypted APFS volume, which mounts read-only only; mount it again read-only"
       die "cannot mount $target"
     fi
     if [ "$type" = ntfs3 ] && [ -z "$ro" ] && grep -q 'volume is dirty' "$log"; then

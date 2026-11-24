@@ -17,6 +17,7 @@ cc() { "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wal
 cc -DLINUXFS_PROBE_NO_MAIN -o "$D/helper" "$ROOT/tools/helper.c" "$ROOT/tools/probe.c" "$ROOT/tools/fstab.c" "$ROOT/tools/fsrules.c" \
   "$ROOT/tools/plist.c" -framework IOKit -framework CoreFoundation || exit 1
 cc -DLINUXFS_PROBE_NO_MAIN -o "$D/open" "$ROOT/tools/open.c" "$ROOT/tools/probe.c" || exit 1
+cc -DLINUXFS_PROBE_NO_MAIN -DLINUXFS_OPEN_TEST -o "$D/open-t" "$ROOT/tools/open.c" "$ROOT/tools/probe.c" || exit 1
 cc -o "$D/probe" "$ROOT/tools/probe.c" "$ROOT/tools/fsrules.c" || exit 1
 cc -DLINUXFS_PROBE_NO_MAIN -o "$D/policy" "$ROOT/tests/helper-policy-test.c" "$ROOT/tools/probe.c" "$ROOT/tools/fstab.c" "$ROOT/tools/fsrules.c" \
   "$ROOT/tools/plist.c" -framework IOKit -framework CoreFoundation || exit 1
@@ -90,6 +91,7 @@ $I "$D/open" 3<"/dev/r${e#/dev/}" > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "inherit
 #       one descriptor root sends comes back as FD for the program; a lock held, or anything but one descriptor, runs nothing
 cc -o "$D/chanroot" "$ROOT/tests/lib/chan-root.c" || exit 1
 cr() { MODE=$1; shift; env LINUXFS_OPEN_INHERITED=1 "$D/chanroot" "$MODE" "$D/open" "$@" 3<"/dev/r${e#/dev/}" 2>&1; }
+cr_t() { MODE=$1; shift; env LINUXFS_OPEN_INHERITED=1 "$D/chanroot" "$MODE" "$D/open-t" "$@" 3<"/dev/r${e#/dev/}" 2>&1; }
 out=$(cr device --fuse-chan 6:4 --lock "$D/chan.lock" "$e" /bin/sh -c 'printf x >&4'); echo "$out" | tr '\n' ' ' > "$D/cr.txt"
 [ "$(echo "$out" | tr '\n' ' ')" = "ready byte x exit 0 " ]; ok $? "--fuse-chan: ready, the device comes back as fd 4, the program writes to it ($(cat "$D/cr.txt"))"
 out=$(cr device --fuse-chan 6:4 "$e" /bin/sh -c 'ls -l /dev/fd/6 > /dev/null 2>&1; echo chan-closed=$?'); echo "$out" | grep -q 'chan-closed=1'
@@ -102,8 +104,10 @@ ok $? "a lock held elsewhere: no \"R\", the program does not run, exit 1 ($(echo
 out=$(cr two --fuse-chan 6:4 "$e" /bin/echo ran); echo "$out" | grep -q '^exit 1$' && ! echo "$out" | grep -q '^ran'; ok $? "two descriptors from root: refused, the program does not run ($(echo "$out" | tr '\n' ' '))"
 out=$(cr close --fuse-chan 6:4 "$e" /bin/echo ran); echo "$out" | grep -q 'closed the channel without sending' && echo "$out" | grep -q '^exit 1$' && ! echo "$out" | grep -q '^ran'
 ok $? "root closing the channel without sending: exit 1, cleanly, the program does not run ($(echo "$out" | tr '\n' ' '))"
-s0=$(date +%s); out=$(LINUXFS_OPEN_CHAN_TIMEOUT=2 cr none --fuse-chan 6:4 "$e" /bin/echo ran); t=$(( $(date +%s) - s0 ))
-echo "$out" | grep -q 'no macFUSE device within 2 s' && echo "$out" | grep -q '^exit 1$' && [ $t -lt 5 ]; ok $? "no device at all: exit 1 at the (test-only, non-root) bound, in $t s"
+s0=$(date +%s); out=$(LINUXFS_OPEN_CHAN_TIMEOUT=2 cr_t none --fuse-chan 6:4 "$e" /bin/echo ran); t=$(( $(date +%s) - s0 ))
+echo "$out" | grep -q 'no macFUSE device within 2 s' && echo "$out" | grep -q '^exit 1$' && [ $t -lt 5 ]; ok $? "no device at all: exit 1 at the test build's bound, in $t s"
+# spec: tools/open.c chan_wait_s -- LINUXFS_OPEN_CHAN_TIMEOUT exists only in the test build, and only shortens
+! strings "$D/open" | grep -q LINUXFS_OPEN_CHAN_TIMEOUT; ok $? "the shipped linuxfs-open carries no LINUXFS_OPEN_CHAN_TIMEOUT"
 # spec: tools/open.c fuse_chan -- the lock stays held across the exec on fd 7: lklfuse's own open of /dev/fd/7 shares it, and no
 #       other process can take it while the program runs
 cat > "$D/lockprobe.pl" <<'EOP'

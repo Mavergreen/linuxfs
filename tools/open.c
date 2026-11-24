@@ -17,8 +17,9 @@
  * [--ro] DEVICE PROGRAM [ARG...] runs PROGRAM with fd 3 as it is. --also exits 1: the partner cannot be probed there.
  * There also --fuse-chan CHAN:FD [--lock FILE] (before DEVICE): the mount program's channel is open on CHAN. linuxfs-open
  * takes FILE's lock (flock, exclusive, without waiting) and KEEPS it: the locked descriptor stays open on fd 7 across the exec,
- * so lklfuse is run with lock=/dev/fd/7; opening /dev/fd/7 duplicates that descriptor (the same open file description: the
- * checked behaviour on 10.9), so lklfuse's own flock succeeds at once while every other process stays excluded, from before
+ * so lklfuse is run with lock=/dev/fd/7; opening /dev/fd/7 duplicates that descriptor (the same open file description: macOS's
+ * /dev/fd semantics, checked on 10.9; on Linux the open would be a new description that conflicts with the held lock, so this
+ * path is macOS-only, as is everything before login), so lklfuse's own flock succeeds at once while every other process stays excluded, from before
  * "R" until lklfuse ends. It then writes "R" to the channel, waits for the one descriptor root sends over it (the macFUSE
  * device; CHAN_WAIT_S, longer than root's own waits), puts it on FD and runs PROGRAM. What is guaranteed: nobody else can take
  * the lock in between, and a lock held elsewhere, no device, or anything but one descriptor exits 1 with nothing run. What is
@@ -136,14 +137,21 @@ static int open_one(const char *device, int ro)
 
 #define LOCK_FD 7		/* where the held lock stays for lklfuse (cli/linuxfs passes lock=/dev/fd/7) */
 /* waiting for root's device: longer than root's own waits (30 s for the CLI's "ready", 30 s for mount_macfuse's device), so root
- * gives up first and says why. LINUXFS_OPEN_CHAN_TIMEOUT shortens it, for tests, when not root. */
+ * gives up first and says why. Test builds only (-DLINUXFS_OPEN_TEST: tests/helper-test.sh's own copy, never the shipped one),
+ * LINUXFS_OPEN_CHAN_TIMEOUT may shorten it, never lengthen it. */
 #define CHAN_WAIT_S 45
 
 static int chan_wait_s(void)
 {
+#ifdef LINUXFS_OPEN_TEST
 	const char *t = getenv("LINUXFS_OPEN_CHAN_TIMEOUT");
+	char *end;
+	long v = t ? strtol(t, &end, 10) : 0;
 
-	return t && getuid() != 0 && atoi(t) > 0 ? atoi(t) : CHAN_WAIT_S;
+	if (t && end != t && !*end && v > 0 && v < CHAN_WAIT_S)
+		return (int)v;
+#endif
+	return CHAN_WAIT_S;
 }
 
 /* A descriptor number from s, in 4..255 and not 5 (the password's) or LOCK_FD; -1 otherwise. endp gets the end. */

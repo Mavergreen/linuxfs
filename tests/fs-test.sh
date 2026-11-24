@@ -516,6 +516,10 @@ done
 s0=$(date +%s); hs nofd "diesAfterR 3" 20; t=$(( $(date +%s) - s0 ))
 hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
 [ $rc = 3 ] && [ $t -lt 10 ] && gone "$hp"; ok $? "a CLI that dies right after \"ready\": root stops mount_macfuse and exits 3 in $t s, not at the bound (rc $rc)"
+# spec: tools/fs.c recv_device -- a healthy, slow mount is not aborted: the CLI's shell closes its own copy of the channel after "ready",
+#       another process of the CLI (the opener's role) keeps it open, and mount_macfuse sends the device 4 s late
+hs delay forkchan 20
+[ $rc = 0 ] && grep -q '^device on 4$' "$M/fdcli.log" && grep -q '^status 0$' "$D/drop/mhelper.log"; ok $? "a slow device (4 s) while another CLI process holds the channel: the mount is not aborted (rc $rc)"
 s0=$(date +%s); hs nofd ok 2; t=$(( $(date +%s) - s0 ))
 hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
 [ $rc = 1 ] && [ $t -lt 8 ] && gone "$hp"; ok $? "a helper that sends no device: exit 1 after the bounded wait ($t s), the helper is killed (rc $rc)"
