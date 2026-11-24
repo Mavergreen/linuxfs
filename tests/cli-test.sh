@@ -393,9 +393,9 @@ out=$(echo x | FAKE_PROBE=ext4 sh "$L" mount "$T/enc.img" --password-stdin 2>&1)
 [ $rc -eq 2 ] || { [ $rc -eq 1 ] && echo "$out" | grep -q "encrypted APFS"; }; ok $? "--password-stdin on a volume that is not APFS is refused (got $rc: '$out')"
 sh "$L" unmount "$T/enc.img" > /dev/null 2>&1
 mkdir -p "$T/dam"
-LINUXFS_DA=1 FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret LINUXFS_OPEN="$T/bin/open" sh "$L" da-mount --asked /dev/disk2s1 "$T/dam" < /dev/null > /dev/null 2>&1; [ $? -eq 4 ]; ok $? "da-mount of an encrypted volume exits 4, for the bundle's mount program to ask"
-# spec: tools/fs.c run_cli -- the mount program passes --password-stdin to da-mount, in any order with --asked and --ro
-for order in "--asked --password-stdin" "--password-stdin --asked" "--ro --password-stdin --asked"; do
+LINUXFS_DA=1 FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret LINUXFS_OPEN="$T/bin/open" sh "$L" da-mount /dev/disk2s1 "$T/dam" < /dev/null > /dev/null 2>&1; [ $? -eq 4 ]; ok $? "da-mount of an encrypted volume exits 4, for the bundle's mount program to ask"
+# spec: tools/fs.c run_cli -- the mount program passes --password-stdin to da-mount, in any order with --ro
+for order in "--password-stdin" "--ro --password-stdin" "--password-stdin --ro"; do
   rm -f "$T/pwgot"
   out=$(printf 's3cret\n' | LINUXFS_DA=1 FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret LINUXFS_OPEN="$T/bin/open" sh "$L" da-mount $order /dev/disk2s1 "$T/dam" 2>&1); rc=$?
   [ $rc -eq 0 ] && [ "$(cat "$T/pwgot" 2>/dev/null)" = s3cret ]; ok $? "da-mount $order mounts an encrypted volume with the password from stdin (got $rc: '$out')"
@@ -403,10 +403,10 @@ for order in "--asked --password-stdin" "--password-stdin --asked" "--ro --passw
 done
 # spec: cli/linuxfs cmd_da_mount -- the password is read before any helper can inherit and drain stdin
 rm -f "$T/pwgot"
-out=$(printf 's3cret\n' | LINUXFS_DA=1 FAKE_OPEN_EAT=1 FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret LINUXFS_OPEN="$T/bin/open" sh "$L" da-mount --asked --password-stdin /dev/disk2s1 "$T/dam" 2>&1); rc=$?
+out=$(printf 's3cret\n' | LINUXFS_DA=1 FAKE_OPEN_EAT=1 FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret LINUXFS_OPEN="$T/bin/open" sh "$L" da-mount --password-stdin /dev/disk2s1 "$T/dam" 2>&1); rc=$?
 [ $rc -eq 0 ] && [ "$(cat "$T/pwgot" 2>/dev/null)" = s3cret ]; ok $? "a probe that reads stdin does not eat the da-mount password (got $rc: '$out')"
 sh "$L" unmount "$T/dam" > /dev/null 2>&1; sh "$L" unmount disk2s1 > /dev/null 2>&1
-out=$(printf 'nope\n' | LINUXFS_DA=1 FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret LINUXFS_OPEN="$T/bin/open" sh "$L" da-mount --asked --password-stdin /dev/disk2s1 "$T/dam" 2>&1); rc=$?
+out=$(printf 'nope\n' | LINUXFS_DA=1 FAKE_PROBE=apfs FAKE_ENCRYPTED=s3cret LINUXFS_OPEN="$T/bin/open" sh "$L" da-mount --password-stdin /dev/disk2s1 "$T/dam" 2>&1); rc=$?
 [ $rc -eq 4 ] && echo "$out" | grep -q "wrong password"; ok $? "da-mount --password-stdin with a wrong password exits 4 (got $rc: '$out')"
 # spec: cli/linuxfs --
 #       review M7: after a reboot a record's pid may belong to some other process; it is not a mount
@@ -451,7 +451,7 @@ diskutil mount disk5" ] && [ "$(cat "$T/agent.pw")" = s3cret ]; ok $? "--passwor
 : > "$DU"
 out=$(printf 's3cret\n' | FAKE_AGENT_RC=1 sh "$L" mount --password-stdin /dev/disk5 2>&1); rc=$?
 [ $rc -eq 4 ] && echo "$out" | grep -q "no one is logged in at the console to unlock /dev/disk5" && ! grep -q diskutil "$DU"; ok $? "with no agent answering, --password-stdin exits 4 and diskutil never runs (got $rc: '$out')"
-LINUXFS_OPEN=$LO sh "$L" da-mount --asked /dev/disk3s1 "$T/dam" > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "da-mount without LINUXFS_DA is misuse (exit 2)"
+LINUXFS_OPEN=$LO sh "$L" da-mount /dev/disk3s1 "$T/dam" > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "da-mount without LINUXFS_DA is misuse (exit 2)"
 DA() { LINUXFS_DA=1 LINUXFS_OPEN=$LO sh "$L" da-mount "$@"; }
 # spec: cli/linuxfs cmd_da_mount -- DiskArbitration runs the mount program alike for a plug-in and for diskutil mount, so
 #       da-mount reads no Automount or Ignore:<LABEL>: /etc/fstab's noauto has kept the plug-in from ever calling it
@@ -481,12 +481,11 @@ ok $r "LINUXFS_ALL_USERS=1 mounts allow_other,uid=99,gid=99, without owner=root"
 sh "$L" unmount disk3s1 > /dev/null 2>&1
 sh "$L" unmount disk3s1 > /dev/null 2>&1
 for t in exfat vfat; do
-  (FAKE_PROBE=$t; export FAKE_PROBE; DA --asked /dev/disk3s1 "$T/dam" > /dev/null 2>&1); [ $? -eq 3 ]; ok $? "da-mount leaves $t to the Mac, even asked"
+  (FAKE_PROBE=$t; export FAKE_PROBE; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); [ $? -eq 3 ]; ok $? "da-mount leaves $t to the Mac"
 done
 sh "$L" prefs NTFSTakeover off
 (FAKE_PROBE=ntfs3; export FAKE_PROBE; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); [ $? -eq 3 ]; ok $? "da-mount leaves NTFS to the Mac unless NTFSTakeover is on"
-(FAKE_PROBE=ntfs3; export FAKE_PROBE; DA --asked /dev/disk3s1 "$T/dam" > /dev/null 2>&1); ok $? "but an asked-for NTFS mount goes ahead"
-sh "$L" unmount disk3s1 > /dev/null 2>&1
+(FAKE_PROBE=ntfs3; export FAKE_PROBE; DA --asked /dev/disk3s1 "$T/dam" > /dev/null 2>&1); [ $? -eq 2 ]; ok $? "da-mount takes no --asked: no mount is ever \"asked for\" by that name, so NTFS cannot bypass NTFSTakeover (exit 2)"
 sh "$L" prefs NTFSTakeover on
 (FAKE_PROBE=ntfs3; export FAKE_PROBE; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); ok $? "with NTFSTakeover on, da-mount takes NTFS"
 sh "$L" unmount disk3s1 > /dev/null 2>&1; sh "$L" prefs NTFSTakeover off
@@ -543,12 +542,13 @@ grep -q "^open --fuse-chan 6:4 --lock $T/locks/linuxfs-rdisk3s1.lock /dev/rdisk3
 ok $? "with LINUXFS_FUSE_CHAN=6 the opener gets --fuse-chan 6:4 and the lock file, and lklfuse still serves /dev/fd/4 (got $rc: $(grep '^open ' "$T/calls" | tail -n 1))"
 grep -q "^open --fuse-chan .*lock=/dev/fd/7[, ]" "$T/calls"; ok $? "and lklfuse's lock= is /dev/fd/7, the lock the opener holds"
 sh "$L" unmount "$T/dam" > /dev/null 2>&1
+sh "$L" prefs NTFSTakeover on   # (the dirty NTFS cases below)
 # spec: cli/linuxfs cmd_mount -- before login no second try is possible (root's one device went to the lklfuse that failed): what the
 #       probe's flags cannot show (a dirty NTFS volume ntfs3 refuses for its own reason) ends with "mount it again read-only"
 : > "$T/calls"
 (LINUXFS_OPEN_INHERITED=1 LINUXFS_ALL_USERS=1 LINUXFS_FUSE_FD=4 LINUXFS_FUSE_CHAN=6 FAKE_PROBE=ntfs3 FAKE_MODE=dirty FAKE_FD_MNT=$T/dam
  export LINUXFS_OPEN_INHERITED LINUXFS_ALL_USERS LINUXFS_FUSE_FD LINUXFS_FUSE_CHAN FAKE_PROBE FAKE_MODE FAKE_FD_MNT
- DA --asked /dev/disk3s1 "$T/dam" 4</dev/null 6</dev/null > "$T/out" 2>&1); rc=$?
+ DA /dev/disk3s1 "$T/dam" 4</dev/null 6</dev/null > "$T/out" 2>&1); rc=$?
 [ $rc -eq 1 ] && grep -q "dirty NTFS volume the check did not see; mount it again read-only (linuxfs mount --ro /dev/disk3s1)" "$T/out" && [ "$(grep -c '^open .*bin/lklfuse' "$T/calls")" = 1 ]
 ok $? "with root's channel, a dirty NTFS volume the probe missed is not retried: one lklfuse, and it says to mount it again read-only (rc $rc: $(tail -n 2 "$T/out" | tr '\n' '|'))"
 sh "$L" unmount "$T/dam" > /dev/null 2>&1
@@ -568,12 +568,13 @@ chanrun FAKE_PROBE=ext4 -- /dev/disk3s1 "$T/dam"
 defaults delete test.linuxfs ReadOnly
 [ $rc -eq 0 ] && ! grep -q ",ro " "$T/calls"; ok $? "root said rw: the CLI's own ReadOnly preference is not read, so it never serves read-only under a rw mount (rc $rc)"
 sh "$L" unmount "$T/dam" > /dev/null 2>&1
-chanrun FAKE_PROBE=ntfs3 FAKE_FLAGS=dirty -- --asked /dev/disk3s1 "$T/dam"
+chanrun FAKE_PROBE=ntfs3 FAKE_FLAGS=dirty -- /dev/disk3s1 "$T/dam"
 [ $rc -eq 1 ] && grep -q "root mounted macFUSE read-write, but this volume would be read-only" "$T/out" && ! grep -q "fuse-chan" "$T/calls"
 ok $? "root said rw but the volume probes dirty: the CLI refuses before the opener, so no mount (rc $rc: $(head -n 2 "$T/out" | tr '\n' '|'))"
-chanrun FAKE_PROBE=ntfs3 FAKE_FLAGS=dirty -- --asked --ro /dev/disk3s1 "$T/dam"
+chanrun FAKE_PROBE=ntfs3 FAKE_FLAGS=dirty -- --ro /dev/disk3s1 "$T/dam"
 [ $rc -eq 0 ] && grep -q "^open --fuse-chan .*,ro " "$T/calls"; ok $? "root said ro for the same dirty volume: it mounts read-only on the first try (rc $rc)"
 sh "$L" unmount "$T/dam" > /dev/null 2>&1
+sh "$L" prefs NTFSTakeover off
 (LINUXFS_OPEN_INHERITED=1 LINUXFS_FUSE_CHAN=6; export LINUXFS_OPEN_INHERITED LINUXFS_FUSE_CHAN; : > "$T/calls"; DA /dev/disk3s1 "$T/dam" 6</dev/null > "$T/out" 2>&1); rc=$?
 [ $rc -eq 2 ] && ! grep -q lklfuse "$T/calls"; ok $? "LINUXFS_FUSE_CHAN without LINUXFS_FUSE_FD is refused, exit 2 (got $rc)"
 for v in abc 3 5 4 04x; do

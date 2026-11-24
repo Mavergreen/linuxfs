@@ -9,7 +9,7 @@
 #          linuxfs ignore [VOLUME]
 #          linuxfs unignore VOLUME
 #          linuxfs automount DISK
-#   internal: linuxfs da-mount [--asked] [--ro] [--password-stdin] DEVICE MOUNTPOINT   (only with LINUXFS_DA=1: the bundle's mount program;
+#   internal: linuxfs da-mount [--ro] [--password-stdin] DEVICE MOUNTPOINT   (only with LINUXFS_DA=1: the bundle's mount program;
 #          before login also LINUXFS_OPEN_INHERITED=1, the device on fd 3, LINUXFS_FUSE_FD=N and LINUXFS_FUSE_CHAN=C: root's
 #          channel is on fd C; once everything that can fail before lklfuse starts has passed, linuxfs-open says "ready" on it,
 #          root mounts macFUSE on MOUNTPOINT and sends the device back, and lklfuse serves that mount through /dev/fd/N)
@@ -18,8 +18,8 @@
 #          volume; new files are written with the filesystem root's owner. --linux-ids shows Linux's owners instead.
 #          A device is mounted by DiskArbitration (diskutil mount), which runs the linuxfs bundle's mount program,
 #          which calls back as da-mount; so a device takes no MOUNTPOINT, --linux-ids, --tier2 or -o (use linuxfs
-#          prefs), and its volume is open to every user. A dirty NTFS volume mounts read-only. A device the Mac has
-#          mounted is refused. APFS mounts read-only (APFSWrite on: read-write, but never an encrypted or Fusion
+#          prefs), and its volume is the console user's alone (open to every user only when mounted before login, or by
+#          sudo diskutil mount). A dirty NTFS volume mounts read-only. A device the Mac has mounted is refused. APFS mounts read-only (APFSWrite on: read-write, but never an encrypted or Fusion
 #          volume); an encrypted volume's password is asked for at the terminal, or read from stdin
 #          (--password-stdin; for a device, offered to the login session's agent). ignore VOLUME (a device, or a volume's
 #          name with its disk attached) keeps that volume from mounting by itself when it is attached, as the Mac's own
@@ -412,7 +412,7 @@ EOF
   esac
   if [ -n "$rec" ]; then pid=${rec%%"$tab"*}; mnt=$(printf '%s\n' "$rec" | cut -f 3)
   else pid=; mnt=$t; is_mounted "$mnt" || die "$1 is not mounted by linuxfs"; fi
-  # forced (a yank or an eject, from the agent): umount -f, not diskutil, which DiskArbitration holds up while
+  # forced (a yank or an eject): umount -f, not diskutil, which DiskArbitration holds up while
   # an eject waits on the agent (P3-3: 9 s, past what DiskArbitration waits, for a 0.7 s unmount)
   if [ -n "$force" ]; then unmount_it() { umount -f "$1"; }; else unmount_it() { diskutil unmount "$1"; }; fi
   if ! unmount_it "$mnt" > /dev/null 2>&1; then
@@ -474,15 +474,16 @@ cmd_automount() {
   diskutil mount "$1"
 }
 
-# For the bundle's mount program (LINUXFS_DA=1), on DiskArbitration's existing mount point. Exit 3: NTFS without NTFSTakeover
-# (unless --asked), or a Fusion second device, or a main device whose second never came. DiskArbitration passes the same options
-# for a plug-in and for diskutil mount, so nothing else here depends on --asked: a volume that is not to mount by itself has
-# an /etc/fstab noauto entry, and DiskArbitration never runs the mount program for it at plug-in.
+# For the bundle's mount program (LINUXFS_DA=1), on DiskArbitration's existing mount point. Exit 3: NTFS without NTFSTakeover,
+# or a Fusion second device, or a main device whose second never came. DiskArbitration passes the same options for a plug-in
+# and for diskutil mount (10.9 passes noowners either way), so nothing here depends on how the mount was asked for: a volume
+# that is not to mount by itself has an /etc/fstab noauto entry, and DiskArbitration never runs the mount program for it
+# at plug-in.
 cmd_da_mount() {
   [ "${LINUXFS_DA:-}" = 1 ] || usage
-  asked= ro= pws=
-  while [ "${1:-}" = --asked ] || [ "${1:-}" = --ro ] || [ "${1:-}" = --password-stdin ]; do
-    case $1 in --asked) asked=1 ;; --ro) ro=1 ;; --password-stdin) pws=1 ;; esac; shift
+  ro= pws=
+  while [ "${1:-}" = --ro ] || [ "${1:-}" = --password-stdin ]; do
+    case $1 in --ro) ro=1 ;; --password-stdin) pws=1 ;; esac; shift
   done
   [ $# -eq 2 ] || usage
   # LINUXFS_FUSE_FD: the macFUSE device root mounted with, inherited with the disk (fd 3); never fd 0-3, nor 5 (the password's)
@@ -507,9 +508,7 @@ cmd_da_mount() {
   fields "$probed"
   # defence in depth: the bundles never claim these, so refuse them here too
   case $type in exfat|vfat) exit 3 ;; esac
-  if [ -z "$asked" ]; then
-    [ "$type" != ntfs3 ] || [ "$(pref NTFSTakeover off)" = on ] || exit 3
-  fi
+  [ "$type" != ntfs3 ] || [ "$(pref NTFSTakeover off)" = on ] || exit 3
   case $fusion in
     "fusion-tier2 "*) exit 3 ;;
     "fusion-main "*)
