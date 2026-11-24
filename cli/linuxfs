@@ -310,7 +310,7 @@ cmd_mount() {
   fi
   access=$("$PROBE" --access "$type" "$fusion" "$flags" ${ro:+ro} $aw < /dev/null) || die "$target: cannot tell how to mount it"
   if [ -n "$rootrw" ]; then
-    case $access in rw) ;; *) die "$target: root mounted macFUSE read-write, but this volume would be read-only ($access); not mounting, so nothing is left half-served. Mount it again" ;; esac
+    case $access in rw) ;; *) die "$target: root mounted macFUSE read-write, but this volume would be read-only ($access); not mounting, so nothing is left half-served. Mount it again read-only (linuxfs mount --ro $target)" ;; esac
   fi
   case $access in
     rw) if [ "$type" = apfs ]; then

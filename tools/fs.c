@@ -614,7 +614,7 @@ static int run_cli(const char *cli, const struct mountreq *req, const char *pw, 
 #define MACFUSE_MANIFEST "/usr/local/mavergreen/macfuse/mavergreen.plist"
 /* The first Mavergreen macFUSE release that ships the fd-mountpoint patch (its libfuse 3 serves a /dev/fd/N mountpoint
  * another process mounted: macfuse's DETAILS.md, "A mount made for you"). build/package.sh's MACFUSE_MIN is later (5.5.0-mavericks.4, where lklfuse also ends on
- * SIGTERM); .2 and .3 serve it fine and only stop slowly, so the gate stays here. Dev builds
+ * SIGTERM, enforced only at install time: a macFUSE replaced later by .2 or .3 passes this gate); .2 and .3 serve it fine and only stop slowly, so the gate stays here. Dev builds
  * labelled 5.5.0-mavericks.2 that predate the patch exist: on those the gate passes, lklfuse cannot serve /dev/fd/N, and
  * root's mount fails, bounded, after STATUS_WAIT_S. */
 #define MACFUSE_FD_MOUNTPOINT_SINCE "5.5.0-mavericks.2"

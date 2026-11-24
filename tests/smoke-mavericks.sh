@@ -184,8 +184,8 @@ root_mount_macfuse_gone() {
 # spec: components/macfuse/version -- macFUSE 5.5.0-mavericks.4's lklfuse ends on SIGTERM over /dev/fd/N (.2 and .3 serve it but ignore
 #       SIGTERM): the version in the guest's manifest, as 0 when it is at least that
 macfuse_term_fixed() {
-  v=$(/usr/libexec/PlistBuddy -c 'Print :version' /usr/local/mavergreen/macfuse/mavergreen.plist 2> /dev/null) || return 1
-  echo "$v" | sed 's/-mavericks[.]/./' | awk -F. 'NF == 4 { for (i = 1; i <= 4; i++) { split("5 5 0 4", t, " "); if ($i + 0 != t[i] + 0) exit !($i + 0 > t[i] + 0) } exit 0 } { exit 1 }'
+  mfv=$(/usr/libexec/PlistBuddy -c 'Print :version' /usr/local/mavergreen/macfuse/mavergreen.plist 2> /dev/null) || return 1
+  echo "$mfv" | sed 's/-mavericks[.]/./' | awk -F. 'NF == 4 { for (i = 1; i <= 4; i++) { split("5 5 0 4", t, " "); if ($i + 0 != t[i] + 0) exit !($i + 0 > t[i] + 0) } exit 0 } { exit 1 }'
 }
 # spec: tools/fs.c mount_by_root -- a daemon that dies leaves the mount unserved (see its use below): SIGTERM through sudo (the
 #       process is _linuxfs's), 5 s; where macFUSE has the fix (macfuse_term_fixed) that must end it, and term_clean says so; else
