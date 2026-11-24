@@ -62,7 +62,7 @@ finish() {
   for f in "$W"/img/*.img; do [ -f "$f" ] && gzip -c "$f" > "$OUT/$(basename "$f").gz"; done
   # spec: .github/workflows/on-mavericks.yml -- the run's evidence comes back in OUT (copyback), uploaded even when this fails
   # platform: sudo logs every COMMAND= line to system.log, and OUT is uploaded publicly: nothing that names the keychain unlock or kcpassword goes in
-  grep -v 'unlock-keychain\|kcpassword\|security -i' /var/log/system.log 2> /dev/null | tail -n 3000 > "$OUT/system.log"
+  grep -v 'unlock-keychain\|kcpassword\|security -i' /var/log/system.log 2> /dev/null | tail -n 9000 > "$OUT/system.log"
   echo "# OUT: $(ls -l "$OUT" | awk 'NR > 1 { printf "%s (%s) ", $NF, $5 }')"
   echo "1..$n"
   exit "$bad"
@@ -255,6 +255,106 @@ fstn_seq() {  # TAG IMG: ignore, diskutil mount, unignore, eject; then how long 
   done
   notok "fstypename seq $tag: a plain attach never automounted again in 8 tries"
 }
+# ---- round 2: why do plain attaches of the same ext4 image stop automounting after ignore -> diskutil mount -> unignore? ----
+DAPL=$(ls /System/Library/LaunchDaemons/*diskarbitrationd*.plist 2> /dev/null | head -n 1)
+DADL=/private/tmp/spike-da-debug.plist
+FSD=/System/Library/Filesystems
+da_debug_on() {  # diskarbitrationd with -d, its stderr in /private/tmp/da-debug.log
+  sudo -n rm -f /private/tmp/da-debug.log "$DADL"
+  sudo -n cp "$DAPL" "$DADL" || return 1
+  echo "# original DA plist:"; rec sudo -n plutil -p "$DAPL"
+  sudo -n /usr/libexec/PlistBuddy -c 'Add :ProgramArguments: string -d' -c 'Add :StandardErrorPath string /private/tmp/da-debug.log' -c 'Add :StandardOutPath string /private/tmp/da-debug.log' "$DADL" 2>&1 | sed 's/^/# PlistBuddy: /'
+  sudo -n launchctl unload "$DAPL" 2>&1 | sed 's/^/# unload: /'
+  sudo -n killall diskarbitrationd > /dev/null 2>&1; sleep 1
+  sudo -n launchctl load "$DADL" 2>&1 | sed 's/^/# load: /'
+  sleep 3
+  echo "# DA processes: $(ps -axww -o pid=,command= | grep -i '[d]iskarbitrationd' | tr '\n' '|')"
+  diskutil list > /dev/null 2>&1 && echo "# diskutil works with the debug DA" || echo "# diskutil does NOT work with the debug DA"
+}
+da_debug_off() {
+  sudo -n launchctl unload "$DADL" > /dev/null 2>&1; sudo -n killall diskarbitrationd > /dev/null 2>&1; sleep 1
+  sudo -n launchctl load "$DAPL" 2>&1 | sed 's/^/# reload: /'
+  sleep 3
+  echo "# DA processes after restore: $(ps -axww -o pid=,command= | grep -i '[d]iskarbitrationd' | tr '\n' '|')"
+  sudo -n cat /private/tmp/da-debug.log > "$OUT/da-debug.log" 2> /dev/null
+  echo "# da-debug.log: $(wc -l < "$OUT/da-debug.log" 2> /dev/null) lines"
+}
+da_restart() {  # a fresh DA (launchd starts the job again)
+  sudo -n killall diskarbitrationd > /dev/null 2>&1; sleep 4
+  echo "# DA restarted: $(ps -axww -o pid=,command= | grep -i '[d]iskarbitrationd' | tr '\n' '|')"
+}
+da_mark() { sudo -n sh -c 'printf "=== %s ===\n" "$1" >> /private/tmp/da-debug.log' _ "$1" 2> /dev/null; }
+fstn_use_baseline() {  # today's linuxfs_ext4 bundle (mounts as plain macfuse), the macfuse_ext4 one moved aside
+  sudo -n rm -rf "$FSD/linuxfs_ext4.fs" /private/var/tmp/spike-macfuse_ext4.fs
+  sudo -n cp -R "$FSD/macfuse_ext4.fs" "$FSD/linuxfs_ext4.fs" || return 1
+  R=$FSD/linuxfs_ext4.fs/Contents/Resources
+  for pr in util:macfuse_ext4.util:linuxfs_ext4.util mount:mount_macfuse_ext4:mount_linuxfs_ext4 fsck:fsck_macfuse_ext4:fsck_linuxfs_ext4; do
+    o=${pr#*:}; sudo -n mv "$R/${o%%:*}" "$R/${o#*:}" || return 1
+  done
+  sudo -n sed -i '' -e 's/macfuse_ext4/linuxfs_ext4/g' -e 's|<integer>7</integer>|<integer>0</integer>|' "$FSD/linuxfs_ext4.fs/Contents/Info.plist" || return 1
+  sudo -n mv "$FSD/macfuse_ext4.fs" /private/var/tmp/spike-macfuse_ext4.fs || return 1
+  echo "# baseline bundle:"; rec ls -la "$R"; rec grep -n 'ext4\|SubType' -A1 "$FSD/linuxfs_ext4.fs/Contents/Info.plist"
+  da_restart
+}
+fstn_use_macfuse() {
+  sudo -n rm -rf "$FSD/linuxfs_ext4.fs"
+  [ -d "$FSD/macfuse_ext4.fs" ] || sudo -n mv /private/var/tmp/spike-macfuse_ext4.fs "$FSD/macfuse_ext4.fs"
+  da_restart
+}
+fstn_try() {  # TAG IMG: a plain attach of a copy; on failure, what DA and diskutil say
+  cp "$2" "$W/img/spike-probe.img" || return 1
+  t0=$(date +%s); da_mark "try $1"
+  if da_attach "$W/img/spike-probe.img" && da_wait 150; then
+    ok "$1: a plain attach automounts ($(( $(date +%s) - t0 )) s): $(mount | grep -F " on $mp (" | sed 's/^.* (//')"; cleanup_disk; return 0
+  fi
+  notok "$1: a plain attach automounts"
+  d=$(image_disk "$W/img/spike-probe.img")
+  echo "# $1: disk '$d'; diskutil info:"; rec diskutil info "$d"
+  echo "# $1: /etc/fstab:"; rec cat /etc/fstab
+  echo "# $1: diskutil mount $d: $(bounded 600 diskutil mount "$d" 2>&1 | tr '\n' ' ')"
+  disk=$d; cleanup_disk; return 1
+}
+fstn_exp() {  # TAG IMG VFSTYPE mount|nomount
+  tag=$1 simg=$2 vfs=$3 var=$4
+  da_restart; da_mark "exp $tag"
+  da_attach_nomount "$simg" || { notok "exp $tag: attach -nomount"; disk=$(image_disk "$simg"); cleanup_disk; return 1; }
+  sleep 6
+  if mount | grep -qF "linuxfs@"; then bounded 600 diskutil unmount "$disk" > /dev/null 2>&1; fi
+  u=$(info "$disk" "Volume UUID")
+  echo "# exp $tag ($(date +%s)): UUID '$u', vfstype $vfs, variant $var; diskutil info before:"; rec diskutil info "$disk"
+  sudo -n sh -c 'printf "%s\n" "$1" >> /etc/fstab' _ "UUID=$u none $vfs rw,noauto # linuxfs"
+  da_mark "exp $tag: fstab entry written"
+  if [ "$var" = mount ]; then echo "# exp $tag: diskutil mount: $(bounded 600 diskutil mount "$disk" 2>&1 | tr '\n' ' ')"; echo "# exp $tag: mount: $(mount | grep -F linuxfs@ | tr '\n' '|')"; fi
+  sudo -n sed -i '' '/# linuxfs$/d' /etc/fstab
+  da_mark "exp $tag: fstab entry removed"
+  echo "# exp $tag ($(date +%s)): fstab now: $(tr '\n' '|' < /etc/fstab)"
+  cleanup_disk
+  fstn_try "exp $tag, same image" "$simg" && return 0
+  fstn_try "exp $tag, other ext4 image (another UUID)" "$W/img/spike-other.img"
+  da_restart; da_mark "exp $tag: after killall diskarbitrationd"
+  fstn_try "exp $tag, same image after killall diskarbitrationd" "$simg"
+}
+fstn_baseline_nested() {  # today's bundle: DA mounts a plain attach; nested lklfuse mount inside it
+  da_attach "$W/img/spike-ext4.img" && da_wait 300 || { notok "baseline: plain attach automounts"; disk=$(image_disk "$W/img/spike-ext4.img"); cleanup_disk; return 1; }
+  ok "baseline (linuxfs_ext4 bundle): automounted at $mp"
+  echo "# baseline mount: $(mount | grep -F " on $mp (")"
+  echo "# baseline diskutil info: $(diskutil info "$dev" | grep -i 'personality\|bundle\|visible' | tr -s ' ' | tr '\n' '|')"
+  fstn_nested "$mp"
+  cleanup_disk
+}
+fstn_experiments() {
+  gunzip -c "$IN/ext4-slash.img.gz" > "$W/img/spike-other.img" || { notok "no ext4-slash.img.gz"; return 1; }
+  da_debug_on || { echo "# no debug DA (plist '$DAPL'): going on without"; DEBUGDA=; }
+  fstn_exp macfuse-ignore-mount-unignore "$W/img/spike-ext4.img" macfuse_ext4 mount
+  fstn_exp macfuse-ignore-unignore-only "$W/img/spike-ext4.img" macfuse_ext4 nomount
+  if fstn_use_baseline; then
+    fstn_baseline_nested
+    fstn_exp baseline-ignore-mount-unignore "$W/img/spike-ext4.img" linuxfs_ext4 mount
+    fstn_exp baseline-ignore-unignore-only "$W/img/spike-ext4.img" linuxfs_ext4 nomount
+  else notok "baseline bundle setup"; fi
+  fstn_use_macfuse
+  da_debug_off
+}
 fstn_section() {
   echo "# fstypename: macFUSE tools and versions in this install:"
   rec ls -la /Library/Filesystems/macfuse.fs/Contents/Resources /usr/local/bin /System/Library/Filesystems/macfuse_ext4.fs/Contents /System/Library/Filesystems/macfuse_ext4.fs/Contents/Resources
@@ -293,22 +393,7 @@ fstn_section() {
   check "fstypename: diskutil eject, and no lklfuse is left on it" da_eject "$disk" "$mp"
   cleanup_disk
   fstn_probe A-after-eject
-  if da_attach_nomount "$W/img/spike-ext4.img"; then
-    sleep 6
-    if mount | grep -qF "linuxfs@"; then echo "# the agent's login sweep mounted it first; unmounting"; bounded 600 diskutil unmount "$disk" > /dev/null 2>&1; fi
-    check "fstypename: linuxfs ignore writes a noauto entry with vfstype macfuse_ext4" fstn_ignore "$disk"
-    out=$(bounded 600 diskutil mount "$disk" 2>&1); rc=$?
-    echo "# diskutil mount $disk with the noauto entry: exit $rc: $(printf '%s' "$out" | tr '\n' ' ')"
-    test "$rc" -eq 0 && ok "fstypename: diskutil mount works with the noauto entry" || notok "fstypename: diskutil mount works with the noauto entry"
-    echo "# mount: $(mount | grep -F linuxfs@ | tr '\n' '|')"
-    rec tail -n 20 /var/log/system.log
-    bounded 600 "$L" unignore "$disk" > /dev/null 2>&1
-    echo "# /etc/fstab after unignore:"; sed 's/^/#   /' /etc/fstab
-  else notok "fstypename: hdiutil attach -nomount"; disk=$(image_disk "$W/img/spike-ext4.img"); fi
-  cleanup_disk
-  fstn_probe B-after-ignore-unignore
-  fstn_seq ext4-recovery "$W/img/spike-ext4.img"
-  if gunzip -c "$IN/btrfs.img.gz" > "$W/img/spike-btrfs.img"; then fstn_seq btrfs-control "$W/img/spike-btrfs.img"; fi
+  fstn_experiments
   m=$W/mnt/spike; mkdir -p "$m"
   check "fstypename: linuxfs mount (the CLI's path)" bounded 600 "$L" mount "$W/img/spike-ext4.img" "$m"
   echo "# CLI path mount: $(mount | grep -F " on $m (")"

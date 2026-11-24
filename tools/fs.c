@@ -607,6 +607,8 @@ static int run_cli(const char *cli, const struct mountreq *req, const char *pw, 
 
 #define PRIV_DIR "/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d"
 #define RUN_USER "_linuxfs"
+/* SPIKE: set when argv[0] names the macfuse_ext4 bundle (a linuxfs_ext4 copy, the baseline, mounts as plain macfuse) */
+static int g_fstypename;
 #define MOUNT_MACFUSE "/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse"
 #define MACFUSE_MANIFEST "/usr/local/mavergreen/macfuse/mavergreen.plist"
 #define LIBFUSE "/usr/local/lib/libfuse3.4.dylib"	/* lklfuse, as _linuxfs, loads this */
@@ -1081,7 +1083,7 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 	time_t deadline, cli_end = 0;
 
 	fsrules_volname(strrchr(req->mnt, '/') + 1, vol, sizeof vol);
-	snprintf(opts, sizeof opts, "allow_other,local,volname=%s,fsname=linuxfs@%s,noappledouble%s%s", vol, bsd, strcmp(fs, "ext4") == 0 ? ",fstypename=ext4,fssubtype=7" : "", ro ? ",rdonly" : "");
+	snprintf(opts, sizeof opts, "allow_other,local,volname=%s,fsname=linuxfs@%s,noappledouble%s%s", vol, bsd, g_fstypename && strcmp(fs, "ext4") == 0 ? ",fstypename=ext4,fssubtype=7" : "", ro ? ",rdonly" : "");
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, cs) != 0)
 		return refuse(fs, "cannot make mount_macfuse's socket");
 	if (pipe(hout) != 0 || socketpair(AF_UNIX, SOCK_STREAM, 0, ch) != 0) {
@@ -1590,6 +1592,7 @@ int main(int argc, char **argv)
 
 	openlog("linuxfs-fs", LOG_PID, LOG_DAEMON);
 	fs = argc > 0 ? fsrules_fs_from_name(argv[0], &role) : NULL;
+	g_fstypename = argc > 0 && strstr(argv[0], "macfuse_") != NULL;
 	if (!fs) {
 		syslog(LOG_NOTICE, "run under a name that is no bundle's");
 		return FSUR_UNRECOGNIZED;
