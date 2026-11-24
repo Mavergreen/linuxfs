@@ -339,6 +339,7 @@ cmd_mount() {
   # the mount's own options (the kernel's): root gave them to mount_macfuse when it made the mount lklfuse serves
   [ -n "$fusefd" ] || opts="$opts,local,volname=$name,fsname=linuxfs@$(safe_name "$(basename "$src")"),noappledouble"
   # SPIKE: ext4 mounts as f_fstypename macfuse_ext4, subtype 7 (the bundle's FSSubType)
+  [ ! -r /private/var/tmp/spike-fstypename ] || LINUXFS_FSTYPENAME=$(cat /private/var/tmp/spike-fstypename)   # SPIKE: the stall loop forces 0/1
   # (a DiskArbitration mount asks for it only from the macfuse_ext4 bundle: the spike's baseline is today's linuxfs_ext4 bundle)
   [ -n "$fusefd" ] || [ "$type" != ext4 ] || { [ "${LINUXFS_DA:-}" = 1 ] && [ "${LINUXFS_FSTYPENAME:-}" != 1 ]; } || opts="$opts,fstypename=ext4,fssubtype=7"
   if [ -n "$ids" ]; then :
