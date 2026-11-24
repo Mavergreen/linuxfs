@@ -45,16 +45,21 @@ jobs:
           mkdir -p "$RUNNER_TEMP/up"
           for fs in ext4 btrfs xfs f2fs ntfs exfat apfs; do gzip -c "$d/$fs.img" > "$RUNNER_TEMP/up/$fs.img.gz"; done
           for l in slash ctl; do [ ! -f "$d/ext4-$l.img" ] || gzip -c "$d/ext4-$l.img" > "$RUNNER_TEMP/up/ext4-$l.img.gz"; done
-      # spec: tests/lib/gpt-wrap.py -- the same images in a GPT wrapper, as an external disk formatted by macOS is laid out,
+      # spec: tests/lib/gpt-wrap.py -- the same images in a GPT wrapper with each filesystem's own partition type (Linux data, basic data for NTFS, APFS), plus ext4 in the basic-data type,
+      #       as an external disk formatted by macOS is laid out,
       #       and the encrypted APFS fixture (password linuxfs-test) in one too: its partition UUID is the keychain's account
       - name: GPT-wrapped copies and the encrypted APFS fixture
         run: |
           set -eu
           d="$RUNNER_TEMP/images"
-          for fs in ext4 btrfs xfs f2fs ntfs apfs; do
-            python3 -I tests/lib/gpt-wrap.py "$d/$fs.img" "$d/gpt-$fs.img"
+          linux=0FC63DAF-8483-4772-8E79-3D69D8477DE4 basic=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7 apfs=7C3457EF-0000-11AA-AA11-00306543ECAC
+          for c in ext4:$linux btrfs:$linux xfs:$linux f2fs:$linux ntfs:$basic apfs:$apfs; do
+            fs=${c%%:*}
+            python3 -I tests/lib/gpt-wrap.py "$d/$fs.img" "$d/gpt-$fs.img" "${c#*:}"
             gzip -c "$d/gpt-$fs.img" > "$RUNNER_TEMP/up/gpt-$fs.img.gz"
           done
+          python3 -I tests/lib/gpt-wrap.py "$d/ext4.img" "$d/gpt-ext4-basic.img" "$basic"
+          gzip -c "$d/gpt-ext4-basic.img" > "$RUNNER_TEMP/up/gpt-ext4-basic.img.gz"
           gzip -dc tests/fixtures/apfs/enc.img.gz > "$d/enc.img"
           python3 -I tests/lib/gpt-wrap.py "$d/enc.img" "$d/gpt-enc.img"
           gzip -c "$d/gpt-enc.img" > "$RUNNER_TEMP/up/gpt-enc.img.gz"

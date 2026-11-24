@@ -15,7 +15,7 @@
 #       fails it. Linux checks the images afterwards (on-mavericks.yml's fsck job).
 #   usage: smoke-mavericks.sh VERSION IN OUT
 #          VERSION is the run's version (the pkg installed). IN holds ext4, btrfs, xfs, ntfs, exfat, f2fs and apfs .img.gz
-#          from tests/lib/probe-images.sh, gpt-<fs>.img.gz and gpt-enc.img.gz (tests/lib/gpt-wrap.py), and ext4-slash and
+#          from tests/lib/probe-images.sh, gpt-<fs>.img.gz (each in its own partition type), gpt-ext4-basic.img.gz and gpt-enc.img.gz (tests/lib/gpt-wrap.py), and ext4-slash and
 #          ext4-ctl .img.gz (tests/lib/label-images.sh). OUT receives every image as it is after the run, gzipped (da-*.img.gz
 #          are the disks DiskArbitration mounted), and the screenshots. Run as the guest's user over ssh, not root and not in
 #          the console session: the steps that need it go through /usr/local/bin/guest-macosx-aqua.
@@ -205,6 +205,9 @@ for c in ext4:ext4:rw btrfs:btrfs:rw xfs:xfs:rw f2fs:f2fs:rw ntfs:NTFS-linuxfs:r
   da_cycle "$fs" "$W/gpt-$fs.img" "$pers" "$kind" GPT
   rm -f "$W/gpt-$fs.img"
 done
+gunzip -c "$IN/gpt-ext4-basic.img.gz" > "$W/gpt-ext4-basic.img" || die "cannot unpack $IN/gpt-ext4-basic.img.gz"
+da_cycle ext4 "$W/gpt-ext4-basic.img" ext4 rw "GPT, basic-data type"
+rm -f "$W/gpt-ext4-basic.img"
 defaults delete dev.mavergreen.linuxfs NTFSTakeover
 
 # spec: tests/smoke-mavericks.sh header -- NTFSTakeover off (the default): Apple's own ntfs mounts it
