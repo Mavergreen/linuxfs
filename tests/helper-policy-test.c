@@ -245,6 +245,15 @@ int main(void)
 		answers("noauto-remove \n", getuid(), getuid(), "no ", "noauto-remove with no spec is refused");
 		answers("noauto-add LABEL=x linuxfs_ext4\n", 502, 501, "no only the user at the console", "noauto-add from another user is refused");
 		iss(slurp(f), big, "and none of the refused requests touched the fstab");
+		/* noauto-remove-all (uninstall): every linuxfs line goes, no other */
+		answers("noauto-add LABEL=a linuxfs_ext4\n", getuid(), getuid(), "ok", "an entry to remove");
+		answers("noauto-add UUID=0123ABCD-4567-89EF-0123-456789ABCDEF linuxfs_btrfs\n", getuid(), getuid(), "ok", "and another");
+		answers("noauto-remove-all extra\n", getuid(), getuid(), "no ", "noauto-remove-all takes nothing after it");
+		answers("noauto-remove-all\n", 502, 501, "no only the user at the console", "noauto-remove-all from another user is refused");
+		answers("noauto-remove-all\n", getuid(), getuid(), "ok", "noauto-remove-all is done");
+		iss(slurp(f), big, "every linuxfs line is gone and the Mac's lines are as they were");
+		answers("noauto-remove-all\n", getuid(), getuid(), "ok", "and with none left it is ok");
+		iss(helper_noauto(f, NULL, "linuxfs_ext4"), "a bundle needs a volume", "a bundle with no spec is refused");
 		unlink(f);
 		rmdir(dir);
 		unsetenv("LINUXFS_FSTAB");

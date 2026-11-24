@@ -19,6 +19,9 @@ cc -o "$D/policy" "$ROOT/tests/agent-policy-test.c" "$ROOT/tools/fstab.c" "$ROOT
 grep -v '^1\.\.' "$D/policy.tap"
 n=$(grep -c '^ok\|^not ok' "$D/policy.tap")
 ok() { n=$((n + 1)); if [ "$1" = 0 ]; then echo "ok $n - $2"; else echo "not ok $n - $2"; bad=1; fi; }
+# spec: tools/agent.c -- every agent here reads and writes test preferences (an absolute path as the domain), never this Mac's,
+#       and records its notices in a file instead of posting them
+export LINUXFS_PREFS_DOMAIN=$D/prefs-$$ LINUXFS_MACHINE_PLIST=$D/machine.plist LINUXFS_NOTICE_LOG=$D/notices
 # a short HOME: the socket's path must fit sockaddr_un (104 bytes)
 H=$(mktemp -d /tmp/lfagent.XXXXXX) || exit 1
 SOCK=$H/Library/Caches/dev.mavergreen.linuxfs/keychain.sock
@@ -104,4 +107,23 @@ i=0; while ! grep -q 'login sweep looked' "$D/agent.log" && [ $i -lt 100 ]; do s
 looked=$(sed -n 's/.*login sweep looked at \([0-9]*\) disks.*/\1/p' "$D/agent.log" | tail -n 1)
 [ "${looked:-0}" -ge 1 ]; ok $? "the sweep ran, and looked at the attached disk among the others (${looked:-none} disks)"
 [ ! -s "$D/cli.calls" ]; ok $? "and ran nothing for a disk with no linuxfs_ kind (calls: $(tr '\n' '|' < "$D/cli.calls"))"
+# spec: tools/agent.c -- at login, one notice for each Ignore:<LABEL> the install could not convert to /etc/fstab (the user's and
+#       the machine's), once: the labels told of are kept in the user's IgnoreNotified
+kill $ap 2>/dev/null; wait $ap 2>/dev/null
+defaults write "$LINUXFS_PREFS_DOMAIN" "Ignore:helped" -bool true; defaults write "$LINUXFS_PREFS_DOMAIN" "Ignore:two words" -bool true
+defaults write "$LINUXFS_PREFS_DOMAIN" "Ignore:off" -bool false
+printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>Ignore:helped</key><true/><key>Ignore:m</key><true/></dict></plist>\n' > "$D/machine.plist"
+: > "$D/notices"; agent; sleep 1
+[ "$(sort "$D/notices")" = 'linuxfs no longer skips "helped" by name: attach it and run linuxfs ignore
+linuxfs no longer skips "m" by name: attach it and run linuxfs ignore
+linuxfs no longer skips "two words" by name: attach it and run linuxfs ignore' ]; ok $? "one notice per unconverted label, each once (got: $(tr '\n' '|' < "$D/notices"))"
+defaults read "$LINUXFS_PREFS_DOMAIN" IgnoreNotified | grep -q '"two words"'; ok $? "the labels told of are kept in IgnoreNotified ($(defaults read "$LINUXFS_PREFS_DOMAIN" IgnoreNotified | tr -d '\n '))"
+kill $ap; wait $ap 2>/dev/null
+: > "$D/notices"; agent; sleep 1
+[ ! -s "$D/notices" ]; ok $? "the next login tells of none again (got: $(tr '\n' '|' < "$D/notices"))"
+kill $ap; wait $ap 2>/dev/null
+defaults write "$LINUXFS_PREFS_DOMAIN" "Ignore:new one" -bool true
+: > "$D/notices"; agent; sleep 1
+[ "$(cat "$D/notices")" = 'linuxfs no longer skips "new one" by name: attach it and run linuxfs ignore' ]; ok $? "a label added later is told of, alone (got: $(tr '\n' '|' < "$D/notices"))"
+kill $ap; wait $ap 2>/dev/null
 echo "1..$n"; exit $bad

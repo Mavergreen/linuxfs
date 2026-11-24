@@ -29,7 +29,7 @@ int fstab_escape(const char *spec, char *out, size_t outlen);
 /* IN (LEN bytes) with every linuxfs line for SPEC removed and, when BUNDLE is not NULL, SPEC's line added at the end; when
  * that line is already there, IN is kept as it is. Every other line is kept byte for byte. The result goes to OUT (CAP
  * bytes) and its length is returned, *changed saying whether it differs from IN; -1 when SPEC or BUNDLE is refused or the
- * result is over FSTAB_MAX or CAP. */
+ * result is over FSTAB_MAX or CAP. With SPEC and BUNDLE both NULL, every linuxfs line goes (uninstall). */
 long fstab_edit(const char *in, size_t len, const char *spec, const char *bundle, char *out, size_t cap, int *changed);
 
 /* Whether IN (LEN bytes) has a linuxfs line for UUID= UUID (any case) or LABEL= VOLNAME; either may be NULL or empty. */

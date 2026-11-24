@@ -214,18 +214,28 @@ printf '#!/bin/sh\n[ -f "%s/created-group" ]\n' "$T" > "$T/bin/ls"
 chmod 755 "$T/bin/dscl" "$T/bin/rm" "$T/bin/ls"; : > "$T/acct.calls"
 printf '#!/bin/sh\nprintf "%%s\\n" "  PID COMMAND" "  412 %s/libexec/lklfuse -f -o type=ext4 /dev/fd/3 /Volumes/data"\n' "$LINUXFS_PREFIX" > "$T/bin/ps"
 chmod 755 "$T/bin/ps"
-h="$REPO_ROOT/packaging/pre-uninstall"
+# the helper's --noauto-remove-all is a stub that logs (the real one would edit this machine's /etc/fstab)
+printf '#!/bin/sh\necho "helper $*" >> "%s/launchctl.calls"\n' "$T" > "$T/bin/helper"; chmod 755 "$T/bin/helper"
+sed "s|/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper|$T/bin/helper|g" "$REPO_ROOT/packaging/pre-uninstall" > "$T/pre-uninstall"
+h="$T/pre-uninstall"
 if PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > "$T/u.out" 2>&1; then fail "pre-uninstall allows uninstall while lklfuse runs"
 else grep -q /Volumes/data "$T/u.out" || fail "pre-uninstall's refusal does not name the volume: $(cat "$T/u.out")"; fi
 printf '#!/bin/sh\nprintf "%%s\\n" "  PID COMMAND" "  412 /Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d/lklfuse -f -o type=ext4 /dev/fd/3 /Volumes/dd"\n' > "$T/bin/ps"
 if PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > "$T/u.out" 2>&1; then fail "pre-uninstall allows uninstall while the .d lklfuse runs"
 else grep -q /Volumes/dd "$T/u.out" || fail "pre-uninstall's refusal does not name the .d volume: $(cat "$T/u.out")"; fi
+! grep -q 'noauto-remove-all' "$T/launchctl.calls" 2>/dev/null || fail "pre-uninstall removed the fstab entries though it refused"
 [ ! -s "$T/acct.calls" ] || fail "pre-uninstall touched _linuxfs while a volume was mounted: $(cat "$T/acct.calls")"
 PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/Volumes/Other sh "$h" > /dev/null 2>&1 || fail "pre-uninstall refuses for another volume"
 printf '#!/bin/sh\necho "  PID COMMAND"\necho "    1 /sbin/launchd"\n' > "$T/bin/ps"
 printf '#!/bin/sh\necho "launchctl $*" >> "%s/launchctl.calls"\n' "$T" > "$T/bin/launchctl"; chmod 755 "$T/bin/launchctl"
 PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > /dev/null 2>&1 || fail "pre-uninstall refuses with nothing mounted"
 grep -q "launchctl unload.*/Library/LaunchDaemons/$H.plist" "$T/launchctl.calls" 2>/dev/null || fail "pre-uninstall does not unload the helper"
+# spec: packaging/pre-uninstall -- linuxfs's /etc/fstab noauto lines go with it (the helper's --noauto-remove-all, as root),
+#       before the helper is unloaded
+grep -qx "helper --noauto-remove-all" "$T/launchctl.calls" || fail "pre-uninstall does not remove linuxfs's /etc/fstab entries"
+[ "$(grep -n 'helper --noauto-remove-all' "$T/launchctl.calls" | cut -d: -f1)" -lt "$(grep -n "launchctl unload.*$H.plist" "$T/launchctl.calls" | cut -d: -f1)" ] ||
+  fail "pre-uninstall removes the fstab entries after unloading the helper"
+grep -q 'dev.mavergreen.linuxfs.helper --noauto-remove-all' "$REPO_ROOT/packaging/pre-uninstall" || fail "pre-uninstall does not run the installed helper's --noauto-remove-all"
 printf '#!/bin/sh\ncase "$*" in "-u _linuxfs") exit 0 ;; esac\necho 77\n' > "$T/bin/pgrep"; chmod 755 "$T/bin/pgrep"; : > "$T/launchctl.calls"; : > "$T/acct.calls"
 PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > "$T/u.out" 2>&1 || fail "pre-uninstall refuses with only _linuxfs processes"
 grep -q '_linuxfs' "$T/u.out" || fail "pre-uninstall says nothing when a _linuxfs process keeps the account"

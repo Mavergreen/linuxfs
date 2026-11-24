@@ -133,6 +133,16 @@ int main(void)
 		snprintf(in, sizeof in, "LABEL=x none hfs rw # linuxfs is not here\n");
 		iss(edit(in, "LABEL=x", NULL, &ch), in, "a line that only mentions linuxfs is not linuxfs's");
 	}
+	{
+		char in[1024];
+
+		snprintf(in, sizeof in, "%sLABEL=my\\040data none linuxfs_ntfs rw,noauto # linuxfs\n%s%s", mine, other, mine);
+		iss(edit(in, NULL, NULL, &ch), other, "no spec and no bundle removes every linuxfs line and keeps every other");
+		is(ch, 1, "and changes it");
+		iss(edit(other, NULL, NULL, &ch), other, "with none there, the fstab is kept");
+		is(ch, 0, "and nothing changed");
+		iss(edit(other, NULL, "linuxfs_ext4", &ch), "(refused)", "a bundle with no spec is refused");
+	}
 	iss(edit("", "LABEL=a#b", "linuxfs_ext4", &ch), "(refused)", "an edit with a refused spec is refused");
 	iss(edit("", "LABEL=ab", "linuxfs_hfs", &ch), "(refused)", "an edit with a refused bundle is refused");
 	memset(big, '#', FSTAB_MAX - 10);

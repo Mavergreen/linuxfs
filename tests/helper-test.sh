@@ -110,6 +110,21 @@ out=$(LINUXFS_FSTAB=$M LINUXFS_PREFS_USER=$D/user.plist LINUXFS_PREFS_MACHINE=$D
 grep -q "nowhere" "$D/migrate.err" && grep -q "a#b" "$D/migrate.err" && grep -q "too long" "$D/migrate.err" && ! grep -q kept "$D/migrate.err"; ok $? "a label with no disk attached, not writable, or too long is logged and left ($(tr '\n' '|' < "$D/migrate.err"))"
 out=$(LINUXFS_FSTAB=$M LINUXFS_PREFS_USER=$D/none.plist LINUXFS_PREFS_MACHINE=$D/none.plist "$D/helper" --migrate-prefs 2>&1); rc=$?
 [ $rc -eq 0 ] && [ -z "$out" ]; ok $? "with no preferences there is nothing to migrate (got $rc: '$out')"
+# spec: tools/helper.c -- noauto-remove-all (pre-uninstall runs --noauto-remove-all as root): every linuxfs line goes, no other
+printf '# the Mac'"'"'s\nLABEL=Backup none hfs ro\n' > "$F"
+"$D/open" --noauto-add "LABEL=my data" linuxfs_ext4 && "$D/open" --noauto-add "LABEL=b" linuxfs_xfs && echo "LABEL=after none hfs ro" >> "$F"
+"$D/open" --noauto-remove-all; ok $? "linuxfs-open --noauto-remove-all exits 0"
+[ "$(cat "$F")" = "# the Mac's
+LABEL=Backup none hfs ro
+LABEL=after none hfs ro" ]; ok $? "every linuxfs line is gone, the others kept in order ($(tr '\n' '|' < "$F"))"
+"$D/open" --noauto-add "LABEL=c" linuxfs_f2fs
+"$D/helper" --noauto-remove-all; rc=$?
+[ $rc -eq 0 ] && ! grep -q linuxfs "$F" && grep -q "LABEL=after none hfs ro" "$F"; ok $? "linuxfs-helper --noauto-remove-all does the same, without the socket (rc $rc)"
+LINUXFS_FSTAB=$D/no-fstab "$D/helper" --noauto-remove-all; rc=$?
+[ $rc -eq 0 ] && [ ! -e "$D/no-fstab" ]; ok $? "with no fstab it is ok and makes none (rc $rc)"
+ln -s "$F" "$D/link-fstab"
+LINUXFS_FSTAB=$D/link-fstab "$D/helper" --noauto-remove-all 2> "$D/rmall.err"; rc=$?
+[ $rc -eq 1 ] && grep -q symlink "$D/rmall.err"; ok $? "a refusal is printed and exits 1 (rc $rc: $(cat "$D/rmall.err"))"
 kill $hp; wait $hp 2>/dev/null
 "$D/open" --probe "$D/ext4.img" > /dev/null 2>&1; [ $? -eq 3 ]; ok $? "with no helper listening, exit 3"
 echo "1..$n"; exit $bad

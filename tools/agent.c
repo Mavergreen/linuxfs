@@ -18,13 +18,19 @@
  * DiskArbitration volume kind starts with linuxfs_ and that has no volume path (DiskArbitration did not mount it, say
  * because the keychain was not ready), it runs `linuxfs automount DISK` -- unless /etc/fstab has linuxfs's noauto entry
  * for the volume's UUID or name (linuxfs ignore), which is why DiskArbitration left it alone.
- * LINUXFS_CLI names another linuxfs, LINUXFS_FSTAB another fstab, and LINUXFS_KEYCHAIN=off swaps the keychain for a store in
- * memory (tests); like LINUXFS_SWEEP_DELAY, they are honoured only when not root.
+ * At start (login), one notice for each Ignore:<LABEL> = true preference (the user's or the machine's) still there: the
+ * install turns those into /etc/fstab entries only for disks attached then, and nothing reads them any more. Each label is
+ * told of once: those told of are kept in the user's preference IgnoreNotified (an array).
+ * LINUXFS_CLI names another linuxfs, LINUXFS_FSTAB another fstab, LINUXFS_PREFS_DOMAIN another preferences domain (an
+ * absolute path), LINUXFS_MACHINE_PLIST another machine plist, LINUXFS_NOTICE_LOG a file the notices are appended to instead
+ * of shown, and LINUXFS_KEYCHAIN=off swaps the keychain for a store in memory (tests); like LINUXFS_SWEEP_DELAY, they are
+ * honoured only when not root.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <DiskArbitration/DiskArbitration.h>
 #include <Security/Security.h>
 #include <ctype.h>
+#include <strings.h>
 #include <mach/mach_time.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -95,6 +101,56 @@ int agent_sweeps(const char *kind, int has_path)
 int agent_sweeps_volume(const char *kind, int has_path, const char *fstab, size_t len, const char *uuid, const char *volname)
 {
 	return agent_sweeps(kind, has_path) && !fstab_has_noauto(fstab, len, uuid, volname);
+}
+
+/* a preference value that means true: a true boolean, a nonzero number, or YES/true/1 */
+static int truthy(CFTypeRef v)
+{
+	char b[8];
+	int n;
+
+	if (!v)
+		return 0;
+	if (CFGetTypeID(v) == CFBooleanGetTypeID())
+		return CFBooleanGetValue(v);
+	if (CFGetTypeID(v) == CFNumberGetTypeID())
+		return CFNumberGetValue(v, kCFNumberIntType, &n) && n != 0;
+	if (CFGetTypeID(v) == CFStringGetTypeID() && CFStringGetCString(v, b, sizeof(b), kCFStringEncodingUTF8))
+		return !strcasecmp(b, "yes") || !strcasecmp(b, "true") || !strcmp(b, "1");
+	return 0;
+}
+
+static void collect_unconverted(const void *key, const void *value, void *ctx)
+{
+	CFMutableArrayRef out = ((CFMutableArrayRef *)ctx)[0];
+	CFArrayRef notified = ((CFArrayRef *)ctx)[1];
+	CFStringRef label;
+
+	if (CFGetTypeID(key) != CFStringGetTypeID() || !CFStringHasPrefix(key, CFSTR("Ignore:")) || !truthy(value))
+		return;
+	label = CFStringCreateWithSubstring(NULL, key, CFRangeMake(7, CFStringGetLength(key) - 7));
+	if (!label)
+		return;
+	if (CFStringGetLength(label) > 0 && !CFArrayContainsValue(out, CFRangeMake(0, CFArrayGetCount(out)), label) &&
+	    !(notified && CFArrayContainsValue(notified, CFRangeMake(0, CFArrayGetCount(notified)), label)))
+		CFArrayAppendValue(out, label);
+	CFRelease(label);
+}
+
+/* The labels of the Ignore:<LABEL> = true keys in USER and MACHINE (either may be NULL) that are not in NOTIFIED (may be
+ * NULL), each once: a new array, the caller's to release; NULL only when out of memory. */
+CFArrayRef agent_unconverted(CFDictionaryRef user, CFDictionaryRef machine, CFArrayRef notified)
+{
+	CFMutableArrayRef out = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+	const void *ctx[2] = { out, notified && CFGetTypeID(notified) == CFArrayGetTypeID() ? notified : NULL };
+
+	if (!out)
+		return NULL;
+	if (user)
+		CFDictionaryApplyFunction(user, collect_unconverted, ctx);
+	if (machine)
+		CFDictionaryApplyFunction(machine, collect_unconverted, ctx);
+	return out;
 }
 
 #ifndef LINUXFS_AGENT_NO_MAIN
@@ -673,6 +729,107 @@ static void sweep(CFRunLoopTimerRef t, void *ctx)
 	}
 }
 
+/* ---- at login: the Ignore:<LABEL> preferences the install left ---- */
+
+#define MACHINE_PLIST_MAX (1024 * 1024)
+
+/* the machine's plist (root's, world-readable), at most 1 MiB, as a dictionary; NULL for anything else */
+static CFDictionaryRef machine_prefs(void)
+{
+	struct stat st;
+	char *buf = NULL;
+	size_t got = 0;
+	ssize_t r;
+	CFDictionaryRef d = NULL;
+	int fd = open(env_or("LINUXFS_MACHINE_PLIST", "/Library/Preferences/dev.mavergreen.linuxfs.plist"), O_RDONLY | O_NONBLOCK | O_NOCTTY);
+
+	if (fd < 0)
+		return NULL;
+	if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 && st.st_size <= MACHINE_PLIST_MAX &&
+	    (buf = malloc((size_t)st.st_size)) != NULL)
+		while (got < (size_t)st.st_size && (r = read(fd, buf + got, (size_t)st.st_size - got)) > 0)
+			got += (size_t)r;
+	close(fd);
+	if (buf && got == (size_t)st.st_size) {
+		CFDataRef data = CFDataCreate(NULL, (const UInt8 *)buf, (CFIndex)got);
+		CFPropertyListRef pl = data ? CFPropertyListCreateWithData(NULL, data, kCFPropertyListImmutable, NULL, NULL) : NULL;
+
+		if (pl && CFGetTypeID(pl) == CFDictionaryGetTypeID())
+			d = pl;
+		else if (pl)
+			CFRelease(pl);
+		if (data)
+			CFRelease(data);
+	}
+	free(buf);
+	return d;
+}
+
+static void notice(CFStringRef label)
+{
+	const char *log = env_or("LINUXFS_NOTICE_LOG", NULL);
+	CFStringRef msg = CFStringCreateWithFormat(NULL, NULL, CFSTR("linuxfs no longer skips \"%@\" by name: attach it and run linuxfs ignore"), label);
+	char text[2048];
+
+	if (!msg)
+		return;
+	if (log) {
+		FILE *f = fopen(log, "a");
+
+		if (f && CFStringGetCString(msg, text, sizeof(text), kCFStringEncodingUTF8))
+			fprintf(f, "%s\n", text);
+		if (f)
+			fclose(f);
+	} else {
+		/* shown and left: DisplayNotice does not wait for the OK */
+		CFUserNotificationDisplayNotice(0, kCFUserNotificationNoteAlertLevel, NULL, NULL, NULL, CFSTR("Linux Filesystems"), msg, CFSTR("OK"));
+	}
+	CFRelease(msg);
+}
+
+static void notify_unconverted(void)
+{
+	const char *dom = env_or("LINUXFS_PREFS_DOMAIN", "dev.mavergreen.linuxfs");
+	CFStringRef app = CFStringCreateWithCString(NULL, dom, kCFStringEncodingUTF8), key = CFSTR("IgnoreNotified");
+	CFDictionaryRef user, machine;
+	CFPropertyListRef was;
+	CFMutableArrayRef told;
+	CFArrayRef labels;
+	CFIndex i;
+
+	if (!app)
+		return;
+	user = CFPreferencesCopyMultiple(NULL, app, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+	machine = machine_prefs();
+	was = CFPreferencesCopyAppValue(key, app);
+	if (was && CFGetTypeID(was) != CFArrayGetTypeID()) {
+		CFRelease(was);
+		was = NULL;
+	}
+	labels = agent_unconverted(user, machine, was);
+	told = was ? CFArrayCreateMutableCopy(NULL, 0, was) : CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+	if (labels && told && CFArrayGetCount(labels) > 0) {
+		for (i = 0; i < CFArrayGetCount(labels); i++) {
+			notice(CFArrayGetValueAtIndex(labels, i));
+			CFArrayAppendValue(told, CFArrayGetValueAtIndex(labels, i));
+		}
+		CFPreferencesSetAppValue(key, told, app);
+		CFPreferencesAppSynchronize(app);
+		syslog(LOG_NOTICE, "told of %d Ignore: preferences the install could not convert", (int)CFArrayGetCount(labels));
+	}
+	if (labels)
+		CFRelease(labels);
+	if (told)
+		CFRelease(told);
+	if (was)
+		CFRelease(was);
+	if (user)
+		CFRelease(user);
+	if (machine)
+		CFRelease(machine);
+	CFRelease(app);
+}
+
 int main(int argc, char **argv)
 {
 	char dir[1024], path[1024];
@@ -725,6 +882,7 @@ int main(int argc, char **argv)
 	CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopDefaultMode);
 	CFRelease(timer);
 	syslog(LOG_NOTICE, "keeping the keychain at %s", path);
+	notify_unconverted();
 	CFRunLoopRun();
 	return 0;
 }

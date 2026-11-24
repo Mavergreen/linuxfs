@@ -3,6 +3,7 @@
  * user at the console, and hands them the descriptor; lklfuse then runs as that user.
  * usage: linuxfs-helper [--socket PATH] [--timeout SECONDS]       (run by launchd as dev.mavergreen.linuxfs.helper)
  *        linuxfs-helper --migrate-prefs                            (run by the postinstall, as root)
+ *        linuxfs-helper --noauto-remove-all                        (run by pre-uninstall, as root: noauto-remove-all)
  * Protocol, one request per connection, one line each way:
  *   "open /dev/rdiskNsM rw|ro"  ->  "ok TYPE<TAB>LABEL" plus the descriptor (SCM_RIGHTS), or "no REASON"
  *   "probe /dev/rdiskNsM"       ->  "ok TYPE<TAB>LABEL", or "no REASON"
@@ -10,6 +11,7 @@
  *   "noauto-add SPEC BUNDLE"    ->  "ok", or "no REASON": /etc/fstab gets SPEC's linuxfs noauto entry (fstab.h); SPEC is
  *                                   UUID=... or LABEL=<label>, which may hold spaces: BUNDLE is the line's last word
  *   "noauto-remove SPEC"        ->  "ok", or "no REASON": SPEC's linuxfs entry goes
+ *   "noauto-remove-all"         ->  "ok", or "no REASON": every linuxfs entry goes, and no other line
  * It refuses a peer other than root or the console user (before reading its request), a request of more than one line,
  * a path other than a raw disk node, a partition the Mac has mounted, a disk with partitions under it, a system partition
  * by type (EFI, Apple, Windows, from IOKit), FAT, exFAT or NTFS on internal media, and any partition whose superblock is
@@ -185,7 +187,8 @@ static const char *why_errno(const char *what)
 }
 
 /*
- * Adds SPEC's linuxfs noauto entry for BUNDLE to the fstab at PATH, or removes it (BUNDLE NULL). NULL when done (or there
+ * Adds SPEC's linuxfs noauto entry for BUNDLE to the fstab at PATH, or removes it (BUNDLE NULL), or every linuxfs entry
+ * (SPEC and BUNDLE NULL). NULL when done (or there
  * was nothing to do), else why not. PATH must be a regular file owned by root (by the caller, when not root: tests) of at
  * most FSTAB_MAX bytes, or absent; it is read whole, edited in memory (fstab.c: every other line kept byte for byte) and
  * replaced by a new file made beside it (O_EXCL, O_NOFOLLOW, mode 0644, root:wheel), synced, then renamed over it, so a
@@ -202,7 +205,9 @@ const char *helper_noauto(const char *path, const char *spec, const char *bundle
 	ssize_t r;
 	int dfd, fd, tfd = -1, changed, retried = 0;
 
-	if ((why = fstab_spec_refusal(spec)) || (bundle && (why = fstab_bundle_refusal(bundle))))
+	if (!spec && bundle)
+		return "a bundle needs a volume";
+	if ((spec && (why = fstab_spec_refusal(spec))) || (bundle && (why = fstab_bundle_refusal(bundle))))
 		return why;
 	if (snprintf(dir, sizeof(dir), "%s", path) >= (int)sizeof(dir) || snprintf(tmp, sizeof(tmp), "%s.linuxfs-new", path) >= (int)sizeof(tmp))
 		return "the fstab's path is too long";
@@ -465,6 +470,13 @@ void helper_serve(int c, uid_t peer, uid_t console, int test_files)
 	}
 	if (nl)
 		*nl = '\0';
+	if (strcmp(req, "noauto-remove-all") == 0) {
+		why = helper_noauto(helper_fstab_path(), NULL, NULL);
+		if (why)
+			snprintf(msg, sizeof(msg), "no %s\n", why);
+		reply(c, why ? msg : "ok\n", -1);
+		return;
+	}
 	if (strncmp(req, "noauto-add ", 11) == 0 || strncmp(req, "noauto-remove ", 14) == 0) {
 		char *spec = req + (req[7] == 'a' ? 11 : 14), *bundle = NULL;
 
@@ -492,7 +504,7 @@ void helper_serve(int c, uid_t peer, uid_t console, int test_files)
 		mode[0] = '\0';
 		want_uuid = 1;
 	} else {
-		reply(c, "no request is open DEVICE rw|ro, probe DEVICE, uuid DEVICE, noauto-add SPEC BUNDLE or noauto-remove SPEC\n", -1);
+		reply(c, "no request is open DEVICE rw|ro, probe DEVICE, uuid DEVICE, noauto-add SPEC BUNDLE, noauto-remove SPEC or noauto-remove-all\n", -1);
 		return;
 	}
 	if (!helper_device_ok(dev) && !test_files) {
@@ -561,6 +573,13 @@ int main(int argc, char **argv)
 		alarm(120);	/* a disk that never answers its probe must not hold up the install */
 		return helper_migrate(stdout);
 	}
+	if (argc == 2 && strcmp(argv[1], "--noauto-remove-all") == 0) {
+		const char *why = helper_noauto(helper_fstab_path(), NULL, NULL);
+
+		if (why)
+			fprintf(stderr, "linuxfs-helper: %s\n", why);
+		return why ? 1 : 0;
+	}
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc)
 			path = argv[++i];
@@ -569,7 +588,7 @@ int main(int argc, char **argv)
 		else if (strcmp(argv[i], "--test-files") == 0)
 			test_files = 1;	/* tests only: regular files stand in for disks, the caller for the console */
 		else {
-			fprintf(stderr, "usage: linuxfs-helper [--socket PATH] [--timeout SECONDS]\n       linuxfs-helper --migrate-prefs\n");
+			fprintf(stderr, "usage: linuxfs-helper [--socket PATH] [--timeout SECONDS]\n       linuxfs-helper --migrate-prefs\n       linuxfs-helper --noauto-remove-all\n");
 			return 2;
 		}
 	}

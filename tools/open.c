@@ -8,6 +8,7 @@
  *        linuxfs-open --uuid DEVICE                      prints the filesystem's UUID, as linuxfs-probe --uuid does
  *        linuxfs-open --noauto-add SPEC BUNDLE           has the helper add SPEC's noauto entry to /etc/fstab
  *        linuxfs-open --noauto-remove SPEC               has it take that entry away (SPEC: UUID=... or LABEL=...)
+ *        linuxfs-open --noauto-remove-all                has it take every linuxfs entry away
  * DEVICE is /dev/rdiskNsM (or /dev/diskNsM, diskNsM). The helper's refusal is printed and exits 1; no helper
  * listening exits 3; misuse exits 2. LINUXFS_HELPER_SOCKET names another socket (tests).
  *
@@ -32,7 +33,7 @@
 static int usage(void)
 {
 	fprintf(stderr, "usage: linuxfs-open [--ro] DEVICE [--also DEVICE2] PROGRAM [ARG...]\n       linuxfs-open --probe|--uuid DEVICE\n"
-		"       linuxfs-open --noauto-add SPEC BUNDLE\n       linuxfs-open --noauto-remove SPEC\n");
+		"       linuxfs-open --noauto-add SPEC BUNDLE\n       linuxfs-open --noauto-remove SPEC\n       linuxfs-open --noauto-remove-all\n");
 	return 2;
 }
 
@@ -201,11 +202,14 @@ int main(int argc, char **argv)
 		printf("%s\n", answer + 3);
 		return 0;
 	}
-	if ((argc == 4 && strcmp(argv[1], "--noauto-add") == 0) || (argc == 3 && strcmp(argv[1], "--noauto-remove") == 0)) {
+	if ((argc == 4 && strcmp(argv[1], "--noauto-add") == 0) || (argc == 3 && strcmp(argv[1], "--noauto-remove") == 0) ||
+	    (argc == 2 && strcmp(argv[1], "--noauto-remove-all") == 0)) {
 		char line[2048];
 
 		/* the helper checks SPEC and BUNDLE, and refuses a request of more than one line */
-		if (snprintf(line, sizeof(line), "%s %s%s%s\n", argv[1] + 2, argv[2], argc == 4 ? " " : "", argc == 4 ? argv[3] : "") >= (int)sizeof(line)) {
+		if (argc == 2)
+			snprintf(line, sizeof(line), "noauto-remove-all\n");
+		else if (snprintf(line, sizeof(line), "%s %s%s%s\n", argv[1] + 2, argv[2], argc == 4 ? " " : "", argc == 4 ? argv[3] : "") >= (int)sizeof(line)) {
 			fprintf(stderr, "linuxfs-open: the volume's name is too long\n");
 			return 1;
 		}

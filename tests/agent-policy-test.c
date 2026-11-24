@@ -73,6 +73,42 @@ int main(void)
 		is(agent_sweeps_volume("linuxfs_ext4", 1, "", 0, NULL, NULL), 0, "but not one already mounted");
 		is(agent_sweeps_volume("hfs", 0, "", 0, NULL, NULL), 0, "nor the Mac's own");
 	}
+	{
+		/* spec: tools/agent.c -- the Ignore:<LABEL> keys the install could not convert, each named once, and never again
+		 * once in IgnoreNotified */
+		CFMutableDictionaryRef u = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+		CFMutableDictionaryRef m = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+		CFMutableArrayRef done = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+		CFArrayRef got;
+		int one = 1, zero = 0;
+		CFNumberRef n1 = CFNumberCreate(NULL, kCFNumberIntType, &one), n0 = CFNumberCreate(NULL, kCFNumberIntType, &zero);
+
+		CFDictionarySetValue(u, CFSTR("Ignore:helped"), kCFBooleanTrue);
+		CFDictionarySetValue(u, CFSTR("Ignore:two words"), CFSTR("YES"));
+		CFDictionarySetValue(u, CFSTR("Ignore:off"), kCFBooleanFalse);
+		CFDictionarySetValue(u, CFSTR("Ignore:zero"), n0);
+		CFDictionarySetValue(u, CFSTR("ReadOnly"), kCFBooleanTrue);
+		CFDictionarySetValue(m, CFSTR("Ignore:helped"), n1);
+		CFDictionarySetValue(m, CFSTR("Ignore:m"), kCFBooleanTrue);
+		got = agent_unconverted(u, m, NULL);
+		is(got && CFArrayGetCount(got) == 3, 1, "three labels to tell of: true, YES and 1, not false or 0 or another key");
+		is(got && CFArrayContainsValue(got, CFRangeMake(0, CFArrayGetCount(got)), CFSTR("helped")) &&
+		   CFArrayContainsValue(got, CFRangeMake(0, CFArrayGetCount(got)), CFSTR("two words")) &&
+		   CFArrayContainsValue(got, CFRangeMake(0, CFArrayGetCount(got)), CFSTR("m")), 1, "helped (in both domains, once), two words and m");
+		if (got)
+			CFRelease(got);
+		CFArrayAppendValue(done, CFSTR("helped"));
+		CFArrayAppendValue(done, CFSTR("m"));
+		got = agent_unconverted(u, m, done);
+		is(got && CFArrayGetCount(got) == 1 && CFEqual(CFArrayGetValueAtIndex(got, 0), CFSTR("two words")), 1, "a label already told of is not told again");
+		if (got)
+			CFRelease(got);
+		got = agent_unconverted(NULL, NULL, NULL);
+		is(got && CFArrayGetCount(got) == 0, 1, "no preferences, nothing to tell");
+		if (got)
+			CFRelease(got);
+		CFRelease(u); CFRelease(m); CFRelease(done); CFRelease(n0); CFRelease(n1);
+	}
 	printf("1..%d\n", tapno);
 	return failures ? 1 : 0;
 }

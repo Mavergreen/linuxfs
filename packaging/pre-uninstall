@@ -3,7 +3,8 @@
 #   usage: pre-uninstall        (MAVERGREEN_ROOT set by the helper)
 #          Refuses while any linuxfs volume is mounted (an lklfuse from this tree is running), naming each, since
 #          removing lklfuse under a mounted volume leaves it unwritable until unmounted. Another volume's uninstall
-#          has nothing to check here. Otherwise it unloads the root helper and the console user's automount agent before their files go,
+#          has nothing to check here. Otherwise it removes linuxfs's /etc/fstab noauto lines (the helper's
+#          --noauto-remove-all), unloads the root helper and the console user's automount agent before their files go,
 #          and removes the _linuxfs account and its home when nothing runs as it. An lklfuse under the .d directory counts as mounted too.
 [ "${MAVERGREEN_ROOT:-/}" = / ] || exit 0
 prefix=/usr/local/mavergreen/linuxfs
@@ -11,6 +12,10 @@ priv=/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d
 running="$(ps -axww -o command= 2>/dev/null | awk -v p="$prefix/libexec/lklfuse" -v q="$priv/lklfuse" 'index($0, p " ") == 1 || index($0, q " ") == 1 { print }')" || running=
 [ -n "$running" ] || running="$(ps -axww -o pid,command 2>/dev/null | awk -v p="$prefix/libexec/lklfuse" -v q="$priv/lklfuse" '{ sub(/^ *[0-9]+ /, "") } index($0, p " ") == 1 || index($0, q " ") == 1 { print }')"
 if [ -z "$running" ]; then
+  # the volumes linuxfs kept from mounting by themselves: their /etc/fstab noauto lines go with it, and no other line (the
+  # helper's own C, run here as root); left behind, a LABEL= line would keep a same-named volume of any filesystem unmounted
+  [ ! -x /Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper ] ||
+    /Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper --noauto-remove-all || echo "linuxfs: could not take linuxfs's lines out of /etc/fstab (lines ending in # linuxfs)" >&2
   launchctl unload /Library/LaunchDaemons/dev.mavergreen.linuxfs.helper.plist 2>/dev/null || :
   user=$(stat -f %Su /dev/console 2>/dev/null); lw=$(pgrep -x -u "$user" loginwindow 2>/dev/null | head -n 1)
   [ -z "$lw" ] || launchctl bsexec "$lw" sudo -u "$user" launchctl unload -S Aqua /Library/LaunchAgents/dev.mavergreen.linuxfs.agent.plist 2>/dev/null || :

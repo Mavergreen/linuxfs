@@ -139,7 +139,8 @@ long fstab_edit(const char *in, size_t len, const char *spec, const char *bundle
 	int have = 0, removed = 0;
 
 	*changed = 0;
-	if (cap == 0 || fstab_escape(spec, espec, sizeof espec) != 0 || (bundle && fstab_bundle_refusal(bundle)))
+	if (cap == 0 || (!spec && bundle) || (spec && fstab_escape(spec, espec, sizeof espec) != 0) ||
+	    (bundle && fstab_bundle_refusal(bundle)))
 		return -1;
 	if (bundle) {
 		snprintf(entry, sizeof entry, "%s none %s rw,noauto %s", espec, bundle, TAG);
@@ -152,7 +153,7 @@ long fstab_edit(const char *in, size_t len, const char *spec, const char *bundle
 		next = e ? e + 1 : end;
 		if (!e)
 			e = end;
-		if (ours(p, e, espec)) {
+		if (ours(p, e, spec ? espec : NULL)) {
 			if (bundle && !have && (size_t)(e - p) == elen && memcmp(p, entry, elen) == 0) {
 				have = 1;	/* the very line: kept where it is */
 			} else {
