@@ -38,7 +38,7 @@
 #                                         (diskutil unmount force on both, checked; Force Eject on HFS+ alone
 #                                         unless PARITY_BUSY_FORCE=1, recorded either way); a linuxfs disk that will not eject is recorded
 #                                         (eject-failed.txt) and left, the steps going on with a fresh copy
-#   census_spotlight FS                   item 5 (checked: .fseventsd; the indexing steps only when indexing is on
+#   census_spotlight FS                   item 5 (.fseventsd by PARITY_MODE_FSEVENTS_DA; the indexing steps only when indexing is on
 #                                         for the HFS+ control, census_index_mode): read-write HFS+ against FS, then
 #                                         attach -readonly HFS+ against FS with ReadOnly on: mdutil -i on (HFS+ alone),
 #                                         mdutil -s, an mdfind find (120 s), .Spotlight-V100 and .fseventsd,
@@ -59,7 +59,7 @@
 #                                         after each step, the disks it left are freed (census_sweep, census-sweep.txt)
 #                                         and Finder's dialogs dismissed (census_finder_dialogs, dialogs.txt); every
 #                                         linuxfs mount's names mode (names-mode.txt) barred by census_names_bar; and
-#                                         census_refusals_bar: no fseventsd, mds or mdworker refused on any of those
+#                                         census_refusals_bar (PARITY_MODE_FSEVENTS_DA): no fseventsd, mds or mdworker refused on any of those
 #   Each records sysctl vfs.generic.macfuse once, as $OUT/parity/<census>.sysctl.txt. Every console step goes through
 #   $AQUA (guest-macosx-aqua by its path), and every screenshot follows census_dismiss (a dialog's or an offer's, from
 #   before the dialog or the attach). WHAT
@@ -94,6 +94,19 @@ PARITY_MODE_SPOTLIGHT=${PARITY_MODE_SPOTLIGHT:-check}
 #   remount's mdutil -s) failed on item 6's f_mntfromname ("could not resolve path"), not on item 5: they take
 #   PARITY_MODE_SPOTLIGHT_DA, checked since Task 16's fsname=/dev/<bsd>, which mds resolves as it does HFS+'s.
 PARITY_MODE_SPOTLIGHT_DA=${PARITY_MODE_SPOTLIGHT_DA:-check}
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/push-d-debug.md and the root-daemon design's amendment (review I2) -- Task 16e takes
+#   allow_root off every logged-in DiskArbitration mount (the mount program's process has diskarbitrationd's groups, so macFUSE
+#   refused it: push D), so root's fseventsd and mds are refused there again, as in push C, until the mount daemon (Task 16l) lets
+#   them in. The three steps that need that, all on the census's DiskArbitration pairs, take PARITY_MODE_FSEVENTS_DA while
+#   PARITY_MODE_SPOTLIGHT is check: census_spotlight's .fseventsd, census_refusals_bar and census_busy_fsevents. Record until Task
+#   16l flips it to check.
+PARITY_MODE_FSEVENTS_DA=${PARITY_MODE_FSEVENTS_DA:-record}
+# census_fsevents_mode: for a step that needs root's processes let in on a DiskArbitration volume, CFM, the mode it takes
+#   (PARITY_MODE_FSEVENTS_DA while PARITY_MODE_SPOTLIGHT is check, else PARITY_MODE_SPOTLIGHT's), and CFM_VAR, whose it is
+census_fsevents_mode() {
+  if test "${PARITY_MODE_SPOTLIGHT:-record}" = check; then CFM=${PARITY_MODE_FSEVENTS_DA:-record} CFM_VAR=PARITY_MODE_FSEVENTS_DA
+  else CFM=${PARITY_MODE_SPOTLIGHT:-record} CFM_VAR=PARITY_MODE_SPOTLIGHT; fi
+}
 
 # The console session's helper: not on the ssh PATH, so always by its path (the smoke sets AQUA to the same)
 AQUA=${AQUA:-/usr/local/bin/guest-macosx-aqua}
@@ -975,20 +988,21 @@ census_busy_bar() {
 
 # spec: .superpowers/sdd/2026-11-25-hfs-parity/task-15-brief.md Step 1 -- item 4's (a) re-measured with fsevents on.
 # census_busy_fsevents WHAT FS LOG: from census_busy_cycles' "NAME: fsevents: .fseventsd yes|no" lines in LOG, whether
-#   both sides' cycles ran with fsevents on. PARITY_MODE_SPOTLIGHT check: ok when both said yes, else not ok and why;
-#   record: recorded; anything else not ok
+#   both sides' cycles ran with fsevents on. Its mode is census_fsevents_mode's (PARITY_MODE_FSEVENTS_DA). check: ok when both
+#   said yes, else not ok and why; record: recorded; anything else not ok
 census_busy_fsevents() {
   _cbf_h=$(sed -n 's/^hfs: fsevents: .fseventsd //p' "$3" 2>/dev/null | tail -n 1)
   _cbf_f=$(sed -n "s/^$2: fsevents: .fseventsd //p" "$3" 2>/dev/null | tail -n 1)
   # .fseventsd stays on disk across the 20 remounts, so "yes" shows fseventsd let in at least once, not on every cycle
   _cbf_s="item 4 (a) with fsevents on: .fseventsd on disk after the cycles, so fseventsd let in at least once: hfs ${_cbf_h:-unknown}, $2 ${_cbf_f:-unknown}"
-  case ${PARITY_MODE_SPOTLIGHT:-record} in
+  census_fsevents_mode
+  case $CFM in
   record) echo "# recorded $1: $_cbf_s" ;;
   check)
     if test "$_cbf_h" = yes && test "$_cbf_f" = yes; then ok "parity $1 ($_cbf_s)"; return 0; fi
     notok "parity $1 ($_cbf_s)"
     echo "parity: $1: fseventsd did not make .fseventsd on both volumes, so (a) did not run with fsevents on"; return 1 ;;
-  *) notok "parity $1"; echo "parity: PARITY_MODE_SPOTLIGHT is '$PARITY_MODE_SPOTLIGHT', not record or check"; return 1 ;;
+  *) notok "parity $1"; echo "parity: $CFM_VAR is '$CFM', not record or check"; return 1 ;;
   esac
 }
 
@@ -1331,8 +1345,8 @@ census_naming() {
 #   linuxfs mount, before cli/linuxfs passed SHARE_OPT (Task 14).
 # census_refusals_bar POS: every linuxfs census mount point (names-mode.txt's) searched in system.log after POS (the
 #   census's start, census_log_pos's; read through rotation) for census_eperm_lines naming it. Those census_access_refusal
-#   keeps go to refusals-linuxfs.txt, and the rest (item 7's) to refusals-linuxfs-other.txt, recorded. PARITY_MODE_SPOTLIGHT
-#   check: ok when refusals-linuxfs.txt is empty, not ok with its lines (and when no mount point was recorded: that proves
+#   keeps go to refusals-linuxfs.txt, and the rest (item 7's) to refusals-linuxfs-other.txt, recorded. Its mode is
+#   census_fsevents_mode's (PARITY_MODE_FSEVENTS_DA). check: ok when refusals-linuxfs.txt is empty, not ok with its lines (and when no mount point was recorded: that proves
 #   nothing); record: recorded; anything else not ok
 census_refusals_bar() {
   _crb_w="spotlight: no refusals for linuxfs volumes"
@@ -1354,13 +1368,14 @@ EOF
   rm -f "$OUT/parity/.refusals.$$"
   _crb_k=$(grep -c . "$OUT/parity/refusals-linuxfs.txt") _crb_o=$(grep -c . "$OUT/parity/refusals-linuxfs-other.txt")
   _crb_s="$_crb_k lines, $_crb_n linuxfs mount points searched, system.log since the census began; $_crb_o others recorded"
-  case ${PARITY_MODE_SPOTLIGHT:-record} in
+  census_fsevents_mode
+  case $CFM in
   record) echo "# recorded $_crb_w ($_crb_s)" ;;
   check)
     if test "$_crb_n" -eq 0; then notok "$_crb_w: no linuxfs census mount to search for, so this proves nothing"; return 1; fi
     if test "$_crb_k" -eq 0; then ok "$_crb_w ($_crb_s)"; return 0; fi
     notok "$_crb_w ($_crb_s)"; head -n 20 "$OUT/parity/refusals-linuxfs.txt" | sed 's/^/# /'; return 1 ;;
-  *) notok "$_crb_w"; echo "parity: PARITY_MODE_SPOTLIGHT is '$PARITY_MODE_SPOTLIGHT', not record or check"; return 1 ;;
+  *) notok "$_crb_w"; echo "parity: $CFM_VAR is '$CFM', not record or check"; return 1 ;;
   esac
 }
 # census_refresh MP: a Finder window on MP/refresh (made empty), awaited (census_await), a file made there from the
@@ -1421,14 +1436,19 @@ census_index_mode() {
   else CS_INDEX_MODE=record CS_INDEX_WHY="indexing could not be turned on for the HFS+ control (mdutil -s: $_cim)"; fi
 }
 CS_INDEX_MODE=record
-# census_spot_parity index|da|record|check WHAT CMD...: parity WHAT with PARITY_MODE_SPOTLIGHT as CS_INDEX_MODE (index: an
-#   indexing step), as PARITY_MODE_SPOTLIGHT_DA while CS_INDEX_MODE is check (da: an indexing step item 6 decides; record
-#   otherwise), as record, or as it is (check), then as it was
+# census_spot_parity index|da|fsevents|record|check WHAT CMD...: parity WHAT with PARITY_MODE_SPOTLIGHT as CS_INDEX_MODE (index:
+#   an indexing step), as PARITY_MODE_SPOTLIGHT_DA while CS_INDEX_MODE is check (da: an indexing step item 6 decides; record
+#   otherwise), as census_fsevents_mode's (fsevents: a step that needs root's fseventsd let in), as record, or as it is (check),
+#   then as it was
 census_spot_parity() {
   csp_m=$PARITY_MODE_SPOTLIGHT
   case $1 in
   index) PARITY_MODE_SPOTLIGHT=$CS_INDEX_MODE ;;
   da) if test "$CS_INDEX_MODE" = check; then PARITY_MODE_SPOTLIGHT=$PARITY_MODE_SPOTLIGHT_DA; else PARITY_MODE_SPOTLIGHT=record; fi ;;
+  fsevents) census_fsevents_mode
+    case $CFM in record|check) PARITY_MODE_SPOTLIGHT=$CFM ;;
+    *) notok "parity $2"; echo "parity: $CFM_VAR is '$CFM', not record or check"; return 1 ;;
+    esac ;;
   record) PARITY_MODE_SPOTLIGHT=record ;;
   esac
   shift; parity "$@"; csp_rc=$?
@@ -1439,7 +1459,8 @@ census_spot_parity() {
 # census_spotlight_steps FS PASS NAME LINE: item 5's steps on the current pair, after sudo mdutil -i on for the HFS+
 #   control alone (index-on, census_index_on), and census_index_mode (said, and in spotlight.FS.PASS.index-mode.txt);
 #   NAME is the file mdfind looks for, LINE system.log's length at the attach; Spotlight's own state in
-#   spotlight.FS.PASS.diagnosis.txt. .fseventsd is checked; the refusals recorded (census_refusals_bar checks them)
+#   spotlight.FS.PASS.diagnosis.txt. .fseventsd takes PARITY_MODE_FSEVENTS_DA (census_fsevents_mode); the refusals recorded
+#   (census_refusals_bar is their bar)
 census_spotlight_steps() {
   _ss_t=spotlight.$1.$2
   # the guest leaves external volumes unindexed ("unknown indexing state"), so HFS+'s control is asked to be indexed
@@ -1452,7 +1473,7 @@ census_spotlight_steps() {
   census_spot_parity da "$_ss_t.mdutil" mdutil -s @MP@
   census_bound $((PARITY_SPOT_SECS * 10 + 400)) census_spot_parity index "$_ss_t.mdfind" census_mdfind @MP@ "$3" "$OUT/parity/$_ss_t.mdfind-seconds.txt"
   census_spot_parity index "$_ss_t.store" census_dirs @MP@ .Spotlight-V100
-  census_spot_parity check "$_ss_t.fseventsd" census_dirs @MP@ .fseventsd
+  census_spot_parity fsevents "$_ss_t.fseventsd" census_dirs @MP@ .fseventsd
   census_spot_parity record "$_ss_t.refusals" census_refusals "$4" @MP@
   census_log_since "$4" | grep -E "$census_refusal_re" | census_refusal_uids >"$OUT/parity/$_ss_t.refusals-all.txt"
   census_md_users >"$OUT/parity/$_ss_t.processes.txt"

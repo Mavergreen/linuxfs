@@ -30,6 +30,8 @@ case "\$mnt" in /dev/fd/*) fdn=\${mnt#/dev/fd/}; if { true >&"\$fdn"; } 2>/dev/n
 case "\${FAKE_MODE:-ok}" in
   dirty) case "\$*" in *,ro\ *|*,ro) ;; *) echo "ntfs3: volume is dirty and \"force\" flag is not set!"; exit 1 ;; esac ;;
   locked) echo "unable to exclusively lock /tmp/x.lock: Resource temporarily unavailable"; exit 2 ;;
+  exit0) exit 0 ;;   # macFUSE refused the mount (its mount is asynchronous): lklfuse ends, status 0, and nothing is mounted
+  exit3) echo "lklfuse: refused"; exit 3 ;;
 esac
 if [ -n "\${FAKE_ENCRYPTED:-}" ]; then
   case "\$*" in
@@ -49,13 +51,15 @@ esac
 # exFAT and FAT have no fstypename, so their type is plain macfuse
 fsn=\$(echo "\$*" | tr , "\\n" | sed -n "s/^fsname=//p" | tail -n 1); ft=\$(echo "\$*" | tr , "\\n" | sed -n "s/^fstypename=//p" | tail -n 1)
 case \$* in *type=exfat,*|*type=vfat,*) mt=macfuse ;; *) mt=macfuse_\${ft:-ext4} ;; esac
-echo "\${fsn:-linuxfs@x} on \$mnt (\$mt, local, nodev, nosuid, synchronous, mounted by me)" >> "$T/mtab"
+echo "\${fsn:-linuxfs@x} on \$mnt (\$mt, local, nodev, nosuid, synchronous, mounted by \$(id -un))" >> "$T/mtab"
 while grep -qF " on \$mnt (" "$T/mtab"; do sleep 0.1; done
 exit 0
 EOF
 cat > "$T/bin/probe" <<EOF
 #!/bin/sh
 if [ "\$1" = --access ]; then echo "\$*" >> "$T/accesscalls"; exec "$T/realprobe" "\$@"; fi
+# the process's own groups (linuxfs-probe --groups): FAKE_GROUPS, else 20 alone
+if [ "\$1" = --groups ]; then echo "\${FAKE_GROUPS-20}"; exit 0; fi
 if [ "\$1" = --uuid ]; then [ -n "\${FAKE_UUID:-}" ] || exit 1; echo "\$FAKE_UUID"; exit 0; fi
 echo "\$1" >> "$T/probecalls"
 case "\$1" in */rdisk3) echo unknown; exit 1 ;; esac
@@ -74,7 +78,8 @@ EOF
 cat > "$T/bin/diskutil" <<EOF
 #!/bin/sh
 case "\$1" in
-  unmount) if [ "\$2" = force ]; then echo "diskutil unmount force \$3" >> "$T/calls"; shift; else [ -z "\${FAKE_BUSY:-}" ] || exit 1; fi
+  unmount) echo "\$*" >> "$T/ucalls"
+           if [ "\$2" = force ]; then echo "diskutil unmount force \$3" >> "$T/calls"; shift; else [ -z "\${FAKE_BUSY:-}" ] || exit 1; fi
            grep -vF " on \$2 (" "$T/mtab" > "$T/mtab.new"; mv "$T/mtab.new" "$T/mtab"; echo "Unmount successful for \$2" ;;
   mount) shift; echo "diskutil mount \$*" >> "$T/dcalls"
          if [ "\${FAKE_DISKUTIL:-}" = busy ]; then echo "Volume on disk5 failed to mount: resource busy" >&2; exit 1; fi
@@ -782,22 +787,22 @@ case $(last) in *fstypename=ext4,fssubtype=7*) case $(last) in *zzz*|*=99*) r=1 
 ok $r "a user's -o fstypename/fssubtype is dropped, ours kept, other -o options kept (rc $rc: $(last))"
 sh "$L" unmount "$T/img" > /dev/null 2>&1
 # spec: cli/linuxfs share_opt, cmd_mount -- SHARE_OPT is passed on lklfuse's -o only when macFUSE lets this user share
-#       (tunables.allow_other is 1, or id -G holds tunables.admin_group), and only on the CLI's own path: not with root's
+#       (tunables.allow_other is 1, or the process's own groups, linuxfs-probe --groups, hold tunables.admin_group; never id -G), and only on the CLI's own path: not with root's
 #       fusefd, not with LINUXFS_ALL_USERS; an unreadable sysctl gives nothing, and the mount still runs
 eval "$(grep '^SHARE_OPT=' "$L")"; [ -n "${SHARE_OPT:-}" ]; ok $? "SHARE_OPT is set at the top of cli/linuxfs (${SHARE_OPT:-})"
 : > "$T/calls"
-FAKE_PROBE=ext4 FAKE_SYSCTL_RC=0 FAKE_ADMIN_GROUP=80 FAKE_ID_G="20 80 501" sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
+FAKE_PROBE=ext4 FAKE_SYSCTL_RC=0 FAKE_ADMIN_GROUP=80 FAKE_GROUPS="20 80" FAKE_ID_G="20 501" sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
 case $(last) in *,${SHARE_OPT:-none}[,\ ]*) r=0 ;; *) r=1 ;; esac; ok $r "share_admin: a user in the admin group gets the option (rc $rc: $(last))"
 sh "$L" unmount "$T/img" > /dev/null 2>&1
-FAKE_PROBE=ext4 FAKE_SYSCTL_RC=0 FAKE_ALLOW_OTHER=1 FAKE_ID_G="20 501" sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
+FAKE_PROBE=ext4 FAKE_SYSCTL_RC=0 FAKE_ALLOW_OTHER=1 FAKE_GROUPS="20 501" sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
 case $(last) in *,${SHARE_OPT:-none}[,\ ]*) r=0 ;; *) r=1 ;; esac; ok $r "share_tunable: allow_other 1 gives the option (rc $rc: $(last))"
 sh "$L" unmount "$T/img" > /dev/null 2>&1
 : > "$T/calls"
-FAKE_PROBE=ext4 FAKE_SYSCTL_RC=0 FAKE_ALLOW_OTHER=0 FAKE_ID_G="20 501" sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
+FAKE_PROBE=ext4 FAKE_SYSCTL_RC=0 FAKE_ALLOW_OTHER=0 FAKE_GROUPS="20 501" sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
 case $(last) in *type=ext4*) case $(last) in *allow_*) r=1 ;; *) r=0 ;; esac ;; *) r=1 ;; esac; ok $r "share_none: neither gives no share option, and the mount runs (rc $rc: $(last))"
 sh "$L" unmount "$T/img" > /dev/null 2>&1
 : > "$T/calls"
-FAKE_PROBE=ext4 FAKE_SYSCTL_RC=1 FAKE_ID_G="20 80 501" sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
+FAKE_PROBE=ext4 FAKE_SYSCTL_RC=1 FAKE_GROUPS="20 80 501" sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
 case $(last) in *type=ext4*) case $(last) in *allow_*) r=1 ;; *) r=0 ;; esac ;; *) r=1 ;; esac; ok $r "share_unreadable: a failing sysctl gives none, and the mount runs (rc $rc: $(last))"
 sh "$L" unmount "$T/img" > /dev/null 2>&1
 : > "$T/calls"
@@ -806,23 +811,87 @@ case $(last) in *,allow_other,*) r=0 ;; *) r=1 ;; esac
 case $(last) in *allow_root*) r=1 ;; esac; ok $r "share_all_users: LINUXFS_ALL_USERS keeps its allow_other and adds no allow_root (rc $rc: $(last))"
 sh "$L" unmount "$T/img" > /dev/null 2>&1
 : > "$T/calls"
-(LINUXFS_OPEN_INHERITED=1 LINUXFS_FUSE_FD=4 LINUXFS_FUSE_CHAN=6 FAKE_FD_MNT=$T/dam FAKE_SYSCTL_RC=0 FAKE_ALLOW_OTHER=1 FAKE_ID_G="20 80"; export LINUXFS_OPEN_INHERITED LINUXFS_FUSE_FD LINUXFS_FUSE_CHAN FAKE_FD_MNT FAKE_SYSCTL_RC FAKE_ALLOW_OTHER FAKE_ID_G
+(LINUXFS_OPEN_INHERITED=1 LINUXFS_FUSE_FD=4 LINUXFS_FUSE_CHAN=6 FAKE_FD_MNT=$T/dam FAKE_SYSCTL_RC=0 FAKE_ALLOW_OTHER=1 FAKE_GROUPS="20 80"; export LINUXFS_OPEN_INHERITED LINUXFS_FUSE_FD LINUXFS_FUSE_CHAN FAKE_FD_MNT FAKE_SYSCTL_RC FAKE_ALLOW_OTHER FAKE_GROUPS
  DA /dev/disk3s1 "$T/dam" 4</dev/null 6</dev/null > "$T/out" 2>&1); rc=$?
 case $(last) in *type=ext4*) case $(last) in *allow_*) r=1 ;; *) r=0 ;; esac ;; *) r=1 ;; esac
 ok $r "share_not_root_channel: with root's channel there is no share option (rc $rc: $(last))"
 sh "$L" unmount "$T/dam" > /dev/null 2>&1
 for uo in allow_other allow_root; do
   : > "$T/calls"
-  FAKE_PROBE=ext4 FAKE_SYSCTL_RC=0 FAKE_ADMIN_GROUP=80 FAKE_ID_G="20 80" sh "$L" mount "$T/img" -o $uo,sync > /dev/null 2>&1; rc=$?
+  FAKE_PROBE=ext4 FAKE_SYSCTL_RC=0 FAKE_ADMIN_GROUP=80 FAKE_GROUPS="20 80" sh "$L" mount "$T/img" -o $uo,sync > /dev/null 2>&1; rc=$?
   c=$(last | grep -o "$uo" | wc -l | tr -d ' ')
   case $(last) in *allow_root*allow_other*|*allow_other*allow_root*) r=1 ;; *,sync[,\ ]*) [ "$c" = 1 ] && r=0 || r=1 ;; *) r=1 ;; esac
   ok $r "share_user_$uo: the user's -o $uo stands alone, no second share option (rc $rc: $(last))"
   sh "$L" unmount "$T/img" > /dev/null 2>&1
 done
 : > "$T/calls"
-FAKE_PROBE=ext4 FAKE_SYSCTL_RC=0 FAKE_ADMIN_GROUP=abc FAKE_ID_G="20 80" sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
+FAKE_PROBE=ext4 FAKE_SYSCTL_RC=0 FAKE_ADMIN_GROUP=abc FAKE_GROUPS="20 80" sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
 case $(last) in *type=ext4*) case $(last) in *allow_*) r=1 ;; *) r=0 ;; esac ;; *) r=1 ;; esac; ok $r "share_bad_group: a non-numeric admin_group gives none, and the mount runs (rc $rc: $(last))"
 sh "$L" unmount "$T/img" > /dev/null 2>&1
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/push-d-debug.md -- DiskArbitration runs the mount program with diskarbitrationd's own
+#       groups, not the user's, so macFUSE judges allow_root by a credential without admin_group: on DiskArbitration's path
+#       (LINUXFS_DA=1) only the allow_other tunable, which the kernel honours whatever the groups, gives SHARE_OPT. Elsewhere the
+#       process's own groups (linuxfs-probe --groups, the kernel's getgroups) decide, never id -G (the directory's list)
+: > "$T/calls"
+(FAKE_SYSCTL_RC=0 FAKE_ADMIN_GROUP=80 FAKE_ALLOW_OTHER=0 FAKE_GROUPS="20 80" FAKE_ID_G="20 80"; export FAKE_SYSCTL_RC FAKE_ADMIN_GROUP FAKE_ALLOW_OTHER FAKE_GROUPS FAKE_ID_G
+ DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); rc=$?
+case $(last) in *allow_root*) r=1 ;; *type=ext4*) r=0 ;; *) r=1 ;; esac
+[ $rc -eq 0 ]; ok $(( $? | r )) "share_da_mount: on DiskArbitration's path admin_group gives no ${SHARE_OPT:-}, and the mount runs (rc $rc: $(last))"
+sh "$L" unmount disk3s1 > /dev/null 2>&1
+: > "$T/calls"
+(FAKE_SYSCTL_RC=0 FAKE_ADMIN_GROUP=80 FAKE_ALLOW_OTHER=1 FAKE_GROUPS="20" FAKE_ID_G="20"; export FAKE_SYSCTL_RC FAKE_ADMIN_GROUP FAKE_ALLOW_OTHER FAKE_GROUPS FAKE_ID_G
+ DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); rc=$?
+case $(last) in *,${SHARE_OPT:-none}[,\ ]*) r=0 ;; *) r=1 ;; esac
+ok $r "share_da_mount_tunable: on DiskArbitration's path the allow_other tunable gives ${SHARE_OPT:-} (rc $rc: $(last))"
+sh "$L" unmount disk3s1 > /dev/null 2>&1
+: > "$T/calls"
+FAKE_PROBE=ext4 FAKE_SYSCTL_RC=0 FAKE_ADMIN_GROUP=80 FAKE_ALLOW_OTHER=0 FAKE_GROUPS="20" FAKE_ID_G="20 80" sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
+case $(last) in *allow_root*) r=1 ;; *type=ext4*) r=0 ;; *) r=1 ;; esac
+ok $r "share_groups_probe: id -G holding admin_group gives nothing when the process's own groups lack it (rc $rc: $(last))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/push-d-debug.md -- an lklfuse that exits before its mount appears is a failure
+#       whatever its status (macFUSE's refusal of an asynchronous mount can end it with 0): no mount point printed, no record
+st0=$(ls "$T/state" 2>/dev/null | wc -l | tr -d ' ')
+out=$(FAKE_MODE=exit0 sh "$L" mount "$T/img" 2>/dev/null); rc=$?
+[ $rc -eq 1 ] && [ -z "$out" ] && [ "$(ls "$T/state" 2>/dev/null | wc -l | tr -d ' ')" = "$st0" ] && grep -q 'lklfuse exited (status 0) before the mount appeared' "$T/logs/img.log"
+ok $? "lklfuse_exit0_unmounted: mount IMAGE whose lklfuse exits 0 unmounted exits 1, prints nothing, records nothing (rc $rc: '$out'; $(tail -n 1 "$T/logs/img.log" 2>/dev/null))"
+out=$(FAKE_MODE=exit0 DA /dev/disk3s1 "$T/dam" 2>/dev/null); rc=$?
+[ $rc -eq 1 ] && [ -z "$out" ] && [ "$(ls "$T/state" 2>/dev/null | wc -l | tr -d ' ')" = "$st0" ] && grep -q 'lklfuse exited (status 0) before the mount appeared' "$T/logs/rdisk3s1.log"
+ok $? "lklfuse_exit0_unmounted: and so does da-mount (rc $rc: '$out'; $(tail -n 1 "$T/logs/rdisk3s1.log" 2>/dev/null))"
+out=$(FAKE_MODE=exit3 sh "$L" mount "$T/img" 2>/dev/null); rc=$?
+[ $rc -ne 0 ] && [ -z "$out" ] && grep -q 'lklfuse exited (status 3) before the mount appeared' "$T/logs/img.log"
+ok $? "lklfuse_exit3_kept: an lklfuse exiting 3 early fails the mount, and the log says status 3 (rc $rc)"
+# spec: cli/linuxfs cmd_da_mount -- with root's channel root decided whether NTFS mounts (the console user's NTFSTakeover, read by root),
+#       as it decided ReadOnly: the CLI does not read the preference again
+sh "$L" prefs NTFSTakeover off
+chanrun FAKE_PROBE=ntfs3 -- /dev/disk3s1 "$T/dam"
+[ $rc -eq 0 ] && grep -q '^open --fuse-chan .*type=ntfs3' "$T/calls"; ok $? "da_chan_ntfs_root_decides: with root's channel NTFS mounts though this user's NTFSTakeover is off (rc $rc: $(head -n 2 "$T/out" | tr '\n' '|'))"
+sh "$L" unmount "$T/dam" > /dev/null 2>&1
+(FAKE_PROBE=ntfs3; export FAKE_PROBE; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1); [ $? -eq 3 ]; ok $? "da_chan_ntfs_root_decides: without the channel, NTFSTakeover off is still exit 3"
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/push-d-debug.md -- a mount of linuxfs's from a disk that this user has no record of (root's,
+#       before login) is listed, shown by status, and unmounted by its device; --force uses umount -f only on the user's own mount
+#       (mounted by this user), and otherwise diskutil's force, which DiskArbitration lets do
+mkdir -p "$T/Volumes"
+rootline="/dev/disk3s1 on /Volumes/x (macfuse_ext4, local, nodev, nosuid)"
+echo "$rootline" >> "$T/mtab"
+out=$(sh "$L" list 2>&1)
+echo "$out" | grep -q "^/dev/disk3s1	.*	/Volumes/x\$"; ok $? "list_root_mount: list shows root's mount of disk3s1 at /Volumes/x (got: $(echo "$out" | grep disk3s1 | tr '\t' ' '))"
+out=$(sh "$L" status 2>&1)
+echo "$out" | grep -qx -- "-	/dev/disk3s1	/Volumes/x	ext4	rw"; ok $? "status_root_mount: status lists it as -, its device, mount point, type and mode (got: $(echo "$out" | tr '\t\n' ' |'))"
+: > "$T/ucalls"
+sh "$L" unmount disk3s1 > /dev/null 2>&1; rc=$?
+[ $rc -eq 0 ] && grep -qx "unmount /Volumes/x" "$T/ucalls" && ! grep -qF " on /Volumes/x (" "$T/mtab"; ok $? "unmount_device_root: unmount DEVICE with no record unmounts root's mount through diskutil (rc $rc: $(tr '\n' '|' < "$T/ucalls"))"
+echo "$rootline" >> "$T/mtab"; : > "$T/ucalls"; : > "$T/calls"
+sh "$L" unmount --force /Volumes/x > /dev/null 2>&1; rc=$?
+[ $rc -eq 0 ] && grep -qx "unmount force /Volumes/x" "$T/ucalls" && ! grep -q '^umount' "$T/calls"; ok $? "force_root_mount: unmount --force of a mount not this user's runs diskutil unmount force, not umount -f (rc $rc: $(tr '\n' '|' < "$T/ucalls"))"
+echo "/dev/disk3s1 on /Volumes/x (macfuse_ext4, local, nodev, nosuid, mounted by $(id -un))" >> "$T/mtab"; : > "$T/ucalls"; : > "$T/calls"
+sh "$L" unmount --force /Volumes/x > /dev/null 2>&1; rc=$?
+[ $rc -eq 0 ] && grep -qx "umount -f /Volumes/x" "$T/calls" && [ ! -s "$T/ucalls" ]; ok $? "force_own_mount: unmount --force of this user's own mount runs umount -f (rc $rc: $(tr '\n' '|' < "$T/calls"))"
+grep -vF " on /Volumes/x (" "$T/mtab" > "$T/mtab.new"; mv "$T/mtab.new" "$T/mtab"
+DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1
+out=$(sh "$L" status 2>&1)
+[ "$(echo "$out" | grep -c "	$T/dam	")" = 1 ] && ! echo "$out" | grep -q '^-	'; ok $? "status lists a recorded DiskArbitration mount once, by its record (got: $(echo "$out" | tr '\t\n' ' |'))"
+sh "$L" unmount disk3s1 > /dev/null 2>&1
 # spec: cli/linuxfs bundle_of, fstype_opts -- agree with tools/fsrules.c's table (fsrules-test --names)
 names=$(sh "$ROOT/tests/fsrules-test.sh" --names 2>/dev/null); [ -n "$names" ]; ok $? "fsrules-test --names prints the table"
 eval "$(grep '^bundle_of()' "$L")"; eval "$(sed -n '/^fstype_opts()/,/; }$/p' "$L")"

@@ -120,4 +120,16 @@ n=$((n + 1)); "$D/probe" --access ext4 "" "" bogus > /dev/null 2>&1; rc=$?
 if [ $rc -eq 2 ]; then echo "ok $n - --access with an unknown word is misuse (2)"; else echo "not ok $n - --access bogus: exit $rc, want 2"; bad=1; fi
 n=$((n + 1)); "$D/probe" --access ext4 "" > /dev/null 2>&1; rc=$?
 if [ $rc -eq 2 ]; then echo "ok $n - --access without FLAGS is misuse (2)"; else echo "not ok $n - --access short: exit $rc, want 2"; bad=1; fi
+# spec: tools/probe.c main -- linuxfs-probe --groups: the process's own groups (the kernel's getgroups), decimal, on one line; the CLI's
+#       share_opt reads them, never id -G, which asks the directory (push-d-debug.md)
+n=$((n + 1)); got=$("$D/probe" --groups 2>&1); rc=$?
+if [ $rc -eq 0 ] && [ "$(printf '%s\n' "$got" | wc -l | tr -d ' ')" = 1 ] && printf '%s\n' "$got" | grep -qE '^[0-9]+( [0-9]+)*$' &&
+   case " $got " in *" $(id -g) "*) true ;; *) false ;; esac; then echo "ok $n - groups_format: --groups prints one line of decimal ids, with $(id -g) ($got)"
+else echo "not ok $n - groups_format: --groups got '$got' ($rc), want one line of decimal ids holding $(id -g)"; bad=1; fi
+if [ "$(uname -s)" = Darwin ]; then
+  # spec: tools/probe.c -- the kernel's getgroups (_getgroups), never getgroups$DARWIN_EXTSN, which asks the directory as id -G does
+  n=$((n + 1)); u=$("$CL/bin/llvm-nm" -u "$D/probe" 2>&1)
+  if printf '%s\n' "$u" | grep -qx '_getgroups' && ! printf '%s\n' "$u" | grep -qF 'getgroups$DARWIN_EXTSN'; then echo "ok $n - groups_kernel: linuxfs-probe imports _getgroups, not _getgroups\$DARWIN_EXTSN"
+  else echo "not ok $n - groups_kernel: nm -u: $(printf '%s\n' "$u" | grep getgroups | tr '\n' ' ')"; bad=1; fi
+fi
 echo "1..$n"; exit $bad

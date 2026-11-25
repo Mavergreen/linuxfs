@@ -129,9 +129,12 @@ kc() { # MODE...: starts the stand-in keeper (logging to $M/kc.log); stop with k
   /usr/bin/python "$ROOT/tests/lib/kcstub.py" "$SOCK" "$M/kc.log" "$@" & KCPID=$!
   i=0; while [ ! -e "$SOCK.ready" ] && [ "$(echo "$*" | cut -c1-5)" != stale ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done; }
 kcstop() { kill "$KCPID" 2>/dev/null; wait "$KCPID" 2>/dev/null; }
+# spec: tools/fs.c mount_role -- the user path exits 0 only with the mount in the table: LINUXFS_MNTTAB (TYPE<TAB>FROM<TAB>ON<TAB>OWNER
+#       lines, last on top) stands in for it; by default it holds the stand-in CLI's mount of disk9 on /tmp/m (an inner env names another)
+printf 'macfuse_ext4\t/dev/disk9\t/tmp/m\t%s\n' "$(id -u)" > "$M/mnttab"
 mt() { # ARGS...: the mount role with a bare environment, HOME unset, the stand-ins in place
   rm -f "$M/log" "$M/log.n"
-  env -u HOME STUB_LOG="$M/log" LINUXFS_CLI="$M/cli" LINUXFS_DIALOG="$M/dialog" LINUXFS_KEYCHAIN_SOCK="$SOCK" "$@"; }
+  env -u HOME STUB_LOG="$M/log" LINUXFS_CLI="$M/cli" LINUXFS_DIALOG="$M/dialog" LINUXFS_KEYCHAIN_SOCK="$SOCK" LINUXFS_MNTTAB="$M/mnttab" "$@"; }
 rm -f "$SOCK"
 mt "$MD" -o nodev -o noowners /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
 [ $rc = 0 ] && grep -qx 'args: da-mount /dev/disk9 /tmp/m' "$M/log"; ok $? "mount runs 'da-mount DEV MNT' for -o nodev -o noowners (rc $rc: $(head -1 "$M/log" 2>/dev/null))"
@@ -236,7 +239,7 @@ exit 0
 EOS
 chmod +x "$M/clibg"
 t0=$(date +%s)
-rm -f "$M/log"; env -u HOME STUB_LOG="$M/log" LINUXFS_CLI="$M/clibg" "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
+rm -f "$M/log"; env -u HOME STUB_LOG="$M/log" LINUXFS_CLI="$M/clibg" LINUXFS_MNTTAB="$M/mnttab" "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
 t1=$(date +%s)
 [ $rc = 0 ] && [ $((t1 - t0)) -lt 3 ]; ok $? "a CLI that leaves a background child: the mount returns in $((t1 - t0)) s, not when the child ends (rc $rc)"
 fds=$(sed -n 's/^fds: //p' "$M/log" | tr -d '\n'); case " $fds " in *" 255 "*) fds=$(echo " $fds " | sed 's/ 255 / /') ;; esac
@@ -262,9 +265,42 @@ kc none
 mt env LINUXFS_CLI="$M/clibad" DLG_PWS=pw DLG_MODE=once "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
 kcstop
 [ $rc = 0 ] && grep -q '^dialog' "$M/log"; ok $? "a hint that is not UTF-8 is left out, and the dialog still runs (rc $rc)"
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/push-d-debug.md -- one exit gate: whichever run of the CLI said 0 (the first try, the keeper's
+#       password or the dialog's), the mount program exits 0 only if the mount table's topmost mount on MNT is the bundle's type from
+#       /dev/BSD (any owner); else exit 1, saying so, so DiskArbitration never records a mount that is not there
+cat > "$M/cliok" <<'EOS'
+#!/bin/sh
+echo "args: $*" >> "$STUB_LOG"
+echo /tmp/m
+exit 0
+EOS
+chmod +x "$M/cliok"
+: > "$M/mnttab-none"
+mt env LINUXFS_CLI="$M/cliok" LINUXFS_MNTTAB="$M/mnttab-none" "$MD" /dev/disk9 /tmp/m >/dev/null 2>"$M/err"; rc=$?
+[ $rc = 1 ] && grep -q 'the CLI exited 0 but nothing is mounted on /tmp/m' "$M/err"; ok $? "user path: the CLI exits 0 with nothing mounted -> exit 1 (rc $rc: $(cat "$M/err"))"
+kc saved pw
+mt env LINUXFS_MNTTAB="$M/mnttab-none" STUB_PW=pw "$MD" /dev/disk9 /tmp/m >/dev/null 2>"$M/err"; rc=$?
+kcstop
+[ $rc = 1 ] && grep -qx 'stdin: pw' "$M/log" && grep -q 'nothing is mounted on /tmp/m' "$M/err"; ok $? "user path: the keeper's password, then the CLI exits 0 with nothing mounted -> exit 1 (rc $rc)"
+kc none
+mt env LINUXFS_MNTTAB="$M/mnttab-none" STUB_PW=pw DLG_PWS=pw DLG_MODE=once "$MD" /dev/disk9 /tmp/m >/dev/null 2>"$M/err"; rc=$?
+kcstop
+[ $rc = 1 ] && grep -q '^dialog' "$M/log" && grep -q 'nothing is mounted on /tmp/m' "$M/err"; ok $? "user path: the dialog's password, then the CLI exits 0 with nothing mounted -> exit 1 (rc $rc)"
+mt env LINUXFS_CLI="$M/cliok" "$MD" /dev/disk9 /tmp/m >/dev/null 2>"$M/err"; rc=$?
+[ $rc = 0 ]; ok $? "user path: the CLI exits 0 with the mount in the table -> exit 0 (rc $rc: $(cat "$M/err"))"
+for l in "macfuse_ext4	/dev/disk8	/tmp/m	0" "macfuse_xfs	/dev/disk9	/tmp/m	0" "macfuse_ext4	/dev/disk9	/tmp/m2	0" "macfuse_ext4	/dev/disk9	/tmp/m	0
+hfs	/dev/disk5s2	/tmp/m	0"; do
+  printf '%s\n' "$l" > "$M/mnttab-other"
+  mt env LINUXFS_CLI="$M/cliok" LINUXFS_MNTTAB="$M/mnttab-other" "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
+  [ $rc = 1 ]; ok $? "user path: the CLI exits 0 but the topmost mount on /tmp/m is not macfuse_ext4 from /dev/disk9 -> exit 1 ($(printf '%s' "$l" | tr '\t\n' ' |'): rc $rc)"
+done
+printf 'macfuse_ext4\t/dev/disk9\t/tmp/m\t0\n' > "$M/mnttab-root"
+mt env LINUXFS_CLI="$M/cliok" LINUXFS_MNTTAB="$M/mnttab-root" "$MD" /dev/disk9 /tmp/m >/dev/null 2>&1; rc=$?
+[ $rc = 0 ]; ok $? "user path: any owner's mount counts (root's: rc $rc)"
 # spec: tools/fs.c run_cli -- the mount program against the REAL cli/linuxfs (da-mount), with stand-ins only for lklfuse, the
 #       opener and the prober (the CLI's own LINUXFS_LKLFUSE, LINUXFS_OPEN and LINUXFS_PROBE; its --access is the real
-#       linuxfs-probe's): every argv form the mount program builds is accepted (not usage, exit 2), and the password reaches
+#       linuxfs-probe's): every argv form the mount program builds is accepted (lklfuse runs, and with nothing mounted here
+#       the exit is 1, not usage's 2), and the password reaches
 #       lklfuse on its fd 5
 R=$M/real; rm -rf "$R"; mkdir -p "$R/mnt"
 "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld \
@@ -286,26 +322,27 @@ esac
 exit 0
 EOS
 chmod +x "$R/open" "$R/lklfuse"
-real() { # ARGS...: the mount role (user path) running the real CLI, whose lklfuse exits at once as a successful mount
+real() { # ARGS...: the mount role (user path) running the real CLI, whose lklfuse exits at once: nothing can mount here, so the CLI says
+#   so (exit 1: an lklfuse that ends before its mount appears is a failure, whatever its status), and an argv it takes is rc 1, not 2
   rm -f "$R/lk.log"
   mt env LINUXFS_CLI="$ROOT/cli/linuxfs" LINUXFS_OPEN="$R/open" LINUXFS_LKLFUSE="$R/lklfuse" LINUXFS_PROBE="$R/open" \
     LINUXFS_STATE="$R/state" LINUXFS_LOGS="$R/logs" LINUXFS_LOCKS="$R/locks" LINUXFS_DOMAIN=test.fsreal \
     LINUXFS_MACHINE_DOMAIN="$R/no-machine" LK_LOG="$R/lk.log" REAL_PROBE="$D/linuxfs-probe" "$@"; }
 real "$MD" /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
-[ $rc = 0 ] && grep -q "^lklfuse: .*$R/mnt" "$R/lk.log"; ok $? "the real CLI accepts the plain da-mount argv (rc $rc)"
+[ $rc = 1 ] && grep -q "^lklfuse: .*$R/mnt" "$R/lk.log"; ok $? "the real CLI accepts the plain da-mount argv (rc $rc)"
 plist "$R/stale.plist" "<key>Automount</key><false/><key>Ignore:lbl</key><true/>"
 real env LINUXFS_DOMAIN="$R/stale" "$MD" /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
-[ $rc = 0 ] && grep -q "^lklfuse: .*$R/mnt" "$R/lk.log"; ok $? "a stale Automount=false and Ignore:<LABEL> are not read: the real CLI mounts (rc $rc)"
+[ $rc = 1 ] && grep -q "^lklfuse: .*$R/mnt" "$R/lk.log"; ok $? "a stale Automount=false and Ignore:<LABEL> are not read: the real CLI mounts (rc $rc)"
 real "$MD" -o owners /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
-[ $rc = 0 ] && grep -q "^lklfuse: .*,default_permissions,owner=caller" "$R/lk.log" && ! grep -q "uid=\|gid=\|owner=root" "$R/lk.log"; ok $? "the real CLI takes da-mount --owners: Linux's ids, checked by the kernel, new files the creator's (rc $rc: $(cat "$R/lk.log" 2>/dev/null))"
+[ $rc = 1 ] && grep -q "^lklfuse: .*,default_permissions,owner=caller" "$R/lk.log" && ! grep -q "uid=\|gid=\|owner=root" "$R/lk.log"; ok $? "the real CLI takes da-mount --owners: Linux's ids, checked by the kernel, new files the creator's (rc $rc: $(cat "$R/lk.log" 2>/dev/null))"
 real "$MD" -o noowners /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
-[ $rc = 0 ] && grep -q "^lklfuse: .*,uid=[0-9]*,gid=[0-9]*,owner=root" "$R/lk.log" && ! grep -q "default_permissions" "$R/lk.log"; ok $? "and with noowners keeps today's mapping (rc $rc: $(cat "$R/lk.log" 2>/dev/null))"
+[ $rc = 1 ] && grep -q "^lklfuse: .*,uid=[0-9]*,gid=[0-9]*,owner=root" "$R/lk.log" && ! grep -q "default_permissions" "$R/lk.log"; ok $? "and with noowners keeps today's mapping (rc $rc: $(cat "$R/lk.log" 2>/dev/null))"
 real "$MD" -o rdonly /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
-[ $rc = 0 ] && grep -q "^lklfuse: .*,ro " "$R/lk.log"; ok $? "the real CLI accepts da-mount --ro and mounts read-only (rc $rc)"
+[ $rc = 1 ] && grep -q "^lklfuse: .*,ro " "$R/lk.log"; ok $? "the real CLI accepts da-mount --ro and mounts read-only (rc $rc)"
 kc saved pw
 real env FAKE_PROBE=apfs FAKE_ENCRYPTED=pw "$MD" -o owners /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
 kcstop
-[ $rc = 0 ] && grep -q "^pw: pw\$" "$R/lk.log" && grep -q "passfd=5" "$R/lk.log"; ok $? "the real CLI accepts da-mount --password-stdin and lklfuse gets the password on fd 5 (rc $rc: $(tr '\n' '|' < "$R/lk.log" 2>/dev/null))"
+[ $rc = 1 ] && grep -q "^pw: pw\$" "$R/lk.log" && grep -q "passfd=5" "$R/lk.log"; ok $? "the real CLI accepts da-mount --password-stdin and lklfuse gets the password on fd 5 (rc $rc: $(tr '\n' '|' < "$R/lk.log" 2>/dev/null))"
 # spec: tools/fs.c -- misuse
 for bad_args in "" "/dev/disk9" "-o /dev/disk9 /tmp/m" "/dev/disk9 /tmp/m extra" "-x /dev/disk9 /tmp/m"; do
   # shellcheck disable=SC2086

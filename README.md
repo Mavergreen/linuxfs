@@ -48,9 +48,17 @@ with `linuxfs prefs`.
 
 ### Spotlight and fsevents
 
-A volume you mount (a disk after login, or `linuxfs mount IMAGE`) is open to root's fseventsd and Spotlight only when
-macFUSE lets you share it: you are an admin (in macFUSE's `admin_group`, 80 by default), or its `allow_other` tunable is
-1. Then linuxfs passes macFUSE's `allow_root` option (and only that), so root's processes can reach the volume and Spotlight and fsevents work, as on an HFS+ disk. Non-admin users mount with no Spotlight or fsevents unless the `allow_other` tunable is 1, which lets them use `allow_root` too. That tunable also lets any user mount with `allow_other`, which opens a volume to every local user, as an HFS+ disk with "Ignore ownership" does; linuxfs does that only for a disk mounted for all users (`LINUXFS_ALL_USERS`).
+An image you mount with `linuxfs mount IMAGE` is open to root's fseventsd and Spotlight only when macFUSE lets you share
+it: you are an admin (in macFUSE's `admin_group`, 80 by default), or its `allow_other` tunable is 1. Then linuxfs passes
+macFUSE's `allow_root` option (and only that), so root's processes can reach the volume and Spotlight and fsevents work, as on an HFS+ disk. Non-admin users mount with no Spotlight or fsevents unless the `allow_other` tunable is 1, which lets them use `allow_root` too. That tunable also lets any user mount with `allow_other`, which opens a volume to every local user, as an HFS+ disk with "Ignore ownership" does; linuxfs does that only for a disk mounted for all users (`LINUXFS_ALL_USERS`).
+
+A disk mounted after login (by the Mac when it is connected, by `diskutil mount`, or by `linuxfs mount DEVICE`) is yours
+alone, admin or not: the Mac runs linuxfs's mount program without your groups, so macFUSE would refuse `allow_root` from
+it, and linuxfs passes it only when the `allow_other` tunable is 1. Root's fseventsd and Spotlight cannot reach such a
+disk, so neither works on it. A disk mounted before login is open to every user, root's processes included.
+
+`linuxfs unmount --force` unmounts your own mount with `umount -f`, and any other linuxfs mount (one made before login)
+with `diskutil unmount force`. `linuxfs list`, `linuxfs status` and `linuxfs unmount DEVICE` show and unmount those too.
 
 ### Ownership
 

@@ -14,9 +14,9 @@
 #       with no mount, mounts through --password-stdin and the keeper's --offer, then from the login keychain with no dialog;
 #       then the HFS+ parity census (tests/lib/parity.sh parity_census_all; PARITY_STALL_N=50: item 3's loop, 50 attaches per loop and volume), which records, and gates only the items it
 #       checks (item 1, Unicode names: on HFS+ and each linuxfs volume, created, listed and opened by both forms alike,
-#       and every linuxfs census mount's lklfuse finding names exactly; item 4's held unmounts and ejects; item 5: .fseventsd
-#       on a linuxfs volume as on HFS+, no fseventsd, mds or mdworker refused on one, Spotlight's indexing steps when the
-#       guest will index the HFS+ control); then a user outside macFUSE's admin_group (lfs_nonadmin, made with dscl and
+#       and every linuxfs census mount's lklfuse finding names exactly; item 4's held unmounts and ejects; item 5: Spotlight's indexing steps when the
+#       guest will index the HFS+ control, and, recorded until the mount daemon (PARITY_MODE_FSEVENTS_DA), .fseventsd on a linuxfs
+#       volume as on HFS+ and no fseventsd, mds or mdworker refused on one); then a user outside macFUSE's admin_group (lfs_nonadmin, made with dscl and
 #       removed) mounts an ext4 image without the CLI's SHARE_OPT;
 #       last, before login (the user's console session ended), an attached ext4 disk is mounted by root (as macfuse_ext4, nosuid and nodev) with allow_other and
 #       served by lklfuse as _linuxfs (with a macFUSE that cannot serve /dev/fd/N the mount program refuses, and that is what is
@@ -368,15 +368,41 @@ cleanup_disk() {
   [ -z "$disk" ] || { bounded 600 diskutil eject "$disk" > /dev/null 2>&1 || bounded 300 hdiutil detach "$disk" > /dev/null 2>&1; }
   disk=
 }
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/push-d-debug.md -- push D's phantom mounts: DiskArbitration said Mounted: Yes with nothing
+#       mounted, after macFUSE refused the mount (mount_macfuse: failed ... Operation not permitted). A mount is there only when the
+#       mount table has it too: /dev/DEV on MP, of the bundle's type
+da_mount_true() {  # DEV MP FS
+  dmt_m=$(info "$1" Mounted)
+  dmt_l=$(mount | awk -v s="/dev/${1#/dev/} on $2 (macfuse_$3," 'index($0, s) == 1')
+  echo "DiskArbitration: Mounted: $dmt_m; mount: ${dmt_l:-nothing from /dev/${1#/dev/} on $2}"
+  test "$dmt_m" = Yes && test -n "$dmt_l"
+}
+# push D's cause: DiskArbitration's mount program has diskarbitrationd's groups, not the user's, so macFUSE refuses SHARE_OPT from it
+#   whatever id -G says. Unless macFUSE's allow_other tunable is 1, the lklfuse serving MP has no SHARE_OPT
+da_unshared() {  # MP
+  test "$(sysctl -n vfs.generic.macfuse.tunables.allow_other 2> /dev/null)" != 1 || { echo "allow_other is 1: SHARE_OPT is allowed"; return 0; }
+  dus_u=$(lklfuse_on "$1" | awk 'NR == 1 { print $1 }')
+  no_share_opt "$(id -u "$dus_u" 2> /dev/null)" "$1" "$(share_opt_of "$L")"
+}
+# system.log's position (LINES|FIRST-LINE), for syslog_since
+log_pos() { echo "$(wc -l < /var/log/system.log 2> /dev/null | tr -d ' ')|$(head -n 1 /var/log/system.log 2> /dev/null)"; }
+no_mount_failed() {  # POS: system.log since POS (log_pos's) has no mount_macfuse or libfuse mount failure; prints any it has
+  nmf=$(syslog_since "${1%%|*}" "${1#*|}" 2> /dev/null | grep -e 'mount_macfuse: failed' -e 'fuse: mount failed')
+  test -z "$nmf" || { printf '%s\n' "$nmf"; return 1; }
+}
 # spec: tests/smoke-mavericks.sh header -- NAME IMAGE PERSONALITY KIND(rw|ro) VIA(raw|GPT): attach, mounted within 30 s, personality, reads and writes,
 #       unmount then mount, eject leaves no lklfuse
 da_cycle() {
   nm=$1 img=$2 want=$3 kind=$4 via=$5 tag="$1 ($5)"
+  pos=$(log_pos)
   da_attach "$img" || { notok "$tag: hdiutil attach"; disk=$(image_disk "$img"); cleanup_disk; return 1; }
   if ! da_wait 300; then
     notok "$tag: mounted by DiskArbitration within 30 s"; diskutil list | sed 's/^/# /'; cleanup_disk; return 1
   fi
   ok "$tag: $dev mounted at $mp within 30 s"
+  check "$tag: the mount table has it: $dev on $mp, macfuse_$nm (no phantom mount)" bounded 300 da_mount_true "$dev" "$mp" "$nm"
+  check "$tag: no mount_macfuse or libfuse mount failure in system.log since the attach" bounded 300 no_mount_failed "$pos"
+  check "$tag: its lklfuse has no SHARE_OPT unless macFUSE's allow_other tunable is 1" bounded 300 da_unshared "$mp"
   check "$tag: diskutil info shows the personality $want, Type (Bundle) macfuse_$nm, Name (User Visible) '$(fsname_of "$nm")' and Mounted: Yes" persona_is "$dev" "$want" "$nm"
   check "$tag: mount shows it as macfuse_$nm" mount_type_is "$mp" "macfuse_$nm"
   check "$tag: no lklfuse runs as root" no_root_lklfuse
@@ -404,9 +430,12 @@ da_cycle() {
   oldmp=$mp
   check "$tag: diskutil unmount" da_unmount "$mp"
   check "$tag: it is unmounted" sh -c '[ "$(diskutil info "$1" 2> /dev/null | sed -n "s/^ *Mounted: *//p")" = No ]' _ "$dev"
+  pos=$(log_pos)
   check "$tag: diskutil mount" bounded 600 diskutil mount "$dev"
   if da_wait 300; then
     ok "$tag: mounted again at $mp"
+    check "$tag: the mount table has it again: $dev on $mp, macfuse_$nm (no phantom mount)" bounded 300 da_mount_true "$dev" "$mp" "$nm"
+    check "$tag: no mount_macfuse or libfuse mount failure in system.log since the mount" bounded 300 no_mount_failed "$pos"
     [ "$kind" != rw ] || check "$tag: what was written reads back after remount" rw_reads "$mp"
   else notok "$tag: mounted again within 30 s"; fi
   check "$tag: diskutil eject leaves no lklfuse" da_eject "$disk" "$mp"

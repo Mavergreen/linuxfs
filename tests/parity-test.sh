@@ -22,6 +22,9 @@ bounded() {
   wait "$bp"
 }
 . "$here/lib/parity.sh"
+# spec: tests/lib/parity.sh PARITY_MODE_FSEVENTS_DA -- record by default until Task 16l flips it; the cases below test its check, as
+#   before Task 16e (fsevents_da_record, at the end, tests the default)
+PARITY_MODE_FSEVENTS_DA=check
 
 fails=0
 expect() { # NAME CONDITION-COMMAND...
@@ -1839,5 +1842,73 @@ expect owners_fstab_gone_tmp_fails has "$r" "^gone 1$"
 expect owners_fstab_gone_tmp_fails_intact test "$(printf '%s\n' "$r" | grep -c '^kept ')" -eq 2 -a -n "$(printf '%s\n' "$r" | grep -x 'kept 1: UUID=A none hfs rw,noauto')"
 expect owners_fstab_in_smoke grep -q '^\. "$tests_dir/lib/owners-fstab.sh"' "$here/smoke-mavericks.sh"
 rm -f "$OF"
+
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/push-d-debug.md -- push E (Task 16e): DiskArbitration's mounts pass no allow_root (the
+#   mount program's process has not the user's groups), so root's fseventsd and mds stay refused on them, as in push C. The three
+#   steps that need them let in on a DiskArbitration volume (.fseventsd's parity, the refusals bar, busy-fsevents) take
+#   PARITY_MODE_FSEVENTS_DA, record until Task 16l; the other item 5, item 4 and item 6 gates stay check
+r=$(unset PARITY_MODE_SPOTLIGHT PARITY_MODE_SPOTLIGHT_DA PARITY_MODE_BUSY_DA PARITY_MODE_FSEVENTS_DA; . "$here/lib/parity.sh"
+  echo "$PARITY_MODE_SPOTLIGHT $PARITY_MODE_SPOTLIGHT_DA $PARITY_MODE_BUSY_DA $PARITY_MODE_FSEVENTS_DA")
+expect modes_e test "$r" = "check check check record"
+expect modes_e_spec has "$(sed -n '/^# spec: .*push-d-debug.md/,/^PARITY_MODE_FSEVENTS_DA=/p' "$here/lib/parity.sh")" 'Task 16l'
+expect modes_e_spec_default grep -qx 'PARITY_MODE_FSEVENTS_DA=${PARITY_MODE_FSEVENTS_DA:-record}' "$here/lib/parity.sh"
+rm -f "$OUT"/*-refresh.png "$OUT"/*-privacy.png "$OUT"/*-privacy-ro.png
+: > "$S/calls"; : > "$S/fsevents-refused"
+r=$(unset PARITY_MODE_FSEVENTS_DA; . "$here/lib/parity.sh"; census_spotlight ext4 2>&1
+  census_refusals_bar 0 2>&1
+  printf '%s\n' 'hfs: fsevents: .fseventsd yes' 'ext4: fsevents: .fseventsd no' > "$T/bf.log"
+  census_busy_fsevents spotlight.ext4.busy-fsevents ext4 "$T/bf.log" 2>&1)
+rm -f "$S/fsevents-refused"
+for p in rw ro; do expect "fsevents_da_record_${p}_fseventsd" has "$r" "^# recorded spotlight.ext4.$p.fseventsd\$"; done
+expect fsevents_da_record_refusals has "$r" "^# recorded spotlight: no refusals for linuxfs volumes ([1-9][0-9]* lines"
+expect fsevents_da_record_busy has "$r" "^# recorded spotlight.ext4.busy-fsevents: .*ext4 no\$"
+expect fsevents_da_record_quiet hasnt "$r" "not ok"
+rm -f "$OUT"/*-refresh.png "$OUT"/*-privacy.png "$OUT"/*-privacy-ro.png
+: > "$S/calls"; : > "$S/fsevents-refused"
+r=$(PARITY_MODE_FSEVENTS_DA=check; census_spotlight ext4 2>&1
+  census_refusals_bar 0 2>&1
+  census_busy_fsevents spotlight.ext4.busy-fsevents ext4 "$T/bf.log" 2>&1)
+rm -f "$S/fsevents-refused" "$T/bf.log"
+for p in rw ro; do expect "fsevents_da_check_${p}_fseventsd" has "$r" "^not ok - parity spotlight.ext4.$p.fseventsd\$"; done
+expect fsevents_da_check_refusals has "$r" "^not ok - spotlight: no refusals for linuxfs volumes ([1-9][0-9]* lines"
+expect fsevents_da_check_busy has "$r" "^not ok - parity spotlight.ext4.busy-fsevents "
+# PARITY_MODE_SPOTLIGHT record still records them; a mode that is neither is not ok, named
+r=$(PARITY_MODE_SPOTLIGHT=record PARITY_MODE_FSEVENTS_DA=check; printf 'xfs: fsevents: .fseventsd no\n' > "$T/bf.log"; census_busy_fsevents spotlight.xfs.busy-fsevents xfs "$T/bf.log" 2>&1)
+expect fsevents_da_spotlight_record has "$r" "^# recorded spotlight.xfs.busy-fsevents"
+r=$(PARITY_MODE_FSEVENTS_DA=chek; census_busy_fsevents spotlight.xfs.busy-fsevents xfs "$T/bf.log" 2>&1)
+expect fsevents_da_badmode has "$r" "^not ok - parity spotlight.xfs.busy-fsevents$"
+expect fsevents_da_badmode_named has "$r" "PARITY_MODE_FSEVENTS_DA is 'chek'"
+r=$(reset; pair; PARITY_MODE_FSEVENTS_DA=chek; census_spot_parity fsevents spotlight.x.fseventsd ls @MP@ 2>&1)
+expect fsevents_da_badmode_parity has "$r" "^not ok - parity spotlight.x.fseventsd"
+expect fsevents_da_badmode_parity_named has "$r" "PARITY_MODE_FSEVENTS_DA is 'chek'"
+rm -f "$T/bf.log"
+# the smoke (push D's phantoms): after each DiskArbitration mount in da_cycle, the mount is in the table (da_mount_true) and system.log
+#   since the attach or the mount has no mount_macfuse or libfuse mount failure (no_mount_failed)
+dc=$(sed -n '/^da_cycle()/,/^}/p' "$sm")
+expect da_cycle_checks_first has "$(printf '%s\n' "$dc" | grep -A 2 'mounted at $mp within 30 s"')" 'da_mount_true "$dev" "$mp" "$nm"'
+expect da_cycle_checks_first_log has "$(printf '%s\n' "$dc" | grep -A 2 'mounted at $mp within 30 s"')" 'no_mount_failed "$pos"'
+expect da_cycle_checks_again has "$(printf '%s\n' "$dc" | grep -A 2 'mounted again at $mp"')" 'da_mount_true "$dev" "$mp" "$nm"'
+expect da_cycle_checks_again_log has "$(printf '%s\n' "$dc" | grep -A 2 'mounted again at $mp"')" 'no_mount_failed "$pos"'
+expect da_cycle_unshared has "$(printf '%s\n' "$dc" | grep -A 3 'mounted at $mp within 30 s"')" 'da_unshared "$mp"'
+expect da_cycle_pos_attach has "$(printf '%s\n' "$dc" | grep -B 1 'da_attach "$img"')" 'pos=$(log_pos)'
+expect da_cycle_pos_mount has "$(printf '%s\n' "$dc" | grep -B 1 'diskutil mount" bounded')" 'pos=$(log_pos)'
+eval "$(sed -n '/^da_mount_true()/,/^}/p; /^no_mount_failed()/,/^}/p' "$sm")"
+r=$(info() { echo Yes; }; mount() { echo '/dev/disk0s2 on / (hfs, local, journaled)'; }; da_mount_true /dev/disk5 /Volumes/x ext4; echo "rc $?")
+expect da_mount_true_phantom has "$r" "^rc 1$"
+r=$(info() { echo Yes; }; mount() { echo '/dev/disk5 on /Volumes/x (macfuse_ext4, local, nodev, nosuid, mounted by me)'; }; da_mount_true /dev/disk5 /Volumes/x ext4; echo "rc $?")
+expect da_mount_true_there has "$r" "^rc 0$"
+r=$(info() { echo No; }; mount() { echo '/dev/disk5 on /Volumes/x (macfuse_ext4, local, nodev, nosuid, mounted by me)'; }; da_mount_true /dev/disk5 /Volumes/x ext4; echo "rc $?")
+expect da_mount_true_not_said has "$r" "^rc 1$"
+r=$(info() { echo Yes; }; mount() { echo '/dev/disk5s1 on /Volumes/x (macfuse_ext4, local)'; echo '/dev/disk5 on /Volumes/xy (macfuse_ext4, local)'; echo '/dev/disk5 on /Volumes/x (macfuse_xfs, local)'; }; da_mount_true /dev/disk5 /Volumes/x ext4; echo "rc $?")
+expect da_mount_true_exact has "$r" "^rc 1$"
+r=$(syslog_since() { printf '%s\n' 'Nov 25 kernel: something' 'Nov 25 mount_macfuse[9]: mount_macfuse: failed to mount /Volumes/Windows@/dev/macfuse0: Operation not permitted'; }; no_mount_failed '5|head'; echo "rc $?")
+expect no_mount_failed_macfuse has "$r" "^rc 1$"
+expect no_mount_failed_says has "$r" "failed to mount /Volumes/Windows"
+r=$(syslog_since() { echo 'Nov 25 lklfuse[9]: fuse: mount failed with error: 1'; }; no_mount_failed '5|head'; echo "rc $?")
+expect no_mount_failed_libfuse has "$r" "^rc 1$"
+r=$(syslog_since() { echo "$1|$2" > "$T/nmf.args"; echo 'Nov 25 linuxfs-mount[9]: mount_ext4: /dev/disk5: exit 0'; }; no_mount_failed '5|head line'; echo "rc $?")
+expect no_mount_failed_clean has "$r" "^rc 0$"
+expect no_mount_failed_pos test "$(cat "$T/nmf.args")" = "5|head line"
+rm -f "$T/nmf.args"
 
 test "$fails" -eq 0

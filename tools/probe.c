@@ -3,6 +3,7 @@
  * usage: linuxfs-probe PATH
  *        linuxfs-probe --uuid PATH
  *        linuxfs-probe --access TYPE FUSION FLAGS [ro] [readonly] [apfs-write] [before-login]
+ *        linuxfs-probe --groups
  * Prints "TYPE<TAB>LABEL" (the label empty where none is read), then a tab and the Fusion role, and a tab and the flags
  * (probe.h), when there are any; exits 0; prints "unknown" and exits 1 when no superblock it knows is there; exits 2 when
  * PATH cannot be read. Reads at most the first 68 KiB, and what an APFS or NTFS volume's name and flags need beyond it.
@@ -11,6 +12,9 @@
  * "rw", "ro REASON" or "refuse REASON"; exits 2 on misuse. It is the CLI's way to the root mount program's rule.
  * --uuid prints the filesystem's UUID as linuxfs_probe_uuid gives it (what the bundles' util -k tells DiskArbitration)
  * and exits 0; exits 1, printing nothing, when there is none.
+ * --groups prints the process's own groups (its credential's, which macFUSE judges allow_root by), decimal, space-separated, on
+ * one line, and exits 0. On Darwin through the kernel's getgroups (_getgroups), never getgroups$DARWIN_EXTSN, which asks the
+ * directory for the user's groups, as id -G prints them: a process DiskArbitration starts has not the user's groups.
  */
 #include "probe.h"
 #include "fsrules.h"
@@ -20,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #define SPAN (0x10000 + 0x1000)
@@ -484,12 +489,36 @@ int linuxfs_probe_uuid(char *out, size_t outlen)
 }
 
 #ifndef LINUXFS_PROBE_NO_MAIN
+#ifdef __APPLE__
+/* the kernel's getgroups(2): the process's credential, at most NGROUPS (16) groups; the SDK's getgroups is getgroups$DARWIN_EXTSN */
+int kernel_getgroups(int, gid_t *) __asm("_getgroups");
+#else
+#define kernel_getgroups getgroups
+#endif
+
+static int print_groups(void)
+{
+	gid_t g[64];
+	int i, n = kernel_getgroups((int)(sizeof g / sizeof g[0]), g);
+
+	if (n < 0) {
+		fprintf(stderr, "linuxfs-probe: getgroups: %s\n", strerror(errno));
+		return 2;
+	}
+	for (i = 0; i < n; i++)
+		printf("%s%lu", i ? " " : "", (unsigned long)g[i]);
+	printf("\n");
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	char lab[512], uuid[40], line[700];
 	const char *type, *path;
 	int fd, err, want_uuid = argc == 3 && strcmp(argv[1], "--uuid") == 0;
 
+	if (argc == 2 && strcmp(argv[1], "--groups") == 0)
+		return print_groups();
 	if (argc >= 5 && strcmp(argv[1], "--access") == 0) {
 		static const char *const names[] = { "rw", "ro", "refuse" };
 		struct fsprefs p;
@@ -517,7 +546,8 @@ int main(int argc, char **argv)
 	if (argc != 2 && !want_uuid) {
 usage:
 		fprintf(stderr, "usage: linuxfs-probe PATH\n       linuxfs-probe --uuid PATH\n"
-			"       linuxfs-probe --access TYPE FUSION FLAGS [ro] [readonly] [apfs-write] [before-login]\n");
+			"       linuxfs-probe --access TYPE FUSION FLAGS [ro] [readonly] [apfs-write] [before-login]\n"
+			"       linuxfs-probe --groups\n");
 		return 2;
 	}
 	path = argv[argc - 1];

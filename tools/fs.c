@@ -204,7 +204,7 @@ static int fsck(const char *fs, int argc, char **argv)
 #define DIALOG_SECONDS 120
 #define DIALOG_TRIES 3
 
-/* LINUXFS_CLI, LINUXFS_DIALOG and LINUXFS_KEYCHAIN_SOCK are for tests, and never obeyed by root */
+/* LINUXFS_CLI, LINUXFS_DIALOG, LINUXFS_KEYCHAIN_SOCK and LINUXFS_MNTTAB are for tests, and never obeyed by root */
 static const char *test_env(const char *name)
 {
 	return getuid() != 0 ? getenv(name) : NULL;
@@ -1580,6 +1580,50 @@ static void log_request(const char *fs, int argc, char **argv)
 	syslog(LOG_NOTICE, "mount_%s: arguments: %s", fs, line);
 }
 
+/* Whether the topmost mount on MNT is one of FS's (its macfuse_<fs> type) from /dev/BSD, whoever owns it: the user path's exit gate,
+ * so that DiskArbitration never records a mount that is not there (push D: an lklfuse ended by macFUSE's refusal of an asynchronous
+ * mount could still say 0). The mount table with MNT_NOWAIT, last entry first, as mounted_on reads it; for tests (as the console
+ * user only, as LINUXFS_CLI) LINUXFS_MNTTAB names a file of TYPE<TAB>FROM<TAB>ON<TAB>OWNER lines, the last on top. */
+static int user_mounted(const char *fs, const char *mnt, const char *bsd)
+{
+	const char *tab = test_env("LINUXFS_MNTTAB"), *t;
+	char line[3 * MAXPATHLEN], type[MFSTYPENAMELEN], from[MAXPATHLEN];
+	struct statfs *m;
+	int n, i, found = 0;
+	FILE *f;
+
+	if (tab && *tab) {
+		if (!(f = fopen(tab, "r")))
+			return 0;
+		while (fgets(line, sizeof line, f)) {
+			char *a = line, *b, *c, *d;
+
+			line[strcspn(line, "\n")] = '\0';
+			if (!(b = strchr(a, '\t')) || !(c = strchr(b + 1, '\t')) || !(d = strchr(c + 1, '\t')))
+				continue;
+			*b++ = *c++ = *d = '\0';
+			if (strcmp(c, mnt) != 0)
+				continue;
+			found = snprintf(type, sizeof type, "%s", a) < (int)sizeof type && snprintf(from, sizeof from, "%s", b) < (int)sizeof from;
+		}
+		fclose(f);
+		if (!found)
+			return 0;
+	} else {
+		n = getmntinfo(&m, MNT_NOWAIT);
+		for (i = n - 1; i >= 0 && !found; i--)
+			if (strcmp(m[i].f_mntonname, mnt) == 0) {
+				snprintf(type, sizeof type, "%s", m[i].f_fstypename);
+				snprintf(from, sizeof from, "%s", m[i].f_mntfromname);
+				found = 1;
+			}
+		if (!found)
+			return 0;
+	}
+	t = fsrules_fs_of_type(type);
+	return t && strcmp(t, fs) == 0 && strncmp(from, "/dev/", 5) == 0 && strcmp(from + 5, bsd) == 0;
+}
+
 static int mount_role(const char *fs, int argc, char **argv)
 {
 	struct mountreq req;
@@ -1681,6 +1725,12 @@ static int mount_role(const char *fs, int argc, char **argv)
 	}
 	rc = 4;
 out:
+	/* one gate for every run of the CLI that said 0: the first try, the keeper's password's or the dialog's */
+	if (rc == 0 && !user_mounted(fs, req.mnt, bsd)) {
+		fprintf(stderr, "mount_macfuse_%s: the CLI exited 0 but nothing is mounted on %s\n", fs, req.mnt);
+		syslog(LOG_NOTICE, "mount_%s: %s: the CLI exited 0 but nothing is mounted on %s", fs, req.dev, req.mnt);
+		rc = 1;
+	}
 	syslog(LOG_NOTICE, "mount_%s: %s: exit %d", fs, req.dev, rc);
 	free(out);
 	return rc < 0 ? 1 : rc;	/* the CLI could not run, or was killed */

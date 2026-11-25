@@ -18,7 +18,7 @@
 #          volume; new files are written with the filesystem root's owner. --linux-ids shows Linux's owners instead.
 #          A device is mounted by DiskArbitration (diskutil mount), which runs the linuxfs bundle's mount program,
 #          which calls back as da-mount; so a device takes no MOUNTPOINT, --linux-ids, --tier2 or -o (use linuxfs
-#          prefs), and its volume is the console user's alone, and root's (allow_root, for an admin; open to every user only when mounted before login, or by
+#          prefs), and its volume is the console user's alone (root's too only when macFUSE's allow_other tunable is 1; open to every user only when mounted before login, or by
 #          sudo diskutil mount). A dirty NTFS volume mounts read-only. A device the Mac has mounted is refused. APFS mounts read-only (APFSWrite on: read-write, but never an encrypted or Fusion
 #          volume); an encrypted volume's password is asked for at the terminal, or read from stdin
 #          (--password-stdin; for a device, offered to the login session's agent). ignore VOLUME (a device, or a volume's
@@ -71,6 +71,13 @@ mount_lines() {
     if (i == 0) next; t = substr(r, i + 2); sub(/[,)].*$/, "", t)
     printf "%s\t%s\t%s\n", substr($0, 1, o - 1), substr(r, 1, i - 1), t }'
 }
+# The same with the options: SOURCE<TAB>MOUNTPOINT<TAB>TYPE<TAB>OPTIONS (what follows the type inside the parentheses, ", "-separated).
+mount_lines_opts() {
+  mount | awk '{ o = index($0, " on "); if (!o) next; r = substr($0, o + 4)
+    for (i = length(r); i > 0; i--) if (substr(r, i, 2) == " (") break
+    if (i == 0) next; p = substr(r, i + 2); sub(/\)$/, "", p); t = p; sub(/,.*$/, "", t); x = substr(p, length(t) + 1); sub(/^, */, "", x)
+    printf "%s\t%s\t%s\t%s\n", substr($0, 1, o - 1), substr(r, 1, i - 1), t, x }'
+}
 # linuxfs's own mount type: one of the six bundles' macfuse_<fs> exactly (tools/fsrules.c's table), never the macfuse_ family.
 ours_type() { case $1 in macfuse_ext4|macfuse_ntfs|macfuse_btrfs|macfuse_xfs|macfuse_f2fs|macfuse_apfs) return 0 ;; *) return 1 ;; esac; }
 # The Mac's own mount of a device node, if any: its mount point. A DiskArbitration mount of linuxfs's is named for its disk too
@@ -80,6 +87,17 @@ mac_mount_of() {
     [ "$_s" = "$1" ] || continue
     ours_type "$_t" || { printf '%s\n' "$_m"; break; }
   done
+}
+# The mount point of linuxfs's mount (one of the six types) whose source is exactly DEV (a block node: DiskArbitration's mounts are
+# named for their disk), whoever made it: root's, before login, has no record here.
+ours_from() { # DEV
+  mount_lines | while IFS="$tab" read -r _s _m _t; do
+    [ "$_s" = "$1" ] && ours_type "$_t" && { printf '%s\n' "$_m"; break; }
+  done
+}
+# Who the topmost mount on MP is "mounted by" (mount's words; nothing for root's own mounts, which mount does not say it of).
+mounted_by() { # MP
+  mount_lines_opts | awk -F"$tab" -v m="$1" '$2 == m { o = $4 } END { n = split(o, a, ", "); for (i = 1; i <= n; i++) if (a[i] ~ /^mounted by /) { sub(/^mounted by /, "", a[i]); print a[i] } }'
 }
 # Whether the topmost mount on MP is linuxfs's: one of the six types, or an exFAT/FAT image mount, which has no fstypename
 # (plain macfuse) and is named linuxfs@<image> by cmd_mount. Another product's macFUSE mount could take either name; that
@@ -155,12 +173,13 @@ cmd_list() {
     esac
     at=$(mac_mount_of "/dev/$d")
     [ -n "$at" ] || at=$(records | awk -F"$tab" -v s="/dev/r$d" '$2 == s { print $3 }')
+    [ -n "$at" ] || at=$(ours_from "/dev/$d")
     printf '/dev/%s\t%s\t%s\n' "$d" "$(printf '%s\n' "$out" | cut -f 1,2)" "${at:--}"
   done
 }
 
 # lklfuse in the foreground of a background job, until the volume appears or lklfuse exits.
-# Sets $pid; returns lklfuse's status when it exits early (output in $log).
+# Sets $pid; when it exits before the mount appears, returns its status, or 1 for 0, and says so in $log (its output).
 # Starts a command in the background, logging to $log, and sets pid. With $password set, the command gets it on fd 5,
 # through a pipe from the shell's own printf, so it is on no command line.
 launch() {
@@ -190,7 +209,14 @@ run_lklfuse() { # SOURCE MOUNTPOINT OPTIONS [OPENER-DEVICE [SECOND-OPENER-DEVICE
   if [ -n "$fusechan" ]; then eval "exec $fusechan<&-"; chanused=1; fusechan=; fi
   i=0
   while ! is_mounted "$2"; do
-    if ! kill -0 "$pid" 2>/dev/null; then wait "$pid"; return $?; fi
+    # ended before its mount appeared: a failure, whatever its status (macFUSE's libfuse mounts asynchronously, and a refused mount
+    # can end lklfuse with 0: push D's phantom mounts)
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid"; _rc=$?
+      echo "lklfuse exited (status $_rc) before the mount appeared" >> "$log"
+      [ "$_rc" -ne 0 ] || _rc=1
+      return "$_rc"
+    fi
     i=$((i + 1)); [ $i -le "$WAIT" ] || { kill "$pid" 2>/dev/null; wait "$pid"; echo "lklfuse did not mount within $((WAIT / 10)) s" >> "$log"; return 1; }
     sleep 0.1
   done
@@ -466,10 +492,19 @@ EOF
       fi ;;
   esac
   if [ -n "$rec" ]; then pid=${rec%%"$tab"*}; mnt=$(printf '%s\n' "$rec" | cut -f 3)
-  else pid=; mnt=$t; ours_on "$mnt" || die "$1 is not mounted by linuxfs"; fi
+  else
+    pid=; mnt=$t
+    # a device with no record: linuxfs's mount of it that this user did not make (root's, before login), by its mount point
+    case $t in /dev/rdisk*) m=$(ours_from "$blk"); [ -z "$m" ] || mnt=$m ;; esac
+    ours_on "$mnt" || die "$1 is not mounted by linuxfs"
+  fi
   # forced (a yank or an eject): umount -f, not diskutil, which DiskArbitration holds up while
-  # an eject waits on the agent (P3-3: 9 s, past what DiskArbitration waits, for a 0.7 s unmount)
-  if [ -n "$force" ]; then unmount_it() { umount -f "$1"; }; else unmount_it() { diskutil unmount "$1"; }; fi
+  # an eject waits on the agent (P3-3: 9 s, past what DiskArbitration waits, for a 0.7 s unmount). umount -f only on this user's
+  # own mount (mount says "mounted by" this user): the kernel lets no one else force it; any other (root's) through diskutil's force,
+  # which DiskArbitration lets the console user do
+  if [ -n "$force" ]; then
+    if [ "$(mounted_by "$mnt")" = "$(id -un)" ]; then unmount_it() { umount -f "$1"; }; else unmount_it() { diskutil unmount force "$1"; }; fi
+  else unmount_it() { diskutil unmount "$1"; }; fi
   if ! unmount_it "$mnt" > /dev/null 2>&1; then
     echo "linuxfs: $mnt is busy; these programs have files open on it:" >&2
     lsof -n 2>/dev/null | grep -F " $mnt" | awk '{ print "  " $1 " (pid " $2 ")" }' | sort -u >&2
@@ -563,7 +598,8 @@ cmd_da_mount() {
   fields "$probed"
   # defence in depth: the bundles never claim these, so refuse them here too
   case $type in exfat|vfat) exit 3 ;; esac
-  [ "$type" != ntfs3 ] || [ "$(pref NTFSTakeover off)" = on ] || exit 3
+  # (with root's channel, root has decided: the console user's NTFSTakeover, read by root, as ReadOnly below)
+  [ -n "$fusechan" ] || [ "$type" != ntfs3 ] || [ "$(pref NTFSTakeover off)" = on ] || exit 3
   case $fusion in
     "fusion-tier2 "*) exit 3 ;;
     "fusion-main "*)
@@ -609,14 +645,18 @@ volicon_opt() { # TYPE
   case $(stat -f %Lp "$_i" 2>/dev/null) in *[2367]?|*[2367]|'') return 0 ;; esac
   echo "volicon=$_i"
 }
-# SHARE_OPT when macFUSE's tunables let this user share the mount with root (allow_other is 1, or the user is in admin_group);
-# nothing when neither holds or sysctl fails or says nothing.
+# SHARE_OPT when macFUSE's tunables let this process share the mount with root: allow_other is 1, or (not on DiskArbitration's path)
+# the process's own groups hold admin_group. macFUSE judges the process's credential, so the groups are the kernel's
+# (linuxfs-probe --groups), never id -G, which prints the directory's list for the user. On DiskArbitration's path (LINUXFS_DA=1)
+# the process has diskarbitrationd's groups, not the user's (push-d-debug.md), so only allow_other, which the kernel honours
+# whatever the groups, counts. Nothing when neither holds, or sysctl or the probe fails or says nothing.
 share_opt() {
   _ao=$(sysctl -n vfs.generic.macfuse.tunables.allow_other 2>/dev/null | tr -d '[:space:]')
-  _ag=$(sysctl -n vfs.generic.macfuse.tunables.admin_group 2>/dev/null | tr -d '[:space:]')
   [ "$_ao" = 1 ] && { echo "$SHARE_OPT"; return 0; }
+  [ "${LINUXFS_DA:-}" != 1 ] || return 0
+  _ag=$(sysctl -n vfs.generic.macfuse.tunables.admin_group 2>/dev/null | tr -d '[:space:]')
   case $_ag in ''|*[!0-9]*) return 0 ;; esac
-  for _g in $(id -G 2>/dev/null); do [ "$_g" = "$_ag" ] && { echo "$SHARE_OPT"; return 0; }; done
+  for _g in $("$PROBE" --groups 2>/dev/null < /dev/null); do [ "$_g" = "$_ag" ] && { echo "$SHARE_OPT"; return 0; }; done
   return 0
 }
 # A device's type, UUID and name (the volume name DiskArbitration sees: the bundle's util prints the label's safe name,
@@ -674,10 +714,21 @@ cmd_unignore() {
   fi
 }
 
+# The type lklfuse's type= spells for a mount type of linuxfs's (macfuse_ntfs: ntfs3), as status's records say it.
+type_of_bundle() { case $1 in macfuse_ntfs) echo ntfs3 ;; *) echo "${1#macfuse_}" ;; esac; }
+
 cmd_status() {
   [ $# -eq 0 ] || usage
   printf 'PID\tSOURCE\tMOUNTPOINT\tTYPE\tMODE\n'
-  records
+  _r=$(records); [ -z "$_r" ] || printf '%s\n' "$_r"
+  # linuxfs's mounts from a disk that this user has no record of (root's, before login): no pid of ours, so "-"
+  mount_lines_opts | while IFS="$tab" read -r _s _m _t _o; do
+    case $_s in /dev/disk*) ;; *) continue ;; esac
+    ours_type "$_t" || continue
+    printf '%s\n' "$_r" | awk -F"$tab" -v m="$_m" '$3 == m { f = 1 } END { exit !f }' && continue
+    case ", $_o," in *", read-only,"*) _mo=ro ;; *) _mo=rw ;; esac
+    printf -- '-\t%s\t%s\t%s\t%s\n' "$_s" "$_m" "$(type_of_bundle "$_t")" "$_mo"
+  done
 }
 
 [ $# -ge 1 ] || usage
