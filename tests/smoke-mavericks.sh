@@ -284,21 +284,22 @@ da_restart() {  # a fresh DA (launchd starts the job again)
   echo "# DA restarted: $(ps -axww -o pid=,command= | grep -i '[d]iskarbitrationd' | tr '\n' '|')"
 }
 da_mark() { sudo -n sh -c 'printf "=== %s ===\n" "$1" >> /private/tmp/da-debug.log' _ "$1" 2> /dev/null; }
-fstn_use_baseline() {  # today's linuxfs_ext4 bundle (mounts as plain macfuse), the macfuse_ext4 one moved aside
-  sudo -n rm -rf "$FSD/linuxfs_ext4.fs" /private/var/tmp/spike-macfuse_ext4.fs
-  sudo -n cp -R "$FSD/macfuse_ext4.fs" "$FSD/linuxfs_ext4.fs" || return 1
+fstn_use_baseline() {  # SUB: today's linuxfs_ext4 bundle with FSSubType SUB (mounts as plain macfuse unless the override asks for fstypename); the macfuse_ext4 one is moved aside
+  fb_sub=$1; fb_aside=/private/var/tmp/spike-macfuse_ext4.fs
+  sudo -n rm -rf "$FSD/linuxfs_ext4.fs"
+  if test -d "$FSD/macfuse_ext4.fs"; then sudo -n rm -rf "$fb_aside"; sudo -n mv "$FSD/macfuse_ext4.fs" "$fb_aside" || return 1; fi
+  sudo -n cp -R "$fb_aside" "$FSD/linuxfs_ext4.fs" || return 1
   R=$FSD/linuxfs_ext4.fs/Contents/Resources
   for pr in util:macfuse_ext4.util:linuxfs_ext4.util mount:mount_macfuse_ext4:mount_linuxfs_ext4 fsck:fsck_macfuse_ext4:fsck_linuxfs_ext4; do
     o=${pr#*:}; sudo -n mv "$R/${o%%:*}" "$R/${o#*:}" || return 1
   done
-  sudo -n sed -i '' -e 's/macfuse_ext4/linuxfs_ext4/g' -e 's|<integer>7</integer>|<integer>0</integer>|' "$FSD/linuxfs_ext4.fs/Contents/Info.plist" || return 1
-  sudo -n mv "$FSD/macfuse_ext4.fs" /private/var/tmp/spike-macfuse_ext4.fs || return 1
-  echo "# baseline bundle:"; rec ls -la "$R"; rec grep -n 'ext4\|SubType' -A1 "$FSD/linuxfs_ext4.fs/Contents/Info.plist"
+  sudo -n sed -i '' -e 's/macfuse_ext4/linuxfs_ext4/g' -e "s|<integer>7</integer>|<integer>$fb_sub</integer>|" "$FSD/linuxfs_ext4.fs/Contents/Info.plist" || return 1
+  echo "# bundle linuxfs_ext4.fs, FSSubType $fb_sub:"; rec ls -la "$R"; rec grep -n 'SubType' -A1 "$FSD/linuxfs_ext4.fs/Contents/Info.plist"
   da_restart
 }
 fstn_use_macfuse() {
   sudo -n rm -rf "$FSD/linuxfs_ext4.fs"
-  [ -d "$FSD/macfuse_ext4.fs" ] || sudo -n mv /private/var/tmp/spike-macfuse_ext4.fs "$FSD/macfuse_ext4.fs"
+  test -d "$FSD/macfuse_ext4.fs" || sudo -n mv /private/var/tmp/spike-macfuse_ext4.fs "$FSD/macfuse_ext4.fs"
   da_restart
 }
 FSN=0
@@ -380,10 +381,14 @@ fstn_experiments() {
   fstn_use_macfuse
   da_debug_off
 }
-# ---- round 3: the stall loop at CI speed (ported from .superpowers/kits/fstypename-stall/run.sh): variants A, B, C ----
-# A: macfuse_ext4.fs bundle, kernel fstype macfuse_ext4 (fstypename=ext4,fssubtype=7); B: the same bundle, plain macfuse kernel type;
-# C: linuxfs_ext4.fs bundle (FSSubType 0, today's plist), kernel fstype macfuse_ext4. The CLI's DA path reads the override file.
+# ---- round 4: the stall loop at CI speed (ported from .superpowers/kits/fstypename-stall/run.sh): variants D, C', A ----
+# D: linuxfs_ext4.fs bundle (FSSubType 0), kernel fstype plain macfuse: today's shipping baseline.
+# C': linuxfs_ext4.fs bundle with FSSubType 7 (matching the fssubtype=7 the mount asks for), kernel fstype macfuse_ext4.
+# A: macfuse_ext4.fs bundle (FSSubType 7), kernel fstype macfuse_ext4. The CLI's DA path reads the override file (0 or 1).
+# Variable names: fl_* functions each keep to their own prefix (it_ fl_iter, dg_ fl_diag, lv_ fl_variant, gi_ fl_getinfo, pa_ fl_plain).
 FLOV=/private/var/tmp/spike-fstypename
+FL_N_SAME=${FL_N_SAME:-12}
+FL_N_FRESH=${FL_N_FRESH:-6}
 fl_set() { sudo -n sh -c 'echo "$1" > "$2"; chmod 644 "$2"' _ "$1" "$FLOV"; }
 fl_tl_start() {  # FILE: once a second, fuse mounts and the processes that matter
   : > "$1.run"
@@ -416,125 +421,130 @@ fl_capture() {  # FILE MP: the state at the moment of a stall
   } > "$cf" 2>&1
 }
 fl_plain() {  # IMG LOG: plain attach, then up to 60 s for the mount; sets PA_DISK PA_MP PA_VERDICT
-  PA_DISK= PA_MP=; t0=$(date +%s)
-  bounded 6000 hdiutil attach -verbose -imagekey diskimage-class=CRawDiskImage "$1" > "$2" 2>&1; rc=$?
+  PA_DISK= PA_MP=; pa_t0=$(date +%s)
+  bounded 6000 hdiutil attach -verbose -imagekey diskimage-class=CRawDiskImage "$1" > "$2" 2>&1; pa_rc=$?
   PA_DISK=$(awk '/^\/dev\/disk/ { print $1; exit }' "$2")
-  if test "$rc" -ne 0; then
-    PA_VERDICT="stalled after $(( $(date +%s) - t0 )) s: hdiutil exit $rc: $(grep -i 'hdiutil:' "$2" | tail -n 1)"
+  if test "$pa_rc" -ne 0; then
+    PA_VERDICT="stalled after $(( $(date +%s) - pa_t0 )) s: hdiutil exit $pa_rc: $(grep -i 'hdiutil:' "$2" | tail -n 1)"
     test -n "$PA_DISK" || PA_DISK=$(image_disk "$1"); return 1
   fi
   while :; do
-    if test "$(info "$PA_DISK" Mounted)" = Yes; then PA_MP=$(info "$PA_DISK" "Mount Point"); PA_VERDICT="automounted in $(( $(date +%s) - t0 )) s ($(mount | grep -F " on $PA_MP (" | sed 's/^.* (//; s/,.*//'))"; return 0; fi
-    test $(( $(date +%s) - t0 )) -lt 60 || break
+    if test "$(info "$PA_DISK" Mounted)" = Yes; then PA_MP=$(info "$PA_DISK" "Mount Point"); PA_VERDICT="automounted in $(( $(date +%s) - pa_t0 )) s ($(mount | grep -F " on $PA_MP (" | sed 's/^.* (//; s/,.*//'))"; return 0; fi
+    test $(( $(date +%s) - pa_t0 )) -lt 60 || break
     sleep 1
   done
-  PA_VERDICT="stalled after $(( $(date +%s) - t0 )) s: attached as $PA_DISK, never mounted"; return 1
+  PA_VERDICT="stalled after $(( $(date +%s) - pa_t0 )) s: attached as $PA_DISK, never mounted"; return 1
 }
 fl_eject() { test -z "$1" || bounded 6000 diskutil eject "$1" > /dev/null 2>&1 || bounded 3000 hdiutil detach -force "$1" > /dev/null 2>&1; }
-fl_diag() {  # V I IMG STATE: after a stall, what lets the same volume automount again
-  v=$1 i=$2 dimg=$3 dlog=$OUT/stall-$1-$2-diag.log
-  echo "d1: wait 30 s, then a plain attach" >> "$dlog"; sleep 30
-  if fl_plain "$dimg" "$W/fl-d.log"; then echo "d1 cleared it: $PA_VERDICT" >> "$dlog"; fl_eject "$PA_DISK"; FLCLEARED="time (30 s)"; return 0; fi
-  echo "d1 (30 s later): $PA_VERDICT" >> "$dlog"; fl_eject "$PA_DISK"
-  bounded 6000 hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$dimg" > "$W/fl-d2.log" 2>&1
-  dd2=$(awk '/^\/dev\/disk/ { print $1; exit }' "$W/fl-d2.log"); sleep 4
-  if test -n "$dd2"; then
-    { echo "d2 diskutil info $dd2:"; diskutil info "$dd2"; } >> "$dlog" 2>&1
-    echo "d2 diskutil mount: exit $(bounded 6000 diskutil mount "$dd2" > "$W/fl-d2m.log" 2>&1; echo $?): $(tr '\n' ' ' < "$W/fl-d2m.log")" >> "$dlog"
-    sleep 3; echo "d2 mount: $(mount | grep -F linuxfs@ | tr '\n' '|')" >> "$dlog"; fl_eject "$dd2"
-  else echo "d2: attach -nomount gave no disk: $(tr '\n' ' ' < "$W/fl-d2.log")" >> "$dlog"; fi
-  if fl_plain "$dimg" "$W/fl-d.log"; then echo "d3 cleared it: $PA_VERDICT" >> "$dlog"; fl_eject "$PA_DISK"; FLCLEARED="diskutil mount"; return 0; fi
-  echo "d3 (after diskutil mount): $PA_VERDICT" >> "$dlog"; fl_eject "$PA_DISK"
+fl_diag() {  # TAG IMG: after a stall, what lets the same volume automount again
+  dg_tag=$1 dg_img=$2 dg_log=$OUT/stall-$1-diag.log
+  echo "d1: wait 30 s, then a plain attach" >> "$dg_log"; sleep 30
+  if fl_plain "$dg_img" "$W/fl-d.log"; then echo "d1 cleared it: $PA_VERDICT" >> "$dg_log"; fl_eject "$PA_DISK"; FLCLEARED="time (30 s)"; return 0; fi
+  echo "d1 (30 s later): $PA_VERDICT" >> "$dg_log"; fl_eject "$PA_DISK"
+  bounded 6000 hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$dg_img" > "$W/fl-d2.log" 2>&1
+  dg_d2=$(awk '/^\/dev\/disk/ { print $1; exit }' "$W/fl-d2.log"); sleep 4
+  if test -n "$dg_d2"; then
+    { echo "d2 diskutil info $dg_d2:"; diskutil info "$dg_d2"; } >> "$dg_log" 2>&1
+    echo "d2 diskutil mount: exit $(bounded 6000 diskutil mount "$dg_d2" > "$W/fl-d2m.log" 2>&1; echo $?): $(tr '\n' ' ' < "$W/fl-d2m.log")" >> "$dg_log"
+    sleep 3; echo "d2 mount: $(mount | grep -F linuxfs@ | tr '\n' '|')" >> "$dg_log"; fl_eject "$dg_d2"
+  else echo "d2: attach -nomount gave no disk: $(tr '\n' ' ' < "$W/fl-d2.log")" >> "$dg_log"; fi
+  if fl_plain "$dg_img" "$W/fl-d.log"; then echo "d3 cleared it: $PA_VERDICT" >> "$dg_log"; fl_eject "$PA_DISK"; FLCLEARED="diskutil mount"; return 0; fi
+  echo "d3 (after diskutil mount): $PA_VERDICT" >> "$dg_log"; fl_eject "$PA_DISK"
   mkdir -p "$W/mnt/fl"
-  echo "d4 linuxfs mount: exit $(bounded 6000 "$L" mount "$dimg" "$W/mnt/fl" > "$W/fl-d4.log" 2>&1; echo $?); mount: $(mount | grep -F " on $W/mnt/fl (")" >> "$dlog"
-  bounded 3000 "$L" unmount "$W/mnt/fl" >> "$W/fl-d4.log" 2>&1; echo "d4 linuxfs unmount: exit $?" >> "$dlog"
-  if fl_plain "$dimg" "$W/fl-d.log"; then echo "d5 cleared it: $PA_VERDICT" >> "$dlog"; fl_eject "$PA_DISK"; FLCLEARED="linuxfs mount (CLI path)"; return 0; fi
-  echo "d5 (after the CLI mount): $PA_VERDICT" >> "$dlog"; fl_capture "$OUT/stall-$1-$2-d5-state.log" "$PA_MP"; fl_eject "$PA_DISK"
+  echo "d4 linuxfs mount: exit $(bounded 6000 "$L" mount "$dg_img" "$W/mnt/fl" > "$W/fl-d4.log" 2>&1; echo $?); mount: $(mount | grep -F " on $W/mnt/fl (")" >> "$dg_log"
+  bounded 3000 "$L" unmount "$W/mnt/fl" >> "$W/fl-d4.log" 2>&1; echo "d4 linuxfs unmount: exit $?" >> "$dg_log"
+  if fl_plain "$dg_img" "$W/fl-d.log"; then echo "d5 cleared it: $PA_VERDICT" >> "$dg_log"; fl_eject "$PA_DISK"; FLCLEARED="linuxfs mount (CLI path)"; return 0; fi
+  echo "d5 (after the CLI mount): $PA_VERDICT" >> "$dg_log"; fl_capture "$OUT/stall-$1-d5-state.log" "$PA_MP"; fl_eject "$PA_DISK"
   FLCLEARED="none"
 }
 FLVER=$OUT/stall-verdicts.txt
-fl_iter() {  # V I BUNDLE MODE(same|fresh): the sequence, once
-  v=$1 i=$2 bundle=$3 mode=$4; tag=$v-$mode-$i
-  fimg=$W/img/fl.img; cp "$W/img/spike-ext4.img" "$fimg" || return 1
-  if test "$mode" = fresh; then fuuid=$(/usr/bin/python "$W/ext4-newuuid.py" "$fimg") || { echo "$tag setup-failed: ext4-newuuid" >> "$FLVER"; return 1; }; fi
+fl_iter() {  # VARIANT NUMBER BUNDLE MODE(same|fresh): the sequence, once; returns 1 for a stall
+  it_tag=$1-$4-$2 it_n=$2 it_bundle=$3 it_mode=$4
+  it_img=$W/img/fl.img; cp "$W/img/spike-ext4.img" "$it_img" || return 1
+  if test "$it_mode" = fresh; then /usr/bin/python "$W/ext4-newuuid.py" "$it_img" > /dev/null || { echo "$it_tag setup-failed: ext4-newuuid" >> "$FLVER"; FLSETUP=$((FLSETUP + 1)); return 1; }; fi
   FLSYS=$(wc -l < /var/log/system.log | tr -d ' '); FLDAL=$(sudo -n sh -c 'wc -c < /var/log/diskarbitrationd.log' 2> /dev/null | tr -d ' '); FLDAE=$(sudo -n sh -c 'wc -c < /private/tmp/da-debug.log' 2> /dev/null | tr -d ' ')
   : "${FLDAL:=0}" "${FLDAE:=0}"
-  fl_tl_start "$OUT/stall-$v-timeline.log"; echo "=== $tag" >> "$OUT/stall-$v-timeline.log"
-  bounded 6000 hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$fimg" > "$W/fl-s1.log" 2>&1
-  fdisk=$(awk '/^\/dev\/disk/ { print $1; exit }' "$W/fl-s1.log")
-  if test -z "$fdisk"; then echo "$tag setup-failed: no disk from attach -nomount" >> "$FLVER"; fl_tl_stop "$OUT/stall-$v-timeline.log"; return 1; fi
-  k=0; fu=; while test -z "$fu" && test $k -lt 60; do fu=$(info "$fdisk" 'Volume UUID'); k=$((k + 1)); test -n "$fu" || sleep 1; done
+  fl_tl_start "$OUT/stall-$1-timeline.log"; echo "=== $it_tag" >> "$OUT/stall-$1-timeline.log"
+  bounded 6000 hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$it_img" > "$W/fl-s1.log" 2>&1
+  it_disk=$(awk '/^\/dev\/disk/ { print $1; exit }' "$W/fl-s1.log")
+  if test -z "$it_disk"; then echo "$it_tag setup-failed: no disk from attach -nomount" >> "$FLVER"; FLSETUP=$((FLSETUP + 1)); fl_tl_stop "$OUT/stall-$1-timeline.log"; return 1; fi
+  it_k=0; it_fu=; while test -z "$it_fu" && test $it_k -lt 60; do it_fu=$(info "$it_disk" 'Volume UUID'); it_k=$((it_k + 1)); test -n "$it_fu" || sleep 1; done
   sleep 6   # as the spike's smoke did: the agent's sweep may mount it first
-  if mount | grep -qF "linuxfs@"; then bounded 6000 diskutil unmount "$fdisk" > /dev/null 2>&1; fi
-  bounded 6000 "$L" ignore "$fdisk" > "$W/fl-s2.log" 2>&1; s2=$?
-  test "$bundle" = macfuse_ext4 || sudo -n sed -i '' "s/ none macfuse_ext4 / none $bundle /" /etc/fstab
-  via=
-  if ! grep -q "^UUID=$fu none $bundle rw,noauto # linuxfs\$" /etc/fstab 2> /dev/null; then
-    via=" | ignore: helper refused (exit $s2), the harness wrote the entry"
-    sudo -n sh -c 'printf "%s\n" "$1" >> /etc/fstab' _ "UUID=$fu none $bundle rw,noauto # linuxfs"
+  if mount | grep -qF "linuxfs@"; then bounded 6000 diskutil unmount "$it_disk" > /dev/null 2>&1; fi
+  bounded 6000 "$L" ignore "$it_disk" > "$W/fl-s2.log" 2>&1; it_s2=$?
+  test "$it_bundle" = macfuse_ext4 || sudo -n sed -i '' "s/ none macfuse_ext4 / none $it_bundle /" /etc/fstab
+  it_via=
+  if ! grep -q "^UUID=$it_fu none $it_bundle rw,noauto # linuxfs\$" /etc/fstab 2> /dev/null; then
+    it_via=" | ignore: helper refused (exit $it_s2), the harness wrote the entry"
+    sudo -n sh -c 'printf "%s\n" "$1" >> /etc/fstab' _ "UUID=$it_fu none $it_bundle rw,noauto # linuxfs"
   fi
-  t3=$(date +%s)
-  bounded 6000 diskutil mount "$fdisk" > "$W/fl-s3.log" 2>&1; s3=$?
-  k=0; while test "$(info "$fdisk" Mounted)" != Yes && test $k -lt 120; do k=$((k + 1)); sleep 1; done
-  s3type=$(mount | grep -F "linuxfs@r${fdisk#/dev/} on " | sed 's/^.* (//; s/,.*//')
-  bounded 6000 "$L" unignore "$fdisk" > "$W/fl-s4.log" 2>&1
-  if grep -q "^UUID=$fu " /etc/fstab 2> /dev/null; then sudo -n sed -i '' "/^UUID=$fu /d" /etc/fstab; via="$via | unignore: the harness removed the entry"; fi
-  bounded 6000 diskutil eject "$fdisk" > "$W/fl-s5.log" 2>&1 || { sleep 5; bounded 6000 diskutil eject "$fdisk" >> "$W/fl-s5.log" 2>&1; }
-  t5=$(date +%s)
-  fl_plain "$fimg" "$W/fl-s6.log"; fok=$?
-  verdict=$PA_VERDICT; FLCLEARED=
-  fl_capture "$OUT/stall-$tag-state.log.tmp" "$PA_MP"
-  if test "$fok" -ne 0; then
-    FLSTALLS=$((FLSTALLS + 1)); mv "$OUT/stall-$tag-state.log.tmp" "$OUT/stall-$tag-state.log"
+  it_t3=$(date +%s)
+  bounded 6000 diskutil mount "$it_disk" > "$W/fl-s3.log" 2>&1; it_s3=$?
+  it_k=0; while test "$(info "$it_disk" Mounted)" != Yes && test $it_k -lt 120; do it_k=$((it_k + 1)); sleep 1; done
+  it_s3type=$(mount | grep -F "linuxfs@r${it_disk#/dev/} on " | sed 's/^.* (//; s/,.*//')
+  bounded 6000 "$L" unignore "$it_disk" > "$W/fl-s4.log" 2>&1
+  if grep -q "^UUID=$it_fu " /etc/fstab 2> /dev/null; then sudo -n sed -i '' "/^UUID=$it_fu /d" /etc/fstab; it_via="$it_via | unignore: the harness removed the entry"; fi
+  bounded 6000 diskutil eject "$it_disk" > "$W/fl-s5.log" 2>&1 || { sleep 5; bounded 6000 diskutil eject "$it_disk" >> "$W/fl-s5.log" 2>&1; }
+  it_t5=$(date +%s)
+  fl_plain "$it_img" "$W/fl-s6.log"; it_ok=$?
+  it_verdict=$PA_VERDICT; FLCLEARED=
+  fl_capture "$OUT/stall-$it_tag-state.log.tmp" "$PA_MP"
+  if test "$it_ok" -ne 0; then
+    FLSTALLS=$((FLSTALLS + 1)); mv "$OUT/stall-$it_tag-state.log.tmp" "$OUT/stall-$it_tag-state.log"
     fl_eject "$PA_DISK"
-    if test "$FLSTALLS" -le 3; then fl_diag "$v" "$mode-$i" "$fimg"; fi
+    if test "$FLSTALLS" -le 2; then fl_diag "$it_tag" "$it_img"; fi
   else
-    # a pass keeps its state only for the first iteration of a variant
-    if test "$i" = 1; then mv "$OUT/stall-$tag-state.log.tmp" "$OUT/stall-$tag-state.log"; else rm -f "$OUT/stall-$tag-state.log.tmp"; fi
+    # a pass keeps its state only for the first iteration of a variant and mode
+    if test "$it_n" = 1; then mv "$OUT/stall-$it_tag-state.log.tmp" "$OUT/stall-$it_tag-state.log"; else rm -f "$OUT/stall-$it_tag-state.log.tmp"; fi
     fl_eject "$PA_DISK"
   fi
-  fl_tl_stop "$OUT/stall-$v-timeline.log"
-  line="$tag: $verdict | uuid $fu | diskutil-mount type '$s3type' (exit $s3) | mount->eject $((t5 - t3)) s${FLCLEARED:+ | cleared by: $FLCLEARED}$via"
-  echo "$line" >> "$FLVER"; echo "# $line"
-  rm -f "$fimg"
-  return "$fok"
+  fl_tl_stop "$OUT/stall-$1-timeline.log"
+  it_line="$it_tag: $it_verdict | uuid $it_fu | diskutil-mount type '$it_s3type' (exit $it_s3) | mount->eject $((it_t5 - it_t3)) s${FLCLEARED:+ | cleared by: $FLCLEARED}$it_via"
+  echo "$it_line" >> "$FLVER"; echo "# $it_line"
+  rm -f "$it_img"
+  return "$it_ok"
 }
-fl_getinfo() {  # NAME (A|B|C): a plain attach of the variant, Get Info screenshot, eject
+fl_finder_restart() { bounded 300 "$AQUA" killall Finder > /dev/null 2>&1; sleep 6; }
+fl_getinfo() {  # NAME: a plain attach, Get Info screenshot, eject
   cp "$W/img/spike-ext4.img" "$W/img/fl.img"
   if fl_plain "$W/img/fl.img" "$W/fl-w.log"; then
-    echo "# variant $1 warm-up: $PA_VERDICT; mount: $(mount | grep -F " on $PA_MP (")"
-    echo "# variant $1 diskutil info: $(diskutil info "$PA_DISK" | grep -i 'personality\|bundle\|visible' | tr -s ' ' | tr '\n' '|')"
-    vn=$(info "$PA_DISK" "Volume Name")
-    bounded 300 "$AQUA" osascript -e 'tell application "Finder" to activate' -e "tell application \"Finder\" to open information window of disk \"$vn\"" > /dev/null 2>&1
-    sleep 4; bounded 300 "$AQUA" screencapture -x "$OUT/fstn-getinfo-$1.png" > /dev/null 2>&1 && ok "round 3 variant $1: Get Info screenshot fstn-getinfo-$1.png" || notok "round 3 variant $1: screencapture"
+    echo "# Get Info $1: $PA_VERDICT; mount: $(mount | grep -F " on $PA_MP (")"
+    echo "# Get Info $1: diskutil info: $(diskutil info "$PA_DISK" | grep -i 'personality\|bundle\|visible' | tr -s ' ' | tr '\n' '|')"
+    gi_vn=$(info "$PA_DISK" "Volume Name")
+    bounded 300 "$AQUA" osascript -e 'tell application "Finder" to activate' -e "tell application \"Finder\" to open information window of disk \"$gi_vn\"" > /dev/null 2>&1
+    sleep 5; bounded 300 "$AQUA" screencapture -x "$OUT/fstn-getinfo-$1.png" > /dev/null 2>&1 && ok "Get Info $1: screenshot fstn-getinfo-$1.png" || notok "Get Info $1: screencapture"
     bounded 300 "$AQUA" osascript -e 'tell application "Finder" to close every information window' > /dev/null 2>&1
-  else notok "round 3 variant $1: warm-up plain attach: $PA_VERDICT"; fi
+  else notok "Get Info $1: warm-up plain attach: $PA_VERDICT"; fi
   fl_eject "$PA_DISK"; rm -f "$W/img/fl.img"
 }
-fl_variant() {  # V BUNDLE FSTYPENAME(1|0)
-  v=$1 vb=$2; fl_set "$3"
+fl_variant() {  # NAME BUNDLE FSTYPENAME(1|0): FL_N_SAME iterations on the image's own UUID, then FL_N_FRESH on fresh UUIDs; fixed counts
+  lv_name=$1 lv_bundle=$2; fl_set "$3"
   da_restart; sleep 10
-  echo "# variant $v: bundle $vb, override $(cat "$FLOV")"
-  fl_getinfo "$v"
-  for mode in same fresh; do
-    n=10; test "$mode" = fresh && n=5
-    FLSTALLS=0; i=0
-    while test "$i" -lt "$n" && test "$FLSTALLS" -lt 4; do i=$((i + 1)); fl_iter "$v" "$i" "$vb" "$mode"; done   # a stall sticks to the UUID: 4 are enough
-    if test "$FLSTALLS" -eq 0; then ok "variant $v ($mode UUID): no stall in $i iterations"; else notok "variant $v ($mode UUID): $FLSTALLS stalls in $i iterations"; fi
-    echo "# STALLS variant $v $mode UUID: $FLSTALLS/$i (of $n planned)"
+  echo "# variant $lv_name: bundle $lv_bundle, override $(cat "$FLOV")"
+  for lv_mode in same fresh; do
+    lv_n=$FL_N_SAME; test "$lv_mode" = fresh && lv_n=$FL_N_FRESH
+    FLSTALLS=0; FLSETUP=0; lv_i=0
+    while test "$lv_i" -lt "$lv_n"; do lv_i=$((lv_i + 1)); fl_iter "$lv_name" "$lv_i" "$lv_bundle" "$lv_mode"; done
+    if test "$FLSTALLS" -eq 0; then ok "variant $lv_name ($lv_mode UUID): no stall in $lv_n iterations"; else notok "variant $lv_name ($lv_mode UUID): $FLSTALLS stalls in $lv_n iterations"; fi
+    test "$FLSETUP" -eq 0 || notok "variant $lv_name ($lv_mode UUID): $FLSETUP iterations did not get set up (not counted as stalls)"
+    echo "# STALLS variant $lv_name $lv_mode UUID: $FLSTALLS/$lv_n (setup failures $FLSETUP)"
   done
 }
 fl_all() {
   cp tests/lib/ext4-newuuid.py "$W/ext4-newuuid.py" 2> /dev/null || cp "$(dirname "$0")/lib/ext4-newuuid.py" "$W/ext4-newuuid.py" || { notok "no ext4-newuuid.py"; return 1; }
   da_debug_on || echo "# no debug DA: going on without"
-  fl_variant A macfuse_ext4 1
-  fl_variant B macfuse_ext4 0
-  if fstn_use_baseline; then fl_variant C linuxfs_ext4 1; else notok "variant C: bundle setup"; fi
+  if fstn_use_baseline 0; then fl_variant D linuxfs_ext4 0; else notok "variant D: bundle setup"; fi
+  if fstn_use_baseline 7; then fl_variant Cprime linuxfs_ext4 1; else notok "variant C': bundle setup"; fi
   fstn_use_macfuse
+  fl_variant A macfuse_ext4 1
   sudo -n rm -f "$FLOV"
   da_debug_off
   sudo -n cp /var/log/diskarbitrationd.log "$OUT/diskarbitrationd.log" 2> /dev/null && sudo -n chown "$(id -un)" "$OUT/diskarbitrationd.log"
   echo "# verdicts:"; sed 's/^/#   /' "$FLVER"
+}
+fl_first_cprime() {  # Get Info of C' (linuxfs_ext4.fs, FSSubType 7, kernel macfuse_ext4) first of all, in a fresh Finder, before any macfuse_ext4 volume was mounted here
+  if fstn_use_baseline 7; then fl_set 1; fl_finder_restart; fl_getinfo Cprime-fresh; sudo -n rm -f "$FLOV"; fstn_use_macfuse
+  else notok "Get Info C': bundle setup"; fi
 }
 fstn_section() {
   echo "# fstypename: macFUSE tools and versions in this install:"
@@ -542,6 +552,7 @@ fstn_section() {
   rec sh -c 'ls /Library/Filesystems /System/Library/Filesystems; ls /usr/local/bin /usr/local/sbin /usr/local/lib 2>/dev/null | grep -i "fuse"'
   rec sh -c 'plutil -p /System/Library/Filesystems/macfuse_ext4.fs/Contents/Info.plist 2>/dev/null || cat /System/Library/Filesystems/macfuse_ext4.fs/Contents/Info.plist'
   gunzip -c "$IN/ext4.img.gz" > "$W/img/spike-ext4.img" || { notok "fstypename: no $IN/ext4.img.gz"; return 1; }
+  fl_first_cprime
   da_attach "$W/img/spike-ext4.img" || { notok "fstypename: hdiutil attach"; disk=$(image_disk "$W/img/spike-ext4.img"); cleanup_disk; return 1; }
   da_wait 300 || { notok "fstypename: DiskArbitration mounted a plain attach within 30 s"; diskutil list | sed 's/^/# /'; rec tail -n 60 /var/log/system.log; cleanup_disk; return 1; }
   ok "fstypename: DiskArbitration mounted a plain attach: $dev at $mp"
@@ -558,6 +569,7 @@ fstn_section() {
   vn=$(info "$dev" "Volume Name"); [ -n "$vn" ] || vn=$(basename "$mp")
   echo "# volume name: '$vn', mount point $mp"
   fstn_finder_kind "$vn" "$mp"
+  fl_finder_restart
   fstn_getinfo_shot "$vn"
   bounded 300 "$AQUA" screencapture -x "$OUT/fstn-desktop.png" > /dev/null 2>&1
   echo "# processes:"; rec sh -c 'ps -axww -o user=,pid=,command= | grep -i "lklfuse\|mount_macfuse" | grep -v grep'
