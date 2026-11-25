@@ -430,7 +430,7 @@ plan "/dev/disk9;ls" "$V/NAME" 2>&1 >/dev/null | grep -q '^linuxfs-mount: refuse
 plan "/dev/disk99999" "$V/NAME" 2>&1 >/dev/null | grep -q '^linuxfs-mount: refused: '; ok $? "root plan: a device that cannot be opened is refused on stderr too"
 # spec: Task 16f (root-daemon design I4, N4) -- one mount per disk at a time: root takes the disk's lock (flock, LOCK_EX|LOCK_NB)
 #       after the names are checked and before the device is opened; another holder means another mount of the disk is under way
-# spec: Task 16f fix round 1 (I1) -- the locks' directory (/var/run/linuxfs: /var/run is root:daemon 0775) is made on demand, root's
+# spec: Task 16f fix rounds 1 and 2 (I1, I1') -- the locks' directory (/var/db/dev.mavergreen.linuxfs.locks; not under /var/run, which is root:daemon 0775) is made on demand, root's
 #       (here: this user's, with this user's group) and 0700, and is checked before each use: a symlink, another mode or another
 #       group is refused, never repaired
 rm -rf "$LK"
