@@ -282,9 +282,9 @@ census_copy() {
   echo "$W/census/$2.img"
 }
 
-# census_dismiss STEP: the console's alerts dismissed: the unsigned-kext one ("not from an identified developer", kextd's
-#   CFUserNotification) is UserNotificationCenter's, a launchd agent that comes back on demand; whether one ran is
-#   appended to $OUT/parity/alerts.txt
+# census_dismiss STEP: the console's alerts dismissed: the unsigned-kext one ("not from an identified developer",
+#   kextd's CFUserNotification) is UserNotificationCenter's, a launchd agent that comes back on demand; whether one
+#   ran is appended to $OUT/parity/alerts.txt
 census_dismiss() {
   mkdir -p "$OUT/parity"
   _cdi_p=$(bounded 100 ps -axww -o pid=,command= 2>/dev/null </dev/null | awk '/UserNotificationCenter/ && !/awk/ { print $1 }' | tr '\n' ' ')
@@ -617,22 +617,28 @@ census_busy_cycles() {
 
 # census_kib FILE: FILE's size in KiB, rounded up (0 when it is missing)
 census_kib() { _ck=$(wc -c <"$1" 2>/dev/null | tr -d ' '); echo $(((${_ck:-0} + 1023) / 1024)); }
-# census_room KIB RECORD: whether $W has room for KIB more and PARITY_FREE_FLOOR_KB besides; df -k's free KiB, the floor
-#   and the lklfuse count are appended to RECORD, and CR_SAID says it. The floor, 2 GiB: what the run still writes after
-#   a census step is at most the next census's copies at once (trash: HFS+, HFSX and xfs, 576 MiB), the before-login
-#   mount and the finish's gzip of $W/img and copyback (under 1 GiB); 2 GiB keeps that with room over.
+# census_room KIB RECORD [FLOOR]: whether $W has room for KIB more and FLOOR (PARITY_FREE_FLOOR_KB) besides; df -k's
+#   free KiB, the floor and the lklfuse count are appended to RECORD, and CR_SAID says it.
+#   PARITY_FREE_FLOOR_KB, 2 GiB, guards census_busy's fresh copies, which stay attached: what the run still writes
+#   after it is at most the next census's copies at once (trash: HFS+, HFSX and xfs, 576 MiB), the before-login mount
+#   and the finish's gzip of $W/img and copyback (under 1 GiB); 2 GiB keeps that with room over.
+#   PARITY_START_FLOOR_KB, 512 MiB, guards the census's start and each step, whose own copies are counted besides (and
+#   removed by census_clean after it): the margin is for the before-login mount and the finish's gzip of $W/img, which
+#   compresses to little, and the copyback.
 PARITY_FREE_FLOOR_KB=${PARITY_FREE_FLOOR_KB:-2097152}
+PARITY_START_FLOOR_KB=${PARITY_START_FLOOR_KB:-524288}
 census_room() {
+  _cro_fl=${3:-$PARITY_FREE_FLOOR_KB}
   mkdir -p "$OUT/parity"
   _cro_f=$(bounded 300 df -P -k "$W" 2>/dev/null </dev/null | awk 'NR == 2 { print $4 }')
   _cro_l=$(bounded 100 ps -axww -o command= 2>/dev/null </dev/null | awk '/lklfuse/ && !/awk/' | grep -c .)
   {
-    echo "# census: df -k $W: ${_cro_f:-unknown} KiB free, floor $PARITY_FREE_FLOOR_KB KiB and $1 KiB to copy"
+    echo "# census: df -k $W: ${_cro_f:-unknown} KiB free, floor $_cro_fl KiB and $1 KiB to copy"
     echo "# census: lklfuse processes now: $_cro_l"
   } >>"$2"
   case $_cro_f in '' | *[!0-9]*) CR_SAID="free space on $W unknown (df -k)"; return 1 ;; esac
-  if test "$_cro_f" -lt $((PARITY_FREE_FLOOR_KB + $1)); then
-    CR_SAID="$_cro_f KiB free on $W, under the floor $PARITY_FREE_FLOOR_KB KiB and $1 KiB to copy"; return 1
+  if test "$_cro_f" -lt $((_cro_fl + $1)); then
+    CR_SAID="$_cro_f KiB free on $W, under the floor $_cro_fl KiB and $1 KiB to copy"; return 1
   fi
   CR_SAID="$_cro_f KiB free on $W"
 }
@@ -924,8 +930,8 @@ census_finder_props() {
     d = f - k[2] * 1024; if (d < 0) d = -d; print "free space equals df -k available (within 1 MiB): " (n == 2 && d < 1048576 ? "yes" : "no")
   }'
 }
-# census_du_fields MP|DEVICE: the fields 10.9's diskutil info prints that bear on Finder's presentation (it has no Removable
-#   Media or Device Location): Protocol, Read-Only Media, Ejectable, Whole and Internal
+# census_du_fields MP|DEVICE: the fields 10.9's diskutil info prints that bear on Finder's presentation (it has no
+#   Removable Media or Device Location): Protocol, Read-Only Media, Ejectable, Whole and Internal
 census_du_fields() { diskutil info "$1" 2>&1 </dev/null | grep -E '^ *(Protocol|Read-Only Media|Ejectable|Whole|Internal):' | sed 's/^ *//; s/:  */: /'; }
 # census_side_dev MP: the device of the pair's volume mounted at MP (diskutil info MP says nothing on linuxfs)
 census_side_dev() { if test "$1" = "$PARITY_CTL_MP"; then echo "$PARITY_CTL_DEV"; else echo "$PARITY_FS_DEV"; fi; }
@@ -1059,7 +1065,8 @@ if put:
 # The sizes, ascending. 10.9's VFS caps an xattr at INT32_MAX (XATTR_MAXSIZE in Kernel.framework's sys/xattr.h, checked
 #   on a 10.9 box), so HFS+ is bounded by its free space, not a size: 4 MiB was accepted on the dev box. 64 MiB and a
 #   byte pass the 64 MiB cap later xnu has, on the control's own space (about 124 MiB free; each size is written
-#   alone); 128 MiB is the whole control image, so HFS+ must refuse it (ENOSPC, or whatever it says). Memory: one 128 MiB value at most; time: bounded by census_bound in census_trash_tags_case.
+#   alone); 128 MiB is the whole control image, so HFS+ must refuse it (ENOSPC, or whatever it says). Memory: one
+#   128 MiB value at most; time: bounded by census_bound in census_trash_tags_case.
 PARITY_XATTR_SIZES=${PARITY_XATTR_SIZES:-131072 131073 262144 1048576 4194304 16777216 67108864 67108865 134217728}
 # census_xattr_big MP: census_py_xattr on MP/big-xattr with PARITY_XATTR_SIZES, to find HFS+'s limit and its error
 census_xattr_big() {
@@ -1171,9 +1178,18 @@ census_due() {
 }
 # census_on FS CMD...: CMD, when there is time and FS's image ($W/img/FS.img); NTFS with NTFSTakeover on, so linuxfs
 #   mounts it rather than Apple's ntfs, and put back as it was after
+# census_step_room IMAGE WHAT...: room on $W for one census step's copies (up to four 128 MiB control copies and two of
+#   IMAGE: spotlight's two passes) over PARITY_START_FLOOR_KB, recorded in census-room.txt; short of it, the step is
+#   skipped and that said
+census_step_room() {
+  _csr_k=$((4 * 131072 + 2 * $(census_kib "$1"))); shift
+  census_room "$_csr_k" "$OUT/parity/census-room.txt" "$PARITY_START_FLOOR_KB" && return 0
+  echo "# census: $CR_SAID, skipped: $*" | tee -a "$OUT/parity/census-room.txt"; return 1
+}
 census_on() {
   census_due "$2" "$1" || return 1
   test -f "$W/img/$1.img" || { echo "# census: no $W/img/$1.img, so no $2 $1"; return 1; }
+  census_step_room "$W/img/$1.img" "$2" "$1" || return 1
   _con_fs=$1; shift
   if test "$_con_fs" = ntfs; then
     _con_old=$(bounded 300 defaults read dev.mavergreen.linuxfs NTFSTakeover 2>/dev/null </dev/null)
@@ -1221,22 +1237,22 @@ census_left_attached() {
 #   as the longest), items 1 and 7 on ext4, btrfs, xfs, f2fs and NTFS, item 4 on ext4 and xfs, item 5 on ext4, item 6 on
 #   those and APFS, item 7's case step on APFS too, then Later. Nothing is begun past PARITY_CENSUS_MIN (135) minutes
 #   from the smoke's start (PARITY_T0; the census's own start without it). Nothing runs when $W lacks room for the
-#   controls, one census's copies and PARITY_FREE_FLOOR_KB (census-room.txt says so).
+#   controls and PARITY_START_FLOOR_KB; a step without room for its own copies is skipped, and the next tried
+#   (census-room.txt says which).
 parity_census_all() {
   : "${PARITY_STALL_N:=50}"
   CA_T0=${PARITY_T0:-$(date +%s)}
-  # room for the four 128 MiB controls and one census's copies at once (two controls and the largest image)
-  ca_big=0; for ca_f in "$W"/img/*.img; do ca_k=$(census_kib "$ca_f"); test "$ca_k" -le "$ca_big" || ca_big=$ca_k; done
-  if ! census_room $((6 * 131072 + ca_big)) "$OUT/parity/census-room.txt"; then
+  # room for the four 128 MiB controls (each step checks its own copies: census_step_room)
+  if ! census_room $((4 * 131072)) "$OUT/parity/census-room.txt" "$PARITY_START_FLOOR_KB"; then
     echo "# census: $CR_SAID: no census" | tee -a "$OUT/parity/census-room.txt"; census_left_attached; return 1
   fi
   for ca_k in hfs hfsx fat32 exfat; do parity_control "$ca_k" >/dev/null || echo "# census: cannot make the $ca_k control"; done
-  census_due census_stall && { census_stall; census_clean; }
+  census_due census_stall && census_step_room "$W/img/ext4.img" census_stall && { census_stall; census_clean; }
   for ca_fs in ext4 btrfs xfs f2fs ntfs; do census_on "$ca_fs" census_unicode "$ca_fs"; done
   for ca_fs in ext4 xfs; do census_on "$ca_fs" census_busy "$ca_fs"; done
   census_on ext4 census_spotlight ext4
   for ca_fs in ext4 btrfs xfs f2fs ntfs apfs; do census_on "$ca_fs" census_finder "$ca_fs"; done
   for ca_fs in ext4 btrfs xfs f2fs ntfs apfs; do census_on "$ca_fs" census_trash_tags_case "$ca_fs"; done
-  census_due census_later && { census_later; census_clean; }
+  census_due census_later && census_step_room "$W/img/ext4.img" census_later && { census_later; census_clean; }
   census_left_attached
 }

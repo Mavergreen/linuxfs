@@ -382,6 +382,12 @@ defaults)
   delete:NTFSTakeover) rm -f "$STUB/takeover" ;;
   read:NTFSTakeover) cat "$STUB/takeover" 2> /dev/null || exit 1 ;;
   esac ;;
+df)
+  # $STUB/df-free, when there: its first line is the free KiB df -P -k gives, the line dropped while others follow
+  if test -f "$STUB/df-free"; then
+    v=$(sed -n 1p "$STUB/df-free"); test "$(wc -l < "$STUB/df-free")" -le 1 || sed -i.x 1d "$STUB/df-free"; rm -f "$STUB/df-free.x"
+    echo "Filesystem 1024-blocks Used Available Capacity Mounted on"; echo "stub 99999999999 0 $v 0% /"
+  else exec /bin/df "$@"; fi ;;
 xattr)
   case $1 in -l) echo "com.apple.FinderInfo: stub" ;; -px) echo "00 00 04 00" ;; esac ;;
 guest-macosx-aqua)
@@ -399,7 +405,7 @@ esac
 exit 0
 EOF
 chmod +x "$T/bin/stub"
-for c in hdiutil diskutil osascript sudo sysctl mkfile linuxfs mdutil mdfind tmutil defaults xattr; do ln -sf stub "$T/bin/$c"; done
+for c in hdiutil diskutil osascript sudo sysctl mkfile linuxfs mdutil mdfind tmutil defaults xattr df; do ln -sf stub "$T/bin/$c"; done
 rm -f "$T/aqua/guest-macosx-aqua"; ln -sf ../bin/stub "$T/aqua/guest-macosx-aqua"
 expect census_aqua_off_path not command -v guest-macosx-aqua
 L=$T/bin/linuxfs; IN=$T/in
@@ -407,7 +413,7 @@ rm -rf "$W/ctl" "$OUT/parity"; mkdir -p "$W/img"
 for f in ext4 btrfs xfs ntfs apfs; do echo "$f image" > "$W/img/$f.img"; done
 echo names | gzip -c > "$IN/ext4-names.img.gz"
 unbounded=$T/unbounded; : > "$unbounded"
-PARITY_XATTR_SIZES="131072 131073 262144"; PARITY_FREE_FLOOR_KB=1
+PARITY_XATTR_SIZES="131072 131073 262144"; PARITY_FREE_FLOOR_KB=1 PARITY_START_FLOOR_KB=1
 
 # census_xattr_sizes: by default the probe climbs past 10.9's XATTR_MAXSIZE-free HFS+ to a size no 128 MiB control holds
 r=$(unset PARITY_XATTR_SIZES; . "$here/lib/parity.sh"; echo "$PARITY_XATTR_SIZES")
@@ -732,12 +738,31 @@ expect census_all_cleans test ! -e "$W/census/old.img" -a -e "$W/census/left-stu
 r=$(PARITY_CENSUS_MIN=0; census_stall() { echo stall >> "$ran"; }; census_later() { echo later >> "$ran"; }; parity_census_all 2>&1)
 expect census_all_out_of_time test ! -s "$ran"
 expect census_all_out_of_time_said has "$r" "^# census: out of time (0 min), skipped: census_stall"
-# before any copy, $W's free space is checked and recorded; under the floor and the census's own copies, nothing runs
-: > "$ran"
-r=$(PARITY_FREE_FLOOR_KB=999999999999; census_stall() { echo stall >> "$ran"; }; census_later() { echo later >> "$ran"; }; parity_census_all 2>&1)
+# before any copy, $W's free space is checked and recorded, against PARITY_START_FLOOR_KB (not busy's 2 GiB floor);
+#   with no room for the controls, nothing runs
+: > "$ran"; : > "$P/census-room.txt"
+r=$(PARITY_START_FLOOR_KB=999999999999; census_stall() { echo stall >> "$ran"; }; census_later() { echo later >> "$ran"; }; parity_census_all 2>&1)
 expect census_all_room_short test ! -s "$ran"
 expect census_all_room_said has "$r" "^# census: .* KiB free on .*, under the floor .*: no census"
 expect census_all_room_recorded grep -q '^# census: df -k .* KiB free, floor 999999999999 KiB and [0-9]* KiB to copy' "$P/census-room.txt"
+: > "$ran"
+r=$(PARITY_FREE_FLOOR_KB=999999999999; census_stall() { echo stall >> "$ran"; }; census_later() { echo later >> "$ran"; }; PARITY_STALL_N=0; parity_census_all 2>&1)
+expect census_all_room_busy_floor_apart test "$(head -n 1 "$ran")" = stall
+# room for the controls but not for a step's copies: that step is skipped and said, the census goes on to the next
+#   (19 steps: the stub images lack f2fs)
+: > "$ran"; : > "$P/census-room.txt"; printf '%s\n' 99999999 1 > "$S/df-free"
+r=$(
+  census_stall() { echo stall >> "$ran"; }; census_unicode() { echo "unicode $1" >> "$ran"; }; census_busy() { echo "busy $1" >> "$ran"; }
+  census_spotlight() { echo "spotlight $1" >> "$ran"; }; census_finder() { echo "finder $1" >> "$ran"; }
+  census_trash_tags_case() { echo "ttc $1" >> "$ran"; }; census_later() { echo later >> "$ran"; }
+  PARITY_START_FLOOR_KB=524288; parity_census_all 2>&1
+)
+rm -f "$S/df-free"
+expect census_all_step_room_short test ! -s "$ran"
+expect census_all_step_room_said_stall has "$r" "^# census: 1 KiB free on .*, under the floor 524288 KiB .*, skipped: census_stall$"
+expect census_all_step_room_said_each test "$(printf '%s\n' "$r" | grep -c ', skipped: census_')" -eq 19
+expect census_all_step_room_recorded test "$(grep -c ', skipped: census_' "$P/census-room.txt")" -eq 19
+expect census_all_step_room_controls test -f "$W/ctl/hfs.img"
 : > "$ran"
 r=$(census_stall() { echo stall >> "$ran"; }; census_later() { echo later >> "$ran"; }; PARITY_CENSUS_MIN=0; parity_census_all 2>&1)
 expect census_all_room_ok grep -q '^# census: df -k .* KiB free, floor 1 KiB' "$P/census-room.txt"
