@@ -484,26 +484,38 @@ PARITY_XATTR_SIZES="131072 131073 262144"; PARITY_FREE_FLOOR_KB=1 PARITY_START_F
 # census_xattr_sizes: by default the probe climbs past 10.9's XATTR_MAXSIZE-free HFS+ to a size no 128 MiB control holds
 r=$(unset PARITY_XATTR_SIZES; . "$here/lib/parity.sh"; echo "$PARITY_XATTR_SIZES")
 expect census_xattr_sizes_default test "$r" = "131072 131073 262144 1048576 4194304 16777216 67108864 67108865 134217728"
-# census_py_xattr: the sizes in order, stopping at the first refusal, which is said
-r=$("$PARITY_PYTHON" -c "$census_py_xattr" "$T/no-such-file" 131072 262144 2>&1)
-expect census_py_xattr_stops test "$(printf '%s\n' "$r" | sed 's/errno 2 .*/errno 2/')" = "$(printf '%s\n' '131072 bytes: errno 2' 'stopped at the first refusal')" -o "$r" = "$(printf '%s\n' '131072 bytes: no setxattr in this Python' '262144 bytes: no setxattr in this Python')"
-# each size is written on its own space: the attribute is removed before each write (a fake xattr module logs the calls),
-#   and a refusal (ENOSPC here) stops the climb
-mkdir -p "$T/pyx"; : > "$T/pyx.log"; : > "$T/pyx-file"
+# census_py_xattr, against a fake xattr module on PYTHONPATH (not the host's filesystem or xattr module: the CI runner's
+#   differ): it logs its calls, raises KeyError on a remove (as 10.9's module does when there is none), and refuses a
+#   value of PYX_REFUSE_AT bytes or more with errno PYX_ERRNO. Each case prints what it got when it fails.
+mkdir -p "$T/pyx"; : > "$T/pyx-file"
 cat > "$T/pyx/xattr.py" <<'EOF'
-import errno, os
+import os
 def _log(s):
     f = open(os.environ["PYX_LOG"], "a"); f.write(s + "\n"); f.close()
 def setxattr(p, n, v, options=0):
     _log("set %d" % len(v))
-    if len(v) >= 3: raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+    if len(v) >= int(os.environ["PYX_REFUSE_AT"]):
+        e = int(os.environ["PYX_ERRNO"]); raise OSError(e, os.strerror(e))
 def removexattr(p, n, options=0):
     _log("remove")
-    raise KeyError(n)   # as 10.9's module does when there is none
+    raise KeyError(n)
 EOF
-r=$(PYX_LOG=$T/pyx.log PYTHONPATH=$T/pyx "$PARITY_PYTHON" -c "$census_py_xattr" "$T/pyx-file" 1 2 3 4 2>&1)
-expect census_py_xattr_each_alone test "$(tr '\n' ' ' < "$T/pyx.log")" = "remove set 1 remove set 2 remove set 3 remove "
-expect census_py_xattr_enospc_stops test "$(printf '%s\n' "$r" | sed 's/ (.*//')" = "$(printf '%s\n' '1 bytes: ok' '2 bytes: ok' '3 bytes: errno 28' 'stopped at the first refusal')"
+pyx() { # REFUSE-AT ERRNO SIZE...: census_py_xattr on the fake module; its output, the calls in $T/pyx.log
+  : > "$T/pyx.log"
+  _r=$1 _e=$2; shift 2
+  PYX_LOG=$T/pyx.log PYX_REFUSE_AT=$_r PYX_ERRNO=$_e PYTHONPATH=$T/pyx "$PARITY_PYTHON" -c "$census_py_xattr" "$T/pyx-file" "$@" 2>&1
+}
+said() { # NAME GOT WANT: expect GOT = WANT, and when not, both shown
+  if test "$2" = "$3"; then echo "ok - $1"; else echo "not ok - $1"; fails=$((fails + 1)); echo "# got:"; printf '%s\n' "$2" | sed 's/^/#   /'; echo "# want:"; printf '%s\n' "$3" | sed 's/^/#   /'; fi
+}
+# the sizes in order, stopping at the first refusal (ENOENT here), which is said; no larger size is tried
+r=$(pyx 131072 2 131072 262144)
+said census_py_xattr_stops "$(printf '%s\n' "$r" | sed 's/ (.*//')" "$(printf '%s\n' '131072 bytes: errno 2' 'stopped at the first refusal')"
+said census_py_xattr_stops_untried "$(tr '\n' ' ' < "$T/pyx.log")" "remove set 131072 remove "
+# each size is written on its own space: the attribute is removed before each write, and ENOSPC stops the climb
+r=$(pyx 3 28 1 2 3 4)
+said census_py_xattr_each_alone "$(tr '\n' ' ' < "$T/pyx.log")" "remove set 1 remove set 2 remove set 3 remove "
+said census_py_xattr_enospc_stops "$(printf '%s\n' "$r" | sed 's/ (.*//')" "$(printf '%s\n' '1 bytes: ok' '2 bytes: ok' '3 bytes: errno 28' 'stopped at the first refusal')"
 rm -rf "$T/pyx" "$T/pyx.log" "$T/pyx-file"
 
 # census_py_create: a name that cannot be made says its errno, and the next name is still tried
