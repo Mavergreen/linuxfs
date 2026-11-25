@@ -6,13 +6,17 @@
  * Its environment, arguments, open descriptors and pid go to ARGV0.log; ARGV0.mode, when present, changes what it does:
  *   status N   send N (an errno) instead of 0      nofd     never send the device; sleep 30 s
  *   nostatus   send the device, never a status; sleep 30 s
- *   linger     status 0, then sleep 30 s           stubborn   the same, ignoring SIGTERM
+ *   linger     status 0, then sleep 30 s, leaving an heir (logs "heir PID") that keeps its descriptors but 0-2 for 7 s
+ *   stubborn   status 0, then sleep 30 s, ignoring SIGTERM
  *   hold       keep its own copy of the device and send no status, as mount_macfuse blocked in mount(2) on INIT may; sleep 30 s
  *   holdstubborn   the same, ignoring SIGTERM (with LINUXFS_FS_TEST_NOKILL root's SIGKILL is a no-op: one that outlives it)
  *   delay      as normal, but 4 s before the device is sent
  *   partial    2 of the status's 4 bytes, then nothing; sleep 30 s
  *   twofds     two descriptors in one message, ignoring SIGTERM; logs "closed by root N" for how many root closed within 1.5 s
  *   foreign    attach ARGV0.img (hdiutil) on MNT, then status 5: a volume on MNT that is not this mount
+ *   mounted N  append root's mount of FSNAME on MNT to ARGV0.mnttab (TYPE<TAB>FROM<TAB>ON<TAB>OWNER, as macfuse_ext4, owner 0),
+ *              then send the device and status N: a mount that did land, for a request that failed
+ * Each open descriptor's path, where it has one, is logged too: "fdpath N PATH".
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -56,7 +60,20 @@ int main(int argc, char **argv)
 		if (fd != fileno(log) && fcntl(fd, F_GETFD) >= 0)
 			fprintf(log, " %d", fd);
 	fprintf(log, "\n");
+	for (fd = 0; fd < 256; fd++)
+		if (fd != fileno(log) && fcntl(fd, F_GETPATH, path) == 0)
+			fprintf(log, "fdpath %d %s\n", fd, path);
 	fflush(log);
+	if (strncmp(mode, "mounted ", 8) == 0) {
+		const char *fsn = argc > 2 ? strstr(argv[2], "fsname=") : NULL;
+		FILE *t;
+
+		snprintf(path, sizeof path, "%s.mnttab", argv[0]);
+		if (!fsn || (t = fopen(path, "a")) == NULL)
+			return 78;
+		fprintf(t, "macfuse_ext4\t%.*s\t%s\t0\n", (int)strcspn(fsn + 7, ","), fsn + 7, argv[argc - 1]);
+		fclose(t);
+	}
 	e = getenv("_FUSE_COMMFD");
 	if (!e)
 		return 71;
@@ -184,6 +201,8 @@ int main(int argc, char **argv)
 			st = ENOTCONN;	/* every holder closed it: no daemon answered */
 		else if (strncmp(mode, "status ", 7) == 0)
 			st = atoi(mode + 7);
+		else if (strncmp(mode, "mounted ", 8) == 0)
+			st = atoi(mode + 8);
 	}
 	fprintf(log, "status %d\n", (int)st);
 	fflush(log);
@@ -191,6 +210,22 @@ int main(int argc, char **argv)
 		return 76;
 	if (strcmp(mode, "stubborn") == 0)
 		signal(SIGTERM, SIG_IGN);
+	if (strcmp(mode, "linger") == 0) {
+		pid_t h = fork();
+
+		if (h == 0) {	/* what the mount program's own children inherit, held past its exit: the disk's lock among them */
+			int nul = open("/dev/null", O_RDWR);
+
+			dup2(nul, 0);
+			dup2(nul, 1);
+			dup2(nul, 2);
+			fclose(log);
+			sleep(7);
+			_exit(0);
+		}
+		fprintf(log, "heir %d\n", (int)h);
+		fflush(log);
+	}
 	if (strcmp(mode, "linger") == 0 || strcmp(mode, "stubborn") == 0)
 		sleep(30);
 	return 0;

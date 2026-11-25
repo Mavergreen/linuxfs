@@ -12,7 +12,7 @@ D=$HOME/Library/Caches/mm-build/linuxfs-fs-test; rm -rf "$D"; mkdir -p "$D"
 CL=$(sh "$SHIPYARD_SCRIPTS/fetch_clang22.sh" "$ROOT/components/clang22" 2>/dev/null) || exit 1
 SDK=$(sh "$SHIPYARD_SCRIPTS/fetch_sdk.sh" 2>/dev/null) || exit 1
 "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN \
-  -o "$D/linuxfs-fs" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" \
+  -o "$D/linuxfs-fs" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" "$ROOT/tools/trust.c" \
   -framework CoreFoundation -framework DiskArbitration || exit 1
 for n in macfuse_ext4.util macfuse_ntfs.util macfuse_btrfs.util fsck_macfuse_ext4 mount_macfuse_ext4 bogus.util; do cp "$D/linuxfs-fs" "$D/$n"; done
 sh "$ROOT/build/linux-host.sh" sh -c "cd '$D' && sh '$ROOT/tests/lib/probe-images.sh' '$D' && blkid -s UUID -o value ext4.img > ext4.uuid && blkid -s UUID -o value btrfs.img > btrfs.uuid" || exit 1
@@ -354,18 +354,20 @@ done
 #           the drop; it prints the plan instead of dropping and exec'ing) stands in. The shipped build has no such code.
 mkdir -p "$D/drop"
 "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN \
-  -DLINUXFS_FS_TEST_DROP -o "$D/drop/mount_macfuse_ext4" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" \
+  -DLINUXFS_FS_TEST_DROP -o "$D/drop/mount_macfuse_ext4" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" "$ROOT/tools/trust.c" \
   -framework CoreFoundation -framework DiskArbitration || exit 1
 DM=$D/drop/mount_macfuse_ext4
 mkdir -p "$D/short"
 "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN \
-  -DLINUXFS_FS_TEST_DROP -DOPTS_MAX=60 -o "$D/short/mount_macfuse_ext4" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" \
+  -DLINUXFS_FS_TEST_DROP -DOPTS_MAX=60 -o "$D/short/mount_macfuse_ext4" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" "$ROOT/tools/trust.c" \
   -framework CoreFoundation -framework DiskArbitration || exit 1
 V=$D/vols; rm -rf "$V"; mkdir -p "$V/NAME" "$V/other"; : > "$V/file"; ln -s "$V/NAME" "$V/link"
 H=/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d
 UID_D=$(id -u daemon)
+# the disks' locks (root's are /var/run/dev.mavergreen.linuxfs.mount.<bsd>.lock)
+LK=$D/locks; rm -rf "$LK"; mkdir -p "$LK"; LKF=$LK/dev.mavergreen.linuxfs.mount.$E.lock
 plan() { # ARGS...: the drop build's plan for user daemon, volumes under $V
-  env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_PREFS_USER="$D/none.plist" \
+  env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_FS_TEST_LOCKDIR="$LK" LINUXFS_PREFS_USER="$D/none.plist" \
     LINUXFS_PREFS_MACHINE="${MACHP:-$D/none2.plist}" "$DM" "$@"; }
 # spec: tools/fs.c mount_as_root -- with a macFUSE whose libfuse serves /dev/fd/N (Mavergreen's manifest at or past the first
 #       release that ships it), root runs mount_macfuse itself (allow_other is root's to give), takes the device it sends, and
@@ -378,7 +380,7 @@ cp "$MF/5.5.0-mavericks.2.plist" "$MF/writable.plist"; chmod 664 "$MF/writable.p
 HELPER=/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse
 fplan() { # MANIFEST ARGS...: the drop build's plan with that macFUSE manifest (COMMFD's number as N)
   mf=$1; shift
-  env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_FS_TEST_MACFUSE="$mf" LINUXFS_FS_TEST_TRUST_ROOT="$D" LINUXFS_PREFS_USER="$D/none.plist" \
+  env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_FS_TEST_LOCKDIR="$LK" LINUXFS_FS_TEST_MACFUSE="$mf" LINUXFS_FS_TEST_TRUST_ROOT="$D" LINUXFS_PREFS_USER="$D/none.plist" \
     LINUXFS_PREFS_MACHINE="${MACHP:-$D/none2.plist}" ${FP_ENV:-} "$DM" "$@" > "$M/fplan.out"; frc=$?
   sed 's/^helper-env _FUSE_COMMFD=[0-9][0-9]*$/helper-env _FUSE_COMMFD=N/' "$M/fplan.out"; return $frc; }
 fwant() { # RW HELPER-OPTIONS DEV MNT [ARGV-FLAGS]: the plan the brief prescribes for root's mount
@@ -398,7 +400,7 @@ fwant rw "allow_other,nosuid,nodev,local,volname=NAME,fsname=/dev/$E,noappledoub
 [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root plan: a device named without /dev/ is accepted and passed as /dev/DEV (rc $rc)"
 # spec: item 6 (fsname=/dev/<bsd>) -- root's mount is named for its disk, as HFS+'s is, so DiskArbitration and Finder tie it to the disk
 grep -q "^helper-argv .*,fsname=/dev/$E,noappledouble," "$M/plan"; ok $? "root plan: mount_macfuse's -o holds fsname=/dev/$E ($(grep '^helper-argv a' "$M/plan"))"
-env -i LINUXFS_FS_TEST_USER=no_such_user_xyz LINUXFS_FS_TEST_VOLUMES="$V" "$DM" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
+env -i LINUXFS_FS_TEST_USER=no_such_user_xyz LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_FS_TEST_LOCKDIR="$LK" "$DM" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
 [ $rc = 1 ] && [ ! -s "$M/plan" ] || { [ $rc = 1 ] && ! grep -q '^env' "$M/plan"; }; ok $? "root plan: no _linuxfs user: exit 1, nothing planned (rc $rc)"
 for bad_dev in "/dev/disk" "/dev/disk9s" "/dev/../etc/passwd" "/dev/disk9;ls" "/dev/rdisk9" "disk9/../disk8" "/dev/disk9 " "/dev/disk9s1s2" "/dev/tty" "" "/dev/disk$(printf '9%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34)"; do
   plan "$bad_dev" "$V/NAME" > "$M/plan" 2>&1; rc=$?
@@ -410,14 +412,50 @@ for bad_mnt in "/tmp/NAME" "$V" "$V/" "$V/NAME/" "$V/NAME/sub" "$V/." "$V/.." "$
 done
 # spec: tools/fs.c -- a directory under the volumes directory that root does not own (here: that this user does not own)
 mkdir -p "$D/vols2"
-env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES=/private/var "$DM" "/dev/$E" /private/var/empty > "$M/plan" 2>&1; rc=$?
+env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES=/private/var LINUXFS_FS_TEST_LOCKDIR="$LK" "$DM" "/dev/$E" /private/var/empty > "$M/plan" 2>&1; rc=$?
 [ $rc = 1 ] && ! grep -q '^mnt' "$M/plan"; ok $? "root plan: a mount point not owned by the expected owner is refused (rc $rc)"
-# spec: tools/fs.c -- the mount point must be on the volumes directory's device: /dev (devfs) is not on /'s
-env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES=/ "$DM" "/dev/$E" /dev > "$M/plan" 2>&1; rc=$?
+# spec: tools/fs.c -- the mount point must be on the volumes directory's device: /dev (devfs) is not on /'s. /dev is itself a mount
+#       point, which Task 16f's "nothing mounted already" refuses first, so the mount table here is an empty one
+: > "$M/empty.mnttab"
+env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES=/ LINUXFS_FS_TEST_LOCKDIR="$LK" LINUXFS_FS_TEST_MNTTAB="$M/empty.mnttab" "$DM" "/dev/$E" /dev > "$M/plan" 2>&1; rc=$?
 [ $rc = 1 ] && ! grep -q '^mnt' "$M/plan" && grep -q 'another volume' "$M/plan"; ok $? "root plan: a mount point on another device than the volumes directory is refused (rc $rc: $(tail -1 "$M/plan"))"
 # spec: tools/fs.c -- every refusal is on stderr (and syslog) with a reason
 plan "/dev/disk9;ls" "$V/NAME" 2>&1 >/dev/null | grep -q '^linuxfs-mount: refused: '; ok $? "root plan: a refusal writes its reason to stderr"
 plan "/dev/disk99999" "$V/NAME" 2>&1 >/dev/null | grep -q '^linuxfs-mount: refused: '; ok $? "root plan: a device that cannot be opened is refused on stderr too"
+# spec: Task 16f (root-daemon design I4, N4) -- one mount per disk at a time: root takes the disk's lock (flock, LOCK_EX|LOCK_NB)
+#       after the names are checked and before the device is opened; another holder means another mount of the disk is under way
+hold() { # SECONDS: a perl that holds the disk's lock that long, in the background ($holder); waits, bounded, until it does
+  rm -f "$M/held"
+  /usr/bin/perl -MFcntl=:flock -e 'open(my $f, ">>", $ARGV[0]) or exit 1; flock($f, LOCK_EX) or exit 1; open(my $h, ">", $ARGV[1]) or exit 1; close $h; sleep $ARGV[2]' \
+    "$LKF" "$M/held" "$1" & holder=$!
+  i=0; while test ! -e "$M/held" && test $i -lt 50; do sleep 0.1; i=$((i + 1)); done; }
+lockfree() { /usr/bin/perl -MFcntl=:flock -e 'open(my $f, "<", $ARGV[0]) or exit 1; flock($f, LOCK_EX | LOCK_NB) or exit 1' "$LKF"; }
+hold 5
+fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc=$?
+kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+test $rc = 1 && grep -qx "linuxfs-mount: refused: another mount of $E is under way" "$M/plan.err" && ! grep -q '^fd3' "$M/plan"
+ok $? "root plan: the disk's lock held → refused, \"another mount of\", nothing opened (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
+rm -f "$LKF" "$D/lock-target"; ln -s "$D/lock-target" "$LKF"
+fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc=$?
+test $rc = 1 && grep -q '^linuxfs-mount: refused: ' "$M/plan.err" && ! grep -q '^fd3' "$M/plan" && test ! -e "$D/lock-target"
+ok $? "root plan: a symlink where the lock file goes → refused, nothing created through it (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
+rm -f "$LKF"
+fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
+test $rc = 0 && test -f "$LKF" && test ! -L "$LKF" && test "$(stat -f %Lp "$LKF")" = 600 && lockfree
+ok $? "root plan: the lock is free again after a plan (rc $rc, $(ls -l "$LKF" 2>&1))"
+# spec: Task 16f -- nothing mounted already: anything on MNT, or anything from /dev/<bsd> (any type, anywhere), refuses the request
+#       before the device is opened (the drop build reads LINUXFS_FS_TEST_MNTTAB, TYPE<TAB>FROM<TAB>ON<TAB>OWNER, for the table)
+tabplan() { # MNTTAB-LINE: the plan against a mount table of that line
+  printf '%s\n' "$1" > "$M/mnttab"
+  FP_ENV="LINUXFS_FS_TEST_MNTTAB=$M/mnttab" fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc=$?; }
+tabplan "$(printf 'macfuse_ext4\t/dev/disk99\t%s\t0' "$V/NAME")"
+test $rc = 1 && grep -q "^linuxfs-mount: refused: something is mounted on .* or from /dev/$E already\$" "$M/plan.err" && ! grep -q '^fd3' "$M/plan"
+ok $? "root plan: a mount on MNT → refused (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
+tabplan "$(printf 'hfs\t/dev/%s\t/Volumes/other\t501' "$E")"
+test $rc = 1 && grep -q '^linuxfs-mount: refused: something is mounted' "$M/plan.err" && ! grep -q '^fd3' "$M/plan"
+ok $? "root plan: a mount from /dev/$E elsewhere → refused (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
+tabplan "$(printf 'hfs\t/dev/%s1\t/Volumes/other\t0\nhfs\t/dev/disk0s2\t%s/other\t0\nhfs\t/dev/r%s\t/x\t0' "$E" "$V" "$E")"
+test $rc = 0 && grep -q '^fd3' "$M/plan"; ok $? "root plan: other mounts (/dev/${E}1, another mount point, /dev/r$E) do not refuse it (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
 # spec: tools/fs.c -- test environment overrides are not honoured by the mount role's environment; the shipped build has no test code at all
 FP_ENV="LINUXFS_CLI=/bin/false LINUXFS_OPEN=/bin/false LINUXFS_LKLFUSE=/bin/false" fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1
 grep -qx "env LINUXFS_OPEN=$H/linuxfs-open" "$M/plan" && grep -qx "env LINUXFS_LKLFUSE=$H/lklfuse" "$M/plan"; ok $? "root plan: a caller's LINUXFS_OPEN and LINUXFS_LKLFUSE are not passed on"
@@ -518,7 +556,7 @@ hs() { # HELPER-MODE CLI-MODE [WAIT]: root's mount with both stand-ins; status i
   rm -f "$D/drop/mhelper.log" "$M/fdcli.log"
   if [ -n "$1" ]; then echo "$1" > "$D/drop/mhelper.mode"; else rm -f "$D/drop/mhelper.mode"; fi
   echo "$2" > "$M/fdcli.mode"
-  env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" \
+  env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_FS_TEST_LOCKDIR="$LK" \
     LINUXFS_FS_TEST_MOUNT_HELPER="${HS_HELPER:-$D/drop/mhelper}" LINUXFS_FS_TEST_ROOT_CLI="$M/fdcli" LINUXFS_FS_TEST_TRUST_ROOT="$D" \
     LINUXFS_FS_TEST_MACFUSE="${HS_MANIFEST:-$MF/5.5.0-mavericks.2.plist}" ${3:+LINUXFS_FS_TEST_WAIT=$3} ${HS_ENV:-} \
     ${HS_WRAP:-} "$DM" "/dev/$E" "$V/NAME" 7</dev/null > "$M/plan" 2>&1; rc=$?; }
@@ -532,13 +570,21 @@ grep -qx LINUXFS_FUSE_FD=4 "$M/fdcli.log" && grep -qx LINUXFS_FUSE_CHAN=6 "$M/fd
 hfd=$(sed -n 's/^env _FUSE_COMMFD=//p' "$D/drop/mhelper.log")
 [ "$(grep '^env ' "$D/drop/mhelper.log" | sort | tr '\n' ' ')" = "$(printf 'env _FUSE_CALL_BY_LIB=1\nenv _FUSE_COMMFD=%s\nenv _FUSE_COMMVERS=2\nenv _FUSE_DAEMON_PATH=%s/lklfuse\n' "$hfd" "$H" | sort | tr '\n' ' ')" ]
 ok $? "the helper's environment is the handshake's four variables and nothing else ($(grep '^env ' "$D/drop/mhelper.log" | tr '\n' ' '))"
-[ "$(sed -n 's/^fds //p' "$D/drop/mhelper.log")" = "0 1 2 $hfd" ]; ok $? "the helper holds 0-2 and its socket only, never the disk ($(sed -n 's/^fds //p' "$D/drop/mhelper.log"))"
+lfd=$(awk -v p="$LKF" '$1 == "fdpath" && $3 == p { print $2 }' "$D/drop/mhelper.log")
+test "$(sed -n 's/^fds //p' "$D/drop/mhelper.log" | tr ' ' '\n' | grep -vx "$lfd" | sort -n | tr '\n' ' ')" = "$(printf '0\n1\n2\n%s\n' "$hfd" | sort -n | tr '\n' ' ')"
+ok $? "the helper holds 0-2, its socket and the disk's lock only, never the disk ($(sed -n 's/^fds //p' "$D/drop/mhelper.log"); lock on '$lfd')"
+# spec: Task 16f (design N4) -- the lock is not close-on-exec: mount_macfuse inherits it through the loop that closes the rest, and the CLI
+#       closes it before it becomes _linuxfs, so nothing of _linuxfs's ever holds a disk root believes free
+test -n "$lfd" && ! grep -q "^fdpath .*dev\.mavergreen\.linuxfs\.mount\." "$M/fdcli.log" && grep -q "^fdpath 3 /dev/r$E\$" "$M/fdcli.log"
+ok $? "root plan (helper stand-in): the CLI does not hold the lock, mount_macfuse does (helper's lock fd '$lfd'; CLI's $(grep '^fdpath' "$M/fdcli.log" | tr '\n' ' '))"
 [ "$(grep '^argv ' "$D/drop/mhelper.log" | tr '\n' '|')" = "argv -o|argv allow_other,nosuid,nodev,local,volname=NAME,fsname=/dev/$E,noappledouble,fstypename=ext4,fssubtype=7|argv $V/NAME|" ]; ok $? "the helper's argv is -o OPTIONS MNT"
 # spec: tools/fs.c mount_by_root -- every other descriptor is closed: descriptors the mount program inherited (3, 4, 5, 9) are gone
 #       in the CLI and in the helper, and with stdin closed the device still lands on fd 3 and nothing on 0-2
 hs "" ok 4</dev/null 5</dev/null 9</dev/null 3</dev/null; fdl=$(sed -n 's/^fds: //p' "$M/fdcli.log" | sed 's/ *255//')
-[ $rc = 0 ] && [ "$fdl" = "3 6:sock" ] && [ "$(sed -n 's/^fds //p' "$D/drop/mhelper.log")" = "0 1 2 $(sed -n 's/^env _FUSE_COMMFD=//p' "$D/drop/mhelper.log")" ]
-ok $? "inherited descriptors 3, 4, 5, 9 are gone: the CLI holds the disk on 3 and its channel on 6 only, the helper its socket only (rc $rc, CLI fds '$fdl')"
+lfd=$(awk -v p="$LKF" '$1 == "fdpath" && $3 == p { print $2 }' "$D/drop/mhelper.log")
+hfds=$(sed -n 's/^fds //p' "$D/drop/mhelper.log" | tr ' ' '\n' | grep -vx "$lfd" | sort -n | tr '\n' ' ')
+[ $rc = 0 ] && [ "$fdl" = "3 6:sock" ] && test -n "$lfd" && test "$hfds" = "$(printf '0\n1\n2\n%s\n' "$(sed -n 's/^env _FUSE_COMMFD=//p' "$D/drop/mhelper.log")" | sort -n | tr '\n' ' ')"
+ok $? "inherited descriptors 3, 4, 5, 9 are gone: the CLI holds the disk on 3 and its channel on 6 only, the helper its socket and the disk's lock only (rc $rc, CLI fds '$fdl', helper's '$hfds' and lock '$lfd')"
 hs "" ok <&-; fdl=$(sed -n 's/^fds: //p' "$M/fdcli.log" | sed 's/ *255//')
 [ $rc = 0 ] && [ "$fdl" = "3 6:sock" ]; ok $? "with stdin closed the device still lands on fd 3 and nothing else is open (rc $rc, fds '$fdl')"
 hs "status 5" ok
@@ -579,8 +625,16 @@ lp=$(sed -n 's/^lingerer //p' "$M/fdcli.log")
 [ -z "$lp" ] || kill "$lp" 2>/dev/null
 # spec: tools/fs.c mount_by_root -- mount_macfuse still running 2 s after a good mount: SIGTERM, then SIGKILL 1 s later; reaped
 s0=$(date +%s); hs linger ok; t=$(( $(date +%s) - s0 ))
-hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
+hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log"); heir=$(sed -n 's/^heir //p' "$D/drop/mhelper.log")
 [ $rc = 0 ] && [ -n "$hp" ] && gone "$hp" && [ $t -ge 2 ] && [ $t -lt 6 ]; ok $? "a mount_macfuse that lingers after a good mount is stopped and reaped: no root helper left (rc $rc, $t s)"
+# spec: Task 16f (design I4) -- the lock lives as long as anything of root's for the mount does: mount_macfuse's own child (the heir,
+#       7 s) outlives the program by about 5 s, and until it ends a second request for the disk is refused; then it is accepted
+s0=$(date +%s); hs "" ok; t=$(( $(date +%s) - s0 ))
+test -n "$heir" && ps -p "$heir" > /dev/null && test $rc = 1 && grep -qx "linuxfs-mount: refused: another mount of $E is under way" "$M/plan" && test ! -e "$M/fdcli.log"
+ok $? "root plan (helper stand-in): mount_macfuse holds the lock: while its heir lives a second request is refused (rc $rc, $t s, heir '$heir')"
+i=0; while test -n "$heir" && ps -p "$heir" > /dev/null && test $i -lt 100; do sleep 0.1; i=$((i + 1)); done
+hs "" ok
+test $rc = 0 && grep -q '^status 0$' "$D/drop/mhelper.log"; ok $? "and once it has ended, the next request is accepted (rc $rc: $(tail -n 2 "$M/plan" | tr '\n' ';'))"
 s0=$(date +%s); hs stubborn ok; t=$(( $(date +%s) - s0 ))
 hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
 [ $rc = 0 ] && [ -n "$hp" ] && gone "$hp" && [ $t -ge 3 ] && [ $t -lt 7 ]; ok $? "one that ignores SIGTERM is killed a second later (rc $rc, $t s)"
@@ -595,10 +649,12 @@ hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
 [ $rc = 3 ] && [ $t -lt 20 ] && [ -n "$hp" ] && grep -q "mount_macfuse (pid $hp) is still running after SIGKILL" "$M/plan"
 ok $? "one that outlives SIGKILL: root still exits 3 in $t s, and says it is left running ($(grep -i 'still running' "$M/plan" | tr '\n' ' '))"
 [ -z "$hp" ] || kill -9 "$hp" 2>/dev/null
+i=0; while ! gone "$hp" && test $i -lt 50; do sleep 0.1; i=$((i + 1)); done
 HS_ENV=LINUXFS_FS_TEST_NOKILL=1; hs stubborn ok; unset HS_ENV
 hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log")
 [ $rc = 0 ] && [ -n "$hp" ] && grep -q "mount_macfuse (pid $hp) is still running after SIGKILL" "$M/plan"; ok $? "after a good mount too, a mount_macfuse that outlives SIGKILL is reported (rc $rc)"
 [ -z "$hp" ] || kill -9 "$hp" 2>/dev/null
+i=0; while ! gone "$hp" && test $i -lt 50; do sleep 0.1; i=$((i + 1)); done
 # spec: tools/fs.c mount_by_root -- the status is read without blocking, under the same deadline: 2 of its 4 bytes and no more
 #       end in the bounded wait, not a hang (a watchdog ends a hung run at 20 s)
 s0=$(date +%s); hs partial ok 2 & hj=$!
@@ -675,6 +731,16 @@ fm=$(mount | grep -F " on $V/NAME (")
 [ $rc != 0 ] && grep -q '^attached 0$' "$D/drop/mhelper.log" && [ -n "$fm" ]; ok $? "a volume on MNT that is not root's mount is never force-unmounted (rc $rc, '$fm')"
 fd9=$(hdiutil info | awk -v p="$D/drop/mhelper.img" '/^image-path/ { sub(/^image-path[ \t]*:[ \t]*/, ""); cur = ($0 == p) } cur && /^\/dev\/disk[0-9]+[ \t]/ { print $1; exit }')
 [ -z "$fd9" ] || hdiutil detach -quiet -force "$fd9" 2>/dev/null
+# spec: Task 16f (root-daemon design §3) -- f_owner 0 no longer tells one root mount from another; the lock and the pre-check do: a
+#       failed request only ever unmounts its own. Root's live mount of $E on MNT refuses a second request before the CLI runs, and
+#       its failure path (here forced: the helper's status 5) never reaches unmount(2) (the drop build says "unmount-attempt MNT")
+printf 'macfuse_ext4\t/dev/%s\t%s\t0\n' "$E" "$V/NAME" > "$M/mnttab"
+HS_ENV="LINUXFS_FS_TEST_MNTTAB=$M/mnttab"; hs "status 5" ok; unset HS_ENV
+test $rc = 1 && test ! -e "$M/fdcli.log" && test ! -e "$D/drop/mhelper.log" && ! grep -q '^unmount-attempt' "$M/plan" && grep -q '^linuxfs-mount: refused: something is mounted' "$M/plan"
+ok $? "root plan (helper stand-in): a live root mount of $E is never unmounted by a second request (rc $rc: $(tr '\n' ';' < "$M/plan" | cut -c1-200))"
+rm -f "$D/drop/mhelper.mnttab"; : > "$D/drop/mhelper.mnttab"
+HS_ENV="LINUXFS_FS_TEST_MNTTAB=$D/drop/mhelper.mnttab"; hs "mounted 5" ok; unset HS_ENV
+test $rc != 0 && grep -qx "unmount-attempt $V/NAME" "$M/plan"; ok $? "and a request whose own mount landed before it failed unmounts that mount (rc $rc: $(grep '^unmount' "$M/plan"))"
 ! strings "$D/linuxfs-fs" | grep -q 'LINUXFS_FS_TEST'; ok $? "the shipped build carries no LINUXFS_FS_TEST_* code"
 ! grep -q 'LINUXFS_FS_TEST' "$ROOT"/build/*.sh; ok $? "no build script defines LINUXFS_FS_TEST_DROP"
 echo "1..$n"; exit $bad

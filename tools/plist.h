@@ -8,6 +8,8 @@
 
 #include <CoreFoundation/CoreFoundation.h>
 
+struct fsprefs;
+
 /* The console user's and the machine's preferences, each NULL when absent, unreadable or not a dictionary; the caller
  * releases what is not NULL. A plist counts only when it is a regular file, not a symlink, at most 1 MiB and owned by the
  * user (the machine's: by root); the user's is opened and read as the user. When not root, LINUXFS_PREFS_USER and
@@ -20,5 +22,10 @@ int pref_bool(CFDictionaryRef d, CFStringRef key);
 /* A plist only OWNER can have written (a product's manifest): a regular file, not a symlink, at most 1 MiB, owned by OWNER and
  * writable by no one else; NULL for anything else. The caller releases what is not NULL. */
 CFDictionaryRef plist_load_owned(const char *path, uid_t owner);
+
+/* Fills p from the console user's plist, then the machine's, then the defaults, key by key. A plist that cannot be read
+ * or parsed counts as absent (plist.c). Automount and Ignore:<LABEL> are not read: a volume's own "do not mount by
+ * itself" is /etc/fstab's noauto, which DiskArbitration applies before it ever runs the util. */
+void prefs_read(struct fsprefs *p);
 
 #endif

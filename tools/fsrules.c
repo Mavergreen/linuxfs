@@ -1,4 +1,5 @@
 /* The bundles' portable rules (see fsrules.h). Pure C99, libc only. */
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 #include "fsrules.h"
@@ -296,4 +297,25 @@ int fsrules_hint(const char *err, char *hint, size_t len)
 	memcpy(hint, p, o);
 	hint[o] = '\0';
 	return 1;
+}
+
+int fsrules_valid_bsd(const char *s)
+{
+	const char *q = s;
+
+	if (strncmp(q, "disk", 4) != 0)
+		return 0;
+	q += 4;
+	if (!isdigit((unsigned char)*q))
+		return 0;
+	while (isdigit((unsigned char)*q))
+		q++;
+	if (*q == 's') {
+		q++;
+		if (!isdigit((unsigned char)*q))
+			return 0;
+		while (isdigit((unsigned char)*q))
+			q++;
+	}
+	return *q == '\0' && q - s <= 32;
 }

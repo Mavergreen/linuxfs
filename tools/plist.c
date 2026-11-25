@@ -1,5 +1,6 @@
 /* linuxfs's preferences as root-run code reads them (see plist.h). */
 #include <fcntl.h>
+#include <stddef.h>
 #include <grp.h>
 #include <pwd.h>
 #include <stdio.h>
@@ -9,6 +10,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include "fsrules.h"
 #include "plist.h"
 
 #define PREFS_NAME "dev.mavergreen.linuxfs.plist"
@@ -151,4 +153,35 @@ void prefs_load(CFDictionaryRef *user, CFDictionaryRef *machine)
 CFDictionaryRef plist_load_owned(const char *path, uid_t owner)
 {
 	return load_plist(path, owner, 0, 0, 0, 1);
+}
+
+void prefs_read(struct fsprefs *p)
+{
+	static const struct { const char *name; size_t off; } keys[] = {
+		{ "ReadOnly", offsetof(struct fsprefs, readonly) },
+		{ "NTFSTakeover", offsetof(struct fsprefs, ntfs_takeover) },
+		{ "APFSWrite", offsetof(struct fsprefs, apfs_write) },
+	};
+	CFDictionaryRef d[2];
+	size_t i, j;
+
+	fsrules_default_prefs(p);
+	prefs_load(&d[0], &d[1]);
+	for (i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+		CFStringRef k = CFStringCreateWithCString(NULL, keys[i].name, kCFStringEncodingUTF8);
+
+		for (j = 0; k && j < 2; j++) {
+			int v = pref_bool(d[j], k);
+
+			if (v >= 0) {
+				*(int *)((char *)p + keys[i].off) = v;
+				break;
+			}
+		}
+		if (k)
+			CFRelease(k);
+	}
+	for (j = 0; j < 2; j++)
+		if (d[j])
+			CFRelease(d[j]);
 }

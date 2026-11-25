@@ -112,6 +112,23 @@ int main(int argc, char **argv)
 	iss(fsrules_fs_of_type("linuxfs_ext4"), NULL, "the old name is not");
 	iss(fsrules_fs_of_type("osxfuse"), NULL, "osxfuse is not");
 	iss(fsrules_fs_of_type(NULL), NULL, "NULL is not");
+	/* spec: Task 16f -- a BSD name is disk[0-9]+(s[0-9]+)?, at most 32 characters: what root opens as /dev/r<bsd>, and what
+	 * the mount daemon (16g) takes from a request; moved from fs.c unchanged */
+	{
+		static const char *const good[] = { "disk2", "disk2s1" };
+		static const char *const bad[] = { "diskX", "disk", "disk2s", "../disk2", "disk2s1x", "rdisk2",
+						    "disk12345678901234567890123456789" };
+		char what[96];
+
+		for (k = 0; k < sizeof good / sizeof good[0]; k++) {
+			snprintf(what, sizeof what, "valid_bsd: %s is a BSD name", good[k]);
+			is(fsrules_valid_bsd(good[k]), 1, what);
+		}
+		for (k = 0; k < sizeof bad / sizeof bad[0]; k++) {
+			snprintf(what, sizeof what, "valid_bsd: %s (%d characters) is not", bad[k], (int)strlen(bad[k]));
+			is(fsrules_valid_bsd(bad[k]), 0, what);
+		}
+	}
 	/* spec: item 6 (fsname=/dev/<bsd>) -- root's force-unmount takes only a mount root made itself: one of our six, of
 	 * the bundle's own fs, from /dev/<bsd>, owned by root; anything else on that mount point is someone else's */
 	is(fsrules_mount_is_roots("ext4", "disk2s1", "macfuse_ext4", "/dev/disk2s1", 0), 1, "roots: ext4 mounted by root from /dev/disk2s1");

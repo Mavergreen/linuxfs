@@ -49,7 +49,7 @@ cc -g0 -fuse-ld=lld -o "$OUT/linuxfs-probe" "$ROOT/tools/probe.c" "$ROOT/tools/f
 cc -g0 -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN -o "$OUT/linuxfs-open" "$ROOT/tools/open.c" "$ROOT/tools/probe.c"
 cc -g0 -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN -o "$OUT/linuxfs-helper" "$ROOT/tools/helper.c" "$ROOT/tools/probe.c" "$ROOT/tools/fstab.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" -framework IOKit -framework CoreFoundation
 cc -g0 -fuse-ld=lld -o "$OUT/linuxfs-agent" "$ROOT/tools/agent.c" "$ROOT/tools/fstab.c" "$ROOT/tools/fsrules.c" -framework DiskArbitration -framework CoreFoundation -framework Security
-cc -g0 -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN -o "$OUT/linuxfs-fs" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" -framework CoreFoundation -framework DiskArbitration
+cc -g0 -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN -o "$OUT/linuxfs-fs" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" "$ROOT/tools/trust.c" -framework CoreFoundation -framework DiskArbitration
 cc -g0 -fuse-ld=lld -o "$OUT/linuxfs-volicon" "$ROOT/tools/volicon.c" -framework ApplicationServices -framework CoreFoundation
 F=$WORK/macfuse
 sh "$SHIPYARD_SCRIPTS/fetch_product_pkg.sh" macfuse "$(tr -d '[:space:]' < "$ROOT/components/macfuse/version")" "$F" >/dev/null

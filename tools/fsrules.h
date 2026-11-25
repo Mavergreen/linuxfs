@@ -84,4 +84,7 @@ void fsrules_volname(const char *label, char *out, size_t outlen);
  * into HINT (LEN bytes, cut to fit on a character boundary); 0 when ERR names none or the hint is not valid UTF-8. */
 int fsrules_hint(const char *err, char *hint, size_t len);
 
+/* Whether S is a BSD disk name, disk[0-9]+(s[0-9]+)? and at most 32 characters: what root opens as /dev/r<S>. */
+int fsrules_valid_bsd(const char *s);
+
 #endif

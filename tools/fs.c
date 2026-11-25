@@ -9,7 +9,8 @@
  * fsck -q DEV                                     exit 0 (a quick check has nothing to do); -n or -y exit 8
  * mount [-o OPT]... DEV MNT                       as the console user: runs the CLI's da-mount and, for an encrypted volume,
  *                                                  asks for the password (the keychain keeper first, then Apple's dialog);
- *                                                  as root (nobody logged in): opens /dev/rDEV as fd 3; then, with a macFUSE that
+ *                                                  as root: takes the disk's lock (one mount of a disk at a time) and refuses when
+ *                                                  anything is mounted on MNT or from /dev/DEV already; opens /dev/rDEV as fd 3; then, with a macFUSE that
  *                                                  serves a /dev/fd/N mountpoint, runs the bundled CLI's da-mount as _linuxfs first,
  *                                                  until it is ready (nothing left that can fail before lklfuse starts), then runs
  *                                                  mount_macfuse itself (allow_other) and hands the device it sends to the CLI over
@@ -32,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/mount.h>
 #include <sys/param.h>
 #include <sys/socket.h>
@@ -45,66 +47,11 @@
 #include "fsrules.h"
 #include "plist.h"
 #include "probe.h"
+#include "trust.h"
 
 #define FSUR_RECOGNIZED 255
 #define FSUR_IO_SUCCESS 253	/* sys/loadable_fs.h's (-3), as an exit status */
 #define FSUR_UNRECOGNIZED 254
-
-/* Fills p from the console user's plist, then the machine's, then the defaults, key by key. A plist that cannot be read
- * or parsed counts as absent (plist.c). Automount and Ignore:<LABEL> are not read: a volume's own "do not mount by
- * itself" is /etc/fstab's noauto, which DiskArbitration applies before it ever runs the util. */
-static void fs_read_prefs(struct fsprefs *p)
-{
-	static const struct { const char *name; size_t off; } keys[] = {
-		{ "ReadOnly", offsetof(struct fsprefs, readonly) },
-		{ "NTFSTakeover", offsetof(struct fsprefs, ntfs_takeover) },
-		{ "APFSWrite", offsetof(struct fsprefs, apfs_write) },
-	};
-	CFDictionaryRef d[2];
-	size_t i, j;
-
-	fsrules_default_prefs(p);
-	prefs_load(&d[0], &d[1]);
-	for (i = 0; i < sizeof keys / sizeof keys[0]; i++) {
-		CFStringRef k = CFStringCreateWithCString(NULL, keys[i].name, kCFStringEncodingUTF8);
-
-		for (j = 0; k && j < 2; j++) {
-			int v = pref_bool(d[j], k);
-
-			if (v >= 0) {
-				*(int *)((char *)p + keys[i].off) = v;
-				break;
-			}
-		}
-		if (k)
-			CFRelease(k);
-	}
-	for (j = 0; j < 2; j++)
-		if (d[j])
-			CFRelease(d[j]);
-}
-
-/* disk[0-9]+(s[0-9]+)? */
-static int valid_bsd(const char *s)
-{
-	const char *q = s;
-
-	if (strncmp(q, "disk", 4) != 0)
-		return 0;
-	q += 4;
-	if (!isdigit((unsigned char)*q))
-		return 0;
-	while (isdigit((unsigned char)*q))
-		q++;
-	if (*q == 's') {
-		q++;
-		if (!isdigit((unsigned char)*q))
-			return 0;
-		while (isdigit((unsigned char)*q))
-			q++;
-	}
-	return *q == '\0' && q - s <= 32;
-}
 
 /* Probes /dev/r<bsd>; the type or NULL (logged) */
 static const char *probe_bsd(const char *bsd, char *label, size_t labellen)
@@ -135,7 +82,7 @@ static int util(const char *fs, int argc, char **argv)
 	int removable;
 
 	if (argc == 5 && strcmp(argv[1], "-p") == 0) {
-		if (!valid_bsd(argv[2]) || (strcmp(argv[3], "removable") && strcmp(argv[3], "fixed")) ||
+		if (!fsrules_valid_bsd(argv[2]) || (strcmp(argv[3], "removable") && strcmp(argv[3], "fixed")) ||
 		    (strcmp(argv[4], "readonly") && strcmp(argv[4], "writable"))) {
 			syslog(LOG_NOTICE, "%s util: bad -p arguments", fs);
 			return FSUR_UNRECOGNIZED;
@@ -148,7 +95,7 @@ static int util(const char *fs, int argc, char **argv)
 			syslog(LOG_NOTICE, "%s: %s is not for the %s bundle", argv[2], type, fs);
 			return FSUR_UNRECOGNIZED;
 		}
-		fs_read_prefs(&p);
+		prefs_read(&p);
 		if (!fsrules_claims(fs, type, removable, &p)) {
 			syslog(LOG_NOTICE, "%s: %s (%s) is not for the %s bundle", argv[2], type, removable ? "removable" : "fixed", fs);
 			return FSUR_UNRECOGNIZED;
@@ -161,7 +108,7 @@ static int util(const char *fs, int argc, char **argv)
 	if (argc == 3 && strcmp(argv[1], "-k") == 0) {
 		struct fsprefs all = { .readonly = 0, .ntfs_takeover = 1, .apfs_write = 1 };
 
-		if (!valid_bsd(argv[2])) {
+		if (!fsrules_valid_bsd(argv[2])) {
 			syslog(LOG_NOTICE, "%s util: bad -k argument", fs);
 			return FSUR_UNRECOGNIZED;
 		}
@@ -631,6 +578,8 @@ static int run_cli(const char *cli, const struct mountreq *req, const char *pw, 
 #define STATUS_WAIT_S 60	/* for its mount status: mount(2) ends when lklfuse answers the kernel's INIT */
 #define REFUSED_WAIT_S 5	/* for that status after the CLI failed (its descriptors closed, the mount fails) */
 #define STOP_WAIT_S 2		/* for a process told to stop, before SIGKILL */
+#define LOCK_DIR "/var/run"	/* the disks' locks: LOCK_DIR/dev.mavergreen.linuxfs.mount.<bsd>.lock */
+#define LOCK_FD_MIN 10		/* the lock's descriptor, at or above this: clear of the disk (3), the device (4), 5 and the channel (6) */
 #define STR_(x) #x
 #define STR(x) STR_(x)
 #define ROOT_CLI_ENV "HOME=/private/var/db/linuxfs", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LINUXFS_DA=1", "LINUXFS_ALL_USERS=1", \
@@ -666,6 +615,7 @@ static int kill_sig(void) { return getenv("LINUXFS_FS_TEST_NOKILL") ? 0 : SIGKIL
 static const char *trust_root(void) { const char *v = getenv("LINUXFS_FS_TEST_TRUST_ROOT"); return v && *v ? v : NULL; }
 /* lklfuse's libfuse is checked in a test build only when the test names one */
 static const char *libfuse_path(void) { const char *v = getenv("LINUXFS_FS_TEST_LIBFUSE"); return v && *v ? v : NULL; }
+static const char *lock_dir(void) { const char *v = getenv("LINUXFS_FS_TEST_LOCKDIR"); return v && *v ? v : LOCK_DIR; }
 #else
 #define ROOT_ONLY_UID 0
 static const char *volumes_dir(void) { return "/Volumes"; }
@@ -676,120 +626,14 @@ static int wait_s(int s) { return s; }
 static int kill_sig(void) { return SIGKILL; }
 static const char *trust_root(void) { return NULL; }
 static const char *libfuse_path(void) { return LIBFUSE; }
+static const char *lock_dir(void) { return LOCK_DIR; }
 #endif
 
-/* Whether a file or directory is root's and writable by root alone (a group counts only when it is gid 0: /usr/local is root:wheel
- * 0775). A root-owned directory with the sticky bit counts whoever can write it: nobody else can rename or remove root's
- * entries, and the walk requires each entry below it to be root's too (stock 10.9 may ship / as 1775 root:admin). */
-static int root_only(const struct stat *st)
-{
-	if (st->st_uid != ROOT_ONLY_UID)
-		return 0;
-	if (S_ISDIR(st->st_mode) && (st->st_mode & S_ISVTX))
-		return 1;
-	return !(st->st_mode & S_IWOTH) && (!(st->st_mode & S_IWGRP) || st->st_gid == 0);
-}
-
-/* Whether root may trust the file at path. The path is walked the way the kernel and dyld walk it, one component at a time,
- * following every symlink by hand: each directory the walk stands in (so the directories holding each symlink hop, as well as
- * the target's own) must be root's and not writable by anyone else, each symlink must be root's, and the end must be a regular
- * file that is root's and writable by root alone. out gets the resolved path, which is what must then be opened or run.
- * 0 when trusted; -1 when something on the way is writable by a user; -2 when it is missing, not a regular file, or too deep. */
+/* Whether root may trust the file at path: trust_path (trust.c) with root's uid (the tests' stand-in for it in a test build) and
+ * the test build's trust root. 0 trusted; -1 writable by a user; -2 missing or not a regular file. out gets the resolved path. */
 static int path_trusted(const char *path, char *out, size_t outlen)
 {
-	char cur[PATH_MAX], rest[2 * PATH_MAX], trust[PATH_MAX], next[PATH_MAX], link[PATH_MAX], compbuf[NAME_MAX + 1];
-	const char *tr = trust_root();
-	struct stat st;
-	size_t skip = 0, cn;
-	int hops = 0;
-
-	if (path[0] != '/' || strlen(path) >= sizeof rest)
-		return -2;
-	if (tr && !(realpath(tr, trust) && (skip = strlen(trust)) > 0))
-		return -1;
-	snprintf(rest, sizeof rest, "%s", path);
-	cur[0] = '/';
-	cur[1] = '\0';
-	if (!skip && (lstat("/", &st) != 0 || !root_only(&st)))
-		return -1;
-	for (;;) {
-		char *r = rest, *slash;
-		const char *comp;
-		size_t cl = strlen(cur);
-
-		while (*r == '/')
-			r++;
-		if (!*r)
-			break;
-		slash = strchr(r, '/');
-		cn = slash ? (size_t)(slash - r) : strlen(r);
-		if (cn >= sizeof compbuf)
-			return -2;
-		memcpy(compbuf, r, cn);
-		compbuf[cn] = '\0';
-		comp = compbuf;
-		memmove(rest, r + cn, strlen(r + cn) + 1);
-		if (strcmp(comp, ".") == 0)
-			continue;
-		if (strcmp(comp, "..") == 0) {
-			while (cl > 1 && cur[cl - 1] != '/')
-				cl--;
-			if (cl > 1)
-				cl--;
-			cur[cl] = '\0';
-			continue;
-		}
-		if ((size_t)snprintf(next, sizeof next, "%s%s%s", cur, cl > 1 ? "/" : "", comp) >= sizeof next)
-			return -2;
-		if (lstat(next, &st) != 0)
-			return -2;
-		if (S_ISLNK(st.st_mode)) {
-			ssize_t n;
-			size_t tl, rl;
-
-			if (st.st_uid != ROOT_ONLY_UID && !(skip && strlen(next) <= skip))
-				return -1;
-			if (++hops > 16 || (n = readlink(next, link, sizeof link - 1)) <= 0)
-				return -2;
-			link[n] = '\0';
-			tl = strlen(link);
-			rl = strlen(rest);
-			if (tl + 1 + rl >= sizeof rest)
-				return -2;
-			memmove(rest + tl + 1, rest, rl + 1);
-			memcpy(rest, link, tl);
-			rest[tl] = '/';
-			if (link[0] == '/') {
-				cur[0] = '/';
-				cur[1] = '\0';
-			}
-			continue;
-		}
-		if (S_ISDIR(st.st_mode)) {
-			if (strlen(next) > skip && !root_only(&st))
-				return -1;
-			memcpy(cur, next, strlen(next) + 1);
-			continue;
-		}
-		if (!S_ISREG(st.st_mode))
-			return -2;
-		/* a file ends the path */
-		{
-			char *e = rest;
-
-			while (*e == '/')
-				e++;
-			if (*e)
-				return -2;
-		}
-		if (!root_only(&st))
-			return -1;
-		if (strlen(next) >= outlen)
-			return -1;
-		memcpy(out, next, strlen(next) + 1);
-		return 0;
-	}
-	return -2;	/* the path ended on a directory */
+	return trust_path(path, ROOT_ONLY_UID, trust_root(), out, outlen);
 }
 
 /* MNT is exactly <volumes>/<name>: one component, not . or .. */
@@ -1009,6 +853,47 @@ static int recv_device(int sock, int secs, int watch)
 	return fd;
 }
 
+/* The mount table, as getmntinfo(MNT_NOWAIT) gives it: the number of entries, in *m, or -1 when it cannot be read. MNT_NOWAIT
+ * asks no file system (statfs of each would hang on a dead macFUSE mount), so there is no wait to bound. In a test build,
+ * LINUXFS_FS_TEST_MNTTAB names a file of TYPE<TAB>FROM<TAB>ON<TAB>OWNER lines instead, the last on top, read at each call. */
+static int mnt_table(struct statfs **m)
+{
+	int n;
+
+#ifdef LINUXFS_FS_TEST_DROP
+	const char *tab = getenv("LINUXFS_FS_TEST_MNTTAB");
+
+	if (tab && *tab) {
+		static struct statfs t[64];
+		char line[3 * MAXPATHLEN + 64];
+		FILE *f = fopen(tab, "r");
+
+		if (!f)
+			return -1;
+		n = 0;
+		while (n < (int)(sizeof t / sizeof t[0]) && fgets(line, sizeof line, f)) {
+			char *a = line, *b, *c, *d;
+
+			line[strcspn(line, "\n")] = '\0';
+			if (!(b = strchr(a, '\t')) || !(c = strchr(b + 1, '\t')) || !(d = strchr(c + 1, '\t')))
+				continue;
+			*b++ = *c++ = *d++ = '\0';
+			memset(&t[n], 0, sizeof t[n]);
+			snprintf(t[n].f_fstypename, sizeof t[n].f_fstypename, "%s", a);
+			snprintf(t[n].f_mntfromname, sizeof t[n].f_mntfromname, "%s", b);
+			snprintf(t[n].f_mntonname, sizeof t[n].f_mntonname, "%s", c);
+			t[n].f_owner = (uid_t)strtoul(d, NULL, 10);
+			n++;
+		}
+		fclose(f);
+		*m = t;
+		return n;
+	}
+#endif
+	n = getmntinfo(m, MNT_NOWAIT);
+	return n > 0 ? n : -1;
+}
+
 /* What is mounted on MNT, judged by the topmost mount, the one unmount(MNT) would hit: 0 nothing; 1 root's own mount of FS
  * from /dev/BSD (fsrules_mount_is_roots: FS's macfuse_<fs> type, that source, owned by root); -1 something else, which is never
  * root's to unmount: an HFS+ volume from the same disk, a user's macFUSE mount, another of the six. The mount table is read with
@@ -1019,11 +904,75 @@ static int mounted_on(const char *fs, const char *mnt, const char *bsd)
 	struct statfs *m;
 	int n, i;
 
-	n = getmntinfo(&m, MNT_NOWAIT);
+	n = mnt_table(&m);
 	for (i = n - 1; i >= 0; i--)
 		if (strcmp(m[i].f_mntonname, mnt) == 0)
 			return fsrules_mount_is_roots(fs, bsd, m[i].f_fstypename, m[i].f_mntfromname, (unsigned)m[i].f_owner) ? 1 : -1;
 	return 0;
+}
+
+/* Whether anything at all is mounted on MNT, or from /dev/BSD (any type, on any mount point): 0 nothing; 1 something; -1 when the
+ * mount table cannot be read. Root mounts only where nothing is, so that its failure path (mounted_on) can only ever find its own
+ * mount: f_owner 0 tells root's mount from a user's, not one root mount from another. */
+static int mounted_already(const char *mnt, const char *bsd)
+{
+	struct statfs *m;
+	int n, i;
+
+	n = mnt_table(&m);
+	if (n < 0)
+		return -1;
+	for (i = 0; i < n; i++)
+		if (strcmp(m[i].f_mntonname, mnt) == 0 ||
+		    (strncmp(m[i].f_mntfromname, "/dev/", 5) == 0 && strcmp(m[i].f_mntfromname + 5, bsd) == 0))
+			return 1;
+	return 0;
+}
+
+/* The disk's lock, LOCK_DIR/dev.mavergreen.linuxfs.mount.<bsd>.lock, taken (flock, exclusive, without waiting): one mount of a disk
+ * at a time. Its descriptor, at or above LOCK_FD_MIN, is not close-on-exec: root's mount_macfuse inherits it (mount_by_root keeps it
+ * there), so the lock lives as long as anything of root's for this mount does, and the CLI closes it before it becomes _linuxfs,
+ * so nothing of _linuxfs's ever holds it. The file is opened without following a symlink, and must be a regular file of root's
+ * with one link; it is never removed (a removed lock file someone else still holds would let a second lock be taken). The
+ * descriptor, or -1 having refused. */
+static int lock_disk(const char *fs, const char *bsd)
+{
+	char path[PATH_MAX], why[128];
+	struct stat st;
+	int fd, hi;
+
+	if (snprintf(path, sizeof path, "%s/dev.mavergreen.linuxfs.mount.%s.lock", lock_dir(), bsd) >= (int)sizeof path) {
+		refuse(fs, "the disk's lock file's path is too long");
+		return -1;
+	}
+	fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY, 0600);
+	if (fd < 0) {
+		refuse(fs, "the disk's lock file cannot be opened (or is a symlink)");
+		return -1;
+	}
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != ROOT_ONLY_UID || st.st_nlink != 1) {
+		close(fd);
+		refuse(fs, "the disk's lock file is not a regular file of root's alone");
+		return -1;
+	}
+	hi = fcntl(fd, F_DUPFD, LOCK_FD_MIN);	/* the copy is not close-on-exec */
+	close(fd);
+	if (hi < 0) {
+		refuse(fs, "cannot place the disk's lock");
+		return -1;
+	}
+	if (flock(hi, LOCK_EX | LOCK_NB) != 0) {
+		int e = errno;
+
+		close(hi);
+		if (e == EWOULDBLOCK) {
+			snprintf(why, sizeof why, "another mount of %s is under way", bsd);
+			refuse(fs, why);
+		} else
+			refuse(fs, "the disk's lock cannot be taken");
+		return -1;
+	}
+	return hi;
 }
 
 /* Waits up to secs for pid; 1 with *st when it was reaped */
@@ -1139,7 +1088,8 @@ static void stop_group(pid_t pgid, int running)
  * serves it through /dev/fd/FUSE_FD. A CLI that ends, or is not ready within READY_WAIT_S, never has a mount_macfuse run for
  * it. Root then waits, bounded, for mount_macfuse's status: 0 (and the CLI's 0) is exit 0; anything else stops what _linuxfs
  * started, unmounts MNT if it got mounted, stops mount_macfuse, and is the CLI's failure (or 1). Root never reads the file
- * system and never runs lklfuse. Every descriptor but 0-2 is closed in mount_macfuse, and in the CLI all but 3 and CHAN_FD.
+ * system and never runs lklfuse. Every descriptor but 0-2 is closed in mount_macfuse but its socket and the disk's lock (lockfd,
+ * which it holds as long as it lives), and in the CLI all but 3 and CHAN_FD.
  * Unmounting (DiskArbitration, diskutil) ends lklfuse, which sees its device close. If lklfuse dies first the mount stays,
  * with nobody serving it: macFUSE fails its calls (a dead file system, ENXIO) rather than hang, and it still unmounts
  * (tests/smoke-mavericks.sh checks both). The one failure left after "ready" is lklfuse dying at startup, before it answers
@@ -1148,7 +1098,7 @@ static void stop_group(pid_t pgid, int running)
  * the kernel gives up by itself, EAGAIN after about 50 s (macfuse's smoke). So root stops it (stop()) and says so if even
  * SIGKILL leaves it running. */
 static int mount_by_root(const char *fs, const struct mountreq *req, const char *bsd, int ro, const char *name, uid_t uid,
-			 gid_t gid, char **args)
+			 gid_t gid, char **args, int lockfd)
 {
 	static const char *const vars[] = { ROOT_CLI_ENV, "LINUXFS_FUSE_FD=" STR(FUSE_FD), "LINUXFS_FUSE_CHAN=" STR(CHAN_FD), NULL };
 	const struct fsname *nm;
@@ -1257,6 +1207,7 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 		fcntl(CHAN_FD, F_SETFD, 0);
 		close(FUSE_FD);	/* fd 4 is lklfuse's, put there by linuxfs-open from the device root sends: nothing of root's may sit on it */
 		close(5);
+		close(lockfd);	/* root's: nothing of _linuxfs's may hold a disk root believes free */
 		if (become_run_user(fs, name, uid, gid) != 0)
 			_exit(1);
 		syslog(LOG_NOTICE, "mount_%s: %s on %s: da-mount as %s, the device to come on channel fd %d%s", fs, bsd, req->mnt, RUN_USER,
@@ -1286,7 +1237,7 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 		if (in < 0 || dup2(in, 0) < 0 || dup2(hout[1], 1) < 0 || dup2(hout[1], 2) < 0)
 			_exit(127);
 		for (fd = 3; fd < getdtablesize(); fd++)
-			if (fd != cs[0])
+			if (fd != cs[0] && fd != lockfd)	/* the lock stays: it lives while mount_macfuse does (not close-on-exec) */
 				close(fd);
 		fcntl(cs[0], F_SETFD, 0);
 		execve(rhelper, hargv, henv);
@@ -1396,6 +1347,10 @@ failed:
 		if (fd < 0)
 			syslog(LOG_NOTICE, "mount_%s: %s: %s holds another volume than root's mount; left mounted", fs, bsd, req->mnt);
 		if (fd > 0) {
+#ifdef LINUXFS_FS_TEST_DROP
+			printf("unmount-attempt %s\n", req->mnt);
+			fflush(stdout);
+#endif
 			if (unmount(req->mnt, MNT_FORCE) == 0)
 				syslog(LOG_NOTICE, "mount_%s: %s: unmounted %s", fs, bsd, req->mnt);
 			else
@@ -1437,13 +1392,13 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 	char node[64], devarg[64], name[64];
 	char *args[8];
 	const char *bsd;
-	int fd, mfd, n = 0, ro_fallback = 0, ro, by_root;
+	int fd, mfd, n = 0, ro_fallback = 0, ro, by_root, lockfd, m;
 	uid_t uid;
 	gid_t gid;
 
 	fill_std_fds();
 	bsd = strncmp(req->dev, "/dev/", 5) == 0 ? req->dev + 5 : req->dev;
-	if (!valid_bsd(bsd))
+	if (!fsrules_valid_bsd(bsd))
 		return refuse(fs, "the device is not diskN or diskNsM");
 	if (!valid_mnt_path(req->mnt))
 		return refuse(fs, "the mount point is not directly under /Volumes");
@@ -1455,6 +1410,22 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 	snprintf(name, sizeof name, "%s", pw->pw_name);
 	snprintf(node, sizeof node, "/dev/r%s", bsd);
 	snprintf(devarg, sizeof devarg, "/dev/%s", bsd);
+
+	/* One mount of a disk at a time (its lock, held to the end by this program and by root's mount_macfuse), and only where
+	 * nothing is mounted already, on MNT or from the disk: so a failure here can only ever unmount this request's own mount. */
+	lockfd = lock_disk(fs, bsd);
+	if (lockfd < 0)
+		return 1;
+	m = mounted_already(req->mnt, bsd);
+	if (m != 0) {
+		char why[96];
+
+		close(lockfd);
+		if (m < 0)
+			return refuse(fs, "the mount table cannot be read");
+		snprintf(why, sizeof why, "something is mounted on the mount point or from /dev/%s already", bsd);
+		return refuse(fs, why);
+	}
 
 	/* read-only when asked; else read-write, falling back to read-only (and --ro) */
 	fd = req->ro ? -1 : open(node, O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
@@ -1490,7 +1461,7 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 		type = linuxfs_probe_fd(3, label, sizeof label, &err);
 		if (!type)
 			return refuse(fs, "no filesystem linuxfs knows on the device");
-		fs_read_prefs(&p);
+		prefs_read(&p);
 		switch (fsrules_access(type, fsrules_probe_flags(linuxfs_probe_extra(), linuxfs_probe_flags()), req->ro || ro_fallback,
 				       1, &p, &why)) {
 		case FSA_REFUSE:
@@ -1555,7 +1526,7 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 	args[n++] = (char *)req->mnt;
 	args[n] = NULL;
 
-	return mount_by_root(fs, req, bsd, ro, name, uid, gid, args);
+	return mount_by_root(fs, req, bsd, ro, name, uid, gid, args, lockfd);
 }
 
 /* What DiskArbitration passed: the arguments after the program name, joined by spaces and cut at 200 bytes. They hold the device,
