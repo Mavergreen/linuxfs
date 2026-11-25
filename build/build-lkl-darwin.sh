@@ -53,10 +53,11 @@ cc -g0 -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN -o "$OUT/linuxfs-fs" "$ROOT/tools/fs
 F=$WORK/macfuse
 sh "$SHIPYARD_SCRIPTS/fetch_product_pkg.sh" macfuse "$(tr -d '[:space:]' < "$ROOT/components/macfuse/version")" "$F" >/dev/null
 cc -I"$F/include" -c -o "$O/lklfuse.o" "$L/lklfuse.c"
-link "$OUT/lklfuse" "$O/lklfuse.o" -L"$F/lib" -lfuse3
+# platform: lklfuse's Darwin Unicode names (patch 0012) normalize with CoreFoundation, Apple's own tables
+link "$OUT/lklfuse" "$O/lklfuse.o" -L"$F/lib" -lfuse3 -framework CoreFoundation
 # platform: tests/lklfuse-ops-test.c calls lklfuse's callbacks without a mount, so libfuse is never called and stays unbound
 cc -I"$F/include" -I"$L" -c -o "$O/lklfuse-ops.o" "$ROOT/tests/lklfuse-ops-test.c"
-link "$OUT/tests/lklfuse-ops" "$O/lklfuse-ops.o" -Wl,-undefined,dynamic_lookup
+link "$OUT/tests/lklfuse-ops" "$O/lklfuse-ops.o" -Wl,-undefined,dynamic_lookup -framework CoreFoundation
 for b in "$OUT/tests/boot" "$OUT/tests/disk" "$OUT/gate0-rw" "$OUT/lklfuse"; do
   sh "$ROOT/build/check-macho-layout.sh" "$CL/bin/llvm-otool" "$b"
 done

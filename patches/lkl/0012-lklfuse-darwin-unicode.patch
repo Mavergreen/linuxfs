@@ -1,0 +1,636 @@
+lklfuse: on Darwin, names are stored NFC, shown as HFS+ shows them, and found in any normalization form
+
+Mac programs name files in either Unicode normalization form, and macFUSE's libfuse makes it worse: it names its
+nodes NFD (ICU's unorm2 NFD, in its node table) and builds every path from those names, except a new entry's last
+component, which it passes as the kernel gave it. Linux filesystems store a name's bytes as given, and Linux's own
+programs write NFC. The census (push A, run 45550175916) found the result: a shell create of NFC "café" landed on
+disk as NFC and then failed with ENXIO, and a Linux-made NFC name opened by neither form. The ENXIO: libfuse's
+create succeeds (its follow-up getattr uses the open file), but it hashes the new node under its NFD name, so the
+kernel's next call on the node, a getattr, comes by an NFD path that names nothing. macFUSE's kernel side then
+drops the vnode, and the open ends ENXIO (inferred: macFUSE's kext is closed, but osxfuse's open one revoked a vnode
+whose getattr said ENOENT, and a revoked vnode's open gives ENXIO).
+
+On Darwin, for the filesystems that store names as given:
+- every path-taking callback resolves its path one component at a time: the NFC form, the name as given, then
+  HFS+'s NFD form; a non-ASCII name found by none of them is looked for by scanning its directory, comparing NFC
+  forms (an ASCII miss, the usual lookup before a create, never scans). A name on disk is never rewritten;
+- a new entry (create, mknod, mkdir, symlink, link, rename's target) is stored NFC on ext2/3/4, btrfs, xfs, f2fs and
+  ntfs3, and as given on apfs (as macOS does there); an existing entry in another form is used instead, so O_CREAT
+  opens it, O_EXCL gives EEXIST and rename replaces it;
+- a symlink's target is stored NFC, since Linux resolves it byte for byte;
+- readdir and readlink hand names out in HFS+'s NFD (CFStringGetFileSystemRepresentation, which leaves
+  U+2000-U+2FFF, U+F900-U+FAFF and U+2F800-U+2FAFF composed), or as stored when that would be over NAME_MAX.
+Other filesystems (vfat, exfat) are unchanged for now. The conversions are CoreFoundation's (CFStringNormalize), so
+lklfuse links it; lklfuse runs in the foreground on Darwin and never forks after using it. tests/lklfuse-ops-test.c
+checks the conversions and each case above on an ext4 image, without a mount.
+
+Darwin only: on Linux the resolver, the stored form and the shown form are the name itself.
+
+diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
+--- a/tools/lkl/lklfuse.c
++++ b/tools/lkl/lklfuse.c
+@@ -10,6 +10,7 @@
+ #include <sys/stat.h>
+ #include <string.h>
+ #include <errno.h>
++#include <limits.h>
+ #include <unistd.h>
+ #include <pthread.h>
+ #include <signal.h>
+@@ -138,6 +139,7 @@
+ 
+ #ifdef __APPLE__
+ #include <sys/xattr.h>
++#include <CoreFoundation/CoreFoundation.h>
+ 
+ #define st_atim st_atimespec
+ #define st_mtim st_mtimespec
+@@ -267,10 +269,297 @@
+ #endif
+ 	return f;
+ }
++
++/*
++ * Unicode names, as HFS+ has them. Mac programs name files in either normalization form (the census, push A, saw
++ * both), macFUSE's libfuse names its nodes NFD and builds every path but a new entry's from those names, and Linux
++ * filesystems store bytes as given, where Linux's own programs write NFC. So:
++ * - new names are stored NFC (NF_STORE_NFC), or as given where macOS itself would (APFS, NF_AS_GIVEN);
++ * - a name is found in any form: each component is tried as NFC, as given, then as HFS+'s NFD, and a non-ASCII
++ *   name found by none of them is looked for by scanning its directory, comparing NFC forms; a name already on disk
++ *   is never rewritten;
++ * - readdir and readlink hand names out as HFS+ would (its NFD, which leaves U+2000-U+2FFF, U+F900-U+FAFF and
++ *   U+2F800-U+2FAFF composed), unless that is over NAME_MAX.
++ * Without this, a create by NFC landed on disk and then failed with ENXIO: libfuse's next getattr of the new node
++ * came with its NFD path, missed, and macFUSE's kernel side dropped the vnode. CoreFoundation is Apple's own table;
++ * lklfuse never forks once it has used it (on Darwin it runs in the foreground).
++ */
++enum lklfuse_nfmode { NF_OFF, NF_STORE_NFC, NF_AS_GIVEN };
++static enum lklfuse_nfmode lklfuse_nf;
++static unsigned long lklfuse_nf_scans;	/* directory scans, for the tests */
++
++static enum lklfuse_nfmode lklfuse_nfmode_for(const char *type)
++{
++	static const char *const nfc[] = { "ext4", "ext2", "ext3", "btrfs", "xfs", "f2fs", "ntfs3" };
++	size_t i;
++
++	if (!type)
++		return NF_OFF;
++	for (i = 0; i < ARRAY_SIZE(nfc); i++)
++		if (strcmp(type, nfc[i]) == 0)
++			return NF_STORE_NFC;
++	return strcmp(type, "apfs") == 0 ? NF_AS_GIVEN : NF_OFF;
++}
++
++static int lklfuse_ascii(const char *s)
++{
++	for (; *s; s++)
++		if (*s & 0x80)
++			return 0;
++	return 1;
++}
++
++/* NULL for invalid UTF-8 */
++static CFStringRef lklfuse_cfstring(const char *in)
++{
++	return CFStringCreateWithBytes(NULL, (const UInt8 *)in, strlen(in), kCFStringEncodingUTF8, false);
++}
++
++/* IN's NFC form: IN itself for ASCII, invalid UTF-8 or a name already NFC; else BUF, or NULL when it does not fit */
++static const char *lklfuse_nfc(const char *in, char *buf, size_t len)
++{
++	CFStringRef s;
++	CFMutableStringRef m;
++	Boolean ok = false;
++
++	if (lklfuse_ascii(in) || !(s = lklfuse_cfstring(in)))
++		return in;
++	m = CFStringCreateMutableCopy(NULL, 0, s);
++	CFRelease(s);
++	if (m) {
++		CFStringNormalize(m, kCFStringNormalizationFormC);
++		ok = CFStringGetCString(m, buf, len, kCFStringEncodingUTF8);
++		CFRelease(m);
++	}
++	if (!ok)
++		return NULL;
++	return strcmp(buf, in) == 0 ? in : buf;
++}
++
++/* CoreFoundation's file system form of IN's first INLEN bytes, into BUF: its length, -1 when it does not fit, -2 for
++ * invalid UTF-8 */
++static long lklfuse_cf_fsrep(const char *in, size_t inlen, char *buf, size_t len)
++{
++	CFStringRef s = CFStringCreateWithBytes(NULL, (const UInt8 *)in, inlen, kCFStringEncodingUTF8, false);
++	Boolean ok;
++
++	if (!s)
++		return -2;
++	ok = CFStringGetFileSystemRepresentation(s, buf, len);
++	CFRelease(s);
++	return ok ? (long)strlen(buf) : -1;
++}
++
++/* U+2F800-U+2FAFF: HFS+ leaves them composed, and 10.9's CFStringGetFileSystemRepresentation does not */
++static int lklfuse_hfs_kept(const char *c)
++{
++	const unsigned char *p = (const unsigned char *)c;
++
++	return p[0] == 0xf0 && p[1] == 0xaf && p[2] >= 0xa0 && p[2] <= 0xab && (p[3] & 0xc0) == 0x80;
++}
++
++/* IN as HFS+ stores it (its NFD variant), with lklfuse_nfc's results */
++static const char *lklfuse_nfd_hfs(const char *in, char *buf, size_t len)
++{
++	const char *p, *q;
++	size_t n = 0;
++	long r;
++
++	if (lklfuse_ascii(in))
++		return in;
++	/* each run between two kept characters on its own: they are starters, so nothing reorders across them */
++	for (p = in; *p; p = q) {
++		for (q = p; *q && !lklfuse_hfs_kept(q); q++)
++			;
++		if (q > p) {
++			r = lklfuse_cf_fsrep(p, q - p, buf + n, len - n);
++			if (r == -2)
++				return in;
++			if (r < 0)
++				return NULL;
++			n += r;
++		}
++		if (*q) {
++			if (n + 4 >= len)
++				return NULL;
++			memcpy(buf + n, q, 4);
++			n += 4;
++			q += 4;
++		}
++	}
++	if (n >= len)
++		return NULL;
++	buf[n] = '\0';
++	return strcmp(buf, in) == 0 ? in : buf;
++}
++
++/* the entry of directory DIR whose NFC form is NFC, into OUT: 0, or -ENOENT */
++static int lklfuse_nf_scan(const char *dir, const char *nfc, char *out, size_t len)
++{
++	char b[PATH_MAX];
++	struct lkl_dir *d;
++	struct lkl_linux_dirent64 *de;
++	const char *n;
++	int err, ret = -ENOENT;
++
++	lklfuse_nf_scans++;
++	d = lkl_opendir(*dir ? dir : "/", &err);
++	if (!d)
++		return -ENOENT;
++	while ((de = lkl_readdir(d))) {
++		if (lklfuse_ascii(de->d_name))
++			continue;
++		n = lklfuse_nfc(de->d_name, b, sizeof(b));
++		if (n && strcmp(n, nfc) == 0 && strlen(de->d_name) < len) {
++			strcpy(out, de->d_name);
++			ret = 0;
++			break;
++		}
++	}
++	lkl_closedir(d);
++	return ret;
++}
++
++/*
++ * PATH, each component the entry on disk it names in any form, into BUF (*OUT is PATH itself when nothing needs
++ * resolving). A missing last component with CREATE gets the name a new entry is stored under; any other missing one
++ * is left as given, for the call itself to report. 0, or a negative host errno.
++ */
++static int lklfuse_resolve(const char *path, char *buf, size_t len, int create, const char **out)
++{
++	char comp[PATH_MAX], nfc[PATH_MAX], nfd[PATH_MAX], found[PATH_MAX];
++	const char *p, *e, *r, *cand[3], *name;
++	struct lkl_stat st;
++	size_t n = 0, clen;
++	int i, j, last, hit, enoent, missing = 0;
++	long ret;
++
++	*out = path;
++	if (lklfuse_nf == NF_OFF || !path || path[0] != '/' || lklfuse_ascii(path))
++		return 0;
++	buf[0] = '\0';
++	for (p = path; *p; p = e) {
++		while (*p == '/')
++			p++;
++		if (!*p)
++			break;
++		e = strchr(p, '/');
++		if (!e)
++			e = p + strlen(p);
++		clen = e - p;
++		if (clen >= sizeof(comp))
++			return -ENAMETOOLONG;
++		memcpy(comp, p, clen);
++		comp[clen] = '\0';
++		for (r = e; *r == '/'; r++)
++			;
++		last = !*r;
++		name = comp;
++		if (!missing && !lklfuse_ascii(comp)) {
++			cand[0] = lklfuse_nfc(comp, nfc, sizeof(nfc));
++			cand[1] = comp;
++			cand[2] = lklfuse_nfd_hfs(comp, nfd, sizeof(nfd));
++			hit = enoent = 0;
++			for (i = 0; i < 3 && !hit; i++) {
++				if (!cand[i] || n + 1 + strlen(cand[i]) >= len)
++					continue;
++				for (j = 0; j < i; j++)
++					if (cand[j] && strcmp(cand[j], cand[i]) == 0)
++						break;
++				if (j < i)
++					continue;
++				buf[n] = '/';
++				strcpy(buf + n + 1, cand[i]);
++				ret = lkl_sys_lstat(buf, &st);
++				if (ret == 0) {
++					name = cand[i];
++					hit = 1;
++				} else if (ret == -LKL_ENOENT) {
++					enoent = 1;
++				}
++			}
++			buf[n] = '\0';
++			if (!hit && enoent && cand[0] &&
++			    lklfuse_nf_scan(buf, cand[0], found, sizeof(found)) == 0) {
++				name = found;
++				hit = 1;
++			}
++			if (!hit) {
++				missing = 1;
++				if (last && create && lklfuse_nf == NF_STORE_NFC) {
++					if (!cand[0])
++						return -ENAMETOOLONG;
++					name = cand[0];
++				}
++			}
++		}
++		if (n + 1 + strlen(name) >= len)
++			return -ENAMETOOLONG;
++		buf[n++] = '/';
++		strcpy(buf + n, name);
++		n += strlen(name);
++	}
++	*out = n ? buf : path;
++	return 0;
++}
++
++/* a name as stored, for a new symlink's target */
++static int lklfuse_nf_store(const char *in, char *buf, size_t len, const char **out)
++{
++	*out = in;
++	if (lklfuse_nf == NF_STORE_NFC && !(*out = lklfuse_nfc(in, buf, len)))
++		return -ENAMETOOLONG;
++	return 0;
++}
++
++/* a symlink's target as handed out, in place in BUF (LEN bytes): HFS+'s form, or as stored when that does not fit */
++static void lklfuse_nf_show_target(char *buf, size_t len)
++{
++	char shown[PATH_MAX];
++	const char *s;
++
++	if (lklfuse_nf == NF_OFF)
++		return;
++	s = lklfuse_nfd_hfs(buf, shown, len < sizeof(shown) ? len : sizeof(shown));
++	if (s && s != buf)
++		strcpy(buf, s);
++}
++
++/* a name as handed out: HFS+'s form, or as stored when that does not fit */
++static const char *lklfuse_nf_shown(const char *in, char *buf, size_t len)
++{
++	const char *s;
++
++	if (lklfuse_nf == NF_OFF)
++		return in;
++	s = lklfuse_nfd_hfs(in, buf, len);
++	return s ? s : in;
++}
+ #else
+ #define lklfuse_err(ret) (ret)
+ #define lklfuse_xattr_flags(flags) (flags)
+ #define lklfuse_rename_flags(flags) (flags)
++
++static inline int lklfuse_resolve(const char *path, char *buf, size_t len, int create, const char **out)
++{
++	*out = path;
++	return 0;
++}
++
++static inline int lklfuse_nf_store(const char *in, char *buf, size_t len, const char **out)
++{
++	*out = in;
++	return 0;
++}
++
++static inline void lklfuse_nf_show_target(char *buf, size_t len)
++{
++}
++
++static inline const char *lklfuse_nf_shown(const char *in, char *buf, size_t len)
++{
++	return in;
++}
+ #endif
+ 
+ static void lklfuse_xlat_stat(const struct lkl_stat *in, struct stat *st)
+@@ -303,8 +592,12 @@
+ 	 * With nullpath_ok, path will be provided only if the struct
+ 	 * fuse_file_info argument is NULL.
+ 	 */
++	char pbuf[PATH_MAX];
++
+ 	if (fi)
+ 		ret = lkl_sys_fstat(fi->fh, &lkl_stat);
++	else if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
++		return ret;
+ 	else
+ 		ret = lkl_sys_lstat(path, &lkl_stat);
+ 	if (!ret)
+@@ -315,8 +608,11 @@
+ 
+ static int lklfuse_readlink(const char *path, char *buf, size_t len)
+ {
++	char pbuf[PATH_MAX];
+ 	long ret;
+ 
++	if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
++		return ret;
+ 	ret = lkl_sys_readlink(path, buf, len);
+ 	if (ret < 0)
+ 		return lklfuse_err(ret);
+@@ -326,6 +622,8 @@
+ 
+ 	buf[ret] = 0;
+ 
++	lklfuse_nf_show_target(buf, len);
++
+ 	return 0;
+ }
+ 
+@@ -369,33 +667,57 @@
+ 
+ static int lklfuse_mknod(const char *path, mode_t mode, dev_t dev)
+ {
+-	return lklfuse_own(path, lkl_sys_mknod(path, mode, dev));
++	char pbuf[PATH_MAX];
++	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 1, &path);
++
++	return ret ? ret : lklfuse_own(path, lkl_sys_mknod(path, mode, dev));
+ }
+ 
+ static int lklfuse_mkdir(const char *path, mode_t mode)
+ {
+-	return lklfuse_own(path, lkl_sys_mkdir(path, mode));
++	char pbuf[PATH_MAX];
++	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 1, &path);
++
++	return ret ? ret : lklfuse_own(path, lkl_sys_mkdir(path, mode));
+ }
+ 
+ static int lklfuse_unlink(const char *path)
+ {
+-	return lklfuse_err(lkl_sys_unlink(path));
++	char pbuf[PATH_MAX];
++	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
++
++	return ret ? ret : lklfuse_err(lkl_sys_unlink(path));
+ }
+ 
+ static int lklfuse_rmdir(const char *path)
+ {
+-	return lklfuse_err(lkl_sys_rmdir(path));
++	char pbuf[PATH_MAX];
++	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
++
++	return ret ? ret : lklfuse_err(lkl_sys_rmdir(path));
+ }
+ 
+ static int lklfuse_symlink(const char *oldname, const char *newname)
+ {
+-	return lklfuse_own(newname, lkl_sys_symlink(oldname, newname));
++	char obuf[PATH_MAX], nbuf[PATH_MAX];
++	int ret = lklfuse_nf_store(oldname, obuf, sizeof(obuf), &oldname);
++
++	if (!ret)
++		ret = lklfuse_resolve(newname, nbuf, sizeof(nbuf), 1, &newname);
++	return ret ? ret : lklfuse_own(newname, lkl_sys_symlink(oldname, newname));
+ }
+ 
+ 
+ static int lklfuse_rename(const char *oldname, const char *newname,
+ 			  unsigned int flags)
+ {
++	char obuf[PATH_MAX], nbuf[PATH_MAX];
++	int ret = lklfuse_resolve(oldname, obuf, sizeof(obuf), 0, &oldname);
++
++	if (!ret)
++		ret = lklfuse_resolve(newname, nbuf, sizeof(nbuf), 1, &newname);
++	if (ret)
++		return ret;
+ 	/* libfuse: *flags* may be `RENAME_EXCHANGE` or `RENAME_NOREPLACE` */
+ 	return lklfuse_err(lkl_sys_renameat2(LKL_AT_FDCWD, oldname, LKL_AT_FDCWD, newname,
+ 				 lklfuse_rename_flags(flags)));
+@@ -403,16 +725,24 @@
+ 
+ static int lklfuse_link(const char *oldname, const char *newname)
+ {
+-	return lklfuse_err(lkl_sys_link(oldname, newname));
++	char obuf[PATH_MAX], nbuf[PATH_MAX];
++	int ret = lklfuse_resolve(oldname, obuf, sizeof(obuf), 0, &oldname);
++
++	if (!ret)
++		ret = lklfuse_resolve(newname, nbuf, sizeof(nbuf), 1, &newname);
++	return ret ? ret : lklfuse_err(lkl_sys_link(oldname, newname));
+ }
+ 
+ static int lklfuse_chmod(const char *path, mode_t mode,
+ 			 struct fuse_file_info *fi)
+ {
++	char pbuf[PATH_MAX];
+ 	int ret;
+ 
+ 	if (fi)
+ 		ret = lkl_sys_fchmod(fi->fh, mode);
++	else if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
++		return ret;
+ 	else
+ 		ret = lkl_sys_fchmodat(LKL_AT_FDCWD, path, mode);
+ 
+@@ -422,10 +752,13 @@
+ static int lklfuse_chown(const char *path, uid_t uid, gid_t gid,
+ 			 struct fuse_file_info *fi)
+ {
++	char pbuf[PATH_MAX];
+ 	int ret;
+ 
+ 	if (fi)
+ 		ret = lkl_sys_fchown(fi->fh, uid, gid);
++	else if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
++		return ret;
+ 	else
+ 		ret = lkl_sys_fchownat(LKL_AT_FDCWD, path, uid, gid,
+ 				LKL_AT_SYMLINK_NOFOLLOW);
+@@ -435,10 +768,13 @@
+ static int lklfuse_truncate(const char *path, off_t off,
+ 			    struct fuse_file_info *fi)
+ {
++	char pbuf[PATH_MAX];
+ 	int ret;
+ 
+ 	if (fi)
+ 		ret = lkl_sys_ftruncate(fi->fh, off);
++	else if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
++		return ret;
+ 	else
+ 		ret = lkl_sys_truncate(path, off);
+ 
+@@ -524,9 +860,13 @@
+ static int lklfuse_create(const char *path, mode_t mode,
+ 	                  struct fuse_file_info *fi)
+ {
++	char pbuf[PATH_MAX];
+ 	int flags = fi->flags;
+ 	int ret, tries;
+ 
++	/* an existing entry in any form is opened (EEXIST with O_EXCL); only a new one gets the stored form */
++	if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 1, &path)))
++		return ret;
+ 	if (!lklfuse.set_owner)
+ 		return lklfuse_open3(path, true, mode, fi);
+ 	/*
+@@ -555,7 +895,10 @@
+ 
+ static int lklfuse_open(const char *path, struct fuse_file_info *fi)
+ {
+-	return lklfuse_open3(path, false, 0, fi);
++	char pbuf[PATH_MAX];
++	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
++
++	return ret ? ret : lklfuse_open3(path, false, 0, fi);
+ }
+ 
+ static int lklfuse_read(const char *path, char *buf, size_t size, off_t offset,
+@@ -600,7 +943,10 @@
+ {
+ 	long ret;
+ 	struct lkl_statfs lkl_statfs;
++	char pbuf[PATH_MAX];
+ 
++	if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
++		return ret;
+ 	ret = lkl_sys_statfs(path, &lkl_statfs);
+ 	if (ret < 0)
+ 		return lklfuse_err(ret);
+@@ -642,30 +988,45 @@
+ static int lklfuse_setxattr(const char *path, const char *name, const char *val,
+ 		   size_t size, int flags)
+ {
+-	return lklfuse_err(lkl_sys_setxattr(path, name, val, size, lklfuse_xattr_flags(flags)));
++	char pbuf[PATH_MAX];
++	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
++
++	return ret ? ret : lklfuse_err(lkl_sys_setxattr(path, name, val, size, lklfuse_xattr_flags(flags)));
+ }
+ 
+ static int lklfuse_getxattr(const char *path, const char *name, char *val,
+ 			  size_t size)
+ {
+-	return lklfuse_err(lkl_sys_getxattr(path, name, val, size));
++	char pbuf[PATH_MAX];
++	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
++
++	return ret ? ret : lklfuse_err(lkl_sys_getxattr(path, name, val, size));
+ }
+ 
+ static int lklfuse_listxattr(const char *path, char *list, size_t size)
+ {
+-	return lklfuse_err(lkl_sys_listxattr(path, list, size));
++	char pbuf[PATH_MAX];
++	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
++
++	return ret ? ret : lklfuse_err(lkl_sys_listxattr(path, list, size));
+ }
+ 
+ static int lklfuse_removexattr(const char *path, const char *name)
+ {
+-	return lklfuse_err(lkl_sys_removexattr(path, name));
++	char pbuf[PATH_MAX];
++	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
++
++	return ret ? ret : lklfuse_err(lkl_sys_removexattr(path, name));
+ }
+ 
+ static int lklfuse_opendir(const char *path, struct fuse_file_info *fi)
+ {
+ 	struct lkl_dir *dir;
++	char pbuf[PATH_MAX];
+ 	int err;
+ 
++	if ((err = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
++		return err;
+ 	dir = lkl_opendir(path, &err);
+ 	if (!dir)
+ 		return lklfuse_err(err);
+@@ -705,11 +1066,13 @@
+ 
+ 	while ((de = lkl_readdir(dir))) {
+ 		struct stat st = { 0, };
++		char shown[NAME_MAX + 1];
+ 
+ 		st.st_ino = de->d_ino;
+ 		st.st_mode = de->d_type << 12;
+ 
+-		if (fill(buf, de->d_name, &st, 0, 0))
++		/* HFS+'s form, or the name as stored when that is over NAME_MAX */
++		if (fill(buf, lklfuse_nf_shown(de->d_name, shown, sizeof(shown)), &st, 0, 0))
+ 			break;
+ 	}
+ 
+@@ -740,12 +1103,16 @@
+ 
+ static int lklfuse_access(const char *path, int mode)
+ {
+-	return lklfuse_err(lkl_sys_access(path, mode));
++	char pbuf[PATH_MAX];
++	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
++
++	return ret ? ret : lklfuse_err(lkl_sys_access(path, mode));
+ }
+ 
+ static int lklfuse_utimens(const char *path, const struct timespec tv[2],
+ 			   struct fuse_file_info *fi)
+ {
++	char pbuf[PATH_MAX];
+ 	int ret;
+ 	struct __lkl__kernel_timespec ts[2] = {
+ 		{ .tv_sec = tv[0].tv_sec, .tv_nsec = tv[0].tv_nsec },
+@@ -754,6 +1121,8 @@
+ 
+ 	if (fi)
+ 		ret = lkl_sys_utimensat(fi->fh, NULL, ts, 0);
++	else if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
++		return ret;
+ 	else
+ 		ret = lkl_sys_utimensat(-1, path, ts, LKL_AT_SYMLINK_NOFOLLOW);
+ 
+@@ -1102,6 +1471,10 @@
+ 		goto out_umount;
+ 	}
+ 
++#ifdef __APPLE__
++	lklfuse_nf = lklfuse_nfmode_for(lklfuse.type);
++#endif
++
+ 	ret = lklfuse_set_owner();
+ 	if (ret)
+ 		goto out_umount;
