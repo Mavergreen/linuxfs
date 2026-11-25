@@ -1013,7 +1013,7 @@ expect census_all_cleans test ! -e "$W/census/old.img" -a -e "$W/census/left-stu
 # a step begins only when, at its worst (the console hung: every AppleScript at its bound), it ends by
 #   PARITY_CENSUS_MIN + 11; a step whose worst is 11 or less keeps the plain cutoff
 expect census_worst_default test "$(census_worst_min zzz)" -eq 11
-expect census_worst_table test "$(for c in census_unicode census_busy census_spotlight census_finder census_trash_tags_case census_later census_stall stall; do census_worst_min "$c"; done | tr '\n' ' ')" = '13 20 24 24 13 5 60 60 '
+expect census_worst_table test "$(for c in census_unicode census_busy census_spotlight census_finder census_trash_tags_case census_later census_stall stall; do census_worst_min "$c"; done | tr '\n' ' ')" = '13 23 24 24 13 5 60 60 '
 r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=20; census_due census_finder ext4 2>&1); rc=$?
 expect census_due_worst_skips test "$rc" -ne 0
 expect census_due_worst_said has "$r" "^# census: census_finder may take 24 min, past the census's end (31 min), skipped: census_finder ext4$"

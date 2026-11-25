@@ -910,7 +910,7 @@ PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Content
 # The guest job has 180 min. Before the smoke: the VM's boot and the installs, about 5. The census begins nothing after
 #   PARITY_CENSUS_MIN = 135 min from the smoke's start (PARITY_T0, which the smoke sets first), and begins a step only if
 #   at its worst (census_worst_min: the console hung, spotlight and census_finder 24 min) it ends by 135 + 11 = 146:
-#   census_finder and spotlight begin by 122, busy by 126, unicode and trash/tags/case by 133. Then before login
+#   census_finder and spotlight begin by 122, busy by 123, unicode and trash/tags/case by 133. Then before login
 #   (about 5) and the copyback and uploads (about 5) remain: 5 + 146 + 5 + 5 = 161, leaving 19 to spare. Typical
 #   steps are shorter: spotlight about 11 (its 120 s mdfind waits, remounts, Finder's refresh, the Privacy shots); a
 #   busy census about 7, or about 11 with a stuck disk at each of its six re-attaches; one trash/tags/case census about
@@ -920,7 +920,8 @@ PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Content
 #   about 90 in all, plus item 2's Finder restart and getinfo-format shot in each census_finder (about 15 s typical, 2.5 of
 #   census_finder's 24 at worst). A stall iteration's worst is 60 min (census_worst_min), and census_stall asks census_due
 #   "stall ..." before each of its 200 iterations, so none begins after minute 86 and every one ends by 146 like every
-#   other step: 5 + 146 + 5 + 5 = 161 of 180, under the 165 allowed.
+#   other step: 5 + 146 + 5 + 5 = 161 of 180, under the 165 allowed. A step's larger worst case (census_busy's 23)
+#   moves only when it may begin, never that end.
 PARITY_CENSUS_MIN=${PARITY_CENSUS_MIN:-135}
 
 # census_pair_up CTL-IMAGE FS-IMAGE FS [readonly]: attaches both (the control -readonly when readonly) and makes them
@@ -1341,8 +1342,10 @@ census_later() {
 # census_worst_min CMD: the minutes census step CMD may take at its worst, with the console hung (every AppleScript, aqua
 #   call and screenshot at its bound; disks attaching and ejecting as usual). Counted from each function's bounds:
 #   census_unicode, ext4's (two Finder steps of 60 s a side on ext4 and on FAT32, the pair window and its shots), 13;
-#   census_busy (a stuck disk at each re-attach, about 9, TextEdit, Finder's eject and seven quits, and the six
-#   eject-after-another-volume cycles of census_busy_ejects, about 15 s each and 10 s more when busy, 3), 20;
+#   census_busy, 23: the steps before census_busy_ejects (a stuck disk at each re-attach, about 9, TextEdit, Finder's
+#   eject and seven quits), 17; census_busy_ejects' attempts, up to twice PARITY_BUSY_EJECTS (3) on each side, 12 at
+#   about 15 s, 3; each linuxfs busy eject (3 at most) 10 s more and census_lklfuse_gone's 30 s bound, 2; census_holders'
+#   DiskArbitration and mount lines on those, 1: 17 + 3 + 2 + 1 = 23;
 #   census_spotlight (two passes' mdfind at 160 s a side, the refresh at 150 s a side, two Privacy panes), 24;
 #   census_finder (seven Get Info and window views of about 113 s, two Desktop passes, three restarts), 24;
 #   census_trash_tags_case (Finder's delete and empty trash, two restarts, the label, the xattr climb), 13;
@@ -1354,7 +1357,7 @@ census_later() {
 census_worst_min() {
   case $1 in
   census_spotlight | census_finder) echo 24 ;;
-  census_busy) echo 20 ;;
+  census_busy) echo 23 ;;
   census_unicode | census_trash_tags_case) echo 13 ;;
   census_later) echo 5 ;;
   stall | census_stall) echo 60 ;;
