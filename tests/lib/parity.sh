@@ -1,6 +1,6 @@
 # platform: host-agnostic
-#   Parity library, sourced by tests/smoke-mavericks.sh (which provides ok, notok, check, bounded,
-#   OUT and W): runs one step on an HFS+ control volume and on the filesystem under test, then
+#   Parity library, sourced by tests/smoke-mavericks.sh (which provides ok, notok, bounded (tenths of
+#   a second, then 124 and a "hung:" line), OUT and W): runs one step on an HFS+ control volume and on the filesystem under test, then
 #   records or compares what each did. POSIX sh, sed and diff only.
 #
 #   parity_control KIND                   makes $W/ctl/KIND.img once, prints its path
@@ -8,9 +8,12 @@
 #   parity_pair CTL_DISK CTL_MP CTL_VOL FS FS_DISK FS_MP FS_VOL
 #                                         sets the current pair; the HFS+ side is current
 #   parity_side hfs|fs                    picks the side parity_shot photographs
-#   parity WHAT CMD...                    runs CMD on each volume, @MP@ @VOL@ @DISK@ replaced;
+#   parity WHAT CMD...                    runs CMD on each volume, @MP@ @VOL@ @DISK@ replaced, with no
+#                                         stdin and bounded by PARITY_BOUND (default 600 = 60 s; a
+#                                         timeout is status 124 in the record, so check says not ok);
 #                                         mode is PARITY_MODE_<ITEM> (record|check), ITEM being
-#                                         WHAT up to its first dot, upper-cased; default record
+#                                         WHAT up to its first dot, upper-cased, other characters
+#                                         becoming _; default record, anything else is not ok
 #   parity_norm MP VOL DISK               filter: MP, VOL and diskNsM become <MP>, <VOL>, <DISK>
 #   parity_shot STEP                      screenshot into $OUT/<side>-STEP.png, never compared
 
@@ -26,13 +29,13 @@ parity_control() {
   _pc_img=$W/ctl/$_pc_kind.img
   if test ! -f "$_pc_img"; then
     mkdir -p "$W/ctl" || return 1
-    mkfile 128m "$_pc_img" || return 1
-    _pc_dev=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$_pc_img" |
+    bounded "${PARITY_BOUND:-600}" mkfile 128m "$_pc_img" </dev/null || { rm -f "$_pc_img"; return 1; }
+    _pc_dev=$(bounded "${PARITY_BOUND:-600}" hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$_pc_img" </dev/null |
       sed -n '1s,^/dev/\(disk[0-9][0-9]*\).*,\1,p')
     if test -z "$_pc_dev"; then rm -f "$_pc_img"; return 1; fi
-    diskutil eraseDisk "$_pc_fs" Control GPT "$_pc_dev" >&2
+    bounded "${PARITY_BOUND:-600}" diskutil eraseDisk "$_pc_fs" Control GPT "$_pc_dev" </dev/null >&2
     _pc_rc=$?
-    hdiutil detach "$_pc_dev" >&2 || _pc_rc=1
+    bounded "${PARITY_BOUND:-600}" hdiutil detach "$_pc_dev" </dev/null >&2 || _pc_rc=1
     if test "$_pc_rc" -ne 0; then rm -f "$_pc_img"; return 1; fi
   fi
   echo "$_pc_img"
@@ -62,10 +65,12 @@ parity_sub() {
 parity_esc() { printf '%s\n' "$1" | sed 's/[][\.*^$/]/\\&/g'; }
 
 parity_norm() {
-  _pn_sed="s/disk[0-9][0-9]*\(s[0-9][0-9]*\)\{0,1\}/<DISK>/g"
-  if test -n "$2"; then _pn_sed="s/$(parity_esc "$2")/<VOL>/g;$_pn_sed"; fi
-  if test -n "$1"; then _pn_sed="s/$(parity_esc "$1")/<MP>/g;$_pn_sed"; fi
-  sed "$_pn_sed"
+  _pn_sed=
+  if test -n "$1"; then _pn_sed="s/$(parity_esc "$1")/<MP>/g"; fi
+  if test -n "$2"; then _pn_sed="$_pn_sed;s/$(parity_esc "$2")/<VOL>/g"; fi
+  # diskN or diskNsM as a whole word; twice, because neighbours share their boundary
+  _pn_d='s/(^|[^A-Za-z0-9])disk[0-9]+(s[0-9]+)?([^A-Za-z0-9]|$)/\1<DISK>\3/g'
+  sed "${_pn_sed#;}" | sed -E "$_pn_d;$_pn_d"
 }
 
 # parity_run SIDE MP VOL DISK CMD...: one run, normalized stdout, stderr and status on stdout
@@ -78,9 +83,9 @@ parity_run() {
     _pr_a=$(parity_sub "$_pr_a" @DISK@ "$_pr_disk")
     set -- "$@" "$_pr_a"; shift; _pr_n=$((_pr_n - 1))
   done
-  _pr_t=${TMPDIR:-/tmp}/parity.$$
-  "$@" >"$_pr_t.out" 2>"$_pr_t.err"; _pr_st=$?
-  { echo "== stdout"; cat "$_pr_t.out"; echo "== stderr"; cat "$_pr_t.err"; echo "== status $_pr_st"; } |
+  _pr_t=$OUT/parity/.run.$$
+  bounded "${PARITY_BOUND:-600}" "$@" >"$_pr_t.out" 2>"$_pr_t.err" </dev/null; _pr_st=$?
+  { echo "== stdout"; awk 1 "$_pr_t.out"; echo "== stderr"; awk 1 "$_pr_t.err"; echo "== status $_pr_st"; } |
     parity_norm "$_pr_mp" "$_pr_vol"
   rm -f "$_pr_t.out" "$_pr_t.err"
 }
@@ -88,7 +93,12 @@ parity_run() {
 parity() {
   _pw_what=$1; shift
   _pw_item=$(printf '%s' "${_pw_what%%.*}" | tr '[:lower:]' '[:upper:]')
+  _pw_item=$(printf '%s' "$_pw_item" | tr -c 'A-Za-z0-9\n' _)
   eval "_pw_mode=\${PARITY_MODE_$_pw_item:-record}"
+  case $_pw_mode in
+  record|check) ;;
+  *) notok "parity $_pw_what"; echo "parity: PARITY_MODE_$_pw_item is '$_pw_mode', not record or check"; return 1 ;;
+  esac
   _pw_dir=$OUT/parity
   mkdir -p "$_pw_dir" || return 1
   parity_run hfs "$PARITY_CTL_MP" "$PARITY_CTL_VOL" "$PARITY_CTL_DISK" "$@" >"$_pw_dir/$_pw_what.hfs.txt"
