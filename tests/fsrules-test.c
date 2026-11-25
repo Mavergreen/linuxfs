@@ -129,6 +129,31 @@ int main(int argc, char **argv)
 			is(fsrules_valid_bsd(bad[k]), 0, what);
 		}
 	}
+	/* spec: Task 16f fix round 1 (m4) -- root locks and checks a disk whole: disk2 for disk2sN, and a mount from /dev/disk2 or
+	 * any /dev/disk2s<N> (digits after the s, nothing more) is from that disk; disk22 is another disk */
+	{
+		char w[40];
+
+		is(fsrules_whole_disk("disk2s1", w, sizeof w), 1, "whole_disk: disk2s1 is valid");
+		iss(w, "disk2", "whole_disk: disk2s1's whole disk is disk2");
+		is(fsrules_whole_disk("disk22", w, sizeof w), 1, "whole_disk: disk22 is valid");
+		iss(w, "disk22", "whole_disk: disk22 is its own whole disk");
+		is(fsrules_whole_disk("disk2s", w, sizeof w), 0, "whole_disk: disk2s is not a BSD name");
+		is(fsrules_whole_disk("disk2s1", w, 5), 0, "whole_disk: no room for the name is 0");
+		is(fsrules_from_disk("/dev/disk2", "disk2"), 1, "from_disk: /dev/disk2 is disk2's");
+		is(fsrules_from_disk("/dev/disk2s1", "disk2"), 1, "from_disk: /dev/disk2s1 is disk2's");
+		is(fsrules_from_disk("/dev/disk2s15", "disk2"), 1, "from_disk: /dev/disk2s15 is disk2's");
+		is(fsrules_from_disk("/dev/disk22", "disk2"), 0, "from_disk: /dev/disk22 is not disk2's");
+		is(fsrules_from_disk("/dev/disk22s1", "disk2"), 0, "from_disk: /dev/disk22s1 is not disk2's");
+		is(fsrules_from_disk("/dev/disk2s", "disk2"), 0, "from_disk: /dev/disk2s is not");
+		is(fsrules_from_disk("/dev/disk2s1x", "disk2"), 0, "from_disk: /dev/disk2s1x is not");
+		is(fsrules_from_disk("/dev/disk2sa", "disk2"), 0, "from_disk: /dev/disk2sa is not");
+		is(fsrules_from_disk("/dev/rdisk2s1", "disk2"), 0, "from_disk: /dev/rdisk2s1 is not (a raw node is never a mount's source)");
+		is(fsrules_from_disk("disk2s1", "disk2"), 0, "from_disk: a name without /dev/ is not");
+		is(fsrules_from_disk("linuxfs@disk2s1", "disk2"), 0, "from_disk: linuxfs@disk2s1 is not");
+		is(fsrules_from_disk(NULL, "disk2"), 0, "from_disk: NULL is not");
+		is(fsrules_from_disk("/dev/disk2", NULL), 0, "from_disk: no disk is never matched");
+	}
 	/* spec: item 6 (fsname=/dev/<bsd>) -- root's force-unmount takes only a mount root made itself: one of our six, of
 	 * the bundle's own fs, from /dev/<bsd>, owned by root; anything else on that mount point is someone else's */
 	is(fsrules_mount_is_roots("ext4", "disk2s1", "macfuse_ext4", "/dev/disk2s1", 0), 1, "roots: ext4 mounted by root from /dev/disk2s1");

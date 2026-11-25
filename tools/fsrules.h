@@ -87,4 +87,12 @@ int fsrules_hint(const char *err, char *hint, size_t len);
 /* Whether S is a BSD disk name, disk[0-9]+(s[0-9]+)? and at most 32 characters: what root opens as /dev/r<S>. */
 int fsrules_valid_bsd(const char *s);
 
+/* The whole disk a BSD name is on (disk2 for disk2s1, disk2 for disk2) into OUT: 1, or 0 when BSD is not a BSD name or OUT
+ * (OUTLEN bytes) has no room for it. */
+int fsrules_whole_disk(const char *bsd, char *out, size_t outlen);
+
+/* Whether a mount's source (f_mntfromname) is the whole disk WHOLE or one of its partitions: exactly /dev/WHOLE or
+ * /dev/WHOLEs<digits>. /dev/disk22 is not disk2's, nor is a raw node or any other name. NULL arguments give 0. */
+int fsrules_from_disk(const char *f_mntfromname, const char *whole);
+
 #endif

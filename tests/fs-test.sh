@@ -364,8 +364,8 @@ mkdir -p "$D/short"
 V=$D/vols; rm -rf "$V"; mkdir -p "$V/NAME" "$V/other"; : > "$V/file"; ln -s "$V/NAME" "$V/link"
 H=/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d
 UID_D=$(id -u daemon)
-# the disks' locks (root's are /var/run/dev.mavergreen.linuxfs.mount.<bsd>.lock)
-LK=$D/locks; rm -rf "$LK"; mkdir -p "$LK"; LKF=$LK/dev.mavergreen.linuxfs.mount.$E.lock
+# the disks' locks, in a directory the program makes on demand (root's are /var/run/linuxfs/dev.mavergreen.linuxfs.mount.<disk>.lock)
+LK=$D/locks; rm -rf "$LK"; LKF=$LK/dev.mavergreen.linuxfs.mount.$E.lock
 plan() { # ARGS...: the drop build's plan for user daemon, volumes under $V
   env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_FS_TEST_LOCKDIR="$LK" LINUXFS_PREFS_USER="$D/none.plist" \
     LINUXFS_PREFS_MACHINE="${MACHP:-$D/none2.plist}" "$DM" "$@"; }
@@ -419,17 +419,55 @@ env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES=/private/var LINUXFS_
 : > "$M/empty.mnttab"
 env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES=/ LINUXFS_FS_TEST_LOCKDIR="$LK" LINUXFS_FS_TEST_MNTTAB="$M/empty.mnttab" "$DM" "/dev/$E" /dev > "$M/plan" 2>&1; rc=$?
 [ $rc = 1 ] && ! grep -q '^mnt' "$M/plan" && grep -q 'another volume' "$M/plan"; ok $? "root plan: a mount point on another device than the volumes directory is refused (rc $rc: $(tail -1 "$M/plan"))"
+# spec: Task 16f fix round 1 (m1) -- and with the real mount table (getmntinfo), /dev, devfs's mount point, is something mounted already
+env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES=/ LINUXFS_FS_TEST_LOCKDIR="$LK" "$DM" "/dev/$E" /dev > "$M/plan" 2>&1; rc=$?
+test $rc = 1 && ! grep -q '^fd3' "$M/plan" && grep -q '^linuxfs-mount: refused: something is mounted on the mount point' "$M/plan"
+ok $? "root plan: the real mount table refuses a mount point something is mounted on (/dev) (rc $rc: $(tail -1 "$M/plan"))"
 # spec: tools/fs.c -- every refusal is on stderr (and syslog) with a reason
 plan "/dev/disk9;ls" "$V/NAME" 2>&1 >/dev/null | grep -q '^linuxfs-mount: refused: '; ok $? "root plan: a refusal writes its reason to stderr"
 plan "/dev/disk99999" "$V/NAME" 2>&1 >/dev/null | grep -q '^linuxfs-mount: refused: '; ok $? "root plan: a device that cannot be opened is refused on stderr too"
 # spec: Task 16f (root-daemon design I4, N4) -- one mount per disk at a time: root takes the disk's lock (flock, LOCK_EX|LOCK_NB)
 #       after the names are checked and before the device is opened; another holder means another mount of the disk is under way
+# spec: Task 16f fix round 1 (I1) -- the locks' directory (/var/run/linuxfs: /var/run is root:daemon 0775) is made on demand, root's
+#       (here: this user's, with this user's group) and 0700, and is checked before each use: a symlink, another mode or another
+#       group is refused, never repaired
+rm -rf "$LK"
+fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
+test $rc = 0 && test -d "$LK" && test ! -L "$LK" && test "$(stat -f '%Lp %u %g' "$LK")" = "700 $(id -u) $(id -g)"
+ok $? "root plan: the locks' directory is made on demand, 0700 (rc $rc, $(stat -f '%Sp %u %g' "$LK" 2>&1))"
+lockdir_refused() { # WHAT: a plan now is refused before the device is opened
+  fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc=$?
+  test $rc = 1 && grep -qx "linuxfs-mount: refused: the disks' lock directory is not root's alone (0700, not a symlink)" "$M/plan.err" && ! grep -q '^fd3' "$M/plan"
+  ok $? "root plan: $1 → refused (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"; }
+mv "$LK" "$LK.real"; ln -s "$LK.real" "$LK"
+lockdir_refused "the locks' directory a symlink (to a good one)"
+rm -f "$LK"; mv "$LK.real" "$LK"
+chmod 755 "$LK"; lockdir_refused "the locks' directory 0755"
+test "$(stat -f %Lp "$LK")" = 755; ok $? "and it is left as it is, not repaired ($(stat -f %Lp "$LK"))"
+chmod 700 "$LK"
+og=$(id -G | tr ' ' '\n' | grep -vx "$(id -g)" | head -1)
+if test -n "$og" && chgrp "$og" "$LK" 2>/dev/null; then
+  lockdir_refused "the locks' directory of another group ($og)"
+  chgrp "$(id -g)" "$LK"
+else
+  ok 0 "# SKIP no second group to give the locks' directory"
+fi
+rm -rf "$LK.file"; mv "$LK" "$LK.real"; : > "$LK"; chmod 700 "$LK"
+lockdir_refused "a file where the locks' directory goes"
+rm -f "$LK"; mv "$LK.real" "$LK"
+fplan "$F2" "/dev/$E" "$V/NAME" > /dev/null 2>&1
+chmod 644 "$LKF"
+fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc=$?
+test $rc = 1 && grep -q '^linuxfs-mount: refused: the disk.s lock file' "$M/plan.err" && ! grep -q '^fd3' "$M/plan"
+ok $? "root plan: a lock file of another mode than 0600 → refused (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
+rm -f "$LKF"
 hold() { # SECONDS: a perl that holds the disk's lock that long, in the background ($holder); waits, bounded, until it does
   rm -f "$M/held"
-  /usr/bin/perl -MFcntl=:flock -e 'open(my $f, ">>", $ARGV[0]) or exit 1; flock($f, LOCK_EX) or exit 1; open(my $h, ">", $ARGV[1]) or exit 1; close $h; sleep $ARGV[2]' \
+  /usr/bin/perl -MFcntl=:flock -e 'open(my $f, "+<", $ARGV[0]) or exit 1; flock($f, LOCK_EX) or exit 1; open(my $h, ">", $ARGV[1]) or exit 1; close $h; sleep $ARGV[2]' \
     "$LKF" "$M/held" "$1" & holder=$!
   i=0; while test ! -e "$M/held" && test $i -lt 50; do sleep 0.1; i=$((i + 1)); done; }
 lockfree() { /usr/bin/perl -MFcntl=:flock -e 'open(my $f, "<", $ARGV[0]) or exit 1; flock($f, LOCK_EX | LOCK_NB) or exit 1' "$LKF"; }
+fplan "$F2" "/dev/$E" "$V/NAME" > /dev/null 2>&1	# the lock file, made as the program makes it
 hold 5
 fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc=$?
 kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
@@ -449,13 +487,36 @@ tabplan() { # MNTTAB-LINE: the plan against a mount table of that line
   printf '%s\n' "$1" > "$M/mnttab"
   FP_ENV="LINUXFS_FS_TEST_MNTTAB=$M/mnttab" fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc=$?; }
 tabplan "$(printf 'macfuse_ext4\t/dev/disk99\t%s\t0' "$V/NAME")"
-test $rc = 1 && grep -q "^linuxfs-mount: refused: something is mounted on .* or from /dev/$E already\$" "$M/plan.err" && ! grep -q '^fd3' "$M/plan"
+test $rc = 1 && grep -qx "linuxfs-mount: refused: something is mounted on the mount point or from disk $E already" "$M/plan.err" && ! grep -q '^fd3' "$M/plan"
 ok $? "root plan: a mount on MNT → refused (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
 tabplan "$(printf 'hfs\t/dev/%s\t/Volumes/other\t501' "$E")"
 test $rc = 1 && grep -q '^linuxfs-mount: refused: something is mounted' "$M/plan.err" && ! grep -q '^fd3' "$M/plan"
 ok $? "root plan: a mount from /dev/$E elsewhere → refused (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
 tabplan "$(printf 'hfs\t/dev/%s1\t/Volumes/other\t0\nhfs\t/dev/disk0s2\t%s/other\t0\nhfs\t/dev/r%s\t/x\t0' "$E" "$V" "$E")"
 test $rc = 0 && grep -q '^fd3' "$M/plan"; ok $? "root plan: other mounts (/dev/${E}1, another mount point, /dev/r$E) do not refuse it (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
+# spec: Task 16f fix round 1 (m4) -- a disk is locked and checked whole: the lock is the whole disk's (disk2 for disk2sN), and a mount
+#       from /dev/<whole> or any /dev/<whole>s<N> refuses; partitions of one disk mount one after another, never beside the whole disk
+tabplan "$(printf 'hfs\t/dev/%ss1\t/Volumes/other\t501' "$E")"
+test $rc = 1 && grep -q "^linuxfs-mount: refused: something is mounted .* disk $E already" "$M/plan.err" && ! grep -q '^fd3' "$M/plan"
+ok $? "root plan: the whole disk $E is refused while its partition ${E}s1 is mounted (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
+printf 'hfs\t/dev/%s\t/Volumes/other\t0\n' "$E" > "$M/mnttab"
+FP_ENV="LINUXFS_FS_TEST_MNTTAB=$M/mnttab" fplan "$F2" "/dev/${E}s1" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc=$?
+test $rc = 1 && grep -q "^linuxfs-mount: refused: something is mounted .* disk $E already" "$M/plan.err" && ! grep -q '^fd3' "$M/plan"
+ok $? "root plan: a partition ${E}s1 is refused while the whole disk $E is mounted (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
+printf 'hfs\t/dev/%ss2\t/Volumes/other\t0\n' "$E" > "$M/mnttab"
+FP_ENV="LINUXFS_FS_TEST_MNTTAB=$M/mnttab" fplan "$F2" "/dev/${E}s1" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc=$?
+test $rc = 1 && grep -q "^linuxfs-mount: refused: something is mounted .* disk $E already" "$M/plan.err"
+ok $? "root plan: a partition ${E}s1 is refused while ${E}s2 is mounted (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
+hold 5
+fplan "$F2" "/dev/${E}s1" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc1=$?
+cp "$M/plan.err" "$M/plan.err1"
+fplan "$F2" "/dev/${E}s2" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc2=$?
+fplan "$F2" "/dev/${E}2" "$V/NAME" > "$M/plan" 2> "$M/plan.err3"; rc3=$?
+kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+test $rc1 = 1 && test $rc2 = 1 && grep -qx "linuxfs-mount: refused: another mount of $E is under way" "$M/plan.err1" && grep -qx "linuxfs-mount: refused: another mount of $E is under way" "$M/plan.err" && test ! -e "$LK/dev.mavergreen.linuxfs.mount.${E}s1.lock"
+ok $? "root plan: partitions ${E}s1 and ${E}s2 take the whole disk's lock: refused while it is held (rc $rc1 $rc2: $(cat "$M/plan.err1" "$M/plan.err" | tr '\n' ';'))"
+! grep -q 'under way' "$M/plan.err3" && test -e "$LK/dev.mavergreen.linuxfs.mount.${E}2.lock"
+ok $? "root plan: ${E}2 is another disk than $E: its own lock, not refused as under way (rc $rc3: $(tr '\n' ';' < "$M/plan.err3"))"
 # spec: tools/fs.c -- test environment overrides are not honoured by the mount role's environment; the shipped build has no test code at all
 FP_ENV="LINUXFS_CLI=/bin/false LINUXFS_OPEN=/bin/false LINUXFS_LKLFUSE=/bin/false" fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1
 grep -qx "env LINUXFS_OPEN=$H/linuxfs-open" "$M/plan" && grep -qx "env LINUXFS_LKLFUSE=$H/lklfuse" "$M/plan"; ok $? "root plan: a caller's LINUXFS_OPEN and LINUXFS_LKLFUSE are not passed on"
@@ -741,6 +802,6 @@ ok $? "root plan (helper stand-in): a live root mount of $E is never unmounted b
 rm -f "$D/drop/mhelper.mnttab"; : > "$D/drop/mhelper.mnttab"
 HS_ENV="LINUXFS_FS_TEST_MNTTAB=$D/drop/mhelper.mnttab"; hs "mounted 5" ok; unset HS_ENV
 test $rc != 0 && grep -qx "unmount-attempt $V/NAME" "$M/plan"; ok $? "and a request whose own mount landed before it failed unmounts that mount (rc $rc: $(grep '^unmount' "$M/plan"))"
-! strings "$D/linuxfs-fs" | grep -q 'LINUXFS_FS_TEST'; ok $? "the shipped build carries no LINUXFS_FS_TEST_* code"
+! strings "$D/linuxfs-fs" | grep -qE 'LINUXFS_FS_TEST|unmount-attempt'; ok $? "the shipped build carries no LINUXFS_FS_TEST_* code and no unmount-attempt line"
 ! grep -q 'LINUXFS_FS_TEST' "$ROOT"/build/*.sh; ok $? "no build script defines LINUXFS_FS_TEST_DROP"
 echo "1..$n"; exit $bad

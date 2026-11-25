@@ -9,8 +9,8 @@
  * fsck -q DEV                                     exit 0 (a quick check has nothing to do); -n or -y exit 8
  * mount [-o OPT]... DEV MNT                       as the console user: runs the CLI's da-mount and, for an encrypted volume,
  *                                                  asks for the password (the keychain keeper first, then Apple's dialog);
- *                                                  as root: takes the disk's lock (one mount of a disk at a time) and refuses when
- *                                                  anything is mounted on MNT or from /dev/DEV already; opens /dev/rDEV as fd 3; then, with a macFUSE that
+ *                                                  as root: takes the whole disk's lock (one mount of a disk at a time) and refuses
+ *                                                  when anything is mounted on MNT or from the disk or its partitions already; opens /dev/rDEV as fd 3; then, with a macFUSE that
  *                                                  serves a /dev/fd/N mountpoint, runs the bundled CLI's da-mount as _linuxfs first,
  *                                                  until it is ready (nothing left that can fail before lklfuse starts), then runs
  *                                                  mount_macfuse itself (allow_other) and hands the device it sends to the CLI over
@@ -578,7 +578,7 @@ static int run_cli(const char *cli, const struct mountreq *req, const char *pw, 
 #define STATUS_WAIT_S 60	/* for its mount status: mount(2) ends when lklfuse answers the kernel's INIT */
 #define REFUSED_WAIT_S 5	/* for that status after the CLI failed (its descriptors closed, the mount fails) */
 #define STOP_WAIT_S 2		/* for a process told to stop, before SIGKILL */
-#define LOCK_DIR "/var/run"	/* the disks' locks: LOCK_DIR/dev.mavergreen.linuxfs.mount.<bsd>.lock */
+#define LOCK_DIR "/var/run/linuxfs"	/* the disks' locks: LOCK_DIR/dev.mavergreen.linuxfs.mount.<whole disk>.lock */
 #define LOCK_FD_MIN 10		/* the lock's descriptor, at or above this: clear of the disk (3), the device (4), 5 and the channel (6) */
 #define STR_(x) #x
 #define STR(x) STR_(x)
@@ -603,6 +603,7 @@ static void die(const char *what)
 
 #ifdef LINUXFS_FS_TEST_DROP
 #define ROOT_ONLY_UID geteuid()	/* the tests' stand-in for root: whoever runs the test build owns the mount point */
+#define ROOT_ONLY_GID getegid()	/* and its group stands in for root's (the locks' directory) */
 static const char *volumes_dir(void) { const char *v = getenv("LINUXFS_FS_TEST_VOLUMES"); return v && *v ? v : "/Volumes"; }
 static const char *run_user(void) { const char *u = getenv("LINUXFS_FS_TEST_USER"); return u && *u ? u : RUN_USER; }
 /* no manifest unless the test names one, so a macFUSE installed here never changes the plan */
@@ -618,6 +619,7 @@ static const char *libfuse_path(void) { const char *v = getenv("LINUXFS_FS_TEST_
 static const char *lock_dir(void) { const char *v = getenv("LINUXFS_FS_TEST_LOCKDIR"); return v && *v ? v : LOCK_DIR; }
 #else
 #define ROOT_ONLY_UID 0
+#define ROOT_ONLY_GID 0
 static const char *volumes_dir(void) { return "/Volumes"; }
 static const char *run_user(void) { return RUN_USER; }
 static const char *macfuse_manifest(void) { return MACFUSE_MANIFEST; }
@@ -911,10 +913,15 @@ static int mounted_on(const char *fs, const char *mnt, const char *bsd)
 	return 0;
 }
 
-/* Whether anything at all is mounted on MNT, or from /dev/BSD (any type, on any mount point): 0 nothing; 1 something; -1 when the
- * mount table cannot be read. Root mounts only where nothing is, so that its failure path (mounted_on) can only ever find its own
- * mount: f_owner 0 tells root's mount from a user's, not one root mount from another. */
-static int mounted_already(const char *mnt, const char *bsd)
+/* Whether anything at all is mounted on MNT, or from the disk WHOLE or any of its partitions (/dev/WHOLE, /dev/WHOLEs<N>; any type,
+ * on any mount point): 0 nothing; 1 something; -1 when the mount table cannot be read. Root mounts only where nothing is, so that
+ * its failure path (mounted_on) can only ever find its own mount: f_owner 0 tells root's mount from a user's, not one root mount
+ * from another. A whole disk and its partitions are one: a stale superblock at the start of a partitioned disk must never be
+ * mounted over its mounted partitions. The window this leaves: from this check to mount_macfuse's mount(2), seconds (the CLI's
+ * READY_WAIT_S, then DEVICE_WAIT_S), anything that does not take the disk's lock (diskarbitrationd, or a user's own mount of a
+ * disk image) can still mount the disk elsewhere or MNT's directory over. The disk is then mounted twice; the failure path still
+ * unmounts only the topmost mount on MNT, and only root's of this disk. */
+static int mounted_already(const char *mnt, const char *whole)
 {
 	struct statfs *m;
 	int n, i;
@@ -923,36 +930,89 @@ static int mounted_already(const char *mnt, const char *bsd)
 	if (n < 0)
 		return -1;
 	for (i = 0; i < n; i++)
-		if (strcmp(m[i].f_mntonname, mnt) == 0 ||
-		    (strncmp(m[i].f_mntfromname, "/dev/", 5) == 0 && strcmp(m[i].f_mntfromname + 5, bsd) == 0))
+		if (strcmp(m[i].f_mntonname, mnt) == 0 || fsrules_from_disk(m[i].f_mntfromname, whole))
 			return 1;
 	return 0;
 }
 
-/* The disk's lock, LOCK_DIR/dev.mavergreen.linuxfs.mount.<bsd>.lock, taken (flock, exclusive, without waiting): one mount of a disk
- * at a time. Its descriptor, at or above LOCK_FD_MIN, is not close-on-exec: root's mount_macfuse inherits it (mount_by_root keeps it
- * there), so the lock lives as long as anything of root's for this mount does, and the CLI closes it before it becomes _linuxfs,
- * so nothing of _linuxfs's ever holds it. The file is opened without following a symlink, and must be a regular file of root's
- * with one link; it is never removed (a removed lock file someone else still holds would let a second lock be taken). The
- * descriptor, or -1 having refused. */
-static int lock_disk(const char *fs, const char *bsd)
+/* The locks' directory, LOCK_DIR (/var/run/linuxfs), opened: made on demand (/var/run is emptied at boot), root's (uid and gid 0)
+ * and 0700, because /var/run itself is root:daemon 0775, where the daemon group could rename a held lock file aside or plant one.
+ * It is checked at each use, by lstat and by fstat of the descriptor opened without following a symlink (the same directory both
+ * times): a directory of root's and root's group, mode exactly 0700. Anything else is refused and never repaired. A directory
+ * mkdir made now is ours to give root's group and 0700, but only when it is root's already (a directory someone else put there
+ * between the mkdir and the open is not). The descriptor, or -1 having refused. */
+static int lock_dir_open(const char *fs)
 {
-	char path[PATH_MAX], why[128];
-	struct stat st;
-	int fd, hi;
+	const char *dir = lock_dir();
+	struct stat lst, st;
+	int dfd;
 
-	if (snprintf(path, sizeof path, "%s/dev.mavergreen.linuxfs.mount.%s.lock", lock_dir(), bsd) >= (int)sizeof path) {
-		refuse(fs, "the disk's lock file's path is too long");
+	if (mkdir(dir, 0700) == 0) {
+		dfd = open(dir, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
+		if (dfd < 0 || fstat(dfd, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != ROOT_ONLY_UID ||
+		    fchown(dfd, ROOT_ONLY_UID, ROOT_ONLY_GID) != 0 || fchmod(dfd, 0700) != 0) {
+			if (dfd >= 0)
+				close(dfd);
+			refuse(fs, "the disks' lock directory cannot be made root's alone");
+			return -1;
+		}
+		close(dfd);
+	} else if (errno != EEXIST) {
+		refuse(fs, "the disks' lock directory cannot be made");
 		return -1;
 	}
-	fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY, 0600);
+	dfd = open(dir, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
+	if (dfd < 0 || lstat(dir, &lst) != 0 || fstat(dfd, &st) != 0 || lst.st_dev != st.st_dev || lst.st_ino != st.st_ino ||
+	    !S_ISDIR(st.st_mode) || st.st_uid != ROOT_ONLY_UID || st.st_gid != ROOT_ONLY_GID || (st.st_mode & 07777) != 0700) {
+		if (dfd >= 0)
+			close(dfd);
+		refuse(fs, "the disks' lock directory is not root's alone (0700, not a symlink)");
+		return -1;
+	}
+	return dfd;
+}
+
+/* The disk's lock, LOCK_DIR/dev.mavergreen.linuxfs.mount.<whole>.lock, taken (flock, exclusive, without waiting): one mount of a disk,
+ * whole or any of its partitions, at a time. The file is opened relative to the checked directory's descriptor (fchdir there and
+ * back: 10.9 has no openat), so a directory swapped after the check cannot redirect it. Its descriptor, at or above LOCK_FD_MIN, is
+ * not close-on-exec: root's mount_macfuse inherits it (mount_by_root keeps it there), so the lock lives as long as anything of
+ * root's for this mount does, and the CLI closes it before it becomes _linuxfs, so nothing of _linuxfs's ever holds it. The file
+ * is opened without following a symlink, and must be a regular file of root's, 0600, with one link; it is never removed (a removed
+ * lock file someone else still holds would let a second lock be taken). The descriptor, or -1 having refused. */
+static int lock_disk(const char *fs, const char *whole)
+{
+	char name[96], why[128];
+	struct stat st;
+	int dfd, cwd, fd, hi;
+
+	if (snprintf(name, sizeof name, "dev.mavergreen.linuxfs.mount.%s.lock", whole) >= (int)sizeof name) {
+		refuse(fs, "the disk's lock file's name is too long");
+		return -1;
+	}
+	dfd = lock_dir_open(fs);
+	if (dfd < 0)
+		return -1;
+	cwd = open(".", O_RDONLY | O_NOCTTY);
+	if (cwd < 0 || fchdir(dfd) != 0) {
+		if (cwd >= 0)
+			close(cwd);
+		close(dfd);
+		refuse(fs, "cannot enter the disks' lock directory");
+		return -1;
+	}
+	fd = open(name, O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY, 0600);
+	if (fchdir(cwd) != 0)
+		die("cannot return to the working directory");
+	close(cwd);
+	close(dfd);
 	if (fd < 0) {
 		refuse(fs, "the disk's lock file cannot be opened (or is a symlink)");
 		return -1;
 	}
-	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != ROOT_ONLY_UID || st.st_nlink != 1) {
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != ROOT_ONLY_UID || (st.st_mode & 07777) != 0600 ||
+	    st.st_nlink != 1) {
 		close(fd);
-		refuse(fs, "the disk's lock file is not a regular file of root's alone");
+		refuse(fs, "the disk's lock file is not a regular file of root's alone (0600, one link)");
 		return -1;
 	}
 	hi = fcntl(fd, F_DUPFD, LOCK_FD_MIN);	/* the copy is not close-on-exec */
@@ -966,7 +1026,7 @@ static int lock_disk(const char *fs, const char *bsd)
 
 		close(hi);
 		if (e == EWOULDBLOCK) {
-			snprintf(why, sizeof why, "another mount of %s is under way", bsd);
+			snprintf(why, sizeof why, "another mount of %s is under way", whole);
 			refuse(fs, why);
 		} else
 			refuse(fs, "the disk's lock cannot be taken");
@@ -1390,7 +1450,7 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 	struct passwd *pw;
 	struct stat st;
 	char node[64], devarg[64], name[64];
-	char *args[8];
+	char *args[8], whole[40];
 	const char *bsd;
 	int fd, mfd, n = 0, ro_fallback = 0, ro, by_root, lockfd, m;
 	uid_t uid;
@@ -1398,7 +1458,7 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 
 	fill_std_fds();
 	bsd = strncmp(req->dev, "/dev/", 5) == 0 ? req->dev + 5 : req->dev;
-	if (!fsrules_valid_bsd(bsd))
+	if (!fsrules_valid_bsd(bsd) || !fsrules_whole_disk(bsd, whole, sizeof whole))
 		return refuse(fs, "the device is not diskN or diskNsM");
 	if (!valid_mnt_path(req->mnt))
 		return refuse(fs, "the mount point is not directly under /Volumes");
@@ -1411,19 +1471,20 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 	snprintf(node, sizeof node, "/dev/r%s", bsd);
 	snprintf(devarg, sizeof devarg, "/dev/%s", bsd);
 
-	/* One mount of a disk at a time (its lock, held to the end by this program and by root's mount_macfuse), and only where
-	 * nothing is mounted already, on MNT or from the disk: so a failure here can only ever unmount this request's own mount. */
-	lockfd = lock_disk(fs, bsd);
+	/* One mount of a disk, whole or a partition, at a time (the whole disk's lock, held to the end by this program and by root's
+	 * mount_macfuse), and only where nothing is mounted already, on MNT or from the disk or any of its partitions: so a failure
+	 * here can only ever unmount this request's own mount (mounted_already states the window left to what takes no lock). */
+	lockfd = lock_disk(fs, whole);
 	if (lockfd < 0)
 		return 1;
-	m = mounted_already(req->mnt, bsd);
+	m = mounted_already(req->mnt, whole);
 	if (m != 0) {
-		char why[96];
+		char why[112];
 
 		close(lockfd);
 		if (m < 0)
 			return refuse(fs, "the mount table cannot be read");
-		snprintf(why, sizeof why, "something is mounted on the mount point or from /dev/%s already", bsd);
+		snprintf(why, sizeof why, "something is mounted on the mount point or from disk %s already", whole);
 		return refuse(fs, why);
 	}
 

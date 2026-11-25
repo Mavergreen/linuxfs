@@ -319,3 +319,37 @@ int fsrules_valid_bsd(const char *s)
 	}
 	return *q == '\0' && q - s <= 32;
 }
+
+int fsrules_whole_disk(const char *bsd, char *out, size_t outlen)
+{
+	size_t n;
+
+	if (!bsd || !out || !fsrules_valid_bsd(bsd))
+		return 0;
+	n = 4 + strspn(bsd + 4, "0123456789");
+	if (n >= outlen)
+		return 0;
+	memcpy(out, bsd, n);
+	out[n] = '\0';
+	return 1;
+}
+
+int fsrules_from_disk(const char *f_mntfromname, const char *whole)
+{
+	const char *r;
+	size_t n;
+
+	if (!f_mntfromname || !whole || strncmp(f_mntfromname, "/dev/", 5) != 0)
+		return 0;
+	n = strlen(whole);
+	if (n == 0 || strncmp(f_mntfromname + 5, whole, n) != 0)
+		return 0;
+	r = f_mntfromname + 5 + n;
+	if (*r == '\0')
+		return 1;
+	if (*r++ != 's' || !isdigit((unsigned char)*r))
+		return 0;
+	while (isdigit((unsigned char)*r))
+		r++;
+	return *r == '\0';
+}
