@@ -17,10 +17,11 @@
  *   "noauto-remove-all"         ->  "ok", or "no REASON": every linuxfs entry goes, and no other line
  * It refuses a peer other than root or the console user (before reading its request), a request of more than one line,
  * a path other than a raw disk node, a partition the Mac has mounted, a disk with partitions under it, a system partition
- * by type (EFI, Apple, Windows, from IOKit), FAT, exFAT or NTFS on internal media, and any partition whose superblock is
- * not a filesystem linuxfs knows. It checks SPEC and BUNDLE itself, never trusting the CLI, and edits only linuxfs's own
- * lines of an /etc/fstab that is a regular root-owned file of at most 64 KiB, writing it whole (a new file beside it,
- * renamed over it); adding an entry that is there, or removing one that is not, is "ok". It never runs a program.
+ * by type (EFI, Apple, Windows, from IOKit), FAT, exFAT or NTFS on internal media, a disk whose node is neither root's nor
+ * the peer's ("another user's disk"), and any partition whose superblock is not a filesystem linuxfs knows. It checks SPEC
+ * and BUNDLE itself, never trusting the CLI, and edits only linuxfs's own lines of an /etc/fstab that is a regular
+ * root-owned file of at most 64 KiB, writing it whole (a new file beside it, renamed over it); adding an entry that is
+ * there, or removing one that is not, is "ok". It never runs a program.
  * --migrate-prefs turns each Ignore:<LABEL> = true preference (the console user's and the machine's: the old way to keep a
  * volume from mounting by itself) into a LABEL= entry, when a disk with a volume of that name is attached to give the
  * bundle; it prints "user|machine<TAB>LABEL" for each it converted, for the postinstall to delete, and logs the others.
@@ -561,6 +562,21 @@ static uid_t console_uid(void)
 }
 #endif
 
+/* Why DEV's node may not be handed to PEER (fsrules_node_owner_ok), or NULL. The test build (LINUXFS_HELPER_TEST, never
+ * shipped) takes the node's owner from LINUXFS_HELPER_TEST_NODE_UID when it is set: a test cannot chown its stand-in. */
+static const char *helper_node_refusal(const char *dev, uid_t peer)
+{
+	struct stat st;
+
+	if (stat(dev, &st) != 0)
+		return why_errno(dev);
+#ifdef LINUXFS_HELPER_TEST
+	if (getenv("LINUXFS_HELPER_TEST_NODE_UID"))
+		st.st_uid = (uid_t)strtoul(getenv("LINUXFS_HELPER_TEST_NODE_UID"), NULL, 10);
+#endif
+	return fsrules_node_owner_ok(st.st_uid, peer) ? NULL : "another user's disk";
+}
+
 static void reply(int c, const char *msg, int fd)
 {
 	struct msghdr mh = { 0 };
@@ -659,6 +675,15 @@ void helper_serve(int c, uid_t peer, uid_t console, int test_files)
 	}
 	if (!helper_device_ok(dev) && !test_files) {
 		reply(c, "no not a raw disk node (/dev/rdiskN or /dev/rdiskNsM)\n", -1);
+		return;
+	}
+	/* whose disk it is (fsrules_node_owner_ok): only a node of root's or the peer's own is handed out, so another user's
+	 * attached image, left behind after a fast user switch, is not. No image rule: this is the user's own mount, shared with
+	 * no one, so an image root attached (sudo hdiutil attach) stays the console user's to open, as before. First, so
+	 * nothing more is told of another user's disk */
+	if ((why = helper_node_refusal(dev, peer))) {
+		snprintf(msg, sizeof(msg), "no %s\n", why);
+		reply(c, msg, -1);
 		return;
 	}
 	if (helper_device_ok(dev) && helper_mac_mounted(dev, where, sizeof(where))) {

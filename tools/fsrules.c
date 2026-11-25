@@ -353,3 +353,8 @@ int fsrules_from_disk(const char *f_mntfromname, const char *whole)
 		r++;
 	return *r == '\0';
 }
+
+int fsrules_node_owner_ok(uid_t node, uid_t peer)
+{
+	return node == 0 || node == peer;
+}

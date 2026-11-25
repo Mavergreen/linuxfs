@@ -16,10 +16,12 @@ SDK=$(sh "$SHIPYARD_SCRIPTS/fetch_sdk.sh" 2>/dev/null) || exit 1
 cc() { "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld "$@"; }
 cc -DLINUXFS_PROBE_NO_MAIN -o "$D/helper" "$ROOT/tools/helper.c" "$ROOT/tools/probe.c" "$ROOT/tools/fstab.c" "$ROOT/tools/fsrules.c" \
   "$ROOT/tools/plist.c" -framework IOKit -framework CoreFoundation || exit 1
+cc -DLINUXFS_PROBE_NO_MAIN -DLINUXFS_HELPER_TEST -o "$D/helper-t" "$ROOT/tools/helper.c" "$ROOT/tools/probe.c" "$ROOT/tools/fstab.c" \
+  "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" -framework IOKit -framework CoreFoundation || exit 1
 cc -DLINUXFS_PROBE_NO_MAIN -o "$D/open" "$ROOT/tools/open.c" "$ROOT/tools/probe.c" || exit 1
 cc -DLINUXFS_PROBE_NO_MAIN -DLINUXFS_OPEN_TEST -o "$D/open-t" "$ROOT/tools/open.c" "$ROOT/tools/probe.c" || exit 1
 cc -o "$D/probe" "$ROOT/tools/probe.c" "$ROOT/tools/fsrules.c" || exit 1
-cc -DLINUXFS_PROBE_NO_MAIN -o "$D/policy" "$ROOT/tests/helper-policy-test.c" "$ROOT/tools/probe.c" "$ROOT/tools/fstab.c" "$ROOT/tools/fsrules.c" \
+cc -DLINUXFS_PROBE_NO_MAIN -DLINUXFS_HELPER_TEST -o "$D/policy" "$ROOT/tests/helper-policy-test.c" "$ROOT/tools/probe.c" "$ROOT/tools/fstab.c" "$ROOT/tools/fsrules.c" \
   "$ROOT/tools/plist.c" -framework IOKit -framework CoreFoundation || exit 1
 sh "$ROOT/build/linux-host.sh" sh -c 'truncate -s 32M "$1/ext4.img" && mkfs.ext4 -q -F -L helped "$1/ext4.img" &&
   truncate -s 32M "$1/mydata.img" && mkfs.ext4 -q -F -L "my data" -U 0123abcd-4567-89ef-0123-456789abcdef "$1/mydata.img" &&
@@ -27,7 +29,7 @@ sh "$ROOT/build/linux-host.sh" sh -c 'truncate -s 32M "$1/ext4.img" && mkfs.ext4
 # spec: tools/helper.c LINUXFS_TEST_DISKS -- the disks attached, for noauto-add (tests only, not root: these files stand in
 #       for /dev's raw disks): ext4 "helped", and ext4 "my data" with UUID 0123ABCD-4567-89EF-0123-456789ABCDEF
 export LINUXFS_TEST_DISKS="$D/ext4.img:$D/mydata.img"
-"$D/policy" > "$D/policy.tap"; bad=$?
+"$D/policy" "$D/ext4.img" > "$D/policy.tap"; bad=$?
 grep -v '^1\.\.' "$D/policy.tap"
 n=$(grep -c '^ok\|^not ok' "$D/policy.tap")
 head -c 1048576 /dev/zero > "$D/zero.img"
@@ -188,6 +190,29 @@ LINUXFS_FSTAB=$D/no-fstab "$D/helper" --noauto-remove-all; rc=$?
 ln -s "$F" "$D/link-fstab"
 LINUXFS_FSTAB=$D/link-fstab "$D/helper" --noauto-remove-all 2> "$D/rmall.err"; rc=$?
 [ $rc -eq 1 ] && grep -q symlink "$D/rmall.err"; ok $? "a refusal is printed and exits 1 (rc $rc: $(cat "$D/rmall.err"))"
+# spec: item 5 amendment, §1 step 2 and §5 (controller's ruling) -- the helper hands out only the user's disks: open, probe and
+#       uuid of a disk whose node is neither root's nor the caller's are refused, "no another user's disk". The test build
+#       (-DLINUXFS_HELPER_TEST) reads LINUXFS_HELPER_TEST_NODE_UID for the node's owner, since a test cannot chown
+th() { LINUXFS_HELPER_TEST_NODE_UID=$1 "$D/helper-t" --socket "$D/t$1.sock" --test-files --timeout 3 & thp="$thp $!"; }
+thp=; th 502; th "$(id -u)"; th 0
+trap 'kill $hp $thp 2>/dev/null; for d in $devs; do hdiutil detach -quiet -force "$d" 2>/dev/null; done' EXIT
+i=0; while { test ! -S "$D/t502.sock" || test ! -S "$D/t$(id -u).sock" || test ! -S "$D/t0.sock"; } && test $i -lt 50; do sleep 0.1; i=$((i + 1)); done
+tor() { LINUXFS_HELPER_SOCKET=$D/t$1.sock; shift; LINUXFS_HELPER_SOCKET=$LINUXFS_HELPER_SOCKET "$D/open" "$@" 2>&1; }
+out=$(tor 502 "$D/ext4.img" /bin/echo ran); rc=$?
+test $rc -eq 1 && test "$out" = "linuxfs-open: $D/ext4.img: another user's disk"; ok $? "open of another user's disk: refused, the program not run (rc $rc: '$out')"
+out=$(tor 502 --probe "$D/ext4.img"); rc=$?
+test $rc -eq 1 && echo "$out" | grep -qx "linuxfs-open: $D/ext4.img: another user's disk"; ok $? "probe of it: refused (rc $rc: '$(echo "$out" | head -1)')"
+out=$(tor 502 --uuid "$D/ext4.img"); rc=$?
+test $rc -eq 1 && test "$out" = "linuxfs-open: $D/ext4.img: another user's disk"; ok $? "uuid of it: refused (rc $rc: '$out')"
+out=$(tor "$(id -u)" "$D/ext4.img" "$D/probe" /dev/fd/3); rc=$?
+test $rc -eq 0 && test "$out" = "ext4${T}helped"; ok $? "the caller's own disk: opened, on fd 3 (rc $rc: '$out')"
+out=$(tor 0 "$D/ext4.img" "$D/probe" /dev/fd/3); rc=$?
+test $rc -eq 0 && test "$out" = "ext4${T}helped"; ok $? "a disk whose node is root's: opened, on fd 3 (rc $rc: '$out')"
+out=$(tor 0 --probe "$D/ext4.img"); rc=$?
+test $rc -eq 0 && test "$out" = "ext4${T}helped"; ok $? "and probed (rc $rc: '$out')"
+kill $thp 2>/dev/null; wait $thp 2>/dev/null; thp=
+! strings "$D/helper" | grep -q LINUXFS_HELPER_TEST_; ok $? "the shipped linuxfs-helper carries no LINUXFS_HELPER_TEST_ string"
+strings "$D/helper-t" | grep -q LINUXFS_HELPER_TEST_NODE_UID; ok $? "the test build does (so the check above can fail)"
 kill $hp; wait $hp 2>/dev/null
 "$D/open" --probe "$D/ext4.img" > /dev/null 2>&1; [ $? -eq 3 ]; ok $? "with no helper listening, exit 3"
 echo "1..$n"; exit $bad

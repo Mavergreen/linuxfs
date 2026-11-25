@@ -6,6 +6,7 @@
 #define LINUXFS_FSRULES_H
 
 #include <stddef.h>
+#include <sys/types.h>
 
 enum fsrole { FS_UTIL, FS_MOUNT, FS_FSCK };
 
@@ -94,5 +95,10 @@ int fsrules_whole_disk(const char *bsd, char *out, size_t outlen);
 /* Whether a mount's source (f_mntfromname) is the whole disk WHOLE or one of its partitions: exactly /dev/WHOLE or
  * /dev/WHOLEs<digits>. /dev/disk22 is not disk2's, nor is a raw node or any other name. NULL arguments give 0. */
 int fsrules_from_disk(const char *f_mntfromname, const char *whole);
+
+/* Whose disk it is, the one rule both root processes use (the helper's open, probe and uuid; the mount daemon's judge): 1 when
+ * the disk's node (/dev/BSD's st_uid) is root's, the Mac's own, or the asking user PEER's, as hdiutil makes an image's node for
+ * the user who attached it; else 0. The mount daemon adds that an image's node must be the peer's. */
+int fsrules_node_owner_ok(uid_t node, uid_t peer);
 
 #endif

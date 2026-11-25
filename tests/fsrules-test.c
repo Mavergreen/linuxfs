@@ -415,6 +415,12 @@ int main(int argc, char **argv)
 #undef ACC
 	}
 
+	/* spec: item 5, amendment §1 step 2 and §5 -- whose disk it is: the node's owner is root (the Mac's) or the peer's own */
+	is(fsrules_node_owner_ok(0, 501), 1, "node_owner_ok: a node of root's is anyone's to ask for");
+	is(fsrules_node_owner_ok(501, 501), 1, "node_owner_ok: the peer's own node");
+	is(fsrules_node_owner_ok(502, 501), 0, "node_owner_ok: another user's node is not");
+	is(fsrules_node_owner_ok(99, 501), 0, "node_owner_ok: nor is one of unknown's (99)");
+
 	printf("1..%d\n", tapno);
 	return failures != 0;
 }

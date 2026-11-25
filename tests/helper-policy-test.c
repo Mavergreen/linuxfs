@@ -92,7 +92,50 @@ static void answers(const char *req, uid_t peer, uid_t console, const char *want
 	}
 }
 
-int main(void)
+/* helper_serve of REQ for PEER (test files, console = PEER) with LINUXFS_HELPER_TEST_NODE_UID=NODE (NULL: unset): its reply
+ * begins with WANT, and a descriptor came with it exactly when FD says */
+static void served(const char *req, uid_t peer, const char *node, const char *want, int fd, const char *what)
+{
+	union {
+		struct cmsghdr h;
+		char buf[64];
+	} ctl;
+	struct msghdr mh = { 0 };
+	char buf[1024] = { 0 };
+	struct iovec iov = { buf, sizeof(buf) - 1 };
+	int sv[2], got = -1;
+	ssize_t n;
+
+	if (node)
+		setenv("LINUXFS_HELPER_TEST_NODE_UID", node, 1);
+	else
+		unsetenv("LINUXFS_HELPER_TEST_NODE_UID");
+	socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+	write(sv[1], req, strlen(req));
+	helper_serve(sv[0], peer, peer, 1);
+	mh.msg_iov = &iov;
+	mh.msg_iovlen = 1;
+	mh.msg_control = ctl.buf;
+	mh.msg_controllen = sizeof(ctl.buf);
+	n = recvmsg(sv[1], &mh, 0);
+	if (n > 0 && mh.msg_controllen > 0 && CMSG_FIRSTHDR(&mh) && CMSG_FIRSTHDR(&mh)->cmsg_type == SCM_RIGHTS) {
+		memcpy(&got, CMSG_DATA(CMSG_FIRSTHDR(&mh)), sizeof(int));
+		close(got);
+	}
+	close(sv[0]);
+	close(sv[1]);
+	unsetenv("LINUXFS_HELPER_TEST_NODE_UID");
+	tapno++;
+	if (n > 0 && strncmp(buf, want, strlen(want)) == 0 && (got >= 0) == fd) {
+		printf("ok %d - %s\n", tapno, what);
+	} else {
+		printf("not ok %d - %s (got '%s'%s, want '%s...'%s)\n", tapno, what, buf, got >= 0 ? " and a descriptor" : "", want,
+		       fd ? " and a descriptor" : "");
+		failures++;
+	}
+}
+
+int main(int argc, char **argv)
 {
 	struct statfs root;
 	char raw[128], where[1024], req[256];
@@ -283,6 +326,25 @@ int main(void)
 		rmdir(dir);
 		unsetenv("LINUXFS_FSTAB");
 	}
+	/* spec: item 5 amendment, §1 step 2 and §5 (controller's ruling) -- the helper hands out only the user's disks: a node of
+	 * root's or the peer's own. The test build reads LINUXFS_HELPER_TEST_NODE_UID for the node's owner (a test cannot chown) */
+	if (argc == 2) {
+		char me[16], open_rw[1100], probe[1100], uuid[1100];
+
+		snprintf(me, sizeof(me), "%u", (unsigned)getuid());
+		snprintf(open_rw, sizeof(open_rw), "open %s rw\n", argv[1]);
+		snprintf(probe, sizeof(probe), "probe %s\n", argv[1]);
+		snprintf(uuid, sizeof(uuid), "uuid %s\n", argv[1]);
+		served(open_rw, getuid(), "502", "no another user's disk", 0, "owner: open of another user's disk is refused, no descriptor passed");
+		served(probe, getuid(), "502", "no another user's disk", 0, "owner: probe of it is refused too");
+		served(uuid, getuid(), "502", "no another user's disk", 0, "owner: and uuid");
+		served(open_rw, getuid(), me, "ok ext4\thelped", 1, "owner: open of the caller's own disk: ok, with the descriptor");
+		served(open_rw, getuid(), "0", "ok ext4\thelped", 1, "owner: open of a disk whose node is root's: ok, with the descriptor");
+		served(uuid, getuid(), "0", "ok ", 0, "owner: uuid of a disk whose node is root's: ok");
+		served(open_rw, getuid(), NULL, "ok ext4\thelped", 1, "owner: with no stand-in, the file's own owner (the caller): ok");
+	}
+	else
+		is(argc, 2, "the ext4 image is named (helper-test.sh does)");
 	printf("1..%d\n", tapno);
 	return failures ? 1 : 0;
 }
