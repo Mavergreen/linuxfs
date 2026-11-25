@@ -495,7 +495,9 @@ expect census_mdfind_not_found test "$rnf" = "not found within 1 s" -a "$(cat "$
 expect census_mdfind_by_clock test $((t1 - t0)) -ge 1
 expect census_spotlight_refresh test -s "$P/spotlight.ext4.rw.refresh.hfs.txt" -a -s "$P/spotlight.ext4.rw.refresh.ext4.txt" -a ! -e "$P/spotlight.ext4.ro.refresh.ext4.txt"
 expect census_spotlight_dirs grep -q '^.fseventsd: no$' "$P/spotlight.ext4.rw.dirs.ext4.txt"
-expect census_spotlight_refusal_uid grep -q '^#   pid 1: uid 0 root$' "$P/spotlight.ext4.rw.refusals-all.txt"
+# pid 1's owner is the host's own: root on a Mac, the build user in the Linux container
+pid1=$(ps -o uid=,user= -p 1 2> /dev/null | sed 's/^ *//; s/  */ /g')
+expect census_spotlight_refusal_uid grep -qxF "#   pid 1: uid ${pid1:-unknown (it has exited)}" "$P/spotlight.ext4.rw.refusals-all.txt"
 expect census_spotlight_refusal_mp grep -q '<MP>/.fseventsd (Operation not permitted)' "$P/spotlight.ext4.rw.refusals.ext4.txt"
 expect census_spotlight_refusal_not_hfs not grep -q 'Operation not permitted' "$P/spotlight.ext4.rw.refusals.hfs.txt"
 expect census_spotlight_readonly grep -q '^hdiutil attach -readonly -imagekey diskimage-class=CRawDiskImage .*/spotlight-hfs-ext4-ro.img$' "$S/calls"
@@ -546,7 +548,12 @@ expect census_ttc_shot test "$(grep -Ec 'screencapture -x .*/(hfs|ext4)-trash-de
 expect census_ttc_tag grep -q '^xattr -wx com.apple.metadata:_kMDItemUserTags 62706c6973743030a10156506172697479080a0000000000000101000000000000000200000000000000000000000000000011 .*/vols/trash-ext4/tagged$' "$S/calls"
 expect census_ttc_label grep -q 'set label index of (POSIX file ".*/vols/trash-ext4/tagged" as alias) to 2' "$S/calls"
 expect census_ttc_remount test "$(grep -c '^hdiutil attach -imagekey diskimage-class=CRawDiskImage .*/trash-ext4.img$' "$S/calls")" -eq 2
-expect census_ttc_oversized test "$(sort -u "$S/xattr-sizes" | tr '\n' ' ')" = "131072 131073 "
+for f in hfs ext4; do expect "census_ttc_oversized_tried_$f" test "$(grep -c '^13107[23] bytes: exit [0-9]*$' "$P/tags.ext4.oversized.$f.txt")" -eq 2; done
+# Linux caps one exec argument at 131072 bytes with its NUL (MAX_ARG_STRLEN), so there the stub never starts; a Mac
+#   (and 10.9, ARG_MAX 262144) passes both
+if "$T/bin/stub" "$(printf '%0131073d' 0)" > /dev/null 2>&1; then
+  expect census_ttc_oversized test "$(sort -u "$S/xattr-sizes" | tr '\n' ' ')" = "131072 131073 "
+else echo "ok - census_ttc_oversized # SKIP this host cannot pass a 128 KiB argument (Linux MAX_ARG_STRLEN)"; fi
 expect census_ttc_hfsx grep -q '^hdiutil attach -imagekey diskimage-class=CRawDiskImage .*/trash-hfsx-ext4.img$' "$S/calls"
 expect census_ttc_pathconf grep -Eq '^(pathconf\(_PC_CASE_SENSITIVE\) = -?[0-9]+|errno [0-9]+)$' "$P/case.ext4.pathconf.ext4.txt"
 expect census_ttc_quiet hasnt "$r" "not ok"
