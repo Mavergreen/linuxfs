@@ -109,6 +109,8 @@ done < "$T/names"
 # spec: build/package.sh -- the fs-bundles test hook must not leak into a shipping build
 if LINUXFS_TEST_EXTRA_FSTYPENAME=ext2 sh "$REPO_ROOT/build/package.sh" --stage "$T/stage" --version "$V" --out "$T/dist-hook" > "$T/hook.out" 2>&1; then
   fail "package.sh builds with LINUXFS_TEST_EXTRA_FSTYPENAME set"
+else
+  grep -q LINUXFS_TEST_EXTRA_FSTYPENAME "$T/hook.out" || fail "package.sh's refusal does not name LINUXFS_TEST_EXTRA_FSTYPENAME: $(cat "$T/hook.out")"
 fi
 for prog in lklfuse linuxfs linuxfs-probe linuxfs-open; do
   grep -qxF "$D/$prog	100755	0/0" "$T/list" || fail "the payload lacks $D/$prog (0755)"
