@@ -50,9 +50,7 @@ with `linuxfs prefs`.
 
 A volume you mount (a disk after login, or `linuxfs mount IMAGE`) is open to root's fseventsd and Spotlight only when
 macFUSE lets you share it: you are an admin (in macFUSE's `admin_group`, 80 by default), or its `allow_other` tunable is
-1. Then linuxfs passes macFUSE's `allow_root` option, so root's processes can reach the volume and Spotlight and fsevents
-work, as on an HFS+ disk. Non-admin users mount with no Spotlight or fsevents. Setting the `allow_other` tunable gives
-every local user access to the volume, as an HFS+ disk with "Ignore ownership" does.
+1. Then linuxfs passes macFUSE's `allow_root` option (and only that), so root's processes can reach the volume and Spotlight and fsevents work, as on an HFS+ disk. Non-admin users mount with no Spotlight or fsevents unless the `allow_other` tunable is 1, which lets them use `allow_root` too. That tunable also lets any user mount with `allow_other`, which opens a volume to every local user, as an HFS+ disk with "Ignore ownership" does; linuxfs does that only for a disk mounted for all users (`LINUXFS_ALL_USERS`).
 
 ### Preferences
 

@@ -709,6 +709,18 @@ sh "$L" unmount "$T/img" > /dev/null 2>&1
 case $(last) in *type=ext4*) case $(last) in *allow_*) r=1 ;; *) r=0 ;; esac ;; *) r=1 ;; esac
 ok $r "share_not_root_channel: with root's channel there is no share option (rc $rc: $(last))"
 sh "$L" unmount "$T/dam" > /dev/null 2>&1
+for uo in allow_other allow_root; do
+  : > "$T/calls"
+  FAKE_PROBE=ext4 FAKE_SYSCTL_RC=0 FAKE_ADMIN_GROUP=80 FAKE_ID_G="20 80" sh "$L" mount "$T/img" -o $uo,sync > /dev/null 2>&1; rc=$?
+  c=$(last | grep -o "$uo" | wc -l | tr -d ' ')
+  case $(last) in *allow_root*allow_other*|*allow_other*allow_root*) r=1 ;; *,sync[,\ ]*) [ "$c" = 1 ] && r=0 || r=1 ;; *) r=1 ;; esac
+  ok $r "share_user_$uo: the user's -o $uo stands alone, no second share option (rc $rc: $(last))"
+  sh "$L" unmount "$T/img" > /dev/null 2>&1
+done
+: > "$T/calls"
+FAKE_PROBE=ext4 FAKE_SYSCTL_RC=0 FAKE_ADMIN_GROUP=abc FAKE_ID_G="20 80" sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
+case $(last) in *type=ext4*) case $(last) in *allow_*) r=1 ;; *) r=0 ;; esac ;; *) r=1 ;; esac; ok $r "share_bad_group: a non-numeric admin_group gives none, and the mount runs (rc $rc: $(last))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
 # spec: cli/linuxfs bundle_of, fstype_opts -- agree with tools/fsrules.c's table (fsrules-test --names)
 names=$(sh "$ROOT/tests/fsrules-test.sh" --names 2>/dev/null); [ -n "$names" ]; ok $? "fsrules-test --names prints the table"
 eval "$(grep '^bundle_of()' "$L")"; eval "$(sed -n '/^fstype_opts()/,/; }$/p' "$L")"

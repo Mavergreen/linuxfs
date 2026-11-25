@@ -18,7 +18,7 @@
 #          volume; new files are written with the filesystem root's owner. --linux-ids shows Linux's owners instead.
 #          A device is mounted by DiskArbitration (diskutil mount), which runs the linuxfs bundle's mount program,
 #          which calls back as da-mount; so a device takes no MOUNTPOINT, --linux-ids, --tier2 or -o (use linuxfs
-#          prefs), and its volume is the console user's alone (open to every user only when mounted before login, or by
+#          prefs), and its volume is the console user's alone, and root's (allow_root, for an admin; open to every user only when mounted before login, or by
 #          sudo diskutil mount). A dirty NTFS volume mounts read-only. A device the Mac has mounted is refused. APFS mounts read-only (APFSWrite on: read-write, but never an encrypted or Fusion
 #          volume); an encrypted volume's password is asked for at the terminal, or read from stdin
 #          (--password-stdin; for a device, offered to the login session's agent). ignore VOLUME (a device, or a volume's
@@ -346,7 +346,9 @@ cmd_mount() {
     opts="$opts,local,volname=$name,fsname=linuxfs@$(safe_name "$(basename "$src")"),noappledouble"
     ft=$(fstype_opts "$type"); [ -z "$ft" ] || opts="$opts,$ft"
     # root's fseventsd and mds reach the volume only if macFUSE lets this user share (an admin, or allow_other on)
-    if [ "${LINUXFS_ALL_USERS:-}" != 1 ]; then sh_opt=$(share_opt); [ -z "$sh_opt" ] || opts="$opts,$sh_opt"; fi
+    case ,$extra, in *,allow_other,*|*,allow_root,*) ;; *)  # the user's own -o says it already: macFUSE refuses both
+      if [ "${LINUXFS_ALL_USERS:-}" != 1 ]; then sh_opt=$(share_opt); [ -z "$sh_opt" ] || opts="$opts,$sh_opt"; fi ;;
+    esac
   fi
   if [ -n "$ids" ]; then :
   elif [ "${LINUXFS_ALL_USERS:-}" = 1 ]; then [ -n "$fusefd" ] || opts="$opts,allow_other"; opts="$opts,uid=99,gid=99"
@@ -560,8 +562,8 @@ fstype_opts() { case $1 in ext4) echo fstypename=ext4,fssubtype=7 ;; ntfs3) echo
 # SHARE_OPT when macFUSE's tunables let this user share the mount with root (allow_other is 1, or the user is in admin_group);
 # nothing when neither holds or sysctl fails or says nothing.
 share_opt() {
-  _ao=$(sysctl -n vfs.generic.macfuse.tunables.allow_other 2>/dev/null) || return 0
-  _ag=$(sysctl -n vfs.generic.macfuse.tunables.admin_group 2>/dev/null) || _ag=
+  _ao=$(sysctl -n vfs.generic.macfuse.tunables.allow_other 2>/dev/null | tr -d '[:space:]')
+  _ag=$(sysctl -n vfs.generic.macfuse.tunables.admin_group 2>/dev/null | tr -d '[:space:]')
   [ "$_ao" = 1 ] && { echo "$SHARE_OPT"; return 0; }
   case $_ag in ''|*[!0-9]*) return 0 ;; esac
   for _g in $(id -G 2>/dev/null); do [ "$_g" = "$_ag" ] && { echo "$SHARE_OPT"; return 0; }; done
