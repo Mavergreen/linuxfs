@@ -712,6 +712,42 @@ static int same_file(int fd, const struct stat *st)
 	return fstat(fd, &now) == 0 && now.st_dev == st->st_dev && now.st_ino == st->st_ino;
 }
 
+/* lklfuse_destroy(NULL) with its stderr kept in SAID (at most N bytes, NUL-terminated) */
+static void destroy_saying(char *said, size_t n)
+{
+	char path[PATH_MAX];
+	const char *tmp = getenv("TMPDIR");
+	int f, saved;
+	ssize_t got = 0;
+
+	snprintf(path, sizeof(path), "%s/lklfuse-ops-said.XXXXXX", tmp && *tmp ? tmp : "/tmp");
+	f = mkstemp(path);
+	fflush(stderr);
+	saved = dup(2);
+	if (f >= 0)
+		dup2(f, 2);
+	lklfuse_destroy(NULL);
+	fflush(stderr);
+	dup2(saved, 2);
+	close(saved);
+	if (f >= 0) {
+		got = pread(f, said, n - 1, 0);
+		close(f);
+		unlink(path);
+	}
+	said[got > 0 ? got : 0] = '\0';
+}
+
+static int lock_free(const char *path)
+{
+	int other = open(path, O_RDWR), r;
+
+	r = other >= 0 && flock(other, LOCK_EX | LOCK_NB) == 0;
+	if (other >= 0)
+		close(other);
+	return r;
+}
+
 static void destroy_tests(const char *image)
 {
 	char lockpath[PATH_MAX];
@@ -719,20 +755,31 @@ static void destroy_tests(const char *image)
 	unsigned char b[4];
 	struct statvfs vfs;
 	struct stat img;
-	int lf, other, fd;
+	char said[512];
+	long busy;
+	int lf, fd;
 
 	snprintf(lockpath, sizeof(lockpath), "%s/lklfuse-ops-lock.XXXXXX", tmp && *tmp ? tmp : "/tmp");
 	lf = mkstemp(lockpath);
 	is(lf >= 0 && flock(lf, LOCK_EX | LOCK_NB) == 0, 1, "destroy: a lock held, as lock= holds one");
 	lklfuse_lockfd = lf;
 	is(stat(image, &img) == 0 && same_file(lklfuse.disk.fd, &img), 1, "before destroy, the disk descriptor is the image");
+	/* a file open for writing in LKL: the read-only remount is refused (EBUSY), so destroy keeps everything */
+	busy = lkl_sys_open("/destroy-busy", LKL_O_WRONLY | LKL_O_CREAT | LKL_O_TRUNC, 0644);
+	is(busy >= 0, 1, "destroy: an LKL file held open for writing");
+	destroy_saying(said, sizeof(said));
+	is(strstr(said, "cannot make the volume read-only at unmount") != NULL, 1, "destroy says it cannot make the volume read-only");
+	is(lklfuse_released, 0, "and does not count the disk released");
+	is(same_file(lklfuse.disk.fd, &img), 1, "and the disk descriptor is still the image");
+	is(lock_free(lockpath), 0, "and the lock is still held");
+	is(lklfuse_statfs("/", &vfs) == 0 && !(vfs.f_flag & ST_RDONLY), 1, "and LKL's mount is still writable");
+	is(lklfuse_mkdir("/while-busy", 0755), 0, "so a write still goes through");
+	if (busy >= 0)
+		lkl_sys_close(busy);
 	lklfuse_destroy(NULL);
 	is(same_file(lklfuse.disk.fd, &img), 0, "after destroy, the device is closed: no descriptor of lklfuse's names it");
 	is(fcntl(lklfuse.disk.fd, F_GETFD) >= 0, 1, "and its number stays taken, so LKL's copy of it reaches nothing else");
-	other = open(lockpath, O_RDWR);
-	is(other >= 0 && flock(other, LOCK_EX | LOCK_NB) == 0, 1, "after destroy, the lock is free for the next mount");
-	if (other >= 0)
-		close(other);
+	is(lock_free(lockpath), 1, "after destroy, the lock is free for the next mount");
 	unlink(lockpath);
 	is(lklfuse_statfs("/", &vfs) == 0 && (vfs.f_flag & ST_RDONLY), 1, "after destroy, LKL's mount is read-only");
 	is(lklfuse_mkdir("/after-destroy", 0755) < 0, 1, "and a write fails: nothing more reaches the disk");
@@ -843,8 +890,23 @@ int main(int argc, char **argv)
 #endif
 	stop_lkl();
 #ifdef __APPLE__
-	lklfuse_destroy(NULL);
-	is(1, 1, "destroy after LKL has stopped (libfuse's own, when no FUSE_DESTROY came) returns, touching nothing");
+	{
+		/* libfuse's own destroy, when no FUSE_DESTROY came (SIGTERM): LKL has halted, so it must not be called. Reset
+		 * what destroy_tests let go of, so only lklfuse_stopped stands in the way. */
+		char said[512];
+		struct stat img;
+		int n = open(argv[1], O_RDWR);
+
+		is(n >= 0 && dup2(n, lklfuse.disk.fd) == lklfuse.disk.fd, 1, "after stop_lkl: the disk descriptor names the image again");
+		if (n >= 0)
+			close(n);
+		lklfuse_released = 0;
+		lklfuse_lockfd = -1;
+		destroy_saying(said, sizeof(said));
+		is(said[0], '\0', "destroy after LKL has stopped says nothing: no sync or remount was tried");
+		is(stat(argv[1], &img) == 0 && same_file(lklfuse.disk.fd, &img), 1, "and leaves the disk descriptor as it was");
+		is(lklfuse_released, 0, "and does not count the disk released");
+	}
 #endif
 	lkl_cleanup();
 	printf("1..%d\n", tapno);

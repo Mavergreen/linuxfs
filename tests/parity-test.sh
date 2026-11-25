@@ -786,7 +786,6 @@ expect census_busy_force_unmount_both test -s "$P/busy.ext4.force-unmount.hfs.tx
 expect census_busy_force_unmount_checked has "$r" "^ok - parity busy.ext4.force-unmount$"
 expect census_busy_force_unmount_gone grep -q '^mounted afterwards: no$' "$P/busy.ext4.force-unmount.ext4.txt"
 expect census_busy_force_unmount_words grep -q '^Volume <VOL> on <DISK> unmounted$' "$P/busy.ext4.force-unmount.ext4.txt"
-expect census_busy_force_unmount_da test -n "$(grep 'census_busy_parity da "busy.$cb_fs.force-unmount" census_force_unmount @MP@$' "$here/lib/parity.sh")"
 expect census_busy_textedit grep -q 'open -a TextEdit' "$S/calls"
 expect census_busy_finder grep -q 'eject disk' "$S/calls"
 expect census_busy_shot test "$(grep -c 'screencapture -x .*-busy-eject.png' "$S/calls")" -eq 2
@@ -886,6 +885,10 @@ echo calm > "$W/img/calm.img"; : > "$S/da-forgets"
 r=$(PARITY_MODE_BUSY_DA=record; census_busy calm 2>&1)
 expect census_busy_calm_bar has "$r" "^ok - parity busy.calm.cycles (hfs 0 of 20, calm 0 of 20)$"
 expect census_busy_untied_recorded has "$r" "^# recorded busy.calm.ejects: hfs 0 of 3, calm 3 of 3$"
+# force-unmount's comparison goes by PARITY_MODE_BUSY_DA (diskutil's words come from DiskArbitration), not PARITY_MODE_BUSY:
+#   recorded here, where only the da mode is record
+expect census_busy_force_unmount_da has "$r" "^# recorded busy.calm.force-unmount$"
+expect census_busy_force_unmount_da_only test "$PARITY_MODE_BUSY" = check
 expect census_busy_untied_busy grep -q '^calm eject 1: BUSY: Volume failed to eject$' "$P/busy.calm.cycles.txt"
 expect census_busy_untied_da grep -q '^# census: DiskArbitration: disk[0-9]* Mounted: No$' "$P/busy.calm.cycles.txt"
 expect census_busy_untied_mount grep -q '^#   /dev/disk[0-9]* on .*/vols/busy-calm (macfuse_ext4' "$P/busy.calm.cycles.txt"

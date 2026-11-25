@@ -78,10 +78,15 @@ mac_mount_of() {
     ours_type "$_t" || { printf '%s\n' "$_m"; break; }
   done
 }
-# Whether linuxfs's: the topmost mount on MOUNTPOINT (the last in the table) is of one of the six types.
+# Whether the topmost mount on MP is linuxfs's: one of the six types, or an exFAT/FAT image mount, which has no fstypename
+# (plain macfuse) and is named linuxfs@<image> by cmd_mount. Another product's macFUSE mount could take either name; that
+# only lets a caller ask diskutil to unmount it, which the caller could do anyway.
 ours_on() {
-  _t=$(mount_lines | awk -F"$tab" -v m="$1" '$2 == m { t = $3 } END { print t }')
-  ours_type "$_t"
+  _l=$(mount_lines | awk -F"$tab" -v m="$1" '$2 == m { l = $0 } END { print l }')
+  _t=${_l##*"$tab"}
+  ours_type "$_t" && return 0
+  [ "$_t" = macfuse ] && case $_l in linuxfs@*) return 0 ;; esac
+  return 1
 }
 
 # STATE holds one file per running lklfuse, named by its pid: source, mount point, type, mode (rw|ro).

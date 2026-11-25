@@ -83,7 +83,11 @@ int helper_peer_ok(uid_t peer, uid_t console)
 }
 
 /* Whether a mount-table entry (its f_mntfromname and f_fstypename) is the Mac's mount of block node BLK: from BLK exactly,
- * and not one of linuxfs's six macfuse_<fs> types, whose mounts are named /dev/DISK as the Mac's are (item 6). */
+ * and not one of linuxfs's six macfuse_<fs> types, whose mounts are named /dev/DISK as the Mac's are (item 6).
+ * Accepted risk (the spec's "shared names", item 2): another product's macFUSE mount of BLK typed one of the six (its own
+ * fstypename=ext4, say) is taken for linuxfs's and skipped, so the helper opens the raw disk under it, a second writer
+ * that does not take linuxfs's lock. A user's forged entry gains nothing: the Mac's real mount of BLK stays in the table
+ * and is still found. A real guard would need more proof that the mount is linuxfs's (its device lock held, say). */
 int helper_is_mac_mount(const char *blk, const char *from, const char *fstype)
 {
 	return strcmp(from, blk) == 0 && !fsrules_fs_of_type(fstype);

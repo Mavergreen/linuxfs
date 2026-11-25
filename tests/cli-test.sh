@@ -45,9 +45,11 @@ case "\$lock" in
   *) mkdir "\$lock.held" 2>/dev/null || { echo "unable to exclusively lock \$lock: Resource temporarily unavailable"; exit 2; }
      trap 'rmdir "\$lock.held"' EXIT ;;
 esac
-# the mount line macFUSE would make: named by fsname=, typed macfuse_<fstypename>
+# the mount line macFUSE would make: named by fsname=, typed macfuse_<fstypename> (root's channel: root's, taken as ext4);
+# exFAT and FAT have no fstypename, so their type is plain macfuse
 fsn=\$(echo "\$*" | tr , "\\n" | sed -n "s/^fsname=//p" | tail -n 1); ft=\$(echo "\$*" | tr , "\\n" | sed -n "s/^fstypename=//p" | tail -n 1)
-echo "\${fsn:-linuxfs@x} on \$mnt (macfuse_\${ft:-ext4}, local, nodev, nosuid, synchronous, mounted by me)" >> "$T/mtab"
+case \$* in *type=exfat,*|*type=vfat,*) mt=macfuse ;; *) mt=macfuse_\${ft:-ext4} ;; esac
+echo "\${fsn:-linuxfs@x} on \$mnt (\$mt, local, nodev, nosuid, synchronous, mounted by me)" >> "$T/mtab"
 while grep -qF " on \$mnt (" "$T/mtab"; do sleep 0.1; done
 exit 0
 EOF
@@ -286,7 +288,17 @@ out=$(sh "$L" unmount "$T/Volumes/early" 2>&1); rc=$?
 out=$(sh "$L" unmount "$T/Volumes/hfsvol" 2>&1); rc=$?
 [ $rc -eq 1 ] && echo "$out" | grep -q "not mounted by linuxfs" && grep -qF " on $T/Volumes/hfsvol (" "$T/mtab"
 ok $? "unmount of the Mac's HFS+ volume from a disk is refused, and it stays mounted (got $rc: $out)"
-grep -vF " on $T/Volumes/hfsvol (" "$T/mtab" > "$T/mtab.new"; mv "$T/mtab.new" "$T/mtab"; rmdir "$T/Volumes/hfsvol" "$T/Volumes/early" 2>/dev/null
+# exFAT/FAT image mounts carry no fstypename (plain macfuse); linuxfs names them linuxfs@<image>, and that is what says ours
+mkdir -p "$T/Volumes/img" "$T/Volumes/other"
+echo "linuxfs@stick.img on $T/Volumes/img (macfuse, local, nodev, nosuid, synchronous, mounted by someone)" >> "$T/mtab"
+echo "sshfs@host on $T/Volumes/other (macfuse, nodev, nosuid, synchronous, mounted by me)" >> "$T/mtab"
+out=$(sh "$L" unmount "$T/Volumes/img" 2>&1); rc=$?
+[ $rc -eq 0 ] && ! grep -qF " on $T/Volumes/img (" "$T/mtab"; ok $? "unmount of linuxfs's own exFAT/FAT image mount (macfuse, linuxfs@) it has no record of goes through (got $rc: $out)"
+out=$(sh "$L" unmount "$T/Volumes/other" 2>&1); rc=$?
+[ $rc -eq 1 ] && echo "$out" | grep -q "not mounted by linuxfs" && grep -qF " on $T/Volumes/other (" "$T/mtab"
+ok $? "unmount of another product's macFUSE mount is refused, and it stays mounted (got $rc: $out)"
+grep -vF " on $T/Volumes/hfsvol (" "$T/mtab" | grep -vF " on $T/Volumes/other (" > "$T/mtab.new"; mv "$T/mtab.new" "$T/mtab"
+rmdir "$T/Volumes/hfsvol" "$T/Volumes/early" "$T/Volumes/img" "$T/Volumes/other" 2>/dev/null
 # spec: cli/linuxfs --
 #       a whole disk being ejected (the agent, P3-2): what linuxfs mounted from its partitions is unmounted
 mnt=$(LINUXFS_OPEN="$T/bin/open" LINUXFS_DA=1 sh "$L" mount /dev/disk3s1 2>/dev/null)
