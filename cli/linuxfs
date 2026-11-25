@@ -378,12 +378,14 @@ cmd_mount() {
     esac
   fi
   # da-mount --owners (spec: item 6, "Ignore ownership" unchecked): Linux's own ids, which the kernel checks (default_permissions;
-  # lklfuse, LKL's root, checks nothing itself). With root's device, root gave default_permissions to mount_macfuse.
+  # lklfuse, LKL's root, checks nothing itself). With root's device, root gave default_permissions to mount_macfuse. What a
+  # user makes is that user's, as on HFS+ (owner=caller: the FUSE request's ids), never LKL's root.
   if [ -n "$da_owners" ]; then
     if [ -z "$fusefd" ]; then
       [ "${LINUXFS_ALL_USERS:-}" != 1 ] || opts="$opts,allow_other"
       opts="$opts,default_permissions"
     fi
+    opts="$opts,owner=caller"
   elif [ -n "$ids" ]; then :
   elif [ "${LINUXFS_ALL_USERS:-}" = 1 ]; then [ -n "$fusefd" ] || opts="$opts,allow_other"; opts="$opts,uid=99,gid=99"
   else opts="$opts,uid=$(id -u),gid=$(id -g),owner=root"; fi

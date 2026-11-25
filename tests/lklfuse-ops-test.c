@@ -5,7 +5,9 @@
  * usage: lklfuse-ops-test EXT4-IMAGE
  */
 #define main lklfuse_main
+#define fuse_get_context test_fuse_get_context	/* the FUSE caller, which a test sets (owner=caller) */
 #include "lklfuse.c"
+#undef fuse_get_context
 #undef main
 #include <sys/xattr.h>
 #include <limits.h>
@@ -42,6 +44,15 @@ static void owned(const char *path, uid_t uid, gid_t gid, const char *what)
 	owner_of(path, &u, &g);
 	is((int)u, (int)uid, what);
 	is((int)g, (int)gid, what);
+}
+
+/* no FUSE request here: the caller is whatever the test says, or none */
+static struct fuse_context test_ctx;
+static int test_ctx_set;
+
+struct fuse_context *test_fuse_get_context(void)
+{
+	return test_ctx_set ? &test_ctx : NULL;
 }
 
 #ifdef ENOATTR
@@ -691,6 +702,57 @@ static void shown_tests(void)
 	lklfuse_nf_exact = 0;
 }
 
+static mode_t mode_of(const char *path)
+{
+	struct stat st;
+
+	return lklfuse_getattr(path, &st, NULL) == 0 ? st.st_mode : 0;
+}
+
+/*
+ * owner=caller (spec: item 6, "Ignore ownership" off, the CLI's --owners): what a Mac user creates is that user's, by the
+ * FUSE request's ids, as on HFS+ with ownership on; never LKL's root. Linux's chown drops a setuid or setgid bit a
+ * create asked for (ATTR_KILL_SUID); one the owner sets afterwards stays, the owner's own.
+ */
+static void caller_owner_tests(void)
+{
+	struct fuse_file_info fi = { .flags = O_WRONLY };
+
+	lklfuse.owner = "caller";
+	is(lklfuse_set_owner(), 0, "owner=caller is taken");
+	test_ctx.uid = 501;
+	test_ctx.gid = 20;
+	test_ctx_set = 1;
+	is(lklfuse_mkdir("/c", 0755), 0, "owner=caller: mkdir by uid 501");
+	owned("/c", 501, 20, "owner=caller: a new directory is the caller's, 501:20");
+	is(lklfuse_create("/c/f", 0644, &fi), 0, "owner=caller: create by uid 501");
+	lklfuse_release("/c/f", &fi);
+	owned("/c/f", 501, 20, "owner=caller: a file created by uid 501 is 501:20");
+	is(lklfuse_symlink("f", "/c/l"), 0, "owner=caller: symlink");
+	owned("/c/l", 501, 20, "owner=caller: a new symlink itself is the caller's");
+	is(lklfuse_mknod("/c/p", S_IFIFO | 0644, 0), 0, "owner=caller: mknod");
+	owned("/c/p", 501, 20, "owner=caller: a new fifo is the caller's");
+	fi.flags = O_WRONLY;
+	is(lklfuse_create("/c/s", 04755, &fi), 0, "owner=caller: create mode 4755 by uid 501");
+	lklfuse_release("/c/s", &fi);
+	owned("/c/s", 501, 20, "owner=caller: a 4755 create by a non-root caller is the caller's, not root's");
+	is(!!(mode_of("/c/s") & (S_ISUID | S_ISGID)), 0, "and its setuid bit is gone (Linux's chown drops it)");
+	is(lklfuse_chmod("/c/s", 04755, NULL), 0, "the owner sets the setuid bit afterwards");
+	is(!!(mode_of("/c/s") & S_ISUID), 1, "it stays, on a file the owner owns (as on HFS+)");
+	owned("/c/s", 501, 20, "and the file is still the owner's");
+	test_ctx.uid = 502;
+	test_ctx.gid = 12;
+	fi.flags = O_WRONLY;
+	is(lklfuse_create("/c/f", 0644, &fi), 0, "owner=caller: create of an existing file by another caller");
+	lklfuse_release("/c/f", &fi);
+	owned("/c/f", 501, 20, "does not change its owner");
+	test_ctx_set = 0;
+	is(lklfuse_mkdir("/c/none", 0755), 0, "owner=caller with no FUSE caller: mkdir");
+	owned("/c/none", 0, 0, "keeps LKL's own ids");
+	lklfuse.owner = NULL;
+	lklfuse_set_owner();
+}
+
 static void unicode_tests(void)
 {
 	unicode_conv_tests();
@@ -902,6 +964,7 @@ int main(int argc, char **argv)
 		is(v.f_bavail < v.f_bfree, 1, "statfs: available is below free (root's reserve), not swapped with it");
 	}
 #ifdef __APPLE__
+	caller_owner_tests();
 	unicode_tests();
 	destroy_tests(argv[1]);
 #endif

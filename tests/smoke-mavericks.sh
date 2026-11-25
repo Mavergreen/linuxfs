@@ -8,7 +8,8 @@
 #       bundles: ext4, btrfs, xfs, f2fs, NTFS (NTFSTakeover on) and APFS, raw and GPT-wrapped, are mounted by an attach within 30 s (personality, Type (Bundle) macfuse_<fs>, Name (User Visible) the FSName, mount type macfuse_<fs>, reads, writes, unmount and mount, eject
 #       leaves no lklfuse); NTFS with NTFSTakeover off is Apple's; `linuxfs ignore` (an /etc/fstab noauto entry: ext4 by device, NTFS by
 #       label; ext4 by a label with a space, written as LABEL=my\040data; each entry's type macfuse_<fs>) mounts nothing on a plain attach and never runs the mount program, `diskutil mount` mounts it, and after `linuxfs unignore` a plain attach does;
-#       ReadOnly in the user's plist (read by the root mount program) mounts read-only; a label with a slash or a control
+#       ReadOnly in the user's plist (read by the root mount program) mounts read-only; an /etc/fstab rw,owners line shows
+#       Linux's ids, refuses the user's write to Linux root's 0644 file, and gives what the user makes to the user; a label with a slash or a control
 #       character gets a safe /Volumes name; the encrypted APFS fixture shows the password dialog (screenshot), times out
 #       with no mount, mounts through --password-stdin and the keeper's --offer, then from the login keychain with no dialog;
 #       then the HFS+ parity census (tests/lib/parity.sh parity_census_all; PARITY_STALL_N=50: item 3's loop, 50 attaches per loop and volume), which records, and gates only the items it
@@ -17,7 +18,7 @@
 #       on a linuxfs volume as on HFS+, no fseventsd, mds or mdworker refused on one, Spotlight's indexing steps when the
 #       guest will index the HFS+ control); then a user outside macFUSE's admin_group (lfs_nonadmin, made with dscl and
 #       removed) mounts an ext4 image without the CLI's SHARE_OPT;
-#       last, before login (the user's console session ended), an attached ext4 disk is mounted by root (as macfuse_ext4) with allow_other and
+#       last, before login (the user's console session ended), an attached ext4 disk is mounted by root (as macfuse_ext4, nosuid and nodev) with allow_other and
 #       served by lklfuse as _linuxfs (with a macFUSE that cannot serve /dev/fd/N the mount program refuses, and that is what is
 #       checked: nothing mounted, the reason in system.log); with that lklfuse killed, diskutil unmount still works. No lklfuse ever runs as root. exFAT keeps no symlinks, hard links, modes or xattrs, and ntfs3 keeps no
 #       POSIX mode without its acl option, so those are not asked of them. Any hang, new panic or new lklfuse crash report
@@ -77,6 +78,7 @@ mountpoint_of() { "$L" status | awk -F"$tab" -v s="$1" '$2 == s { print $3; exit
 pid_of() { "$L" status | awk -F"$tab" -v s="$1" '$2 == s { print $1; exit }'; }
 finish() {
   test -z "${na_made:-}" || nonadmin_remove > /dev/null 2>&1
+  test -z "${OWNERS_TAG:-}" || owners_line_gone > /dev/null 2>&1
   for m in "$W"/mnt/*; do mount | grep -qF " on $m (" && { umount -f "$m" || diskutil unmount force "$m"; } > /dev/null 2>&1; done
   [ -z "$disk" ] || hdiutil detach -force "$disk" > /dev/null 2>&1
   defaults delete dev.mavergreen.linuxfs > /dev/null 2>&1
@@ -518,6 +520,39 @@ else notok "ReadOnly on: copy and attach the ext4 image"; disk=$(image_disk "$W/
 cleanup_disk
 "$L" prefs ReadOnly off
 
+# spec: README.md Ownership -- item 6, "Ignore ownership" off: an /etc/fstab rw,owners line makes DiskArbitration pass owners,
+#       so the volume shows Linux's own ids (ls -ln: Linux root's 0 0, not the user's ids as the mapping shows them, nor 99),
+#       the kernel refuses the user's write to Linux root's 0644 file (default_permissions), and what the user makes is the
+#       user's (lklfuse -o owner=caller), as on HFS+; the line is taken away after (and by finish, if a step failed)
+OWNERS_TAG="# linuxfs-smoke-owners"
+owners_line_gone() {
+  if grep -qF "$OWNERS_TAG" /etc/fstab 2> /dev/null; then sudo -n sed -i '' "/$OWNERS_TAG\$/d" /etc/fstab 2> /dev/null; fi
+  ! grep -qF "$OWNERS_TAG" /etc/fstab 2> /dev/null
+}
+owners_case() {
+  oimg=$W/img/da-ext4-owners.img om=$W/mnt/owners-prep
+  cp "$W/img/ext4.img" "$oimg" && mkdir -p "$om" || { notok "owners: cannot copy ext4.img"; return 1; }
+  # made through the user's own mount (noowners' mapping: what it makes is Linux root's, owner=root, and chmod passes)
+  check "owners: linuxfs mount of the image, to prepare it" bounded 600 "$L" mount "$oimg" "$om"
+  check "owners: rootfile (0644) and shared (1777) made, both Linux root's" sh -c 'echo root > "$1/rootfile" && chmod 644 "$1/rootfile" && mkdir "$1/shared" && chmod 1777 "$1/shared"' _ "$om"
+  check "owners: unmounted, and lklfuse exits" unmount_and_wait "$oimg" "$om"
+  if ! da_attach_nomount "$oimg"; then notok "owners: hdiutil attach -nomount"; disk=$(image_disk "$oimg"); cleanup_disk; return 1; fi
+  ouuid=$(info "$disk" "Volume UUID") odisk=$disk
+  cleanup_disk
+  if test -z "$ouuid"; then notok "owners: diskutil info $odisk gives a Volume UUID"; return 1; fi
+  check "owners: an /etc/fstab line UUID=$ouuid none macfuse_ext4 rw,owners" sudo -n sh -c 'printf "%s\n" "$1" >> /etc/fstab' _ "UUID=$ouuid none macfuse_ext4 rw,owners $OWNERS_TAG"
+  if da_attach "$oimg" && da_wait 300; then
+    ok "owners: a plain attach mounts it at $mp"
+    echo "# owners: ls -ln: $(ls -ln "$mp" 2>&1 | tr '\n' '|')"
+    check "owners: ls -ln shows Linux's ids: rootfile is 0 0 (not $(id -u) $(id -g), nor 99)" sh -c 'ls -ln "$1" | awk '"'"'$NF == "rootfile" { print $3, $4 }'"'"' | grep -qx "0 0"' _ "$mp"
+    check "owners: the kernel refuses the user's write to Linux root's 0644 rootfile" sh -c '! ( echo x >> "$1/rootfile" ) 2> /dev/null && [ "$(cat "$1/rootfile")" = root ]' _ "$mp"
+    check "owners: a file the user makes in shared is the user's ($(id -u):$(id -g))" sh -c 'echo mine > "$1/shared/mine" && s=$(stat -f %u:%g "$1/shared/mine") && echo "$s" && [ "$s" = "$(id -u):$(id -g)" ]' _ "$mp"
+  else notok "owners: a plain attach mounts it within 30 s"; disk=${disk:-$(image_disk "$oimg")}; fi
+  cleanup_disk
+  check "owners: /etc/fstab's owners line taken away" owners_line_gone
+}
+owners_case
+
 # spec: tests/smoke-mavericks.sh header -- a control character or a slash in the label gets a safe /Volumes name
 for c in slash ctl; do
   if [ ! -f "$W/img/ext4-$c.img" ] && ! gunzip -c "$IN/ext4-$c.img.gz" > "$W/img/ext4-$c.img" 2> /dev/null; then
@@ -679,6 +714,9 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
         mount | grep -F " on $mp (" | sed 's/^/# /'
         check "before login: the mount at $mp is root's (no 'mounted by')" mounted_by_root "$mp"
         check "before login: mount shows it as macfuse_ext4" mount_type_is "$mp" macfuse_ext4
+        # spec: tools/fs.c mount_by_root -- root's mount asks nosuid and nodev, as DiskArbitration does for every external disk:
+        #       a Linux setuid-root file or device node on the volume is inert for every user allow_other lets in
+        check "before login: the mount has nosuid and nodev" sh -c 'l=$(mount | grep -F " on $1 ("); echo "$l"; case $l in *nosuid*) ;; *) exit 1 ;; esac; case $l in *nodev*) ;; *) exit 1 ;; esac' _ "$mp"
         check "before login: the lklfuse serving it runs as _linuxfs, on a /dev/fd/N mountpoint" lklfuse_fd_runs
         check "before login: no lklfuse runs as root" no_root_lklfuse
         # spec: tools/open.c fuse_chan -- the opener holds the lock from before "ready" on fd 7, which lklfuse's lock= names

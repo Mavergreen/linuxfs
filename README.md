@@ -56,17 +56,27 @@ macFUSE lets you share it: you are an admin (in macFUSE's `admin_group`, 80 by d
 
 A disk's files appear to be yours, as on an external HFS+ disk with "Ignore ownership on this volume" checked, which is
 how the Mac mounts every external disk until told otherwise. To see Linux's own owners instead, with the Mac checking
-permissions against them, give the volume an `/etc/fstab` line with `owners` (edit it with `sudo vifs`; the UUID is
-`diskutil info`'s Volume UUID, and the type is the volume's bundle):
+permissions against them, give the volume an `/etc/fstab` line with `owners` (edit it with `sudo vifs`; the type is the
+volume's bundle, and the volume is named by `diskutil info`'s Volume UUID, or by `LABEL=` and its name when it has no
+UUID, as an NTFS volume has none):
 
 ```
 UUID=6A698689-F3F0-4B3A-92EF-0C25FD2D3496 none macfuse_ext4 rw,owners
 ```
 
-It takes effect at the next mount. Get Info's "Ignore ownership on this volume" checkbox and `diskutil enableOwnership`
-do not work on a linuxfs volume, and Finder shows the box unchecked even though ownership is ignored. These are limits
-of Mac OS X 10.9 and macFUSE, not choices: the Mac keeps that setting by a volume ID that only HFS+ stores, it changes
-a mounted volume in place (`mount -u`), which macFUSE refuses, and macFUSE has no mount option for the flag Finder reads.
+It takes effect at the next mount. What you then create on the volume is yours, by your Mac user and group ids, as on
+HFS+. Ids are matched by number only: a Mac user or group whose id is a Linux user's or group's (the Mac's group 20,
+`staff`, is `dialout` on many Linux systems) gets that user's or group's access.
+
+The Mac uses only the first `/etc/fstab` line that names the volume. If the volume is also ignored (`linuxfs ignore`),
+add `owners` to linuxfs's line instead of writing a second one, so it reads `rw,noauto,owners # linuxfs`; keep the
+`# linuxfs` at its end, by which linuxfs knows the volume is ignored. `linuxfs ignore` and `linuxfs unignore` rewrite
+or remove that line, and `owners` with it.
+
+Get Info's "Ignore ownership on this volume" checkbox and `diskutil enableOwnership` do not work on a linuxfs volume,
+and Finder reports ownership as not ignored even when it is. These are limits of Mac OS X 10.9 and macFUSE, not
+choices: the Mac keeps that setting by a volume ID that only HFS+ stores, it changes a mounted volume in place
+(`mount -u`), which macFUSE refuses, and macFUSE has no mount option for the flag Finder reads.
 
 ### Preferences
 

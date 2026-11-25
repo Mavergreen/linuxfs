@@ -1095,6 +1095,20 @@ for s in sidebar getinfo desktop-on desktop-off icon; do expect "census_finder_s
 expect census_finder_props grep -q '^capacity equals df -k' "$P/finder.ext4.properties.ext4.txt"
 expect census_finder_props_ejectable grep -q '^ejectable: true$' "$P/finder.ext4.properties.hfs.txt"
 expect census_finder_raw grep -q 'Mac OS Extended format' "$P/finder.ext4.raw.txt"
+# the 20 MiB Finder's free space lacks on ext4 and xfs (item 6): df -k before and after Finder's query and beside the
+#   Get Info shot, and du -sk of what Spotlight and fseventsd keep on the volume, on both sides, recorded only
+for w in "before Finder's query" "after Finder's query" "beside Get Info"; do
+  expect "census_finder_space_df_$w" test "$(grep -c "^-- $w: df -k (size, used, available): [0-9]* [0-9]* [0-9]*$" "$P/finder.ext4.raw.txt")" -eq 2
+  for d in .Spotlight-V100 .fseventsd; do
+    expect "census_finder_space_du_${w}_$d" test "$(grep -c "^-- $w: du -sk $d: " "$P/finder.ext4.raw.txt")" -eq 2
+  done
+done
+# (the stub logs the two-line script as two lines: sudo's, then the du loop's, ending in the volume)
+expect census_finder_space_du_root sh -c 'grep -q "^sudo -n sh -c df -P -k" "$1" && grep -q "du -sk .* _ .*/vols/finder-ext4\$" "$1"' _ "$S/calls"
+# one sudo of df and du, bounded at 5 s: census_finder's worst stays 30 min (29.2 + 6 x 5 s), so the census still ends by 143
+expect census_finder_space_bounded grep -qF '_cs_o=$(bounded 50 sudo -n sh -c ' "$here/lib/parity.sh"
+expect census_finder_space_order awk '/^-- before Finder.s query: df/ && !b { b = NR } /^Finder \(/ && !f { f = NR } /^-- beside Get Info: df/ && !g { g = NR } END { exit !(b && b < f && f < g) }' "$P/finder.ext4.raw.txt"
+expect census_finder_space_not_compared hasnt "$(cat "$P/finder.ext4.properties.ext4.txt")" "^-- "
 expect census_finder_icon_flag grep -q '^xattr -wx com.apple.FinderInfo 0000000000000000040000000000000000000000000000000000000000000000 .*/vols/finder-ext4$' "$S/calls"
 expect census_finder_icns test -s "$T/vols/finder-ext4/.VolumeIcon.icns"
 expect census_finder_desktop_on grep -q '^guest-macosx-aqua defaults write com.apple.finder ShowExternalHardDrivesOnDesktop -bool true$' "$S/calls"

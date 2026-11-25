@@ -297,7 +297,7 @@ plist "$R/stale.plist" "<key>Automount</key><false/><key>Ignore:lbl</key><true/>
 real env LINUXFS_DOMAIN="$R/stale" "$MD" /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
 [ $rc = 0 ] && grep -q "^lklfuse: .*$R/mnt" "$R/lk.log"; ok $? "a stale Automount=false and Ignore:<LABEL> are not read: the real CLI mounts (rc $rc)"
 real "$MD" -o owners /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
-[ $rc = 0 ] && grep -q "^lklfuse: .*,default_permissions" "$R/lk.log" && ! grep -q "uid=\|gid=\|owner=" "$R/lk.log"; ok $? "the real CLI takes da-mount --owners: Linux's ids, checked by the kernel (rc $rc: $(cat "$R/lk.log" 2>/dev/null))"
+[ $rc = 0 ] && grep -q "^lklfuse: .*,default_permissions,owner=caller" "$R/lk.log" && ! grep -q "uid=\|gid=\|owner=root" "$R/lk.log"; ok $? "the real CLI takes da-mount --owners: Linux's ids, checked by the kernel, new files the creator's (rc $rc: $(cat "$R/lk.log" 2>/dev/null))"
 real "$MD" -o noowners /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
 [ $rc = 0 ] && grep -q "^lklfuse: .*,uid=[0-9]*,gid=[0-9]*,owner=root" "$R/lk.log" && ! grep -q "default_permissions" "$R/lk.log"; ok $? "and with noowners keeps today's mapping (rc $rc: $(cat "$R/lk.log" 2>/dev/null))"
 real "$MD" -o rdonly /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
@@ -356,7 +356,7 @@ fwant() { # RW HELPER-OPTIONS DEV MNT [ARGV-FLAGS]: the plan the brief prescribe
 }
 F2=$MF/5.5.0-mavericks.2.plist
 fplan "$F2" "$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
-fwant rw "allow_other,nosuid,local,volname=NAME,fsname=/dev/$E,noappledouble,fstypename=ext4,fssubtype=7" "$E" "$V/NAME" > "$M/want"
+fwant rw "allow_other,nosuid,nodev,local,volname=NAME,fsname=/dev/$E,noappledouble,fstypename=ext4,fssubtype=7" "$E" "$V/NAME" > "$M/want"
 [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root plan: a device named without /dev/ is accepted and passed as /dev/DEV (rc $rc)"
 # spec: item 6 (fsname=/dev/<bsd>) -- root's mount is named for its disk, as HFS+'s is, so DiskArbitration and Finder tie it to the disk
 grep -q "^helper-argv .*,fsname=/dev/$E,noappledouble," "$M/plan"; ok $? "root plan: mount_macfuse's -o holds fsname=/dev/$E ($(grep '^helper-argv a' "$M/plan"))"
@@ -384,16 +384,16 @@ plan "/dev/disk99999" "$V/NAME" 2>&1 >/dev/null | grep -q '^linuxfs-mount: refus
 FP_ENV="LINUXFS_CLI=/bin/false LINUXFS_OPEN=/bin/false LINUXFS_LKLFUSE=/bin/false" fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1
 grep -qx "env LINUXFS_OPEN=$H/linuxfs-open" "$M/plan" && grep -qx "env LINUXFS_LKLFUSE=$H/lklfuse" "$M/plan"; ok $? "root plan: a caller's LINUXFS_OPEN and LINUXFS_LKLFUSE are not passed on"
 fplan "$MF/5.5.0-mavericks.2.plist" -o nodev -o noowners -o nosuid "/dev/$E" "$V/NAME" > "$M/plan" 2>"$M/plan.err"; rc=$?
-fwant rw "allow_other,nosuid,local,volname=NAME,fsname=/dev/$E,noappledouble,fstypename=ext4,fssubtype=7" "$E" "$V/NAME" > "$M/want"
+fwant rw "allow_other,nosuid,nodev,local,volname=NAME,fsname=/dev/$E,noappledouble,fstypename=ext4,fssubtype=7" "$E" "$V/NAME" > "$M/want"
 [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root mount plan: mount_macfuse's fixed path, argv, the libfuse handshake's environment, the CLI's channel as fd 6, LINUXFS_FUSE_FD=4, LINUXFS_FUSE_CHAN=6 (rc $rc: $(diff "$M/plan" "$M/want" | head -4 | tr '\n' ';'))"
 fplan "$MF/5.5.0-mavericks.2.plist" -o rdonly "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
-fwant ro "allow_other,nosuid,local,volname=NAME,fsname=/dev/$E,noappledouble,fstypename=ext4,fssubtype=7,rdonly" "$E" "$V/NAME" --ro > "$M/want"
+fwant ro "allow_other,nosuid,nodev,local,volname=NAME,fsname=/dev/$E,noappledouble,fstypename=ext4,fssubtype=7,rdonly" "$E" "$V/NAME" --ro > "$M/want"
 [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root mount plan: rdonly adds rdonly to mount_macfuse's options and --ro to the CLI's (rc $rc: $(diff "$M/plan" "$M/want" | head -4 | tr '\n' ';'))"
 # spec: item 6 ("Ignore ownership") -- with owners the volume shows Linux's ids to every user (allow_other), so the kernel checks
 #       them (default_permissions) and a setuid file stays inert (nosuid, as on every root mount: DiskArbitration asks it for
 #       an external disk)
 fplan "$MF/5.5.0-mavericks.2.plist" -o nodev,noowners,nosuid,owners,rdonly "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
-fwant ro "allow_other,nosuid,default_permissions,local,volname=NAME,fsname=/dev/$E,noappledouble,fstypename=ext4,fssubtype=7,rdonly" "$E" "$V/NAME" --ro --owners > "$M/want"
+fwant ro "allow_other,nosuid,nodev,default_permissions,local,volname=NAME,fsname=/dev/$E,noappledouble,fstypename=ext4,fssubtype=7,rdonly" "$E" "$V/NAME" --ro --owners > "$M/want"
 [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root mount plan: owners adds default_permissions to mount_macfuse's options and --owners to the CLI's (rc $rc: $(diff "$M/plan" "$M/want" | head -4 | tr '\n' ';'))"
 fplan "$MF/5.5.0-mavericks.2.plist" -o owners,noowners "/dev/$E" "$V/NAME" > "$M/plan" 2>&1
 ! grep -q 'default_permissions\|^argv --owners$' "$M/plan"; ok $? "root mount plan: a later noowners leaves neither default_permissions nor --owners"
@@ -401,7 +401,7 @@ fplan "$MF/5.5.0-mavericks.2.plist" -o update "/dev/$E" "$V/NAME" > "$M/plan" 2>
 [ $rc = 1 ] && ! grep -q '^fd3\|^helper' "$M/plan"; ok $? "root mount plan: an update is refused before the device is opened (rc $rc: $(tail -1 "$M/plan"))"
 mkdir -p "$V/a,b=c"
 fplan "$MF/5.5.0-mavericks.2.plist" "/dev/$E" "$V/a,b=c" > "$M/plan" 2>&1
-grep -qx "helper-argv allow_other,nosuid,local,volname=a-b-c,fsname=/dev/$E,noappledouble,fstypename=ext4,fssubtype=7" "$M/plan"; ok $? "root mount plan: the volume name is the mount point's, made safe for an option list ($(grep '^helper-argv a' "$M/plan"))"
+grep -qx "helper-argv allow_other,nosuid,nodev,local,volname=a-b-c,fsname=/dev/$E,noappledouble,fstypename=ext4,fssubtype=7" "$M/plan"; ok $? "root mount plan: the volume name is the mount point's, made safe for an option list ($(grep '^helper-argv a' "$M/plan"))"
 # spec: tools/fs.c mount_by_root -- options that do not fit are refused, never cut (a cut one would lose a trailing rdonly)
 DM_EXT=$DM; DM=$D/short/mount_macfuse_ext4
 fplan "$F2" -o rdonly "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
@@ -411,7 +411,7 @@ DM=$DM_EXT
 cp "$DM" "$D/drop/mount_macfuse_ntfs"
 DM_EXT=$DM; DM=$D/drop/mount_macfuse_ntfs
 fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
-fwant rw "allow_other,nosuid,local,volname=NAME,fsname=/dev/$E,noappledouble,fstypename=ntfs,fssubtype=8" "$E" "$V/NAME" > "$M/want"
+fwant rw "allow_other,nosuid,nodev,local,volname=NAME,fsname=/dev/$E,noappledouble,fstypename=ntfs,fssubtype=8" "$E" "$V/NAME" > "$M/want"
 [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root mount plan: an NTFS mount ends ,fstypename=ntfs,fssubtype=8 (rc $rc: $(diff "$M/plan" "$M/want" | head -4 | tr '\n' ';'))"
 DM=$DM_EXT
 fplan "$F2" "/dev/$E" "$V/NAME" 2>&1 >/dev/null | grep -q .; [ $? -ne 0 ]; ok $? "root mount plan: a good run writes nothing to stderr"
@@ -435,12 +435,12 @@ plist "$D/apfswrite.plist" "<key>APFSWrite</key><true/>"
 plist "$D/readonly.plist" "<key>ReadOnly</key><true/>"
 fro() { # DEV WHAT [MACHINE-PREFS]: root's mount of DEV is read-only (rdonly, --ro), the device still opened read-write
   MACHP=${3:-} fplan "$F2" "/dev/$1" "$V/NAME" > "$M/plan" 2>&1; rc=$?
-  fwant rw "allow_other,nosuid,local,volname=NAME,fsname=/dev/$1,noappledouble,fstypename=ext4,fssubtype=7,rdonly" "$1" "$V/NAME" --ro > "$M/want"
+  fwant rw "allow_other,nosuid,nodev,local,volname=NAME,fsname=/dev/$1,noappledouble,fstypename=ext4,fssubtype=7,rdonly" "$1" "$V/NAME" --ro > "$M/want"
   [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root mount plan: $2: rdonly to mount_macfuse, --ro to the CLI (rc $rc: $(diff "$M/plan" "$M/want" | head -4 | tr '\n' ';'))"
 }
 frw() { # DEV WHAT [MACHINE-PREFS]: root's mount of DEV is read-write
   MACHP=${3:-} fplan "$F2" "/dev/$1" "$V/NAME" > "$M/plan" 2>&1; rc=$?
-  fwant rw "allow_other,nosuid,local,volname=NAME,fsname=/dev/$1,noappledouble,fstypename=ext4,fssubtype=7" "$1" "$V/NAME" > "$M/want"
+  fwant rw "allow_other,nosuid,nodev,local,volname=NAME,fsname=/dev/$1,noappledouble,fstypename=ext4,fssubtype=7" "$1" "$V/NAME" > "$M/want"
   [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root mount plan: $2: read-write (rc $rc: $(diff "$M/plan" "$M/want" | head -4 | tr '\n' ';'))"
 }
 fro "$TD" "a dirty NTFS volume"
@@ -495,7 +495,7 @@ hfd=$(sed -n 's/^env _FUSE_COMMFD=//p' "$D/drop/mhelper.log")
 [ "$(grep '^env ' "$D/drop/mhelper.log" | sort | tr '\n' ' ')" = "$(printf 'env _FUSE_CALL_BY_LIB=1\nenv _FUSE_COMMFD=%s\nenv _FUSE_COMMVERS=2\nenv _FUSE_DAEMON_PATH=%s/lklfuse\n' "$hfd" "$H" | sort | tr '\n' ' ')" ]
 ok $? "the helper's environment is the handshake's four variables and nothing else ($(grep '^env ' "$D/drop/mhelper.log" | tr '\n' ' '))"
 [ "$(sed -n 's/^fds //p' "$D/drop/mhelper.log")" = "0 1 2 $hfd" ]; ok $? "the helper holds 0-2 and its socket only, never the disk ($(sed -n 's/^fds //p' "$D/drop/mhelper.log"))"
-[ "$(grep '^argv ' "$D/drop/mhelper.log" | tr '\n' '|')" = "argv -o|argv allow_other,nosuid,local,volname=NAME,fsname=/dev/$E,noappledouble,fstypename=ext4,fssubtype=7|argv $V/NAME|" ]; ok $? "the helper's argv is -o OPTIONS MNT"
+[ "$(grep '^argv ' "$D/drop/mhelper.log" | tr '\n' '|')" = "argv -o|argv allow_other,nosuid,nodev,local,volname=NAME,fsname=/dev/$E,noappledouble,fstypename=ext4,fssubtype=7|argv $V/NAME|" ]; ok $? "the helper's argv is -o OPTIONS MNT"
 # spec: tools/fs.c mount_by_root -- every other descriptor is closed: descriptors the mount program inherited (3, 4, 5, 9) are gone
 #       in the CLI and in the helper, and with stdin closed the device still lands on fd 3 and nothing on 0-2
 hs "" ok 4</dev/null 5</dev/null 9</dev/null 3</dev/null; fdl=$(sed -n 's/^fds: //p' "$M/fdcli.log" | sed 's/ *255//')

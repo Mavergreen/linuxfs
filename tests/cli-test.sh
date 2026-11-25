@@ -530,10 +530,11 @@ case $(last) in *allow_other,uid=99,gid=99*) r=0 ;; *) r=1 ;; esac; case $(last)
 ok $r "LINUXFS_ALL_USERS=1 mounts allow_other,uid=99,gid=99, without owner=root"
 sh "$L" unmount disk3s1 > /dev/null 2>&1
 # spec: item 6 ("Ignore ownership") -- da-mount --owners (DiskArbitration's owners, from an fstab or vsdb entry): Linux's own
-#       ids, checked by the kernel (default_permissions); no uid=, gid= or owner= mapping
+#       ids, checked by the kernel (default_permissions); no uid= or gid= mapping, and what a user makes is that user's
+#       (owner=caller, as on HFS+), never LKL's root
 DA --owners /dev/disk3s1 "$T/dam" > /dev/null 2>&1; rc=$?
-c=$(last); case $c in *default_permissions*) r=0 ;; *) r=1 ;; esac; case $c in *uid=*|*gid=*|*owner=*) r=1 ;; esac
-[ $rc -eq 0 ]; ok $(( $? | r )) "da-mount --owners mounts with default_permissions and no uid=, gid= or owner= (got $rc: '$c')"
+c=$(last); case $c in *default_permissions*,owner=caller*) r=0 ;; *) r=1 ;; esac; case $c in *uid=*|*gid=*|*owner=root*) r=1 ;; esac
+[ $rc -eq 0 ]; ok $(( $? | r )) "da-mount --owners mounts with default_permissions and owner=caller, no uid= or gid= (got $rc: '$c')"
 sh "$L" unmount disk3s1 > /dev/null 2>&1
 DA --ro --owners /dev/disk3s1 "$T/dam" > /dev/null 2>&1; rc=$?
 c=$(last); case $c in *default_permissions*,ro\ *) r=0 ;; *) r=1 ;; esac
@@ -543,8 +544,8 @@ DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1
 case $(last) in *default_permissions*) r=1 ;; *uid=*,gid=*,owner=root*) r=0 ;; *) r=1 ;; esac; ok $r "without --owners (noowners): today's uid=,gid=,owner=root and no default_permissions"
 sh "$L" unmount disk3s1 > /dev/null 2>&1
 (LINUXFS_ALL_USERS=1; export LINUXFS_ALL_USERS; DA --owners /dev/disk3s1 "$T/dam" > /dev/null 2>&1)
-c=$(last); case $c in *allow_other*default_permissions*) r=0 ;; *) r=1 ;; esac; case $c in *uid=*|*gid=*|*owner=*) r=1 ;; esac
-ok $r "LINUXFS_ALL_USERS=1 with --owners: allow_other,default_permissions and no uid=99,gid=99 ('$c')"
+c=$(last); case $c in *allow_other*default_permissions*owner=caller*) r=0 ;; *) r=1 ;; esac; case $c in *uid=*|*gid=*|*owner=root*) r=1 ;; esac
+ok $r "LINUXFS_ALL_USERS=1 with --owners: allow_other,default_permissions,owner=caller and no uid=99,gid=99 ('$c')"
 sh "$L" unmount disk3s1 > /dev/null 2>&1
 LINUXFS_OPEN=$LO sh "$L" mount --owners "$T/img" "$T/dam" > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "linuxfs mount takes no --owners: only DiskArbitration's da-mount does (exit 2)"
 sh "$L" unmount disk3s1 > /dev/null 2>&1
@@ -629,10 +630,10 @@ chanrun() { # ENV... -- ARGS...: da-mount with root's channel and device descrip
    DA "$@" 4</dev/null 6</dev/null > "$T/out" 2>&1); rc=$?
 }
 # spec: item 6 ("Ignore ownership") -- with root's device, --owners drops the mapping; default_permissions is root's, given to
-#       mount_macfuse (tools/fs.c mount_by_root), so lklfuse gets neither it nor allow_other
+#       mount_macfuse (tools/fs.c mount_by_root), so lklfuse gets neither it nor allow_other; it does get owner=caller
 chanrun -- --owners /dev/disk3s1 "$T/dam"
-c=$(grep '^open --fuse-chan' "$T/calls" | tail -n 1); case $c in *uid=*|*gid=*|*owner=*|*default_permissions*|*allow_other*) r=1 ;; *) r=0 ;; esac
-[ $rc -eq 0 ] && [ -n "$c" ]; ok $(( $? | r )) "with root's device and --owners: no uid=99,gid=99, and no kernel options (got $rc: '$c')"
+c=$(grep '^open --fuse-chan' "$T/calls" | tail -n 1); case $c in *uid=*|*gid=*|*owner=root*|*default_permissions*|*allow_other*) r=1 ;; *owner=caller*) r=0 ;; *) r=1 ;; esac
+[ $rc -eq 0 ] && [ -n "$c" ]; ok $(( $? | r )) "with root's device and --owners: owner=caller, no uid=99,gid=99, and no kernel options (got $rc: '$c')"
 sh "$L" unmount "$T/dam" > /dev/null 2>&1
 chanrun FAKE_PROBE=apfs -- /dev/disk3s1 "$T/dam"
 [ $rc -eq 0 ] && grep -q "opts=readwrite" "$T/calls" && ! grep -q ",ro " "$T/calls"; ok $? "root said rw (no --ro) for APFS: the CLI mounts read-write though its own APFSWrite preference is off (rc $rc)"

@@ -1513,14 +1513,28 @@ census_before_login() {
 }
 
 # ---- item 6: Finder presentation ----
+# census_space MP WHEN: a record of MP's space at WHEN: df -k's size, used and available, and du -sk of .Spotlight-V100 and
+#   .fseventsd (mds's and fseventsd's own, so as root), in one sudo bounded at 5 s. Finder's free space on ext4 and xfs is
+#   20 MiB short of df's (item 6): a df that drops when Finder asks, or what those two hold, says where it goes
+census_space() {
+  _cs_o=$(bounded 50 sudo -n sh -c 'df -P -k "$1" 2>&1 | awk "NR == 2 { print \"df\", \$2, \$3, \$4 }"
+    for d in .Spotlight-V100 .fseventsd; do printf "du %s: %s\n" "$d" "$(du -sk "$1/$d" 2>&1 | cut -f 1 | tr "\n" " ")"; done' _ "$1" 2>&1 </dev/null)
+  echo "-- $2: df -k (size, used, available): $(printf '%s\n' "$_cs_o" | sed -n 's/^df //p')"
+  for _cs_d in .Spotlight-V100 .fseventsd; do
+    echo "-- $2: du -sk $_cs_d: $(printf '%s\n' "$_cs_o" | sed -n "s/^du $_cs_d: //p")"
+  done
+}
 # census_finder_props MP RAW-FILE: Finder's ejectable, local volume and ignore privileges, and whether its capacity and
-#   free space match df -k's; the raw values (and format) are appended to RAW-FILE
+#   free space match df -k's; the raw values (and format) are appended to RAW-FILE, with census_space before and after
+#   Finder's query
 census_finder_props() {
+  { echo "== $1"; census_space "$1" "before Finder's query"; } >>"$2"
   _fp_o=$("$AQUA" osascript -e 'tell application "Finder"' -e "set d to disk of (POSIX file \"$1\" as alias)" \
     -e 'set o to {ejectable of d, local volume of d, ignore privileges of d, capacity of d, free space of d, format of d}' \
     -e 'end tell' -e "set AppleScript's text item delimiters to \"|\"" -e 'return o as text' 2>&1 </dev/null); _fp_rc=$?
   _fp_df=$(df -P -k "$1" 2>&1 | awk 'NR == 2 { print $2, $4 }')
-  { echo "== $1"; echo "Finder (ejectable|local volume|ignore privileges|capacity|free space|format): $_fp_o"; echo "df -k (size, available): $_fp_df"; } >>"$2"
+  { echo "Finder (ejectable|local volume|ignore privileges|capacity|free space|format): $_fp_o"; echo "df -k (size, available): $_fp_df"
+    census_space "$1" "after Finder's query"; } >>"$2"
   if test "$_fp_rc" -ne 0; then echo "Finder: $_fp_o"; return "$_fp_rc"; fi
   printf '%s\n' "$_fp_o" | awk -F'|' -v df="$_fp_df" '{
     n = split(df, k, " "); c = $4 + 0; f = $5 + 0
@@ -1574,7 +1588,8 @@ census_desktop() {
 
 # census_finder FS: item 6 on the HFS+ control against FS: the sidebar and Get Info, photographed for each (and item 2's
 #   Get Info of FS alone, getinfo-format, after a Finder restart); Finder's
-#   properties against df -k (raw values in finder.FS.raw.txt); diskutil info's fields by mount point and by device (the
+#   properties against df -k (raw values in finder.FS.raw.txt, with census_space before and after Finder's query and
+#   beside each getinfo shot); diskutil info's fields by mount point and by device (the
 #   whole of it in finder.FS.diskutil-info-raw.txt); a custom .VolumeIcon.icns
 #   (Get Info photographed as icon); the Desktop with external disks shown and hidden. ShowExternalHardDrivesOnDesktop
 #   is put back as it was.
@@ -1595,7 +1610,11 @@ census_finder() {
   #       FSNames when it starts), shows FS's Get Info: its Format line must be the FSName, which proves the fssubtype
   census_finder_restart
   census_finder_view fs getinfo-format info
-  for cf_s in hfs fs; do census_finder_view "$cf_s" getinfo info; done
+  for cf_s in hfs fs; do
+    census_finder_view "$cf_s" getinfo info
+    if test "$cf_s" = hfs; then cf_m=$PARITY_CTL_MP; else cf_m=$PARITY_FS_MP; fi
+    { echo "== $cf_m"; census_space "$cf_m" "beside Get Info"; } >>"$OUT/parity/finder.$cf_fs.raw.txt"
+  done
   parity "finder.$cf_fs.volumeicon" census_volume_icon @MP@
   census_desktop true desktop-on
   for cf_s in hfs fs; do census_finder_view "$cf_s" icon info; done
@@ -1812,7 +1831,9 @@ census_later() {
 #   census_spotlight 24 + (2 refresh waits 28 + 2 panes 30 + 2 x 60 + 2 x 10 + 205) / 60 = 30.7, 31; Task 15 adds
 #   census_index_mode's mdutil -s, 30 a pass (bounded 300), and nothing that waits on the console (.fseventsd's own step,
 #   a test -e); fix round 1 adds the ro pass's census_fsevents_wait, bounded at 7 s: 30.7 + (60 + 7) / 60 = 31.8, 32;
-#   census_finder 24 + (7 views 105 + 205) / 60 = 29.2, 30;
+#   census_finder 24 + (7 views 105 + 205) / 60 = 29.2, 30; Task 16b fix round 1 adds census_space six times (before and
+#   after each side's Finder query, beside each side's Get Info), one sudo of df and du bounded at 5 s: 29.2 + 30 / 60 =
+#   29.7, still 30;
 #   census_trash_tags_case 13 + (3 census_finder_ask 3 x (68 + 13) = 243 + 205) / 60 = 20.5, 21;
 #   census_later 5 + 205 / 60 = 8.4, 9;
 #   a stall iteration 60 + 137 / 60 = 62.3, 63 (counted on each, though only the last is followed by the sweep);

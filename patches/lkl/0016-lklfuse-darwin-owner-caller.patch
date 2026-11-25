@@ -1,0 +1,95 @@
+lklfuse: on Darwin, -o owner=caller gives each new node the ids of whoever made it
+
+linuxfs mounts a volume whose owner wants ownership kept (fstab or vsdb `owners`, "Ignore ownership" off) with
+default_permissions and no uid=/gid= mapping, so the Mac's kernel checks Linux's ids. Without owner=, every file,
+directory, symlink and node a Mac user then made was LKL's (0:0): the user could not write or chmod it next, and a
+4755 create left a setuid-root file on the disk for wherever it is next mounted with suid. HFS+ with ownership on
+gives a new node to its creator. With owner=caller, lklfuse does the same: mknod, mkdir, symlink and create chown
+the new node to fuse_get_context()'s uid and gid (macFUSE's caller), the way owner= already chowns to fixed ids;
+only a node the call creates (create's O_EXCL loop, unchanged). With no FUSE request to take them from, the node
+keeps LKL's own. Linux's chown drops a setuid or setgid bit the create asked for (ATTR_KILL_SUID); the owner may set
+it afterwards, on a file that is then the owner's. tests/lklfuse-ops-test.c checks each kind of node, the 4755 case,
+an existing file, and no caller.
+
+diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
+--- a/tools/lkl/lklfuse.c
++++ b/tools/lkl/lklfuse.c
+@@ -97,6 +97,9 @@
+ "    -o passfd=N            read an encrypted volume's password from descriptor N\n"
+ "    -o lock=FILE           only mount after taking an exclusive lock on FILE\n"
+ "    -o owner=root|UID:GID  owner of new files: the filesystem root's, or these ids\n"
++#ifdef __APPLE__
++"    -o owner=caller        owner of new files: whoever makes each one (the FUSE request's ids)\n"
++#endif
+ "    -o opts=options        mount options (use \\ to escape , and =)\n"
+ );
+ }
+@@ -879,6 +882,14 @@
+ 	lklfuse.set_owner = 0;
+ 	if (!lklfuse.owner)
+ 		return 0;
++#ifdef __APPLE__
++	/* owner=caller: each new node takes the ids of the FUSE request that made it (macFUSE's caller), as on HFS+ with
++	 * ownership on; linuxfs passes it with owners, where the kernel checks Linux's ids (default_permissions) */
++	if (strcmp(lklfuse.owner, "caller") == 0) {
++		lklfuse.set_owner = 2;
++		return 0;
++	}
++#endif
+ 	if (strcmp(lklfuse.owner, "root") == 0) {
+ 		ret = lkl_sys_newfstatat(LKL_AT_FDCWD, "/", &st, 0);
+ 		if (ret < 0)
+@@ -895,11 +906,32 @@
+ 	return 0;
+ }
+ 
++/* The ids a new node takes, into *uid and *gid: owner='s, or with owner=caller the FUSE request's. 0 when none
++ * (no owner=, or no request to take them from): the node keeps LKL's own. */
++static int lklfuse_owner_ids(unsigned int *uid, unsigned int *gid)
++{
++#ifdef __APPLE__
++	if (lklfuse.set_owner == 2) {
++		struct fuse_context *c = fuse_get_context();
++
++		if (!c)
++			return 0;
++		*uid = c->uid;
++		*gid = c->gid;
++		return 1;
++	}
++#endif
++	*uid = lklfuse.owner_uid;
++	*gid = lklfuse.owner_gid;
++	return lklfuse.set_owner;
++}
++
+ static int lklfuse_own(const char *path, long ret)
+ {
+-	if (ret == 0 && lklfuse.set_owner)
+-		lkl_sys_fchownat(LKL_AT_FDCWD, path, lklfuse.owner_uid,
+-				 lklfuse.owner_gid, LKL_AT_SYMLINK_NOFOLLOW);
++	unsigned int uid, gid;
++
++	if (ret == 0 && lklfuse_owner_ids(&uid, &gid))
++		lkl_sys_fchownat(LKL_AT_FDCWD, path, uid, gid, LKL_AT_SYMLINK_NOFOLLOW);
+ 	return lklfuse_err(ret);
+ }
+ 
+@@ -1101,6 +1133,7 @@
+ 	char pbuf[LKLFUSE_PATH_MAX];
+ 	int flags = fi->flags;
+ 	int ret, tries;
++	unsigned int uid, gid;
+ 
+ 	/* an existing entry in any form is opened (EEXIST with O_EXCL); only a new one gets the stored form */
+ 	if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 1, &path)))
+@@ -1127,7 +1160,8 @@
+ 	}
+ 	if (tries == 4 && (ret = lklfuse_open3(path, true, mode, fi)) != 0)
+ 		return ret;
+-	lkl_sys_fchown(fi->fh, lklfuse.owner_uid, lklfuse.owner_gid);
++	if (lklfuse_owner_ids(&uid, &gid))
++		lkl_sys_fchown(fi->fh, uid, gid);
+ 	return 0;
+ }
+ 

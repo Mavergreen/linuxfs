@@ -1169,10 +1169,11 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 	/* fsname=/dev/BSD, as HFS+'s mount is named: DiskArbitration ties the volume to its disk only through f_mntfromname (with
 	 * linuxfs@BSD it lost the tie at the next mount or unmount of any volume, and its ejects failed 0x10: item 4), and so do
 	 * diskutil info and Finder's external-disk presentation (item 6) */
-	/* nosuid always: DiskArbitration asks it for every external disk, and only mount_macfuse running as a user gets it by
-	 * itself. With owners (item 6, "Ignore ownership"), every user sees Linux's own ids through allow_other, so the kernel
+	/* nosuid and nodev always: DiskArbitration asks both for every external disk, and only mount_macfuse running as a user
+	 * gets them by itself (XNU adds them to a user's mount); root's had nodev only by macFUSE's own doing, unasked. With
+	 * owners (item 6, "Ignore ownership"), every user sees Linux's own ids through allow_other, so the kernel
 	 * checks them (default_permissions): lklfuse, LKL's root, checks nothing itself. */
-	if (snprintf(opts, sizeof opts, "allow_other,nosuid%s,local,volname=%s,fsname=/dev/%s,noappledouble,fstypename=%s,fssubtype=%d%s",
+	if (snprintf(opts, sizeof opts, "allow_other,nosuid,nodev%s,local,volname=%s,fsname=/dev/%s,noappledouble,fstypename=%s,fssubtype=%d%s",
 		     req->owners ? ",default_permissions" : "", vol, bsd, nm->fstypename, nm->subtype, ro ? ",rdonly" : "") >= (int)sizeof opts)
 		return refuse(fs, "the mount options do not fit");
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, cs) != 0)
