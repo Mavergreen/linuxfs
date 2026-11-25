@@ -46,6 +46,14 @@ For a disk, `linuxfs mount DEVICE` is `diskutil mount` plus the options `--ro` a
 image files (a mount point, `--linux-ids`, `--tier2`, `-o`) are not for disks. Everything else about a disk is set
 with `linuxfs prefs`.
 
+### Spotlight and fsevents
+
+A volume you mount (a disk after login, or `linuxfs mount IMAGE`) is open to root's fseventsd and Spotlight only when
+macFUSE lets you share it: you are an admin (in macFUSE's `admin_group`, 80 by default), or its `allow_other` tunable is
+1. Then linuxfs passes macFUSE's `allow_root` option, so root's processes can reach the volume and Spotlight and fsevents
+work, as on an HFS+ disk. Non-admin users mount with no Spotlight or fsevents. Setting the `allow_other` tunable gives
+every local user access to the volume, as an HFS+ disk with "Ignore ownership" does.
+
 ### Preferences
 
 `linuxfs prefs` shows them; `linuxfs prefs KEY on|off` sets one for you. Keys: `ReadOnly`, `NTFSTakeover` and

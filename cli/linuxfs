@@ -28,6 +28,10 @@
 #          1 on failure, 2 on misuse, 3 when preferences say not to mount, 4 when an encrypted volume's password is
 #          missing or wrong.
 set -u
+# spec: item 5 census (pushes A and C): of everything refused on a linuxfs volume, only root's fseventsd (uid 0) was, every time
+#   (15+ mounts). `_spotlight` (uid 89) could not be tested: `mdutil -i on` fails with -400 in the CI guest even on HFS+. So
+#   allow_root, which lets root's fseventsd and mds in. If a later run shows uid 89 refused, this becomes allow_other.
+SHARE_OPT=allow_root
 PREFIX=${LINUXFS_PREFIX:-/usr/local/mavergreen/linuxfs}
 LKLFUSE=${LINUXFS_LKLFUSE:-$PREFIX/libexec/lklfuse}
 PROBE=${LINUXFS_PROBE:-$PREFIX/libexec/linuxfs-probe}
@@ -341,6 +345,8 @@ cmd_mount() {
   if [ -z "$fusefd" ]; then
     opts="$opts,local,volname=$name,fsname=linuxfs@$(safe_name "$(basename "$src")"),noappledouble"
     ft=$(fstype_opts "$type"); [ -z "$ft" ] || opts="$opts,$ft"
+    # root's fseventsd and mds reach the volume only if macFUSE lets this user share (an admin, or allow_other on)
+    if [ "${LINUXFS_ALL_USERS:-}" != 1 ]; then sh_opt=$(share_opt); [ -z "$sh_opt" ] || opts="$opts,$sh_opt"; fi
   fi
   if [ -n "$ids" ]; then :
   elif [ "${LINUXFS_ALL_USERS:-}" = 1 ]; then [ -n "$fusefd" ] || opts="$opts,allow_other"; opts="$opts,uid=99,gid=99"
@@ -551,6 +557,16 @@ bundle_of() { case $1 in ext4|btrfs|xfs|f2fs|apfs) echo "macfuse_$1" ;; ntfs3) e
 # fstypename and fssubtype for what the probe calls TYPE; nothing for the filesystems the Mac mounts itself.
 fstype_opts() { case $1 in ext4) echo fstypename=ext4,fssubtype=7 ;; ntfs3) echo fstypename=ntfs,fssubtype=8 ;; btrfs) echo fstypename=btrfs,fssubtype=9 ;;
   xfs) echo fstypename=xfs,fssubtype=10 ;; f2fs) echo fstypename=f2fs,fssubtype=11 ;; apfs) echo fstypename=apfs,fssubtype=12 ;; esac; }
+# SHARE_OPT when macFUSE's tunables let this user share the mount with root (allow_other is 1, or the user is in admin_group);
+# nothing when neither holds or sysctl fails or says nothing.
+share_opt() {
+  _ao=$(sysctl -n vfs.generic.macfuse.tunables.allow_other 2>/dev/null) || return 0
+  _ag=$(sysctl -n vfs.generic.macfuse.tunables.admin_group 2>/dev/null) || _ag=
+  [ "$_ao" = 1 ] && { echo "$SHARE_OPT"; return 0; }
+  case $_ag in ''|*[!0-9]*) return 0 ;; esac
+  for _g in $(id -G 2>/dev/null); do [ "$_g" = "$_ag" ] && { echo "$SHARE_OPT"; return 0; }; done
+  return 0
+}
 # A device's type, UUID and name (the volume name DiskArbitration sees: the bundle's util prints the label's safe name,
 # so a LABEL= entry must spell that, not the raw label). A label that leaves no safe name (empty, not UTF-8) gives no name:
 # DiskArbitration would call it Linux, as it calls every such volume. Sets type, uuid and name.

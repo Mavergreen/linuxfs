@@ -105,6 +105,21 @@ echo "agent \$*" >> "$T/dcalls"
 cat > "$T/agent.pw"
 exit \${FAKE_AGENT_RC:-0}
 EOF
+cat > "$T/bin/sysctl" <<'EOF'
+#!/bin/sh
+# stand-in: FAKE_SYSCTL_RC (default 1: unreadable), FAKE_ALLOW_OTHER, FAKE_ADMIN_GROUP
+[ "${FAKE_SYSCTL_RC:-1}" = 0 ] || exit "${FAKE_SYSCTL_RC:-1}"
+case $2 in
+  vfs.generic.macfuse.tunables.allow_other) echo "${FAKE_ALLOW_OTHER:-0}" ;;
+  vfs.generic.macfuse.tunables.admin_group) echo "${FAKE_ADMIN_GROUP:-80}" ;;
+  *) exit 1 ;;
+esac
+EOF
+cat > "$T/bin/id" <<'EOF'
+#!/bin/sh
+[ "$1" = -G ] && [ -n "${FAKE_ID_G:-}" ] && { echo "$FAKE_ID_G"; exit 0; }
+exec /usr/bin/id "$@"
+EOF
 chmod 755 "$T/bin"/*
 # platform: cli/linuxfs is macOS-only and leans on two BSD behaviours GNU coreutils lacks: stat -f FORMAT, and cut -c
 #           counting characters, not bytes, in a UTF-8 locale. Off macOS these stand-ins supply both (stat's two formats
@@ -664,6 +679,36 @@ FAKE_PROBE=ext4 sh "$L" mount "$T/img" -o fstypename=zzz,fssubtype=99,sync > /de
 case $(last) in *fstypename=ext4,fssubtype=7*) case $(last) in *zzz*|*=99*) r=1 ;; *,sync[,\ ]*) r=0 ;; *) r=1 ;; esac ;; *) r=1 ;; esac
 ok $r "a user's -o fstypename/fssubtype is dropped, ours kept, other -o options kept (rc $rc: $(last))"
 sh "$L" unmount "$T/img" > /dev/null 2>&1
+# spec: cli/linuxfs share_opt, cmd_mount -- SHARE_OPT is passed on lklfuse's -o only when macFUSE lets this user share
+#       (tunables.allow_other is 1, or id -G holds tunables.admin_group), and only on the CLI's own path: not with root's
+#       fusefd, not with LINUXFS_ALL_USERS; an unreadable sysctl gives nothing, and the mount still runs
+eval "$(grep '^SHARE_OPT=' "$L")"; [ -n "${SHARE_OPT:-}" ]; ok $? "SHARE_OPT is set at the top of cli/linuxfs (${SHARE_OPT:-})"
+: > "$T/calls"
+FAKE_PROBE=ext4 FAKE_SYSCTL_RC=0 FAKE_ADMIN_GROUP=80 FAKE_ID_G="20 80 501" sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
+case $(last) in *,${SHARE_OPT:-none}[,\ ]*) r=0 ;; *) r=1 ;; esac; ok $r "share_admin: a user in the admin group gets the option (rc $rc: $(last))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+FAKE_PROBE=ext4 FAKE_SYSCTL_RC=0 FAKE_ALLOW_OTHER=1 FAKE_ID_G="20 501" sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
+case $(last) in *,${SHARE_OPT:-none}[,\ ]*) r=0 ;; *) r=1 ;; esac; ok $r "share_tunable: allow_other 1 gives the option (rc $rc: $(last))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+: > "$T/calls"
+FAKE_PROBE=ext4 FAKE_SYSCTL_RC=0 FAKE_ALLOW_OTHER=0 FAKE_ID_G="20 501" sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
+case $(last) in *type=ext4*) case $(last) in *allow_*) r=1 ;; *) r=0 ;; esac ;; *) r=1 ;; esac; ok $r "share_none: neither gives no share option, and the mount runs (rc $rc: $(last))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+: > "$T/calls"
+FAKE_PROBE=ext4 FAKE_SYSCTL_RC=1 FAKE_ID_G="20 80 501" sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
+case $(last) in *type=ext4*) case $(last) in *allow_*) r=1 ;; *) r=0 ;; esac ;; *) r=1 ;; esac; ok $r "share_unreadable: a failing sysctl gives none, and the mount runs (rc $rc: $(last))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+: > "$T/calls"
+FAKE_PROBE=ext4 FAKE_SYSCTL_RC=0 FAKE_ALLOW_OTHER=1 LINUXFS_ALL_USERS=1 sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
+case $(last) in *,allow_other,*) r=0 ;; *) r=1 ;; esac
+case $(last) in *allow_root*) r=1 ;; esac; ok $r "share_all_users: LINUXFS_ALL_USERS keeps its allow_other and adds no allow_root (rc $rc: $(last))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+: > "$T/calls"
+(LINUXFS_OPEN_INHERITED=1 LINUXFS_FUSE_FD=4 LINUXFS_FUSE_CHAN=6 FAKE_FD_MNT=$T/dam FAKE_SYSCTL_RC=0 FAKE_ALLOW_OTHER=1 FAKE_ID_G="20 80"; export LINUXFS_OPEN_INHERITED LINUXFS_FUSE_FD LINUXFS_FUSE_CHAN FAKE_FD_MNT FAKE_SYSCTL_RC FAKE_ALLOW_OTHER FAKE_ID_G
+ DA /dev/disk3s1 "$T/dam" 4</dev/null 6</dev/null > "$T/out" 2>&1); rc=$?
+case $(last) in *type=ext4*) case $(last) in *allow_*) r=1 ;; *) r=0 ;; esac ;; *) r=1 ;; esac
+ok $r "share_not_root_channel: with root's channel there is no share option (rc $rc: $(last))"
+sh "$L" unmount "$T/dam" > /dev/null 2>&1
 # spec: cli/linuxfs bundle_of, fstype_opts -- agree with tools/fsrules.c's table (fsrules-test --names)
 names=$(sh "$ROOT/tests/fsrules-test.sh" --names 2>/dev/null); [ -n "$names" ]; ok $? "fsrules-test --names prints the table"
 eval "$(grep '^bundle_of()' "$L")"; eval "$(sed -n '/^fstype_opts()/,/; }$/p' "$L")"
