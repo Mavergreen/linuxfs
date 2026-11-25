@@ -11,15 +11,15 @@
 #include <limits.h>
 
 static int tapno, failures;
-
+static const char *tap_tag = "";	/* before each description: the resolver mode a test runs in */
 
 static void is(int got, int want, const char *what)
 {
 	tapno++;
 	if (got == want) {
-		printf("ok %d - %s\n", tapno, what);
+		printf("ok %d - %s%s\n", tapno, tap_tag, what);
 	} else {
-		printf("not ok %d - %s (got %d, want %d)\n", tapno, what, got, want);
+		printf("not ok %d - %s%s (got %d, want %d)\n", tapno, tap_tag, what, got, want);
 		failures++;
 	}
 }
@@ -52,7 +52,8 @@ static void owned(const char *path, uid_t uid, gid_t gid, const char *what)
 
 #ifdef __APPLE__
 /*
- * Darwin Unicode names (patch 0012): stored NFC, shown as HFS+ shows them (NFD), found by any form. The conversions
+ * Darwin Unicode names (patch 0012): stored NFC, shown as HFS+ shows them (NFD), found by any form, in both modes:
+ * scanning (an older macFUSE) and exact (5.5.0-mavericks.5's -o nonorm_insensitive, never a scan). The conversions
  * use CoreFoundation, so these run on the Mac only. Names are planted with lkl_sys_* and read back with getdents64,
  * so what is on disk is seen as Linux sees it.
  */
@@ -63,9 +64,9 @@ static void is_str(const char *got, const char *want, const char *what)
 {
 	tapno++;
 	if (got && strcmp(got, want) == 0) {
-		printf("ok %d - %s\n", tapno, what);
+		printf("ok %d - %s%s\n", tapno, tap_tag, what);
 	} else {
-		printf("not ok %d - %s (got %s)\n", tapno, what, got ? got : "NULL");
+		printf("not ok %d - %s%s (got %s)\n", tapno, tap_tag, what, got ? got : "NULL");
 		failures++;
 	}
 }
@@ -170,14 +171,9 @@ static int readdir_of(const char *path, struct seen *s)
 	return ret;
 }
 
-static void unicode_tests(void)
+static void unicode_conv_tests(void)
 {
-	struct fuse_file_info f;
-	struct stat st;
-	struct seen s;
-	char buf[PATH_MAX], name[PATH_MAX];
-	unsigned long scans;
-	int i;
+	char buf[PATH_MAX];
 
 	/* the modes */
 	is(lklfuse_nfmode_for("ext4"), NF_STORE_NFC, "ext4 stores NFC");
@@ -229,6 +225,26 @@ static void unicode_tests(void)
 	conv(lklfuse_nfc, "/e\xcc\x81/" NFD_CAFE, "/\xc3\xa9/" NFC_CAFE, PATH_MAX, "NFC of a whole path");
 	is(lklfuse_nfc(NFD_CAFE, buf, 4) == NULL, 1, "NFC into a 4-byte buffer: NULL");
 	is(lklfuse_nfd_hfs(NFC_CAFE, buf, 4) == NULL, 1, "NFD into a 4-byte buffer: NULL");
+}
+
+/*
+ * Each resolver case, in one mode: scanning (an older macFUSE, whose libfuse spells every path but a new entry's by
+ * ICU's NFD) or exact (macFUSE's -o nonorm_insensitive: the kernel's bytes, lookups only, never a scan). Run in a
+ * directory of its own, made the root.
+ */
+static void resolver_tests(int exact)
+{
+	struct fuse_file_info f;
+	struct stat st;
+	struct seen s;
+	char buf[PATH_MAX], name[PATH_MAX];
+	unsigned long scans, scans0 = lklfuse_nf_scans;
+	/* the path libfuse hands over for a node it named: its ICU NFD while scanning, the kernel's bytes when exact */
+	const char *later = exact ? NFC_CAFE : NFD_CAFE;
+	int i;
+
+	lklfuse_nf_exact = exact;
+	tap_tag = exact ? "exact: " : "scan: ";
 
 	/* create_nfd_lands_nfc */
 	is(lklfuse_mkdir("/u1", 0755), 0, "mkdir /u1");
@@ -255,9 +271,12 @@ static void unicode_tests(void)
 	is(lklfuse_create("/u2/" NFC_CAFE, 0644, &f), 0, "enxio_sequence: create by NFC");
 	lklfuse_release("/u2/" NFC_CAFE, &f);
 	is(names_in("/u2", NFC_CAFE), 1, "enxio_sequence: on disk as NFC");
-	is(lklfuse_getattr("/u2/" NFD_CAFE, &st, NULL), 0, "enxio_sequence: getattr by libfuse's NFD path");
-	is(opens("/u2/" NFD_CAFE), 0, "enxio_sequence: open by libfuse's NFD path");
-	is(lklfuse_access("/u2/" NFD_CAFE, R_OK), 0, "enxio_sequence: access by libfuse's NFD path");
+	scans = lklfuse_nf_scans;
+	snprintf(name, sizeof(name), "/u2/%s", later);
+	is(lklfuse_getattr(name, &st, NULL), 0, "enxio_sequence: getattr by the path libfuse hands over");
+	is(opens(name), 0, "enxio_sequence: open by the path libfuse hands over");
+	is(lklfuse_access(name, R_OK), 0, "enxio_sequence: access by the path libfuse hands over");
+	is((int)(lklfuse_nf_scans - scans), 0, "enxio_sequence: no scan");
 
 	/* ondisk_nfd_kept */
 	is(lkl_sys_mkdir("/u3", 0755), 0, "mkdir /u3");
@@ -298,12 +317,21 @@ static void unicode_tests(void)
 	/* neither_form_scan: a, U+0301, U+0323 is neither NFC (U+1EA1 U+0301) nor NFD (a U+0323 U+0301) */
 	is(lkl_sys_mkdir("/u5", 0755), 0, "mkdir /u5");
 	plant("/u5/a\xcc\x81\xcc\xa3", "odd");
-	scans = lklfuse_nf_scans;
-	is_str(content_of("/u5/\xe1\xba\xa1\xcc\x81", buf, sizeof(buf)), "odd", "neither_form_scan: opens by its NFC form");
-	is((int)(lklfuse_nf_scans - scans), 1, "neither_form_scan: lklfuse_nf_scans grows by 1 (open)");
-	scans = lklfuse_nf_scans;
-	is(lklfuse_getattr("/u5/\xe1\xba\xa1\xcc\x81", &st, NULL), 0, "neither_form_scan: getattr by its NFC form");
-	is((int)(lklfuse_nf_scans - scans), 1, "neither_form_scan: lklfuse_nf_scans grows by 1");
+	is(readdir_of("/u5", &s), 0, "neither_form: readdir");
+	if (exact) {
+		/* listed as stored, so the bytes Finder sends back name it exactly */
+		is_str(s.names[0], "a\xcc\x81\xcc\xa3", "neither_form: listed as stored");
+		is_str(content_of("/u5/a\xcc\x81\xcc\xa3", buf, sizeof(buf)), "odd", "neither_form: opens by its stored bytes");
+		is(opens("/u5/\xe1\xba\xa1\xcc\x81"), -ENOENT, "neither_form: not by its NFC form (no scan to find it)");
+	} else {
+		is_str(s.names[0], "a\xcc\xa3\xcc\x81", "neither_form: listed in HFS+'s NFD");
+		scans = lklfuse_nf_scans;
+		is_str(content_of("/u5/\xe1\xba\xa1\xcc\x81", buf, sizeof(buf)), "odd", "neither_form_scan: opens by its NFC form");
+		is((int)(lklfuse_nf_scans - scans), 1, "neither_form_scan: lklfuse_nf_scans grows by 1 (open)");
+		scans = lklfuse_nf_scans;
+		is(lklfuse_getattr("/u5/\xe1\xba\xa1\xcc\x81", &st, NULL), 0, "neither_form_scan: getattr by its NFC form");
+		is((int)(lklfuse_nf_scans - scans), 1, "neither_form_scan: lklfuse_nf_scans grows by 1");
+	}
 
 	/* ascii_miss_no_scan */
 	scans = lklfuse_nf_scans;
@@ -412,18 +440,34 @@ static void unicode_tests(void)
 	is(lklfuse_create("/u9/\xe2\x84\xa6", 0644, &f), 0, "create U+2126");
 	lklfuse_release("/u9/\xe2\x84\xa6", &f);
 	is(names_in("/u9", "\xe2\x84\xa6"), 1, "U+2126 is stored as given");
-	is(opens("/u9/\xce\xa9"), 0, "and opens by U+03A9 (libfuse's ICU NFD of it)");
 	f = (struct fuse_file_info){ .flags = O_WRONLY };
 	is(lklfuse_create("/u9/\xe2\x84\xab", 0644, &f), 0, "create U+212B");
 	lklfuse_release("/u9/\xe2\x84\xab", &f);
 	is(names_in("/u9", "\xe2\x84\xab"), 1, "U+212B is stored as given");
-	is(opens("/u9/A\xcc\x8a"), 0, "and opens by A U+030A (libfuse's ICU NFD of it)");
-	is(opens("/u9/\xc3\x85"), 0, "and by U+00C5");
 	plant("/u9/\xe2\x86\x9a", "arrow");
-	scans = lklfuse_nf_scans;
-	is_str(content_of("/u9/\xe2\x86\x90\xcc\xb8", buf, sizeof(buf)), "arrow",
-	       "a Linux-made U+219A opens by U+2190 U+0338 (review N1)");
-	is((int)(lklfuse_nf_scans - scans), 1, "through the scan");
+	if (exact) {
+		/* the kernel's bytes, as HFS+ compares them: a singleton is its own name, and no other spelling's */
+		is(opens("/u9/\xe2\x84\xa6"), 0, "U+2126 opens by itself");
+		is(opens("/u9/\xce\xa9"), -ENOENT, "but not by U+03A9");
+		is(opens("/u9/\xe2\x84\xab"), 0, "U+212B opens by itself");
+		is(opens("/u9/A\xcc\x8a"), -ENOENT, "but not by A U+030A");
+		is(opens("/u9/\xc3\x85"), -ENOENT, "nor by U+00C5");
+		is_str(content_of("/u9/\xe2\x86\x9a", buf, sizeof(buf)), "arrow", "a Linux-made U+219A opens by itself");
+		is(opens("/u9/\xe2\x86\x90\xcc\xb8"), -ENOENT, "but not by U+2190 U+0338");
+	} else {
+		is(opens("/u9/\xce\xa9"), 0, "U+2126 opens by U+03A9 (libfuse's ICU NFD of it)");
+		is(opens("/u9/A\xcc\x8a"), 0, "U+212B opens by A U+030A (libfuse's ICU NFD of it)");
+		is(opens("/u9/\xc3\x85"), 0, "and by U+00C5");
+		scans = lklfuse_nf_scans;
+		is_str(content_of("/u9/\xe2\x86\x90\xcc\xb8", buf, sizeof(buf)), "arrow",
+		       "a Linux-made U+219A opens by U+2190 U+0338 (review N1)");
+		is((int)(lklfuse_nf_scans - scans), 1, "through the scan");
+	}
+	is(readdir_of("/u9", &s), 0, "singletons: readdir");
+	for (i = 0; i < s.n; i++)
+		if (strcmp(s.names[i], "\xe2\x84\xa6") && strcmp(s.names[i], "\xe2\x84\xab") && strcmp(s.names[i], "\xe2\x86\x9a"))
+			break;
+	is(s.n == 3 && i == 3, 1, "singletons: listed as stored");
 
 	/* review M1: a non-ASCII path over Darwin's PATH_MAX (1024), within LKL's (4096) */
 	{
@@ -450,7 +494,120 @@ static void unicode_tests(void)
 		strcat(nfcp, "/f");
 		is(lkl_sys_access(nfcp, 0), 0, "long_path: it lands under the NFC directories");
 	}
+	if (exact)
+		is((int)(lklfuse_nf_scans - scans0), 0, "lklfuse_nf_scans never grew");
+	tap_tag = "";
 }
+
+/* a macFUSE manifest at PATH whose version is VERSION (a plist value), with MODE */
+static void manifest(const char *path, const char *version, mode_t mode)
+{
+	FILE *f;
+
+	unlink(path);
+	f = fopen(path, "w");
+	if (!f)
+		return;
+	fprintf(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+		"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+		"<plist version=\"1.0\">\n<dict>\n  <key>identifier</key>\n  <string>dev.mavergreen.macfuse</string>\n"
+		"  <key>version</key>\n  %s\n</dict>\n</plist>\n", version);
+	fclose(f);
+	chmod(path, mode);
+}
+
+/* names_mode_*: the pass-through is taken from the installed macFUSE's version, as tools/fs.c's /dev/fd/N gate is */
+static void names_mode_tests(void)
+{
+	static const struct { const char *version; int exact; const char *what; } v[] = {
+		{ "<string>5.5.0-mavericks.5</string>", 1, "names_mode: 5.5.0-mavericks.5 passes names through" },
+		{ "<string>5.5.0-mavericks.10</string>", 1, "names_mode: 5.5.0-mavericks.10 too (numbers, not text)" },
+		{ "<string>5.5.1-mavericks.1</string>", 1, "names_mode: 5.5.1-mavericks.1 too" },
+		{ "<string>6.0.0-mavericks.1</string>", 1, "names_mode: 6.0.0-mavericks.1 too" },
+		{ "<string>5.5.0-mavericks.4</string>", 0, "names_mode: 5.5.0-mavericks.4 does not" },
+		{ "<string>5.4.9-mavericks.9</string>", 0, "names_mode: 5.4.9-mavericks.9 does not" },
+		{ "<string>5.5.0</string>", 0, "names_mode: a version that is not Mavergreen's does not" },
+		{ "<string>5.5.0-mavericks.5x</string>", 0, "names_mode: nor one with trailing text" },
+		{ "<integer>6</integer>", 0, "names_mode: nor a version that is not a string" },
+	};
+	char dir[] = "/tmp/lklfuse-ops.XXXXXX", path[64], link_path[64], ver[64];
+	size_t i;
+
+	if (!mkdtemp(dir)) {
+		is(0, 1, "names_mode: a temporary directory");
+		return;
+	}
+	snprintf(path, sizeof(path), "%s/mavergreen.plist", dir);
+	snprintf(link_path, sizeof(link_path), "%s/link.plist", dir);
+	for (i = 0; i < ARRAY_SIZE(v); i++) {
+		manifest(path, v[i].version, 0644);
+		is(lklfuse_macfuse_exact(path, getuid(), ver, sizeof(ver)), v[i].exact, v[i].what);
+	}
+	manifest(path, "<string>5.5.0-mavericks.5</string>", 0644);
+	is(lklfuse_macfuse_exact(path, getuid(), ver, sizeof(ver)), 1, "names_mode: read back");
+	is_str(ver, "5.5.0-mavericks.5", "names_mode: and the version it read, for the log");
+	is(lklfuse_macfuse_exact(path, getuid() + 1, ver, sizeof(ver)), 0, "names_mode: a manifest someone else owns is not read");
+	chmod(path, 0664);
+	is(lklfuse_macfuse_exact(path, getuid(), ver, sizeof(ver)), 0, "names_mode: nor one its group can write");
+	chmod(path, 0646);
+	is(lklfuse_macfuse_exact(path, getuid(), ver, sizeof(ver)), 0, "names_mode: nor one anyone can write");
+	chmod(path, 0644);
+	symlink(path, link_path);
+	is(lklfuse_macfuse_exact(link_path, getuid(), ver, sizeof(ver)), 0, "names_mode: nor a symlink");
+	unlink(link_path);
+	unlink(path);
+	is(lklfuse_macfuse_exact(path, getuid(), ver, sizeof(ver)), 0, "names_mode: no manifest: scanning");
+	is(ver[0], 0, "names_mode: and no version");
+
+	/* what lklfuse hands libfuse, and the mode it records */
+	manifest(path, "<string>5.5.0-mavericks.5</string>", 0644);
+	lklfuse_nf_exact = 0;
+	is_str(lklfuse_names_option(path, getuid()), "-ononorm_insensitive", "names_mode: with 5.5.0-mavericks.5, libfuse is given -o nonorm_insensitive");
+	is(lklfuse_nf_exact, 1, "names_mode: and names are exact");
+	manifest(path, "<string>5.5.0-mavericks.4</string>", 0644);
+	is(lklfuse_names_option(path, getuid()) == NULL, 1, "names_mode: with 5.5.0-mavericks.4, no option (libfuse would refuse it)");
+	is(lklfuse_nf_exact, 0, "names_mode: and names are scanned for");
+	unlink(path);
+	rmdir(dir);
+}
+
+/* the resolver's cases in a directory of its own made the root, then back to the real root */
+static void resolver_tests_in(const char *dir, int exact)
+{
+	long root = lkl_sys_open("/", LKL_O_RDONLY | LKL_O_DIRECTORY, 0);
+
+	is(root >= 0 && lkl_sys_mkdir(dir, 0755) == 0 && lkl_sys_chroot(dir) == 0 && lkl_sys_chdir("/") == 0, 1, dir);
+	resolver_tests(exact);
+	is(lkl_sys_fchdir(root) == 0 && lkl_sys_chroot(".") == 0 && lkl_sys_chdir("/") == 0, 1, "back to the root");
+	lkl_sys_close(root);
+	lklfuse_nf_exact = 0;
+}
+
+/* readdir's rule, on its own: HFS+'s form, except a name in neither form (exact) or over NAME_MAX, as stored */
+static void shown_tests(void)
+{
+	char b[NAME_MAX + 1];
+	const char *odd = "a\xcc\x81\xcc\xa3";
+
+	lklfuse_nf_exact = 0;
+	is_str(lklfuse_nf_shown(odd, b, sizeof(b)), "a\xcc\xa3\xcc\x81", "shown, scanning: a name in neither form, in HFS+'s NFD");
+	lklfuse_nf_exact = 1;
+	is(lklfuse_nf_shown(odd, b, sizeof(b)) == odd, 1, "shown, exact: a name in neither form, as stored");
+	is_str(lklfuse_nf_shown(NFC_CAFE, b, sizeof(b)), NFD_CAFE, "shown, exact: an NFC name, in HFS+'s NFD");
+	is_str(lklfuse_nf_shown(NFD_CAFE, b, sizeof(b)), NFD_CAFE, "shown, exact: an NFD name, as it is");
+	is_str(lklfuse_nf_shown("plain", b, sizeof(b)), "plain", "shown, exact: ASCII");
+	lklfuse_nf_exact = 0;
+}
+
+static void unicode_tests(void)
+{
+	unicode_conv_tests();
+	names_mode_tests();
+	shown_tests();
+	resolver_tests_in("/scan", 0);
+	resolver_tests_in("/exact", 1);
+}
+
 #endif
 
 int main(int argc, char **argv)

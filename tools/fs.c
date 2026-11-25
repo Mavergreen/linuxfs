@@ -612,7 +612,8 @@ static int run_cli(const char *cli, const struct mountreq *req, const char *pw, 
 #define LIBFUSE "/usr/local/lib/libfuse3.4.dylib"	/* lklfuse, as _linuxfs, loads this */
 /* The first Mavergreen macFUSE release that ships the fd-mountpoint patch (its libfuse 3 serves a /dev/fd/N mountpoint
  * another process mounted: macfuse's DETAILS.md, "A mount made for you"): the gate for mounting before login at all. build/package.sh's
- * MACFUSE_MIN is later (5.5.0-mavericks.4), enforced only at install time: .4 is the combination tested here, and it carries the
+ * MACFUSE_MIN is later (5.5.0-mavericks.4), enforced only at install time: .4 is the install floor (the 10.9 job runs
+ * components/macfuse/version, 5.5.0-mavericks.5, whose name pass-through lklfuse gates on its own), and it carries the
  * single-threaded-loop fix. lklfuse's ending on SIGTERM on 10.9 was LKL's setjmp saving the signal mask (patches/0011), not
  * macFUSE's; .2 and .3 with that patch are untested, so a macFUSE replaced later by one of them passes this gate. Dev builds
  * labelled 5.5.0-mavericks.2 that predate the patch exist: on those the gate passes, lklfuse cannot serve /dev/fd/N, and

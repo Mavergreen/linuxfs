@@ -28,7 +28,9 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$stage" ] && [ -n "$V" ] && [ -n "$out" ] || usage
 short=$LINUXFS_SHORT
-# spec: tests/package-test.sh -- the macfuse release this linuxfs is tested with: it carries the single-threaded-loop fix, and lklfuse
+# spec: tests/package-test.sh -- the floor: the macfuse release this linuxfs was tested with before the 10.9 job moved to the pin,
+#       5.5.0-mavericks.5, whose name pass-through (-o nonorm_insensitive) lklfuse gates on the installed version itself and does
+#       without, scanning for names (patches/lkl/0012-lklfuse-darwin-unicode.patch). .4 carries the single-threaded-loop fix, and lklfuse
 #       ends on SIGTERM over /dev/fd/N (the before-login mount; tools/fs.c MACFUSE_FD_MOUNTPOINT_SINCE, 5.5.0-mavericks.2, is the
 #       gate for mounting then at all). The 10.9 cause of lklfuse ignoring SIGTERM was LKL's setjmp saving the signal mask
 #       (patches/0011), not macFUSE: .2 and .3 with that patch are untested. A floor, not the build's pin (components/macfuse/version):

@@ -69,7 +69,7 @@ grep -q "launchctl load.*/Library/LaunchDaemons/$H.plist" "$comp/Scripts/postins
 grep -q 'needs macfuse\|macfuse.*not installed\|requires macfuse\|macfuse' "$comp/Scripts/preinstall" ||
   fail "the preinstall does not mention macfuse"
 grep -q "'5\.5\.0-mavericks\.4'" "$comp/Scripts/preinstall" ||
-  fail "the preinstall does not require macfuse 5.5.0-mavericks.4 (the tested one, with the single-threaded-loop fix) or later"
+  fail "the preinstall does not require macfuse 5.5.0-mavericks.4 (the floor, with the single-threaded-loop fix) or later"
 # platform: the preinstall reads macfuse's version with PlistBuddy, which only macOS has
 if [ -x /usr/libexec/PlistBuddy ]; then
   for mv in 5.4.9-mavericks.3:refused 5.5.0-mavericks.3:refused 5.5.0-mavericks.4:accepted 5.5.0-mavericks.10:accepted; do

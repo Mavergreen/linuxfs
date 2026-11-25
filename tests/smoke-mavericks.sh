@@ -2,7 +2,8 @@
 # platform: macOS-only -- mounts Linux filesystems through Mavergreen macFUSE on a real Mac OS X 10.9 box (the acceptance job's guest)
 # spec: .github/workflows/on-mavericks.yml -- the installed product on 10.9: the manifest is the run's version; the root
 #       helper and the keychain keeper (linuxfs-agent) are running; `linuxfs mount` mounts ext4, btrfs, xfs, NTFS (ntfs3),
-#       exFAT and f2fs images, writes through each, unmounts, mounts again and reads it all back. Then DiskArbitration's six
+#       exFAT and f2fs images (lklfuse finding names exactly, with macFUSE's name pass-through, on the pinned 5.5.0-mavericks.5),
+#       writes through each, unmounts, mounts again and reads it all back. Then DiskArbitration's six
 #       bundles: ext4, btrfs, xfs, f2fs, NTFS (NTFSTakeover on) and APFS, raw and GPT-wrapped, are mounted by an attach within 30 s (personality, reads, writes, unmount and mount, eject
 #       leaves no lklfuse); NTFS with NTFSTakeover off is Apple's; `linuxfs ignore` (an /etc/fstab noauto entry: ext4 by device, NTFS by
 #       label; ext4 by a label with a space, written as LABEL=my\040data) mounts nothing on a plain attach and never runs the mount program, `diskutil mount` mounts it, and after `linuxfs unignore` a plain attach does;
@@ -121,10 +122,24 @@ unmount_and_wait() {  # IMAGE MOUNTPOINT
   [ -z "$p" ] || bounded 300 sh -c 'while ps -p "$1" > /dev/null; do sleep 0.1; done' _ "$p" || { echo "lklfuse $p did not exit"; return 1; }
   ! mount | grep -qF " on $2 (" || { echo "$2 is still mounted"; return 1; }
 }
+# spec: tools/fs.c macfuse_version -- macfuse_at_least A B C N: 0 when the guest's macFUSE (its manifest's version, compared by
+#       number as tools/fs.c does) is A.B.C-mavericks.N or later
+macfuse_at_least() {
+  mfv=$(/usr/libexec/PlistBuddy -c 'Print :version' /usr/local/mavergreen/macfuse/mavergreen.plist 2> /dev/null) || return 1
+  echo "$mfv" | sed 's/-mavericks[.]/./' | awk -F. -v want="$1 $2 $3 $4" 'NF == 4 { split(want, t, " "); for (i = 1; i <= 4; i++) if ($i + 0 != t[i] + 0) exit !($i + 0 > t[i] + 0); exit 0 } { exit 1 }'
+}
+# spec: patches/lkl/0012-lklfuse-darwin-unicode.patch lklfuse_names_option -- lklfuse says in the mount's log how it finds names: exact (macFUSE 5.5.0-mavericks.5
+#       or later passes them through, -o nonorm_insensitive: no directory scan) or scanning (an older one); the guest runs
+#       components/macfuse/version, 5.5.0-mavericks.5, so exact is what the census's item 1 steps run on
+names_mode() { sed -n 's/^lklfuse: names: //p' "$HOME/Library/Logs/linuxfs/$1.log" 2> /dev/null | tail -n 1; }
+names_are() { names_mode "$1" | grep -q "^$2 "; }   # IMAGE exact|scanning
 for fs in $imgfs; do
   img=$W/img/$fs.img m=$W/mnt/$fs
   mkdir -p "$m"
   check "$fs: linuxfs mount" bounded 600 "$L" mount "$img" "$m"
+  echo "# $fs: lklfuse's names: $(names_mode "$fs.img")"
+  if macfuse_at_least 5 5 0 5; then check "$fs: with macFUSE 5.5.0-mavericks.5 or later, lklfuse finds names exactly (-o nonorm_insensitive)" names_are "$fs.img" exact
+  else check "$fs: with a macFUSE before 5.5.0-mavericks.5, lklfuse scans for names (no -o nonorm_insensitive, which it would refuse)" names_are "$fs.img" scanning; fi
   check "$fs: write, rename, symlink, hard link, chmod and xattr through the mount" write_through "$fs" "$m"
   check "$fs: linuxfs unmount, and lklfuse exits" unmount_and_wait "$img" "$m"
   check "$fs: mount again" bounded 600 "$L" mount "$img" "$m"
@@ -188,13 +203,9 @@ root_mount_macfuse_gone() {
     sleep 1
   done
 }
-# spec: components/macfuse/version -- macFUSE 5.5.0-mavericks.4 is the tested combination (build/package.sh's MACFUSE_MIN) and carries the
-#       single-threaded-loop fix; lklfuse's ending on SIGTERM on 10.9 is LKL's (patches/0011), .2 and .3 with it untested: the version
-#       in the guest's manifest, as 0 when it is at least .4
-macfuse_term_fixed() {
-  mfv=$(/usr/libexec/PlistBuddy -c 'Print :version' /usr/local/mavergreen/macfuse/mavergreen.plist 2> /dev/null) || return 1
-  echo "$mfv" | sed 's/-mavericks[.]/./' | awk -F. 'NF == 4 { for (i = 1; i <= 4; i++) { split("5 5 0 4", t, " "); if ($i + 0 != t[i] + 0) exit !($i + 0 > t[i] + 0) } exit 0 } { exit 1 }'
-}
+# spec: build/package.sh MACFUSE_MIN -- macFUSE 5.5.0-mavericks.4, the install floor, carries the single-threaded-loop fix; lklfuse's
+#       ending on SIGTERM on 10.9 is LKL's (patches/0011), .2 and .3 with it untested: 0 when the guest's macFUSE is at least .4
+macfuse_term_fixed() { macfuse_at_least 5 5 0 4; }
 # spec: tools/fs.c mount_by_root -- a daemon that dies leaves the mount unserved (see its use below): SIGTERM through sudo (the
 #       process is _linuxfs's), 5 s; where macFUSE has the fix (macfuse_term_fixed) that must end it, and term_clean says so; else
 #       (or if it does not) it is said and SIGKILL follows, 30 s: only a process still there after SIGKILL fails this function
@@ -549,7 +560,7 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
         if [ -n "$lp" ] && kill_lklfuse "$lp"; then
           ok "before login: lklfuse ($lp) is killed"
           if macfuse_term_fixed; then check "before login: with macFUSE 5.5.0-mavericks.4 or later, SIGTERM ends lklfuse within 5 s, no SIGKILL" test "$term_clean" = 1
-          else echo "# before login: this macFUSE predates 5.5.0-mavericks.4, the tested one: SIGTERM may be ignored ($([ "$term_clean" = 1 ] && echo ended || echo ignored))"; fi
+          else echo "# before login: this macFUSE predates 5.5.0-mavericks.4, the floor: SIGTERM may be ignored ($([ "$term_clean" = 1 ] && echo ended || echo ignored))"; fi
           check "before login: with lklfuse dead, a read of $mp fails at once instead of hanging" bounded 100 sh -c '! ls "$1"' _ "$mp"
           check "before login: with lklfuse dead, diskutil unmount still unmounts $mp" login_unmount "$mp"
           if bounded 600 sudo -n diskutil mount "$dev" > /dev/null 2>&1 && da_wait 300; then

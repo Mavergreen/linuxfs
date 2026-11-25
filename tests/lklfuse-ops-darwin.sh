@@ -3,7 +3,8 @@
 #   usage: lklfuse-ops-darwin.sh
 #          lklfuse's callbacks on 10.9 without a FUSE mount: what macFUSE would be told (Darwin errno
 #          values, Darwin xattr and rename flags translated), and its Unicode names (patch 0012: stored NFC, shown as
-#          HFS+ shows them, found in any form; CoreFoundation's, so checked here only). Needs
+#          HFS+ shows them, found in any form, both scanning and with macFUSE's name pass-through, which it takes
+#          from the installed macFUSE's version; CoreFoundation's, so checked here only). Needs
 #          build/build-lkl-darwin.sh's output.
 set -u
 case "$(uname -s)" in Darwin) ;; *) echo "lklfuse-ops-darwin.sh: runs on a Mac" >&2; exit 77 ;; esac
