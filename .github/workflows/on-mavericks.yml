@@ -156,14 +156,18 @@ jobs:
       - uses: actions/download-artifact@v8
         with: { name: linuxfs-images-after, path: "${{ runner.temp }}/after" }
       # spec: tests/lib/parity.sh census_unicode -- the census records, never gates: the names Apple's msdosfs wrote to the
-      #       FAT32 control (ctl-fat32.img), as Linux reads them, one hex line per root-directory name
+      #       FAT32 control (ctl-fat32.img, in its uni-fat32 directory), as Linux reads them, one hex line per name
       - name: The FAT32 control's names as Linux reads them (census, recorded only)
         run: |
-          d="$RUNNER_TEMP/after"
-          if [ -f "$d/ctl-fat32.img.gz" ]; then
-            gzip -dc "$d/ctl-fat32.img.gz" > "$RUNNER_TEMP/ctl-fat32.img"
-            python3 -I tests/lib/check-names.py fat "$RUNNER_TEMP/ctl-fat32.img" | sed 's/^/# ctl-fat32 name: /' || echo "# check-names.py fat failed on ctl-fat32.img"
-          else echo "# the guest returned no ctl-fat32.img.gz (the census did not run)"; fi
+          set +e
+          d="$RUNNER_TEMP/after" t="$RUNNER_TEMP/check-names.out"
+          if [ ! -f "$d/ctl-fat32.img.gz" ]; then echo "# the guest returned no ctl-fat32.img.gz (the census did not run)"; exit 0; fi
+          gzip -dc "$d/ctl-fat32.img.gz" > "$RUNNER_TEMP/ctl-fat32.img" 2> "$t"; rc=$?
+          if [ "$rc" -ne 0 ]; then echo "# gzip -dc ctl-fat32.img.gz failed (exit $rc):"; sed 's/^/#   /' "$t"; exit 0; fi
+          python3 -I tests/lib/check-names.py fat "$RUNNER_TEMP/ctl-fat32.img" uni-fat32 > "$t" 2>&1; rc=$?
+          sed 's/^/# ctl-fat32 uni-fat32 name: /' "$t"
+          [ "$rc" -eq 0 ] || echo "# check-names.py fat failed on ctl-fat32.img (exit $rc; its output is above)"
+          exit 0
       - name: e2fsck -fn, btrfs check, xfs_repair -n, ntfsfix -n, fsck.exfat -n and fsck.f2fs --dry-run, in the build container
         run: |
           set -eu

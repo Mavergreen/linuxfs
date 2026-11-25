@@ -194,30 +194,41 @@ EOF
 r=$(census_probe_times < "$T/dalog")
 expect probe_times test "$r" = "$(printf '%s\n' 'disk3s1 hfs 3s' 'disk4 none' 'disk5 none')"
 
-# fat_names: check-names.py fat reads a FAT32 long name (UTF-16) from the FAT partition, found by its type GUID
+# fat_names: check-names.py fat reads FAT32 long names (UTF-16) from the FAT partition, found by its type GUID: the root's, and
+#   those in a named subdirectory (census_unicode writes in uni-fat32)
 if test "$(uname -s)" = Linux && command -v mkfs.vfat > /dev/null 2>&1 && command -v python3 > /dev/null 2>&1; then
   truncate -s 64M "$T/fat.img" && mkfs.vfat -F 32 -S 512 -s 1 "$T/fat.img" > /dev/null
   python3 -I - "$T/fat.img" <<'EOF'
 import struct, sys
+def lfn_pair(longname, short, attr, cluster):
+    s = 0
+    for c in bytearray(short):
+        s = (((s & 1) << 7) + (s >> 1) + c) & 0xFF
+    name = longname.encode("utf-16-le") + b"\0\0"
+    name += b"\xff" * (26 - len(name))
+    lfn = struct.pack("<B10sBBB12sH4s", 0x41, name[:10], 0x0F, 0, s, name[10:22], 0, name[22:26])
+    return lfn + struct.pack("<11sBBBHHHHHHHI", short, attr, 0, 0, 0, 0, 0, 0, 0, 0, cluster, 0)
 with open(sys.argv[1], "r+b") as f:
     bs = f.read(512)
     bps, spc, rsv, nfats = struct.unpack_from("<HBHB", bs, 11)
     fatsz, = struct.unpack_from("<I", bs, 36)
     rootc, = struct.unpack_from("<I", bs, 44)
-    short = b"CAFE~1  TXT"
-    s = 0
-    for c in bytearray(short):
-        s = (((s & 1) << 7) + (s >> 1) + c) & 0xFF
-    name = u"café".encode("utf-16-le") + b"\0\0"
-    name += b"\xff" * (26 - len(name))
-    lfn = struct.pack("<B10sBBB12sH4s", 0x41, name[:10], 0x0F, 0, s, name[10:22], 0, name[22:26])
-    sde = struct.pack("<11sBBBHHHHHHHI", short, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-    f.seek((rsv + nfats * fatsz + (rootc - 2) * spc) * bps)
-    f.write(lfn + sde)
+    data = (rsv + nfats * fatsz) * bps
+    for i in range(nfats):                  # cluster 3, the subdirectory, ends its chain
+        f.seek((rsv + i * fatsz) * bps + 3 * 4)
+        f.write(struct.pack("<I", 0x0FFFFFFF))
+    f.seek(data + (rootc - 2) * spc * bps)
+    f.write(lfn_pair(u"uni-fat32", b"UNI-FA~1   ", 0x10, 3))
+    f.seek(data + (3 - 2) * spc * bps)
+    f.write(lfn_pair(u"cafe\u0301", b"CAFE~1  TXT", 0x20, 0))
 EOF
   python3 -I "$here/lib/gpt-wrap.py" "$T/fat.img" "$T/gpt-fat.img" EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
   r=$(python3 -I "$here/lib/check-names.py" fat "$T/gpt-fat.img" 2>&1)
+  expect fat_names_root test "$r" = 756e692d6661743332
+  r=$(python3 -I "$here/lib/check-names.py" fat "$T/gpt-fat.img" uni-fat32 2>&1)
   expect fat_names test "$r" = 63616665cc81
+  r=$(python3 -I "$here/lib/check-names.py" fat "$T/gpt-fat.img" nowhere 2>&1); rc=$?
+  expect fat_names_no_dir test "$rc" -ne 0 -a -n "$r"
   python3 -I "$here/lib/gpt-wrap.py" "$T/fat.img" "$T/gpt-linux.img" 0FC63DAF-8483-4772-8E79-3D69D8477DE4
   r=$(python3 -I "$here/lib/check-names.py" fat "$T/gpt-linux.img" 2>&1); rc=$?
   expect fat_names_by_type test "$rc" -ne 0 -a -n "$r"
@@ -249,7 +260,7 @@ cat > "$T/bin/stub" <<'EOF'
 #!/bin/sh
 # census_dry's stub of the Mac's disk tools: a node file per attached disk node (img, vol, mp, uuid, disk), .m when mounted
 me=${0##*/}
-printf '%s\n' "$me $*" >> "$STUB/calls"
+printf '%s\n' "$me $*" | tee -a "$STUB/calls.all" >> "$STUB/calls"
 N=$STUB/nodes
 field() { sed -n "s/^$2=//p" "$N/$1" 2> /dev/null; }
 node_of() { # a disk node, or a mount point: its node
@@ -277,7 +288,7 @@ hdiutil)
     esac
     k=$(($(cat "$STUB/disks" 2> /dev/null || echo 1) + 1)); echo $k > "$STUB/disks"
     d=disk$k
-    case $b in *hfs*|*fat32*) nd=${d}s1; echo "/dev/$d          	GUID_partition_scheme" ;; *) nd=$d ;; esac
+    case $b in *hfs*|*fat32*) nd=${d}s1; echo "/dev/$d          	GUID_partition_scheme" ;; *) nd=$d; echo "$d" >> "$STUB/fsdisks" ;; esac
     mp=$STUB/../vols/$b; mkdir -p "$mp"
     printf 'img=%s\nvol=%s\nmp=%s\nuuid=UUID-%s\ndisk=%s\n' "$img" "$b" "$mp" "$b" "$d" > "$N/$nd"
     log "created disk, id = /dev/$d."
@@ -311,7 +322,11 @@ diskutil)
     esac
     rm -f "$N/$nd.m"; echo "Volume $(field "$nd" vol) on $nd unmounted" ;;
   eject)
-    d=${2#/dev/}; rm -f "$N/$d" "$N/$d.m" "$N/${d}s1" "$N/${d}s1.m"; echo "Disk $d ejected" ;;
+    d=${2#/dev/}
+    case $(field "$d" vol) in busy-ext4)
+      if test ! -f "$STUB/eject-once"; then : > "$STUB/eject-once"; echo "Disk $d couldn't be ejected (stub busy)"; exit 1; fi ;;
+    esac
+    rm -f "$N/$d" "$N/$d.m" "$N/${d}s1" "$N/${d}s1.m"; echo "Disk $d ejected" ;;
   esac ;;
 linuxfs)
   case $1 in
@@ -350,6 +365,8 @@ expect census_unicode_open_other grep -Eq '^63616665cc81 (ok 636166c3a9|errno 2)
 expect census_unicode_finder grep -q 'character id 233' "$S/calls"
 expect census_unicode_shots test "$(grep -c 'screencapture -x .*-names.png' "$S/calls")" -eq 2
 expect census_unicode_fat32_out test -s "$OUT/ctl-fat32.img.gz"
+expect census_unicode_fat32_copy grep -q '^hdiutil attach -imagekey diskimage-class=CRawDiskImage .*/census/ctl-fat32.img$' "$S/calls"
+expect census_unicode_fat32_control_kept not grep -q '^hdiutil attach -imagekey diskimage-class=CRawDiskImage .*/ctl/fat32.img$' "$S/calls"
 expect census_unicode_sysctl grep -q 'vfs.generic.macfuse' "$P/unicode-ext4.sysctl.txt"
 expect census_unicode_recorded has "$r" "^# recorded unicode.ext4.shell-create"
 expect census_unicode_quiet hasnt "$r" "not ok"
@@ -361,9 +378,11 @@ expect census_unicode_names_ext4_only not test -e "$P/unicode.names.listdir-pair
 
 # census_stall: not run at 0; at 2, both loops on both volumes, counted, with probe times and Fisher's p
 : > "$S/calls"
-r=$(census_stall 0 2>&1)
+r=$(PARITY_STALL_N=0 census_stall 2>&1)
 expect census_stall_zero test ! -e "$P/stall.txt" -a ! -s "$S/calls"
-r=$(census_stall 2 2>&1)
+r=$(unset PARITY_STALL_N; census_stall 2 2>&1)
+expect census_stall_variable_only test ! -e "$P/stall.txt" -a ! -s "$S/calls"
+r=$(PARITY_STALL_N=2 census_stall 2>&1)
 expect census_stall_lines test "$(grep -c '^[a-z0-9]*-loop[12]-[12]: ' "$P/stall.txt")" -eq 8
 expect census_stall_hfs_line grep -q '^hfs-loop1-1: automounted in [0-9]* s .*probe disk[0-9]*s1 stub [0-9]*s' "$P/stall.txt"
 expect census_stall_stalled grep -q '^ext4-loop1-2: stalled after [0-9]* s: hdiutil exit 1: hdiutil: attach failed - no mountable file systems' "$P/stall.txt"
@@ -402,11 +421,19 @@ expect census_busy_finder grep -q 'eject disk' "$S/calls"
 expect census_busy_shot test "$(grep -c 'screencapture -x .*-busy-eject.png' "$S/calls")" -eq 2
 expect census_busy_force_hfs grep -q '^diskutil unmount force .*/vols/busy-hfs-ext4$' "$S/calls"
 expect census_busy_no_force_fs not grep -q '^diskutil unmount force .*/vols/busy-ext4$' "$S/calls"
+expect census_busy_eject_retried grep -q '^# census: retrying diskutil eject /dev/disk' "$P/busy.ext4.cycles.txt"
+expect census_busy_eject_lsof grep -q '^#   COMMAND PID USER (stub lsof lsof .*/vols/busy-ext4)' "$P/busy.ext4.cycles.txt"
 expect census_busy_recorded has "$r" "^# recorded busy.ext4.cycles: hfs 0 of 20, ext4 1 of 20"
 expect census_busy_quiet hasnt "$r" "not ok"
 expect census_busy_sysctl test -s "$P/busy-ext4.sysctl.txt"
 expect census_busy_detached test -z "$(attached)"
 
+# no forced unmount, eject or detach ever targets a linuxfs disk (QEMU first)
+forced=
+for d in $(sort -u "$S/fsdisks"); do
+  grep -Eq "^(hdiutil detach -force|diskutil unmountDisk force|diskutil unmount force) (/dev/)?$d(s1)?\$" "$S/calls.all" && forced="$forced $d"
+done
+expect census_no_force_on_fs test -z "$forced" -a -s "$S/fsdisks"
 expect census_waits_bounded test ! -s "$unbounded"
 test ! -s "$unbounded" || sed 's/^/# /' "$unbounded"
 

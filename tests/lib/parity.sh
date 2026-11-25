@@ -22,8 +22,8 @@
 #   census_unicode FS                     item 1: names made in NFC and NFD from the shell and by Finder, on HFS+
 #                                         against FS; for ext4, IN's ext4-names.img too; once, the FAT32 control,
 #                                         returned as $OUT/ctl-fat32.img.gz
-#   census_stall [N]                      item 3: spike round 4's attach loops on HFS+ and ext4, N times each (default
-#                                         PARITY_STALL_N; 0 runs nothing); counts, probe times and Fisher's p
+#   census_stall                          item 3: spike round 4's attach loops on HFS+ and ext4, PARITY_STALL_N times
+#                                         each (unset or 0 runs nothing); counts, probe times and Fisher's p
 #   census_busy FS                        item 4: write-then-unmount cycles, and a held file's unmount and ejects
 #                                         (forced ones on HFS+ alone unless PARITY_BUSY_FORCE=1)
 #   Each records sysctl vfs.generic.macfuse once, as $OUT/parity/<census>.sysctl.txt.
@@ -195,10 +195,23 @@ census_attach() {
   CA_VOL=${CA_MP##*/}
 }
 
-# census_detach DISK: eject, or failing that detach by force
+# census_detach DISK [apple|nomount|fs] [MP]: eject. When that fails, only a disk of Apple's filesystems (HFS+, FAT32) or one
+#   attached -nomount and never mounted is detached by force; a linuxfs disk (fs, the default) is not, unless
+#   PARITY_BUSY_FORCE=1 (a forced unmount of a busy macFUSE volume runs on the QEMU kit first): its failure is said, with
+#   sudo lsof on MP, and the eject tried once more. Returns 1 when the disk is left attached.
 census_detach() {
   test -n "$1" || return 0
-  bounded 600 diskutil eject "$1" >/dev/null 2>&1 </dev/null || bounded 300 hdiutil detach -force "$1" >/dev/null 2>&1 </dev/null
+  _cd_o=$(bounded 600 diskutil eject "$1" 2>&1 </dev/null) && return 0
+  case ${2:-fs}:${PARITY_BUSY_FORCE:-0} in
+  apple:* | nomount:* | *:1) bounded 300 hdiutil detach -force "$1" >/dev/null 2>&1 </dev/null; return ;;
+  esac
+  echo "# census: diskutil eject $1 failed: $(printf '%s' "$_cd_o" | tr '\n' ' ')"
+  if test -n "${3:-}"; then echo "# census: sudo lsof $3:"; bounded 900 sudo -n lsof "$3" 2>&1 </dev/null | head -n 40 | sed 's/^/#   /'; fi
+  census_pause 2
+  echo "# census: retrying diskutil eject $1 (a linuxfs disk is not detached by force)"
+  _cd_o=$(bounded 600 diskutil eject "$1" 2>&1 </dev/null) && return 0
+  echo "# census: diskutil eject $1 failed again; left attached: $(printf '%s' "$_cd_o" | tr '\n' ' ')"
+  return 1
 }
 
 # census_image_disk IMAGE: the whole disk IMAGE is attached as, if it is
@@ -283,11 +296,11 @@ census_unicode_names() {
     census_shot names "$_cn_s"
     bounded 300 guest-macosx-aqua osascript -e 'tell application "Finder" to close every window' >/dev/null 2>&1 </dev/null
   done
-  census_detach "$CA_DISK"
+  census_detach "$CA_DISK" fs "$CA_MP"
 }
 
 # census_unicode FS: item 1 on the HFS+ control against FS; for ext4 also the Linux-made names; and once, the FAT32
-#   control against HFS+, its image then gzipped into OUT as ctl-fat32.img.gz for the fsck job's check-names.py
+#   control (a copy) against HFS+, that copy then gzipped into OUT as ctl-fat32.img.gz for the fsck job's check-names.py
 census_unicode() {
   _cu_fs=$1
   census_sysctl "unicode-$_cu_fs"
@@ -298,18 +311,18 @@ census_unicode() {
   if census_attach "$_cu_i"; then
     parity_pair "$_cu_hd" "$_cu_hm" "$_cu_hv" "$_cu_fs" "$CA_DISK" "$CA_MP" "$CA_VOL"
     census_unicode_steps "$_cu_fs"
-    census_detach "$CA_DISK"
+    census_detach "$CA_DISK" fs "$CA_MP"
   fi
   test "$_cu_fs" != ext4 || census_unicode_names "$_cu_hd" "$_cu_hm" "$_cu_hv"
-  if test ! -f "$W/ctl/fat32.census"; then
-    if _cu_f=$(parity_control fat32) && census_attach "$_cu_f"; then
+  if test ! -f "$W/census/ctl-fat32.done"; then
+    if _cu_c=$(parity_control fat32) && _cu_f=$(census_copy "$_cu_c" ctl-fat32) && census_attach "$_cu_f"; then
       parity_pair "$_cu_hd" "$_cu_hm" "$_cu_hv" fat32 "$CA_DISK" "$CA_MP" "$CA_VOL"
       census_unicode_steps fat32
-      census_detach "$CA_DISK"
-      gzip -c "$_cu_f" >"$OUT/ctl-fat32.img.gz" && : >"$W/ctl/fat32.census"
+      census_detach "$CA_DISK" apple
+      gzip -c "$_cu_f" >"$OUT/ctl-fat32.img.gz" && : >"$W/census/ctl-fat32.done"
     else echo "# census_unicode: no FAT32 control"; fi
   fi
-  census_detach "$_cu_hd"
+  census_detach "$_cu_hd" apple
 }
 
 # ---- item 3: the plain-attach stall (spike round 4's loop, git show 8a34bc1:tests/smoke-mavericks.sh) ----
@@ -383,44 +396,48 @@ fl_plain() {
 #           taken away (linuxfs unignore), eject, then the plain attach that is counted
 #   loop 2: a plain attach, eject, then the plain attach that is counted
 fl_iter() {
-  it_vol=$1 it_tag=$1-loop$2-$3 it_img=$4 it_via= it_fu= it_s3=
+  it_vol=$1 it_tag=$1-loop$2-$3 it_img=$4 it_via= it_fu= it_s3= it_mp=
+  if test "$1" = hfs; then it_side=apple; else it_side=fs; fi
   if test "$2" = 1; then
     census_attach "$it_img" nomount || { echo "$it_tag: setup failed: no disk from attach -nomount" >>"$OUT/parity/stall.txt"; return 2; }
     it_disk=$CA_DISK
     # shellcheck disable=SC2086  # the nodes are words
     it_dv=$(bounded 900 census_wait_uuid $CA_NODES) || it_dv=
     it_dev=$(printf '%s\n' "$it_dv" | sed -n 1p) it_fu=$(printf '%s\n' "$it_dv" | sed -n 2p)
-    if test -z "$it_fu"; then census_detach "$it_disk"; echo "$it_tag: setup failed: no Volume UUID" >>"$OUT/parity/stall.txt"; return 2; fi
+    if test -z "$it_fu"; then census_detach "$it_disk" nomount; echo "$it_tag: setup failed: no Volume UUID" >>"$OUT/parity/stall.txt"; return 2; fi
     census_pause 6   # as round 4 did: the agent's sweep may mount it first
-    test "$(census_info "$it_dev" Mounted)" != Yes || bounded 6000 diskutil unmount "$it_dev" >/dev/null 2>&1 </dev/null
+    it_how=nomount
+    if test "$(census_info "$it_dev" Mounted)" = Yes; then
+      it_how=$it_side it_mp=$(census_info "$it_dev" "Mount Point"); bounded 6000 diskutil unmount "$it_dev" >/dev/null 2>&1 </dev/null
+    fi
     if test "$it_vol" = hfs; then
       bounded 300 sudo -n sh -c 'printf "%s\n" "$2" >> "$1"' _ "$PARITY_FSTAB" "UUID=$it_fu none hfs rw,noauto" </dev/null
     else
       bounded 6000 "$L" ignore "$it_disk" >/dev/null 2>&1 </dev/null
     fi
     if ! grep -q "^UUID=$it_fu " "$PARITY_FSTAB" 2>/dev/null; then
-      census_detach "$it_disk"; echo "$it_tag: setup failed: no noauto entry for UUID $it_fu" >>"$OUT/parity/stall.txt"; return 2
+      census_detach "$it_disk" "$it_how" "$it_mp"; echo "$it_tag: setup failed: no noauto entry for UUID $it_fu" >>"$OUT/parity/stall.txt"; return 2
     fi
     da_mark "$it_tag: diskutil mount"
     bounded 6000 diskutil mount "$it_dev" >/dev/null 2>&1 </dev/null; it_s3=$?
-    bounded 1300 census_wait_mounted "$it_dev" >/dev/null || it_s3="$it_s3, not mounted"
+    if it_m=$(bounded 1300 census_wait_mounted "$it_dev"); then it_mp=$(printf '%s\n' "$it_m" | sed -n 2p); else it_s3="$it_s3, not mounted"; fi
     test "$it_vol" = hfs || bounded 6000 "$L" unignore "$it_disk" >/dev/null 2>&1 </dev/null
     if grep -q "^UUID=$it_fu " "$PARITY_FSTAB" 2>/dev/null; then
       bounded 300 sudo -n sh -c 'grep -v "^UUID=$2 " "$1" > "$1.parity"; cat "$1.parity" > "$1"; rm -f "$1.parity"' _ "$PARITY_FSTAB" "$it_fu" </dev/null
       test "$it_vol" = hfs || it_via=" | unignore left the entry: the harness took it away"
     fi
-    bounded 6000 diskutil eject "$it_disk" >/dev/null 2>&1 </dev/null || { census_pause 5; census_detach "$it_disk"; }
+    census_detach "$it_disk" "$it_side" "$it_mp" >>"$OUT/parity/stall-detach.txt"
     it_first="ignore, diskutil mount (exit $it_s3), unignore, eject"
   else
     fl_plain "$it_img" "$W/census/fl-first.log"; it_first="first attach: $PA_VERDICT"
-    census_detach "$PA_DISK"
+    census_detach "$PA_DISK" "$it_side" "$PA_MP" >>"$OUT/parity/stall-detach.txt"
   fi
   it_dal=$(census_dalog_size); : "${it_dal:=0}"
   da_mark "$it_tag: plain attach"
   fl_plain "$it_img" "$W/census/fl-plain.log"; it_ok=$?
   it_probe=$(census_dalog_since "$it_dal" | census_probe_times | tr '\n' ',' | sed 's/,$//; s/,/, /g')
   if test "$it_ok" -ne 0; then census_dalog_since "$it_dal" | tail -n 400 >"$OUT/parity/stall-$it_tag.dalog"; fi
-  census_detach "$PA_DISK"
+  census_detach "$PA_DISK" "$it_side" "$PA_MP" >>"$OUT/parity/stall-detach.txt"
   echo "$it_tag: $PA_VERDICT | probe ${it_probe:-none} | ${it_fu:+uuid $it_fu | }$it_first$it_via" >>"$OUT/parity/stall.txt"
   return "$it_ok"
 }
@@ -441,17 +458,17 @@ census_wait_uuid() {
   return 1
 }
 
-# census_stall [N]: item 3, N iterations (default PARITY_STALL_N, and nothing at 0) of each loop on the HFS+ control and
+# census_stall: item 3, PARITY_STALL_N iterations (unset or 0: nothing runs) of each loop on the HFS+ control and
 #   on ext4; stall.txt has a line per iteration (the verdict and each probe's time), stall-summary.txt the counts and
 #   Fisher's exact p per loop (tests/lib/fisher.py: the volumes differ when p < 0.05)
 census_stall() {
-  st_n=${1:-${PARITY_STALL_N:-0}}
+  st_n=${PARITY_STALL_N:-0}
   case $st_n in '' | *[!0-9]*) st_n=0 ;; esac
   if test "$st_n" -eq 0; then echo "# census_stall: PARITY_STALL_N is 0, not run"; return 0; fi
   census_sysctl stall
   st_c=$(parity_control hfs) && st_hfs=$(census_copy "$st_c" stall-hfs) && st_ext4=$(census_copy "$W/img/ext4.img" stall-ext4) ||
     { echo "# census_stall: no images"; return 1; }
-  : >"$OUT/parity/stall.txt"; : >"$OUT/parity/stall-summary.txt"
+  : >"$OUT/parity/stall.txt"; : >"$OUT/parity/stall-summary.txt"; : >"$OUT/parity/stall-detach.txt"
   da_debug_on
   for st_vol in hfs ext4; do
     eval "st_img=\$st_$st_vol"
@@ -482,6 +499,7 @@ census_stall() {
 #   mounted again. Prints the busy count.
 census_busy_cycles() {
   bc_name=$1 bc_busy=0 bc_k=0
+  if test "$1" = hfs; then bc_side=apple; else bc_side=fs; fi
   census_attach "$2" || { echo "$bc_name: not attached" >>"$3"; echo 0; return 1; }
   bc_disk=$CA_DISK bc_dev=$CA_DEV bc_mp=$CA_MP
   while test "$bc_k" -lt 20; do
@@ -506,7 +524,7 @@ census_busy_cycles() {
     if ! bc_m=$(bounded 900 census_wait_mounted "$bc_dev"); then echo "cycle $bc_k: not mounted again; stopping" >>"$3"; break; fi
     bc_mp=$(printf '%s\n' "$bc_m" | sed -n 2p)
   done
-  census_detach "$bc_disk"
+  census_detach "$bc_disk" "$bc_side" "$bc_mp" >>"$3"
   echo "$bc_name: busy $bc_busy of 20" >>"$3"
   echo "$bc_busy"
 }
@@ -514,7 +532,8 @@ census_busy_cycles() {
 # census_busy_up: both volumes of census_busy attached and mounted again, if a step unmounted or ejected one
 census_busy_up() {
   if test "$(census_info "$PARITY_CTL_DEV" Mounted)" = Yes && test "$(census_info "$PARITY_FS_DEV" Mounted)" = Yes; then return 0; fi
-  for bu_i in "$cb_h" "$cb_i"; do bu_d=$(census_image_disk "$bu_i"); census_detach "$bu_d"; done
+  census_detach "$(census_image_disk "$cb_h")" apple
+  census_detach "$(census_image_disk "$cb_i")" fs "$PARITY_FS_MP" || return 1
   census_attach "$cb_h" || return 1
   bu_hd=$CA_DISK bu_hdev=$CA_DEV bu_hm=$CA_MP bu_hv=$CA_VOL
   census_attach "$cb_i" || return 1
@@ -570,7 +589,7 @@ census_busy() {
   cb_bh=$(census_busy_cycles hfs "$cb_h" "$cb_log" | tail -n 1)
   cb_bf=$(census_busy_cycles "$cb_fs" "$cb_i" "$cb_log" | tail -n 1)
   echo "# recorded busy.$cb_fs.cycles: hfs $cb_bh of 20, $cb_fs $cb_bf of 20"
-  PARITY_CTL_DEV= PARITY_FS_DEV=
+  PARITY_CTL_DEV= PARITY_FS_DEV= PARITY_FS_MP=
   for cb_case in shell:unmount shell:eject textedit:unmount textedit:eject shell:finder-eject; do
     census_busy_up || { echo "# census_busy $cb_fs: cannot attach both volumes again"; break; }
     cb_how=${cb_case%%:*} cb_step=${cb_case#*:}
@@ -591,6 +610,7 @@ census_busy() {
     if test "${PARITY_BUSY_FORCE:-0}" = 1; then parity "busy.$cb_fs.$cb_step" "$@"; else census_hfs_only "busy.$cb_fs.$cb_step" "$@"; fi
     census_busy_release
   done
-  for cb_x in "$cb_h" "$cb_i"; do census_detach "$(census_image_disk "$cb_x")"; done
+  census_detach "$(census_image_disk "$cb_h")" apple
+  census_detach "$(census_image_disk "$cb_i")" fs "$PARITY_FS_MP"
   da_debug_off "busy-$cb_fs"
 }
