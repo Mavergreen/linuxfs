@@ -25,6 +25,12 @@ const struct fsname *fsrules_name_at(size_t i);
  * exact names match, never "macfuse" or a longer or other name. */
 const char *fsrules_fs_of_type(const char *f_fstypename);
 
+/* Whether a mount-table entry is root's own mount of <fs> from disk <bsd> (diskN or diskNsM): 1 only when its type
+ * (f_fstypename) is <fs>'s macfuse_ name, its source (f_mntfromname) is exactly /dev/<bsd>, and its owner (f_owner) is
+ * root. Anything else on that mount point (another type, another source, a user's macFUSE mount) is not root's to
+ * unmount. NULL arguments give 0. */
+int fsrules_mount_is_roots(const char *fs, const char *bsd, const char *f_fstypename, const char *f_mntfromname, unsigned owner);
+
 /* The filesystem a program's name stands for: macfuse_<fs>.util, mount_macfuse_<fs> or fsck_macfuse_<fs>
  * (any directory before it). NULL for anything else, or an <fs> that is not ext4, btrfs, xfs, f2fs, apfs or
  * ntfs; *role is then untouched. role may be NULL. */

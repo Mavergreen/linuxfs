@@ -1,0 +1,151 @@
+lklfuse: on Darwin, the disk and the lock are let go of in FUSE_DESTROY, before macFUSE's unmount returns
+
+After a real unmount, DiskArbitration's eject sometimes failed with EBUSY (status 0x10) for a moment: the hfs-fsname
+QEMU kit (fsname=/dev/diskN, 2026-11-25) saw it in 1 or 2 of 3 ejects, the volume already unmounted and lklfuse
+gone by the time anyone looked. lklfuse stopped LKL, closed the disk and dropped lock= only after its FUSE loop ended,
+about a second after the unmount, and DiskArbitration ejects as soon as unmount(2) returns.
+
+macFUSE 5.5.0's kext waits for that: its fuse_vfsop_unmount flushes the volume's vnodes, sends FUSE_DESTROY
+(opcode 0x26, fdisp_make then fdisp_wait_answ) and only then marks the mount dead and returns; libfuse's do_destroy
+calls the file system's destroy before it answers. So, on Darwin, lklfuse_destroy:
+- writes everything out: a sync, then the umount of the chroot's root, which Linux makes a read-only remount;
+- only when that worked, points the disk's descriptors (and an APFS Fusion second device's) at /dev/null, so the
+  disk is no longer open while the numbers stay taken for LKL's own copy of them, from then on answered with an
+  I/O error by lklfuse's block ops, silently;
+- drops lock= (flock LOCK_UN, which also frees linuxfs-open's lock=/dev/fd/7, the same open file description).
+If the remount fails, it says so and keeps both until exit, as before. libfuse also calls destroy at fuse_destroy
+when no FUSE_DESTROY came (a signal, a pulled disk); stop_lkl has halted LKL by then, and it does nothing.
+tests/lklfuse-ops-test.c checks the descriptor, the lock, the read-only mount and the clean superblock.
+
+diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
+--- a/tools/lkl/lklfuse.c
++++ b/tools/lkl/lklfuse.c
+@@ -1404,6 +1404,10 @@
+ 	return NULL;
+ }
+ 
++#ifdef __APPLE__
++static void lklfuse_destroy(void *data);
++#endif
++
+ const struct fuse_operations lklfuse_ops = {
+ 	.init = lklfuse_init,
+ 
+@@ -1447,6 +1451,9 @@
+ 	.fallocate = lklfuse_fallocate,
+ 	.copy_file_range = lklfuse_copy_file_range,
+ 	.lseek = lklfuse_lseek,
++#ifdef __APPLE__
++	.destroy = lklfuse_destroy,
++#endif
+ };
+ 
+ static int lklfuse_parse_vfs_flags(bool ro, const char *opts, int *flags,
+@@ -1598,6 +1605,11 @@
+  */
+ static pthread_t lklfuse_loop_thread;
+ static volatile sig_atomic_t lklfuse_gone, lklfuse_io_errors;
++#ifdef __APPLE__
++/* lklfuse_destroy let go of the disk; stop_lkl halted LKL; lock='s descriptor, for lklfuse_destroy to drop */
++static volatile sig_atomic_t lklfuse_released, lklfuse_stopped;
++static int lklfuse_lockfd = -1;
++#endif
+ 
+ static int lklfuse_blk_get_capacity(struct lkl_disk disk, unsigned long long *res)
+ {
+@@ -1608,6 +1620,10 @@
+ {
+ 	int ret, err;
+ 
++#ifdef __APPLE__
++	if (lklfuse_released)	/* let go of at unmount (lklfuse_destroy): nothing reaches it, and nothing is said */
++		return LKL_DEV_BLK_STATUS_IOERR;
++#endif
+ 	errno = 0;
+ 	ret = lkl_dev_blk_ops.request(disk, req);
+ 	if (ret != LKL_DEV_BLK_STATUS_IOERR)
+@@ -1628,6 +1644,64 @@
+ 	.request = lklfuse_blk_request,
+ };
+ 
++#ifdef __APPLE__
++/* A disk descriptor pointed at /dev/null: the disk is no longer open here, and the number stays taken, so LKL's own copy
++ * of it can reach no file opened later. Closed, and -1, if even that fails. */
++static void lklfuse_let_go(int *fd)
++{
++	int nul;
++
++	if (*fd < 0)
++		return;
++	nul = open("/dev/null", O_RDONLY | O_CLOEXEC);
++	if (nul >= 0 && dup2(nul, *fd) >= 0) {
++		fcntl(*fd, F_SETFD, FD_CLOEXEC);
++	} else {
++		close(*fd);
++		*fd = -1;
++	}
++	if (nul >= 0)
++		close(nul);
++}
++
++/*
++ * FUSE_DESTROY. macFUSE's unmount (its 5.5.0 kext's fuse_vfsop_unmount) sends it once the volume's vnodes are flushed
++ * and waits for the answer, and libfuse answers only after this returns. So what is let go of here is free before
++ * unmount(2) returns: DiskArbitration's eject right after an unmount no longer finds the disk still open here (EBUSY,
++ * status 0x10, while lklfuse took about a second more to stop LKL and exit: the hfs-fsname kit's residual race), and a
++ * mount right after finds lock= free. Everything is written out first: a sync, then the umount of the chroot's root,
++ * which Linux makes a read-only remount. Only when that worked are the disks let go of and lock= dropped (flock's
++ * LOCK_UN, which also frees a lock=/dev/fd/N that linuxfs-open took); otherwise lklfuse keeps them until it exits, as
++ * before. libfuse also calls this, at fuse_destroy, when the loop ended with no FUSE_DESTROY (a signal, a pulled disk):
++ * stop_lkl has halted LKL by then, and this does nothing.
++ */
++static void lklfuse_destroy(void *data)
++{
++	long ret;
++
++	if (lklfuse_released || lklfuse_stopped)
++		return;
++	lkl_sys_sync();
++	ret = lkl_sys_chdir("/");
++	if (!ret)
++		ret = lkl_sys_umount("/", 0);
++	if (ret) {
++		fprintf(stderr, "lklfuse: cannot make the volume read-only at unmount (%s); the disk stays open until lklfuse exits\n",
++			lkl_strerror(ret));
++		return;
++	}
++	lklfuse_released = 1;
++	lklfuse_let_go(&lklfuse.disk.fd);
++	if (lklfuse.tier2file)
++		lklfuse_let_go(&lklfuse.tier2.fd);
++	if (lklfuse_lockfd >= 0) {
++		flock(lklfuse_lockfd, LOCK_UN);
++		close(lklfuse_lockfd);
++		lklfuse_lockfd = -1;
++	}
++}
++#endif
++
+ static int start_lkl(void)
+ {
+ 	long ret;
+@@ -1741,6 +1815,9 @@
+ 		fprintf(stderr, "failed to umount disk: %d: %s\n",
+ 			lklfuse.disk_id, lkl_strerror(ret));
+ 	lkl_sys_halt();
++#ifdef __APPLE__
++	lklfuse_stopped = 1;
++#endif
+ }
+ 
+ /*
+@@ -1796,6 +1873,9 @@
+ 			return 2;
+ 		}
+ 		/* lock dropped when lockfd is closed on program exit */
++#ifdef __APPLE__
++		lklfuse_lockfd = lockfd;	/* or at unmount, by lklfuse_destroy */
++#endif
+ 	}
+ 
+ 	if (fuse_parse_cmdline(&args, &cli_opts))

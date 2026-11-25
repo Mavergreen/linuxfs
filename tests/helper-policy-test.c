@@ -117,6 +117,16 @@ int main(void)
 		answers(req, getuid(), getuid(), "no mounted by the Mac", "probe of the boot partition is refused too");
 	}
 	is(helper_mac_mounted("/dev/rdisk99s9", where, sizeof(where)), 0, "a partition nothing mounts is not mounted");
+	/* spec: item 6 (fsname=/dev/<bsd>) -- linuxfs's own mounts are named /dev/DISK too; one of the six macfuse_<fs> types is
+	 * linuxfs's, not the Mac's, so the helper still probes and opens a disk linuxfs has mounted, as it did when they were
+	 * named linuxfs@DISK; anything else from that disk is the Mac's */
+	is(helper_is_mac_mount("/dev/disk2s1", "/dev/disk2s1", "hfs"), 1, "an hfs mount of the disk is the Mac's");
+	is(helper_is_mac_mount("/dev/disk2s1", "/dev/disk2s1", "macfuse_ext4"), 0, "a macfuse_ext4 mount of it is linuxfs's");
+	is(helper_is_mac_mount("/dev/disk2s1", "/dev/disk2s1", "macfuse_ntfs"), 0, "so is macfuse_ntfs");
+	is(helper_is_mac_mount("/dev/disk2s1", "/dev/disk2s1", "macfuse"), 1, "plain macfuse from the disk is not linuxfs's: refused");
+	is(helper_is_mac_mount("/dev/disk2s1", "/dev/disk2s1", "macfuse_ext4x"), 1, "nor is macfuse_ext4x");
+	is(helper_is_mac_mount("/dev/disk2s1", "/dev/disk2s10", "hfs"), 0, "another disk's mount is not this one's");
+	is(helper_is_mac_mount("/dev/disk2s1", "linuxfs@disk2s1", "macfuse_ext4"), 0, "an old linuxfs@ mount is not the Mac's either");
 	/* what the partition is, not only what its bytes say */
 	is(helper_media_refusal("C12A7328-F81F-11D2-BA4B-00A0C93EC93B", 1, 0, "vfat", 1) != NULL, 1, "the EFI System Partition is refused");
 	is(helper_media_refusal("c12a7328-f81f-11d2-ba4b-00a0c93ec93b", 1, 1, "vfat", 1) != NULL, 1, "an ESP is refused on ejectable media too, in any case");

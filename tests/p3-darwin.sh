@@ -27,8 +27,9 @@ mounts_before=$(mount | sed -n 's/^.* on \(.*\) (.*/\1/p')
 helper=0
 cleanup() {
   # spec: tests/p3-bundle-README --
-  #       linuxfs mounts still up (a failed step): unmounted by force
-  mount | sed -n 's/^linuxfs@.* on \(.*\) (.*/\1/p' | while IFS= read -r m; do
+  #       linuxfs mounts still up (a failed step): unmounted by force; linuxfs's by their type, one of the six (an image's
+  #       is named linuxfs@IMAGE, a device's /dev/diskNsM)
+  mount | sed -nE 's/^.* on (.*) \(macfuse_(ext4|ntfs|btrfs|xfs|f2fs|apfs),.*/\1/p' | while IFS= read -r m; do
     printf '%s\n' "$mounts_before" | grep -qxF "$m" ||
       { sh "$B/linuxfs" unmount --force "$m" > /dev/null 2>&1 || umount -f "$m" 2>/dev/null; }; done
   # spec: tests/p3-bundle-README --

@@ -71,14 +71,17 @@
 # spec: .superpowers/sdd/2026-11-25-hfs-parity/task-7-brief.md -- item 1 is proven: its parity steps say ok or not ok
 PARITY_MODE_UNICODE=${PARITY_MODE_UNICODE:-check}
 # spec: .superpowers/sdd/2026-11-25-hfs-parity/task-12-brief.md Step 3 -- item 4 is checked: (a)'s unmount cycles and (b)'s
-#   held-file eject. The steps whose linuxfs outcome DiskArbitration's tie to the disk decides take PARITY_MODE_BUSY_DA,
-#   record until item 6's fsname=/dev/diskN (QEMU first: the hfs-fsname kit) lands: a linuxfs mount named
-#   linuxfs@rdiskN is untied from its disk by the next mount or unmount of any volume (push A, item-4-findings.md),
-#   after which its eject unmounts nothing and fails busy; and diskutil unmount always reaches it by mount point (the
-#   /Volumes/<name>?owner= entry DiskArbitration makes for a mount no disk matches), tied or not, so words it so.
-#   Those are (a)'s eject cycles, and (b)'s unmounts, TextEdit's eject (after the HFS+ side's unheld eject) and Finder's.
+#   held-file eject. The steps whose linuxfs outcome DiskArbitration's tie to the disk decides take PARITY_MODE_BUSY_DA:
+#   while a linuxfs mount was named linuxfs@rdiskN, the next mount or unmount of any volume untied it from its disk (push
+#   A, item-4-findings.md), after which its eject unmounted nothing and failed busy; and diskutil unmount reached it only by
+#   mount point (the /Volumes/<name>?owner= entry DiskArbitration makes for a mount no disk matches), so worded it so.
+#   Those are (a)'s eject cycles, and (b)'s unmounts (diskutil unmount and unmount force: their words), TextEdit's eject
+#   (after the HFS+ side's unheld eject) and Finder's.
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-16-brief.md -- DiskArbitration's mounts are named fsname=/dev/<bsd>, as
+#   HFS+'s are (the hfs-fsname kit: the tie holds, diskutil words them as HFS+'s), and lklfuse lets go of the disk before
+#   macFUSE's unmount returns (patch 0015: the kit's residual 0x10), so these are checked: (a)'s ejects busy 0 of 3, as HFS+.
 PARITY_MODE_BUSY=${PARITY_MODE_BUSY:-check}
-PARITY_MODE_BUSY_DA=${PARITY_MODE_BUSY_DA:-record}
+PARITY_MODE_BUSY_DA=${PARITY_MODE_BUSY_DA:-check}
 # spec: .superpowers/sdd/2026-11-25-hfs-parity/task-15-brief.md Step 1, and the Task 15 ruling (progress.md) -- item 5 is
 #   checked where the CI guest can show it: .fseventsd made on a linuxfs volume as on HFS+ (each census_spotlight pass),
 #   no fseventsd, mds or mdworker refused on any linuxfs census mount (census_refusals_bar), and item 4's (a) run with
@@ -88,9 +91,9 @@ PARITY_MODE_BUSY_DA=${PARITY_MODE_BUSY_DA:-record}
 PARITY_MODE_SPOTLIGHT=${PARITY_MODE_SPOTLIGHT:-check}
 # spec: .superpowers/sdd/2026-11-25-hfs-parity/item-6-findings.md, and the Task 15 fix round 1 ruling (m4) -- with indexing
 #   on, the indexing steps that reach a linuxfs volume by its mount point through mds (mdutil -s, mdutil -i off and the
-#   remount's mdutil -s) fail on item 6's f_mntfromname ("could not resolve path"), not on item 5: they take
-#   PARITY_MODE_SPOTLIGHT_DA, record until Task 16's fsname lands, when Task 16 flips it to check.
-PARITY_MODE_SPOTLIGHT_DA=${PARITY_MODE_SPOTLIGHT_DA:-record}
+#   remount's mdutil -s) failed on item 6's f_mntfromname ("could not resolve path"), not on item 5: they take
+#   PARITY_MODE_SPOTLIGHT_DA, checked since Task 16's fsname=/dev/<bsd>, which mds resolves as it does HFS+'s.
+PARITY_MODE_SPOTLIGHT_DA=${PARITY_MODE_SPOTLIGHT_DA:-check}
 
 # The console session's helper: not on the ssh PATH, so always by its path (the smoke sets AQUA to the same)
 AQUA=${AQUA:-/usr/local/bin/guest-macosx-aqua}
@@ -280,12 +283,24 @@ census_attach() {
 #   ~/Library/Logs/linuxfs/<basename of the raw device>.log (cli/linuxfs: log=$LOGS/$(basename "$src").log, src=/dev/rdiskN),
 #   the mounting user's: for a DiskArbitration mount the console user's, who runs the smoke
 PARITY_LKLOGS=${PARITY_LKLOGS:-$HOME/Library/Logs/linuxfs}
-# census_names_mode NODE MP: for a linuxfs mount (mount's linuxfs@rNODE on MP), its names line, read at once (the next mount
-#   of NODE writes the log afresh), appended to names-mode.txt as "NODE MP: MODE ...", or "NODE MP: none (...)" when the
-#   log has none; nothing for any other mount (HFS+, FAT32)
+# census_fs_mp NODE [slices]: from mount's lines on stdin, the mount point of a linuxfs mount of /dev/NODE (with slices, or
+#   of one of its slices, /dev/NODEsN): one whose type is one of the six macfuse_<fs> exactly. DiskArbitration's linuxfs
+#   mounts are named /dev/<bsd> as the Mac's are (item 6), so the type tells them apart, never the name.
+census_fs_mp() {
+  awk -v d="/dev/${1#/dev/}" -v sl="${2:-}" '
+    BEGIN { split("ext4 ntfs btrfs xfs f2fs apfs", f, " "); for (k in f) six["macfuse_" f[k]] = 1 }
+    { o = index($0, " on "); if (!o) next; src = substr($0, 1, o - 1)
+      if (src != d && !(sl != "" && index(src, d "s") == 1 && substr(src, length(d) + 2) ~ /^[0-9]+$/)) next
+      r = substr($0, o + 4); for (i = length(r); i > 0; i--) if (substr(r, i, 2) == " (") break
+      if (i == 0) next; t = substr(r, i + 2); sub(/[,)].*$/, "", t)
+      if (t in six) { print substr(r, 1, i - 1); exit } }'
+}
+# census_names_mode NODE MP: for a linuxfs mount (census_fs_mp: /dev/NODE on MP, one of the six types), its names line, read
+#   at once (the next mount of NODE writes the log afresh), appended to names-mode.txt as "NODE MP: MODE ...", or "NODE MP:
+#   none (...)" when the log has none; nothing for any other mount (HFS+, FAT32)
 census_names_mode() {
   _cnm_n=${1#/dev/}
-  bounded 100 mount 2>/dev/null </dev/null | grep -qF "linuxfs@r$_cnm_n on $2 (" || return 0
+  test "$(bounded 100 mount 2>/dev/null </dev/null | census_fs_mp "$_cnm_n")" = "$2" || return 0
   _cnm_l=$(sed -n 's/^lklfuse: names: //p' "$PARITY_LKLOGS/r$_cnm_n.log" 2>/dev/null | tail -n 1)
   mkdir -p "$OUT/parity"
   echo "$_cnm_n $2: ${_cnm_l:-none (no names line in $PARITY_LKLOGS/r$_cnm_n.log)}" >>"$OUT/parity/names-mode.txt"
@@ -313,8 +328,8 @@ census_names_bar() {
 
 # census_holders DISK [MP]: what may hold DISK, as "# " lines: sudo lsof on MP (when given; empty once it is unmounted),
 #   and on DISK's whole and raw device; every lklfuse process; DiskArbitration's view of DISK and its first slice (Mounted);
-#   and mount's lines for DISK (as /dev/diskN or lklfuse's linuxfs@rdiskN) or on MP. A linuxfs volume still in mount's
-#   lines where DiskArbitration says not mounted is its mount untied from the disk (item 4, census_busy_ejects)
+#   and mount's lines for DISK (as /dev/diskN, or an older lklfuse's linuxfs@rdiskN) or on MP. A linuxfs volume still in
+#   mount's lines where DiskArbitration says not mounted is its mount untied from the disk (item 4, census_busy_ejects)
 census_holders() {
   _cho_d=/dev/${1#/dev/} _cho_r=/dev/r${1#/dev/}
   if test -n "${2:-}"; then echo "# census: sudo lsof $2:"; bounded 300 sudo -n lsof "$2" 2>&1 </dev/null | head -n 40 | sed 's/^/#   /'; fi
@@ -884,9 +899,11 @@ census_busy_cycles() {
 
 # census_busy_ejects NAME IMAGE OTHER LOG: push A's spurious busy eject, PARITY_BUSY_EJECTS (3) times: IMAGE attached and
 #   mounted, then another volume (OTHER, an HFS+ copy) attached and ejected, then IMAGE's disk ejected with nothing open
-#   on it. A linuxfs mount is named linuxfs@rdiskN (f_mntfromname), so DiskArbitration ties it to its disk only until
-#   the next mount or unmount of any volume: then the disk's eject unmounts nothing, and the media eject fails busy
-#   (status 0x10) under the lklfuse still serving the volume. A busy eject records census_holders (mount still showing
+#   on it. While a linuxfs mount was named linuxfs@rdiskN (f_mntfromname), DiskArbitration tied it to its disk only until
+#   the next mount or unmount of any volume: then the disk's eject unmounted nothing, and the media eject failed busy
+#   (status 0x10) under the lklfuse still serving the volume (pushes A and C). Since Task 16 (fsname=/dev/<bsd>, and lklfuse
+#   letting go of the disk before the unmount returns) linuxfs is to be busy no more often than HFS+, 0 of 3. A busy
+#   eject records census_holders (mount still showing
 #   the volume, DiskArbitration saying not mounted), then frees the volume as a user would (diskutil unmount of its mount
 #   point), waits for its lklfuse to go (census_lklfuse_gone: an eject racing its exit would fail busy too) and ejects
 #   it (census_detach). A cycle whose other volume did not attach proves nothing: IMAGE is ejected and the cycle not
@@ -1089,15 +1106,15 @@ census_busy_parity() {
 #   checked by census_busy_bar (PARITY_MODE_BUSY); then census_busy_ejects on each (another HFS+ copy coming and
 #   going), barred by PARITY_MODE_BUSY_DA. (b) with a file held open (a shell, then TextEdit): diskutil unmount and
 #   eject, and Finder's eject (parity_shot busy-eject); the shell's eject is checked, the others take PARITY_MODE_BUSY_DA.
-#   diskutil unmount force runs on both and is checked (census_force_unmount: its status, and whether the volume is gone),
+#   diskutil unmount force runs on both (census_force_unmount: its words, its status, and whether the volume is gone),
 #   cleared by the hfs-force-eject QEMU kit (preflight F14: on a busy ext4 volume it is clean, like HFS+'s: no panic, the
-#   holder's descriptor revoked, lklfuse ended, the eject after it exit 0). Force Eject (unmountDisk force, then eject)
-#   runs on HFS+ alone unless PARITY_BUSY_FORCE=1, and is recorded, never checked.
-# census_force_unmount MP WORDING-FILE: diskutil unmount force MP; its words appended to WORDING-FILE (headed by MP: they
-#   differ by f_mntfromname, item 6, until fsname lands), its status and whether MP is still mounted printed
+#   holder's descriptor revoked, lklfuse ended, the eject after it exit 0); its words are DiskArbitration's (item 6), so it
+#   takes PARITY_MODE_BUSY_DA. Force Eject (unmountDisk force, then eject) runs on HFS+ alone unless PARITY_BUSY_FORCE=1, and
+#   is recorded, never checked.
+# census_force_unmount MP: diskutil unmount force MP; its words, its status and whether MP is still mounted printed
 census_force_unmount() {
   _cfu_o=$(bounded 600 diskutil unmount force "$1" 2>&1 </dev/null); _cfu_rc=$?
-  { echo "== $1"; printf '%s\n' "$_cfu_o"; echo "== status $_cfu_rc"; } >>"$2"
+  printf '%s\n' "$_cfu_o"
   echo "diskutil unmount force: status $_cfu_rc"
   if bounded 100 mount 2>/dev/null </dev/null | grep -qF " on $1 ("; then echo "mounted afterwards: yes"; else echo "mounted afterwards: no"; fi
 }
@@ -1130,12 +1147,11 @@ census_busy() {
     esac
     census_busy_release
   done
-  : >"$OUT/parity/busy.$cb_fs.force-unmount-wording.txt"
   for cb_step in force-unmount force-eject; do
     census_busy_up || break
     if test "$cb_step" = force-unmount || test "${PARITY_BUSY_FORCE:-0}" = 1; then census_busy_hold shell "$PARITY_CTL_MP" "$PARITY_FS_MP"; else census_busy_hold shell "$PARITY_CTL_MP"; fi
     if test "$cb_step" = force-unmount; then
-      census_busy_parity check "busy.$cb_fs.force-unmount" census_force_unmount @MP@ "$OUT/parity/busy.$cb_fs.force-unmount-wording.txt"
+      census_busy_parity da "busy.$cb_fs.force-unmount" census_force_unmount @MP@
     else
       set -- sh -c 'diskutil unmountDisk force "$1" && diskutil eject "$1"' _ @DISK@
       if test "${PARITY_BUSY_FORCE:-0}" = 1; then census_busy_parity record "busy.$cb_fs.$cb_step" "$@"; else census_hfs_only "busy.$cb_fs.$cb_step" "$@"; fi
@@ -1886,8 +1902,8 @@ census_attached() {
 # spec: .superpowers/sdd/2026-11-25-hfs-parity/task-13b-brief.md item 4 -- push C left 12 linuxfs disks attached (their
 #   ejects failed busy once DiskArbitration untied them, item 4).
 # census_sweep STEP BEFORE: every census disk attached now and not in BEFORE (census_attached's lines before STEP) is
-#   freed, each begun only within PARITY_SWEEP_SECS (60) of the sweep's start: a linuxfs volume still mounted (mount's
-#   linuxfs@rdiskN, whatever DiskArbitration says) is unmounted by its mount point, its lklfuse waited for (30 s), then
+#   freed, each begun only within PARITY_SWEEP_SECS (60) of the sweep's start: a linuxfs volume still mounted (census_fs_mp:
+#   one of the six types from the disk or a slice, whatever DiskArbitration says) is unmounted by its mount point, its lklfuse waited for (30 s), then
 #   the disk ejected (census_detach fs: never by force); a disk of Apple's mounted is ejected (census_detach apple). One
 #   with nothing mounted that a live lklfuse may hold (one names /dev/rDISK, or the image is a linuxfs one, or ps
 #   cannot say) is ejected, never detached by force (census_detach fs: a forced detach under a live lklfuse is a pulled
@@ -1932,7 +1948,7 @@ census_sweep_disk() {
   _csd_n=${1#/dev/}
   _csd_ml=$(bounded 100 mount 2>/dev/null </dev/null) && printf '%s\n' "$_csd_ml" | grep -q ' on / (' ||
     { echo "mount unreadable; not tried"; return 1; }
-  _csd_mp=$(printf '%s\n' "$_csd_ml" | awk -v d="$_csd_n" 'index($0, "linuxfs@r" d " on ") == 1 || index($0, "linuxfs@r" d "s") == 1 { sub(/^[^ ]* on /, ""); sub(/ \([^(]*$/, ""); print; exit }')
+  _csd_mp=$(printf '%s\n' "$_csd_ml" | census_fs_mp "$_csd_n" slices)
   if test -n "$_csd_mp"; then
     _csd_u=$(bounded 600 diskutil unmount "$_csd_mp" 2>&1 </dev/null) ||
       { echo "linuxfs at $_csd_mp: its unmount failed ($(printf '%s' "$_csd_u" | tr '\n' ' ')); left attached"; return 1; }

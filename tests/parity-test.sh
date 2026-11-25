@@ -334,7 +334,7 @@ if test "$me" = ps; then
   *-ax*) test ! -f "$STUB/ps-fail" || exit 1
     /bin/ps "$@" | grep -v 'lklfuse\|not ok'; echo "stubuser 4242 1 Mon Nov 25 10:00:00 2026 /stub/lklfuse -f stub-lklfuse-line"
     # an lklfuse for each disk in $STUB/lklfuse-holds, its raw device open (as one outliving its unmount would be)
-    test ! -f "$STUB/lklfuse-holds" || while read -r h; do echo "stubuser 4243 1 Mon Nov 25 10:00:00 2026 /stub/lklfuse -f -o fsname=linuxfs@r$h /dev/r$h"; done < "$STUB/lklfuse-holds" ;;
+    test ! -f "$STUB/lklfuse-holds" || while read -r h; do echo "stubuser 4243 1 Mon Nov 25 10:00:00 2026 /stub/lklfuse -f -o fsname=/dev/$h /dev/r$h"; done < "$STUB/lklfuse-holds" ;;
   *) exec /bin/ps "$@" ;;
   esac
   exit 0
@@ -360,7 +360,7 @@ names_log() {
   if test -f "$STUB/names-scanning"; then m=scanning; else m=exact; fi
   printf '%s\n' "lklfuse: mounting" "lklfuse: names: $m (stub)" > "$STUB/lklogs/r$1.log"
 }
-# with $STUB/da-forgets, DiskArbitration as push A saw it (item 4): a linuxfs volume's mount is named linuxfs@rdiskN, so a
+# with $STUB/da-forgets, DiskArbitration as push A saw it (item 4), when a linuxfs volume's mount was named linuxfs@rdiskN: a
 #   mount or an unmount of any other volume leaves its disk untied (.u): DiskArbitration says it is not mounted, its eject
 #   unmounts nothing and fails busy under the lklfuse still serving it; diskutil unmount of its mount point still works
 untie_others() {
@@ -464,7 +464,7 @@ mount)
   for f in "$N"/*.m; do
     test -f "$f" || continue
     nd=${f##*/}; nd=${nd%.m}
-    if test "$(field "$nd" disk)" = "$nd"; then echo "linuxfs@r$nd on $(field "$nd" mp) (macfuse_ext4, local, nodev, nosuid, synchronous, mounted by stub)"
+    if test "$(field "$nd" disk)" = "$nd"; then echo "/dev/$nd on $(field "$nd" mp) (macfuse_ext4, local, nodev, nosuid, synchronous, mounted by stub)"
     else echo "/dev/$nd on $(field "$nd" mp) (hfs, local, nodev, nosuid, journaled, noowners, mounted by stub)"; fi
   done ;;
 linuxfs)
@@ -765,9 +765,9 @@ for f in "$S"/nodes/*; do case $f in *.m | *.u) ;; *) test -f "$f" || continue; 
 
 # census_busy: 20 write-then-unmount cycles per volume (a busy one says who held it), the held-file cases through parity,
 #   and the forced ones on the HFS+ side only. Item 4 is checked (PARITY_MODE_BUSY defaults to check), but for the steps
-#   DiskArbitration's tie to a linuxfs disk decides (PARITY_MODE_BUSY_DA, record until item 6's fsname lands)
+#   DiskArbitration's tie to a linuxfs disk decides too (PARITY_MODE_BUSY_DA, checked since Task 16's fsname=/dev/<bsd>)
 r=$(unset PARITY_MODE_BUSY PARITY_MODE_BUSY_DA; . "$here/lib/parity.sh"; echo "$PARITY_MODE_BUSY $PARITY_MODE_BUSY_DA")
-expect census_busy_modes test "$r" = "check record"
+expect census_busy_modes test "$r" = "check check"
 : > "$S/calls"
 r=$(census_busy ext4 2>&1)
 expect census_busy_cycles grep -q '^hfs: busy 0 of 20$' "$P/busy.ext4.cycles.txt"
@@ -780,11 +780,13 @@ for s in shell-unmount shell-eject textedit-unmount textedit-eject finder-eject;
 done
 expect census_busy_force-eject_hfs_only test -s "$P/busy.ext4.force-eject.hfs.txt" -a ! -e "$P/busy.ext4.force-eject.ext4.txt"
 # Task 13b (the hfs-force-eject kit: clean on a busy ext4 volume, like HFS+): diskutil unmount force runs on both, held,
-#   and is checked by its status and whether the volume went; diskutil's words are kept apart, recorded
+#   and is checked by its status and whether the volume went; since Task 16 (fsname=/dev/<bsd>) by diskutil's words too, under
+#   PARITY_MODE_BUSY_DA
 expect census_busy_force_unmount_both test -s "$P/busy.ext4.force-unmount.hfs.txt" -a -s "$P/busy.ext4.force-unmount.ext4.txt"
 expect census_busy_force_unmount_checked has "$r" "^ok - parity busy.ext4.force-unmount$"
 expect census_busy_force_unmount_gone grep -q '^mounted afterwards: no$' "$P/busy.ext4.force-unmount.ext4.txt"
-expect census_busy_force_unmount_wording test "$(grep -c '^== .*/vols/busy-' "$P/busy.ext4.force-unmount-wording.txt")" -eq 2
+expect census_busy_force_unmount_words grep -q '^Volume <VOL> on <DISK> unmounted$' "$P/busy.ext4.force-unmount.ext4.txt"
+expect census_busy_force_unmount_da test -n "$(grep 'census_busy_parity da "busy.$cb_fs.force-unmount" census_force_unmount @MP@$' "$here/lib/parity.sh")"
 expect census_busy_textedit grep -q 'open -a TextEdit' "$S/calls"
 expect census_busy_finder grep -q 'eject disk' "$S/calls"
 expect census_busy_shot test "$(grep -c 'screencapture -x .*-busy-eject.png' "$S/calls")" -eq 2
@@ -801,15 +803,17 @@ expect census_busy_quiet test "$(printf '%s\n' "$r" | grep -c 'not ok')" -eq 1
 expect census_busy_fsevents_said grep -q '^ext4: fsevents: .fseventsd yes$' "$P/busy.ext4.cycles.txt"
 expect census_busy_fsevents_said_hfs grep -q '^hfs: fsevents: .fseventsd yes$' "$P/busy.ext4.cycles.txt"
 expect census_busy_fsevents_ok has "$r" "^ok - parity spotlight.ext4.busy-fsevents (item 4 (a) with fsevents on: .fseventsd on disk after the cycles, so fseventsd let in at least once: hfs yes, ext4 yes)$"
-# (a)'s eject cycles, each side PARITY_BUSY_EJECTS (3) times with another HFS+ copy coming and going: recorded
-expect census_busy_ejects_recorded has "$r" "^# recorded busy.ext4.ejects: hfs 0 of 3, ext4 0 of 3$"
+# (a)'s eject cycles, each side PARITY_BUSY_EJECTS (3) times with another HFS+ copy coming and going: checked since Task 16,
+#   linuxfs busy no more often than HFS+ (0 of 3)
+expect census_busy_ejects_checked has "$r" "^ok - parity busy.ext4.ejects (hfs 0 of 3, ext4 0 of 3)$"
 # the other volume is the HFSX control (another UUID and name), not a second copy of the HFS+ one
 expect census_busy_ejects_other test "$(grep -c '^hdiutil attach .*busy-hfsx-other-ext4.img$' "$S/calls")" -eq 6
 expect census_busy_ejects_not_hfs_copy not grep -q 'busy-hfs-other' "$S/calls"
 expect census_busy_ejects_said grep -q '^ext4: eject busy 0 of 3$' "$P/busy.ext4.cycles.txt"
-# (b): the shell's eject is checked; the unmounts, TextEdit's eject and Finder's are recorded
+# (b): the shell's eject is checked; since Task 16 (fsname=/dev/<bsd>: diskutil words linuxfs's unmounts as HFS+'s) so are
+#   the unmounts, TextEdit's eject and Finder's
 expect census_busy_shell_eject_checked has "$r" "^ok - parity busy.ext4.shell-eject$"
-for s in shell-unmount textedit-unmount textedit-eject finder-eject; do expect "census_busy_${s}_recorded" has "$r" "^# recorded busy.ext4.$s$"; done
+for s in shell-unmount textedit-unmount textedit-eject finder-eject; do expect "census_busy_${s}_checked" has "$r" "^ok - parity busy.ext4.$s$"; done
 expect census_busy_sysctl test -s "$P/busy-ext4.sysctl.txt"
 # every mount is said, census_busy_cycles' remounts too (20 of them, and the attach)
 expect census_names_busy_remounts test "$(grep -c '/vols/busy-ext4: exact' "$P/names-mode.txt")" -ge 21
@@ -842,7 +846,7 @@ expect census_busy_eject_failed_record grep -q '^#   COMMAND PID USER (stub lsof
 # a linuxfs disk whose eject fails is recorded (lsof on its device, the lklfuse processes) and left attached, not
 #   forced; the busy steps go on, each with a fresh copy
 echo stuck6 > "$W/img/stuck6.img"; : > "$P/eject-failed.txt"
-r=$(census_busy stuck6 2>&1)
+r=$(PARITY_MODE_BUSY_DA=record; census_busy stuck6 2>&1)   # (the leftovers' handling; the stuck disk's da steps differ, recorded)
 for s in shell-unmount shell-eject textedit-unmount textedit-eject finder-eject; do
   expect "census_busy_stuck_$s" test -s "$P/busy.stuck6.$s.hfs.txt" -a -s "$P/busy.stuck6.$s.stuck6.txt"
 done
@@ -867,7 +871,7 @@ drop_stuck stuck6
 rm -f "$W/img/stuck6.img"
 # below the free-space floor no fresh copy is made: said, recorded, and the busy steps stop for that filesystem
 echo stuck7 > "$W/img/stuck7.img"; : > "$P/eject-failed.txt"
-r=$(PARITY_FREE_FLOOR_KB=999999999999; census_busy stuck7 2>&1)
+r=$(PARITY_FREE_FLOOR_KB=999999999999 PARITY_MODE_BUSY_DA=record; census_busy stuck7 2>&1)
 expect census_busy_floor_said has "$r" "^# census_busy stuck7: .* KiB free on .*, under the floor .*: no fresh copy, so the busy steps stop"
 expect census_busy_floor_recorded grep -q 'under the floor' "$P/eject-failed.txt"
 expect census_busy_floor_stops test ! -e "$P/busy.stuck7.shell-eject.stuck7.txt"
@@ -879,12 +883,12 @@ rm -f "$W/img/stuck7.img"
 #   volume's mount or unmount (the stub's da-forgets), so its eject fails busy with the volume still mounted; recorded
 #   with who holds it, DiskArbitration's view and mount's line, then freed by unmounting its mount point
 echo calm > "$W/img/calm.img"; : > "$S/da-forgets"
-r=$(census_busy calm 2>&1)
+r=$(PARITY_MODE_BUSY_DA=record; census_busy calm 2>&1)
 expect census_busy_calm_bar has "$r" "^ok - parity busy.calm.cycles (hfs 0 of 20, calm 0 of 20)$"
 expect census_busy_untied_recorded has "$r" "^# recorded busy.calm.ejects: hfs 0 of 3, calm 3 of 3$"
 expect census_busy_untied_busy grep -q '^calm eject 1: BUSY: Volume failed to eject$' "$P/busy.calm.cycles.txt"
 expect census_busy_untied_da grep -q '^# census: DiskArbitration: disk[0-9]* Mounted: No$' "$P/busy.calm.cycles.txt"
-expect census_busy_untied_mount grep -q '^#   linuxfs@rdisk[0-9]* on .*/vols/busy-calm (macfuse_ext4' "$P/busy.calm.cycles.txt"
+expect census_busy_untied_mount grep -q '^#   /dev/disk[0-9]* on .*/vols/busy-calm (macfuse_ext4' "$P/busy.calm.cycles.txt"
 expect census_busy_untied_freed grep -q '^-- freed as a user would: Volume busy-calm on disk[0-9]* unmounted$' "$P/busy.calm.cycles.txt"
 expect census_busy_untied_hfs grep -q '^hfs: eject busy 0 of 3$' "$P/busy.calm.cycles.txt"
 # a busy eject's volume is freed, and its lklfuse waited for (census_lklfuse_gone), before the eject: no failure block
@@ -939,10 +943,10 @@ for p in rw ro; do
   for s in mdfind store fseventsd; do
     expect "census_spotlight_on_${p}_$s" has "$r" "^ok - parity spotlight.ext4.$p.$s\$"
   done
-  # (fix round 1, m4) mdutil by mount point, privacy-off and the remount hit item 6's f_mntfromname on linuxfs: recorded
-  #   under PARITY_MODE_SPOTLIGHT_DA (record until Task 16)
+  # (fix round 1, m4) mdutil by mount point, privacy-off and the remount hit item 6's f_mntfromname on linuxfs: they take
+  #   PARITY_MODE_SPOTLIGHT_DA, checked since Task 16's fsname=/dev/<bsd>
   for s in mdutil privacy-off privacy-remount; do
-    expect "census_spotlight_on_${p}_${s}_da" has "$r" "^# recorded spotlight.ext4.$p.$s\$"
+    expect "census_spotlight_on_${p}_${s}_da" has "$r" "^ok - parity spotlight.ext4.$p.$s\$"
   done
   expect "census_spotlight_on_${p}_said" has "$r" "^# spotlight.ext4.$p: the indexing steps are checked: indexing is on for the HFS+ control\$"
   expect "census_spotlight_on_${p}_mode_file" grep -q '^check: indexing is on for the HFS+ control$' "$P/spotlight.ext4.$p.index-mode.txt"
@@ -955,10 +959,26 @@ expect census_spotlight_on_store grep -q '^.Spotlight-V100: no$' "$P/spotlight.e
 expect census_spotlight_on_quiet hasnt "$r" "not ok"
 expect census_spotlight_on_detached test -z "$(attached)"
 r=$(unset PARITY_MODE_SPOTLIGHT_DA; . "$here/lib/parity.sh"; echo "$PARITY_MODE_SPOTLIGHT_DA")
-expect census_spotlight_da_mode test "$r" = record
+expect census_spotlight_da_mode test "$r" = check
+rm -f "$OUT"/*-refresh.png "$OUT"/*-privacy.png "$OUT"/*-privacy-ro.png
+r=$(PARITY_MODE_SPOTLIGHT_DA=record; census_spotlight ext4 2>&1)
+for s in mdutil privacy-off privacy-remount; do expect "census_spotlight_da_record_$s" has "$r" "^# recorded spotlight.ext4.rw.$s\$"; done
 rm -f "$OUT"/*-refresh.png "$OUT"/*-privacy.png "$OUT"/*-privacy-ro.png
 r=$(PARITY_MODE_SPOTLIGHT_DA=check; census_spotlight ext4 2>&1)
 for s in mdutil privacy-off privacy-remount; do expect "census_spotlight_da_check_$s" has "$r" "^ok - parity spotlight.ext4.rw.$s\$"; done
+# census_fs_mp NODE [slices] (Task 16): a linuxfs mount is told by its type, one of the six, now that DiskArbitration's are
+#   named /dev/<bsd> as the Mac's are
+printf '%s\n' '/dev/disk0s2 on / (hfs, local, journaled)' '/dev/disk3s1 on /Volumes/my (data) (macfuse_ext4, local, nodev)' \
+  '/dev/disk4 on /Volumes/hfs (hfs, local)' '/dev/disk5 on /Volumes/other (macfuse, local)' '/dev/disk6 on /Volumes/x (macfuse_ext4x, local)' \
+  '/dev/disk7 on /Volumes/whole (macfuse_xfs, local)' '/dev/disk3s10 on /Volumes/ten (macfuse_ext4, local)' > "$T/fsmp"
+expect census_fs_mp_slice test "$(census_fs_mp disk3s1 < "$T/fsmp")" = "/Volumes/my (data)"
+expect census_fs_mp_whole test "$(census_fs_mp /dev/disk7 < "$T/fsmp")" = /Volumes/whole
+expect census_fs_mp_slices test "$(census_fs_mp disk3 slices < "$T/fsmp")" = "/Volumes/my (data)"
+expect census_fs_mp_no_slices test -z "$(census_fs_mp disk3 < "$T/fsmp")"
+expect census_fs_mp_hfs test -z "$(census_fs_mp disk4 slices < "$T/fsmp")"
+expect census_fs_mp_family test -z "$(census_fs_mp disk5 < "$T/fsmp")$(census_fs_mp disk6 < "$T/fsmp")"
+expect census_fs_mp_exact test -z "$(census_fs_mp disk3s1 < "$T/fsmp" | grep ten)"
+rm -f "$T/fsmp"
 # (fix round 1, m5) the ro pass waits (bounded) for .fseventsd on both volumes after the read-write mount that makes its file
 expect census_spotlight_ro_waits test -n "$(sed -n '/^census_spotlight()/,/^}/p' "$here/lib/parity.sh" | grep 'census_fsevents_wait "$PARITY_CTL_MP" "$PARITY_FS_MP"')"
 mkdir -p "$T/fw1/.fseventsd" "$T/fw2"
@@ -1579,8 +1599,8 @@ du_says XFS macfuse_xfs 'Unknown (macfuse_xfs)' Yes; expect smoke_persona_fsname
 du_says XFS macfuse_xfs 'Linux XFS (linuxfs)' No; expect smoke_persona_mounted not persona XFS xfs
 du_says xfs macfuse_xfs 'Linux XFS (linuxfs)' Yes; expect smoke_persona_personality not persona XFS xfs
 # mount_type_is: mount shows the mount point as (TYPE, exactly
-printf '%s\n' 'linuxfs@disk4s1 on /Volumes/my data (macfuse_ext4, local, nodev, nosuid, synchronous, mounted by u)' \
-  'linuxfs@disk5 on /Volumes/x (macfuse, local, nodev)' 'linuxfs@disk6 on /Volumes/y (macfuse_ext4x, local)' > "$T/mounts"
+printf '%s\n' '/dev/disk4s1 on /Volumes/my data (macfuse_ext4, local, nodev, nosuid, synchronous, mounted by u)' \
+  '/dev/disk5 on /Volumes/x (macfuse, local, nodev)' '/dev/disk6 on /Volumes/y (macfuse_ext4x, local)' > "$T/mounts"
 mtype() { (eval "$(smoke_fn mount_type_is)"; mount() { cat "$T/mounts"; }; mount_type_is "$@") > /dev/null 2>&1; }
 expect smoke_mount_type_ok mtype '/Volumes/my data' macfuse_ext4
 expect smoke_mount_type_plain mtype /Volumes/x macfuse
@@ -1654,7 +1674,7 @@ busyfn() { # FAILS CMD...: the smoke's retry_busy (and da_unmount), diskutil fai
      k=$(cat "$T/busy.left"); test "$k" -gt 0 || return 0; echo $((k - 1)) > "$T/busy.left"; echo "Volume failed to eject"; return 1
    }
    sudo() { echo "sudo $*" >> "$T/busy.calls"; echo "COMMAND PID USER (stub)"; }
-   mount() { echo "linuxfs@rdisk9 on /Volumes/x (macfuse_ext4, local, nodev, nosuid, synchronous, mounted by u)"; }
+   mount() { echo "/dev/disk9 on /Volumes/x (macfuse_ext4, local, nodev, nosuid, synchronous, mounted by u)"; }
    "$@")
 }
 r=$(busyfn 1 da_unmount /Volumes/x 2>&1); rc=$?
@@ -1668,7 +1688,7 @@ expect smoke_da_unmount_quiet test "$rc" -eq 0 -a -z "$r" -a "$(grep -c . "$T/bu
 r=$(busyfn 2 retry_busy /Volumes/x /dev/disk9 diskutil eject /dev/disk9 2>&1); rc=$?
 expect smoke_eject_fails_twice test "$rc" -ne 0 -a "$(grep -c '^diskutil eject' "$T/busy.calls")" -eq 2
 expect smoke_eject_da_view has "$r" "^#   DiskArbitration: disk9 Mounted: No$"
-expect smoke_eject_mount_line has "$r" "^#   mount: linuxfs@rdisk9 on /Volumes/x (macfuse_ext4"
+expect smoke_eject_mount_line has "$r" "^#   mount: /dev/disk9 on /Volumes/x (macfuse_ext4"
 expect smoke_eject_lsof_mp grep -qx 'sudo -n lsof /Volumes/x' "$T/busy.calls"
 expect smoke_da_eject_uses_retry test -n "$(smoke_fn da_eject | grep 'retry_busy "$2" "$1" diskutil eject "$1"')"
 

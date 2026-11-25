@@ -700,6 +700,51 @@ static void unicode_tests(void)
 	resolver_tests_in("/exact", 1);
 }
 
+/*
+ * FUSE_DESTROY (patch 0015). macFUSE's unmount sends it after vflush and waits for the answer, and libfuse answers only
+ * once lklfuse's destroy returns: so the disk and the lock let go of there are free before unmount(2) returns and
+ * DiskArbitration ejects (the hfs-fsname kit's residual 0x10).
+ */
+static int same_file(int fd, const struct stat *st)
+{
+	struct stat now;
+
+	return fstat(fd, &now) == 0 && now.st_dev == st->st_dev && now.st_ino == st->st_ino;
+}
+
+static void destroy_tests(const char *image)
+{
+	char lockpath[PATH_MAX];
+	const char *tmp = getenv("TMPDIR");
+	unsigned char b[4];
+	struct statvfs vfs;
+	struct stat img;
+	int lf, other, fd;
+
+	snprintf(lockpath, sizeof(lockpath), "%s/lklfuse-ops-lock.XXXXXX", tmp && *tmp ? tmp : "/tmp");
+	lf = mkstemp(lockpath);
+	is(lf >= 0 && flock(lf, LOCK_EX | LOCK_NB) == 0, 1, "destroy: a lock held, as lock= holds one");
+	lklfuse_lockfd = lf;
+	is(stat(image, &img) == 0 && same_file(lklfuse.disk.fd, &img), 1, "before destroy, the disk descriptor is the image");
+	lklfuse_destroy(NULL);
+	is(same_file(lklfuse.disk.fd, &img), 0, "after destroy, the device is closed: no descriptor of lklfuse's names it");
+	is(fcntl(lklfuse.disk.fd, F_GETFD) >= 0, 1, "and its number stays taken, so LKL's copy of it reaches nothing else");
+	other = open(lockpath, O_RDWR);
+	is(other >= 0 && flock(other, LOCK_EX | LOCK_NB) == 0, 1, "after destroy, the lock is free for the next mount");
+	if (other >= 0)
+		close(other);
+	unlink(lockpath);
+	is(lklfuse_statfs("/", &vfs) == 0 && (vfs.f_flag & ST_RDONLY), 1, "after destroy, LKL's mount is read-only");
+	is(lklfuse_mkdir("/after-destroy", 0755) < 0, 1, "and a write fails: nothing more reaches the disk");
+	fd = open(image, O_RDONLY);
+	is(fd >= 0 && pread(fd, b, 2, 1024 + 0x3a) == 2 && (b[0] & 1), 1, "after destroy, the image's superblock says clean (s_state)");
+	is(fd >= 0 && pread(fd, b, 4, 1024 + 0x60) == 4 && !(b[0] & 4), 1, "and needs no journal recovery");
+	if (fd >= 0)
+		close(fd);
+	lklfuse_destroy(NULL);
+	is(same_file(lklfuse.disk.fd, &img), 0, "a second destroy changes nothing");
+}
+
 #endif
 
 int main(int argc, char **argv)
@@ -794,8 +839,13 @@ int main(int argc, char **argv)
 	}
 #ifdef __APPLE__
 	unicode_tests();
+	destroy_tests(argv[1]);
 #endif
 	stop_lkl();
+#ifdef __APPLE__
+	lklfuse_destroy(NULL);
+	is(1, 1, "destroy after LKL has stopped (libfuse's own, when no FUSE_DESTROY came) returns, touching nothing");
+#endif
 	lkl_cleanup();
 	printf("1..%d\n", tapno);
 	return failures ? 1 : 0;

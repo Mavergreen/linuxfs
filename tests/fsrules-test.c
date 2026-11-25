@@ -112,6 +112,22 @@ int main(int argc, char **argv)
 	iss(fsrules_fs_of_type("linuxfs_ext4"), NULL, "the old name is not");
 	iss(fsrules_fs_of_type("osxfuse"), NULL, "osxfuse is not");
 	iss(fsrules_fs_of_type(NULL), NULL, "NULL is not");
+	/* spec: item 6 (fsname=/dev/<bsd>) -- root's force-unmount takes only a mount root made itself: one of our six, of
+	 * the bundle's own fs, from /dev/<bsd>, owned by root; anything else on that mount point is someone else's */
+	is(fsrules_mount_is_roots("ext4", "disk2s1", "macfuse_ext4", "/dev/disk2s1", 0), 1, "roots: ext4 mounted by root from /dev/disk2s1");
+	is(fsrules_mount_is_roots("ext4", "disk2s1", "hfs", "/dev/disk2s1", 0), 0, "roots: not hfs from the same disk (a foreign mount on the point)");
+	is(fsrules_mount_is_roots("ext4", "disk2s1", "macfuse_ext4", "/dev/disk2s1", 501), 0, "roots: not macfuse_ext4 a user (501) made");
+	is(fsrules_mount_is_roots("ext4", "disk2s1", "macfuse_btrfs", "/dev/disk2s1", 0), 0, "roots: not macfuse_btrfs, for fs ext4");
+	is(fsrules_mount_is_roots("ext4", "disk2s1", "macfuse_ext4", "linuxfs@disk2s1", 0), 0, "roots: not linuxfs@disk2s1");
+	is(fsrules_mount_is_roots("ext4", "disk2s1", "macfuse_ext4", "/dev/disk2s10", 0), 0, "roots: not /dev/disk2s10 (a longer name)");
+	is(fsrules_mount_is_roots("ext4", "disk2s1", "macfuse_ext4", "/dev/disk2", 0), 0, "roots: not /dev/disk2 (a shorter one)");
+	is(fsrules_mount_is_roots("ext4", "disk2s1", "macfuse_ext4", "/dev/rdisk2s1", 0), 0, "roots: not /dev/rdisk2s1");
+	is(fsrules_mount_is_roots("ext4", "disk2s1", "macfuse", "/dev/disk2s1", 0), 0, "roots: not plain macfuse");
+	is(fsrules_mount_is_roots("ntfs", "disk3", "macfuse_ntfs", "/dev/disk3", 0), 1, "roots: ntfs from a whole disk, /dev/disk3");
+	is(fsrules_mount_is_roots(NULL, "disk2s1", "macfuse_ext4", "/dev/disk2s1", 0), 0, "roots: no fs is never root's");
+	is(fsrules_mount_is_roots("ext4", NULL, "macfuse_ext4", "/dev/disk2s1", 0), 0, "roots: no bsd is never root's");
+	is(fsrules_mount_is_roots("ext4", "disk2s1", NULL, "/dev/disk2s1", 0), 0, "roots: no type is never root's");
+	is(fsrules_mount_is_roots("ext4", "disk2s1", "macfuse_ext4", NULL, 0), 0, "roots: no source is never root's");
 	iss(fsrules_fs_from_name("mount_linuxfs_ext4", &r), NULL, "mount_linuxfs_ext4 names nothing now");
 	iss(fsrules_fs_from_name("linuxfs_ext4.util", &r), NULL, "linuxfs_ext4.util names nothing now");
 	iss(fsrules_fs_from_name("fsck_linuxfs_ext4", &r), NULL, "fsck_linuxfs_ext4 names nothing now");

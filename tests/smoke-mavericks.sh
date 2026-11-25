@@ -305,10 +305,11 @@ mounted_by_root() { l=$(mount | grep -F " on $1 ("); echo "$l"; [ -n "$l" ] && !
 # spec: .superpowers/sdd/2026-11-25-hfs-parity/task-12-brief.md Step 2 -- who holds a volume: sudo -n lsof on its mount point,
 #       every user's open files on that filesystem, root's too (the directory walk it replaces, run as the user, saw only
 #       the user's own). With DISK, also DiskArbitration's view of the disk, the mount table's line for MOUNTPOINT and
-#       who has the disk's devices open: a linuxfs volume still mounted where DiskArbitration says it is not is item 4's
-#       spurious busy eject (push A, task-12-report.md): its mount is named linuxfs@rdiskN (f_mntfromname, item 6), so
-#       DiskArbitration unties it from its disk at the next mount or unmount of any volume, and the disk's eject then
-#       unmounts nothing and fails busy under the lklfuse still serving it
+#       who has the disk's devices open: a linuxfs volume still mounted where DiskArbitration says it is not was item 4's
+#       spurious busy eject (push A, task-12-report.md): its mount was named linuxfs@rdiskN (f_mntfromname, item 6), so
+#       DiskArbitration untied it from its disk at the next mount or unmount of any volume, and the disk's eject then
+#       unmounted nothing and failed busy under the lklfuse still serving it. DiskArbitration's mounts are now named
+#       /dev/diskN (Task 16), as HFS+'s are
 holders() {  # MOUNTPOINT [DISK]
   echo "#   sudo -n lsof $1:"; bounded 300 sudo -n lsof "$1" 2>&1 < /dev/null | sed 's/^/#     /' | head -n 20
   test -n "${2:-}" || return 0
@@ -666,7 +667,7 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
         j=$((j + 1)); [ $j -le 30 ] || break; sleep 1
       done
       check "before login (older macFUSE): the mount program refused, saying macFUSE is too old ($gate)" sh -c 'tail -n +"$1" /var/log/system.log | grep -q "refused: macFUSE is too old to mount before login; update macFUSE"' _ "$((${loglog:-0} + 1))"
-      check "before login (older macFUSE): nothing is mounted from $disk" sh -c '! mount | grep -qF "linuxfs@$1 "' _ "${disk#/dev/}"
+      check "before login (older macFUSE): nothing is mounted from $disk" sh -c '! mount | grep -qE "^$1(s[0-9]+)? on "' _ "$disk"
       check "before login (older macFUSE): no lklfuse runs as root" no_root_lklfuse
       if [ -n "$disk" ]; then check "before login (older macFUSE): eject leaves no lklfuse" login_eject "$disk" && disk=; fi
       check "before login (older macFUSE): no lklfuse runs as root, after the eject" no_root_lklfuse ;;
@@ -708,7 +709,7 @@ f = open(sys.argv[1], "a"); fcntl.flock(f, fcntl.LOCK_EX); sys.stdout.write("hel
               j=0; while ! grep -q held "$W/lockhold.out" 2> /dev/null && [ $j -lt 100 ]; do j=$((j + 1)); sleep 0.1; done
               bounded 1800 sudo -n diskutil mount "$dev" > "$W/lockmount.log" 2>&1; lrc=$?
               check "before login: with lklfuse's lock held, diskutil mount $dev fails ($(head -n 1 "$W/lockmount.log"))" test "$lrc" -ne 0
-              check "before login: and nothing is left mounted from $dev" sh -c '! mount | grep -qF "linuxfs@$1 "' _ "${dev#/dev/}"
+              check "before login: and nothing is left mounted from $dev" sh -c '! mount | grep -qE "^$1(s[0-9]+)? on "' _ "$dev"
               # spec: tools/open.c fuse_chan -- the CLI's own lock check fails before root runs mount_macfuse at all, so none lingers: within a few seconds
               check "before login: and no root mount_macfuse survives it" root_mount_macfuse_gone 5
               sudo -n kill "$hold" 2> /dev/null; sudo -n pkill -f "fcntl.flock" 2> /dev/null; wait "$hold" 2> /dev/null

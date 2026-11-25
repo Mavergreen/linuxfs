@@ -61,10 +61,27 @@ mounted_points() {
     for (i = length(r); i > 0; i--) if (substr(r, i, 2) == " (") { print substr(r, 1, i - 1); next } }'
 }
 is_mounted() { mounted_points | grep -qxF "$1"; }
-# The Mac's own mount of a device node, if any: its mount point.
+# The mount table as SOURCE<TAB>MOUNTPOINT<TAB>TYPE lines (the type: what follows " (" up to its first comma).
+mount_lines() {
+  mount | awk '{ o = index($0, " on "); if (!o) next; r = substr($0, o + 4)
+    for (i = length(r); i > 0; i--) if (substr(r, i, 2) == " (") break
+    if (i == 0) next; t = substr(r, i + 2); sub(/[,)].*$/, "", t)
+    printf "%s\t%s\t%s\n", substr($0, 1, o - 1), substr(r, 1, i - 1), t }'
+}
+# linuxfs's own mount type: one of the six bundles' macfuse_<fs> exactly (tools/fsrules.c's table), never the macfuse_ family.
+ours_type() { case $1 in macfuse_ext4|macfuse_ntfs|macfuse_btrfs|macfuse_xfs|macfuse_f2fs|macfuse_apfs) return 0 ;; *) return 1 ;; esac; }
+# The Mac's own mount of a device node, if any: its mount point. A DiskArbitration mount of linuxfs's is named for its disk too
+# (fsname=/dev/diskNsM, as HFS+'s is), so a mount of one of the six types is linuxfs's, not the Mac's.
 mac_mount_of() {
-  mount | awk -v d="$1" '{ o = index($0, " on "); if (!o) next; if (substr($0, 1, o - 1) != d) next
-    r = substr($0, o + 4); for (i = length(r); i > 0; i--) if (substr(r, i, 2) == " (") { print substr(r, 1, i - 1); exit } }'
+  mount_lines | while IFS="$tab" read -r _s _m _t; do
+    [ "$_s" = "$1" ] || continue
+    ours_type "$_t" || { printf '%s\n' "$_m"; break; }
+  done
+}
+# Whether linuxfs's: the topmost mount on MOUNTPOINT (the last in the table) is of one of the six types.
+ours_on() {
+  _t=$(mount_lines | awk -F"$tab" -v m="$1" '$2 == m { t = $3 } END { print t }')
+  ours_type "$_t"
 }
 
 # STATE holds one file per running lklfuse, named by its pid: source, mount point, type, mode (rw|ro).
@@ -247,11 +264,14 @@ cmd_mount() {
     fi
     mount_device "$blk" "$pwstdin" "$ro"; return
   fi
-  open_dev=
+  open_dev= fsn=
   if device_nodes "$target"; then
     at=$(mac_mount_of "$blk")
     [ -z "$at" ] || die "$blk is mounted by the Mac at $at; eject it first (diskutil unmount $blk)"
     src=$raw lockname=${raw#/dev/}
+    # DiskArbitration's mount is named for its disk, as HFS+'s is (item 6): DiskArbitration, diskutil and Finder tie the volume to
+    # its disk only through the mount's source, f_mntfromname
+    [ "${LINUXFS_DA:-}" != 1 ] || fsn=$blk
     # review M6: a disk hdiutil attached from an image is that image, so it takes the image file's lock
     # (with the partition's number), and mounting the file and the device at once is refused
     whole=${blk%s[0-9]*}; img=$(image_of "$whole")
@@ -343,7 +363,8 @@ cmd_mount() {
   opts="type=$type,lock=$lockopt"
   # the mount's own options (the kernel's): root gave them to mount_macfuse when it made the mount lklfuse serves
   if [ -z "$fusefd" ]; then
-    opts="$opts,local,volname=$name,fsname=linuxfs@$(safe_name "$(basename "$src")"),noappledouble"
+    [ -n "$fsn" ] || fsn=linuxfs@$(safe_name "$(basename "$src")")
+    opts="$opts,local,volname=$name,fsname=$fsn,noappledouble"
     ft=$(fstype_opts "$type"); [ -z "$ft" ] || opts="$opts,$ft"
     # root's fseventsd and mds reach the volume only if macFUSE lets this user share (an admin, or allow_other on)
     case ,$extra, in *,allow_other,*|*,allow_root,*) ;; *)  # the user's own -o says it already: macFUSE refuses both
@@ -427,7 +448,7 @@ EOF
       fi ;;
   esac
   if [ -n "$rec" ]; then pid=${rec%%"$tab"*}; mnt=$(printf '%s\n' "$rec" | cut -f 3)
-  else pid=; mnt=$t; is_mounted "$mnt" || die "$1 is not mounted by linuxfs"; fi
+  else pid=; mnt=$t; ours_on "$mnt" || die "$1 is not mounted by linuxfs"; fi
   # forced (a yank or an eject): umount -f, not diskutil, which DiskArbitration holds up while
   # an eject waits on the agent (P3-3: 9 s, past what DiskArbitration waits, for a 0.7 s unmount)
   if [ -n "$force" ]; then unmount_it() { umount -f "$1"; }; else unmount_it() { diskutil unmount "$1"; }; fi

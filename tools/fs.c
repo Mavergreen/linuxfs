@@ -1007,21 +1007,20 @@ static int recv_device(int sock, int secs, int watch)
 	return fd;
 }
 
-/* What is mounted on MNT, judged by the topmost mount, the one unmount(MNT) would hit: 0 nothing; 1 root's own mount, from
- * linuxfs@BSD, one of our six macfuse_<fs> file systems; -1 something else, which is never root's to unmount. The mount table is read
- * with MNT_NOWAIT, last entry first (a later mount on the same path is on top), rather than by statfs(MNT), which asks the file
+/* What is mounted on MNT, judged by the topmost mount, the one unmount(MNT) would hit: 0 nothing; 1 root's own mount of FS
+ * from /dev/BSD (fsrules_mount_is_roots: FS's macfuse_<fs> type, that source, owned by root); -1 something else, which is never
+ * root's to unmount: an HFS+ volume from the same disk, a user's macFUSE mount, another of the six. The mount table is read with
+ * MNT_NOWAIT, last entry first (a later mount on the same path is on top), rather than by statfs(MNT), which asks the file
  * system and so could hang on a dead macFUSE mount: no wait to bound. */
-static int mounted_on(const char *mnt, const char *bsd)
+static int mounted_on(const char *fs, const char *mnt, const char *bsd)
 {
 	struct statfs *m;
-	char from[64];
 	int n, i;
 
-	snprintf(from, sizeof from, "linuxfs@%s", bsd);
 	n = getmntinfo(&m, MNT_NOWAIT);
 	for (i = n - 1; i >= 0; i--)
 		if (strcmp(m[i].f_mntonname, mnt) == 0)
-			return strcmp(m[i].f_mntfromname, from) == 0 && fsrules_fs_of_type(m[i].f_fstypename) ? 1 : -1;
+			return fsrules_mount_is_roots(fs, bsd, m[i].f_fstypename, m[i].f_mntfromname, (unsigned)m[i].f_owner) ? 1 : -1;
 	return 0;
 }
 
@@ -1165,7 +1164,10 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 	nm = fsrules_name(fs);
 	if (!nm)
 		return refuse(fs, "no such filesystem");
-	if (snprintf(opts, sizeof opts, "allow_other,local,volname=%s,fsname=linuxfs@%s,noappledouble,fstypename=%s,fssubtype=%d%s", vol, bsd,
+	/* fsname=/dev/BSD, as HFS+'s mount is named: DiskArbitration ties the volume to its disk only through f_mntfromname (with
+	 * linuxfs@BSD it lost the tie at the next mount or unmount of any volume, and its ejects failed 0x10: item 4), and so do
+	 * diskutil info and Finder's external-disk presentation (item 6) */
+	if (snprintf(opts, sizeof opts, "allow_other,local,volname=%s,fsname=/dev/%s,noappledouble,fstypename=%s,fssubtype=%d%s", vol, bsd,
 		     nm->fstypename, nm->subtype, ro ? ",rdonly" : "") >= (int)sizeof opts)
 		return refuse(fs, "the mount options do not fit");
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, cs) != 0)
@@ -1384,7 +1386,7 @@ failed:
 			cli_rc = WIFEXITED(w) ? WEXITSTATUS(w) : 1;
 		if (cpid > 0)	/* the CLI and its lklfuse, if any: without the mount there is nothing for them to serve */
 			stop_group(cpid, cli_rc == -2);
-		fd = mounted_on(req->mnt, bsd);
+		fd = mounted_on(fs, req->mnt, bsd);
 		if (fd < 0)
 			syslog(LOG_NOTICE, "mount_%s: %s: %s holds another volume than root's mount; left mounted", fs, bsd, req->mnt);
 		if (fd > 0) {

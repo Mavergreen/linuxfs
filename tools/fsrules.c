@@ -44,6 +44,14 @@ const char *fsrules_fs_of_type(const char *f_fstypename)
 	return NULL;
 }
 
+int fsrules_mount_is_roots(const char *fs, const char *bsd, const char *f_fstypename, const char *f_mntfromname, unsigned owner)
+{
+	const char *t = fsrules_fs_of_type(f_fstypename);
+
+	return fs && bsd && f_mntfromname && t && strcmp(t, fs) == 0 && owner == 0 && strncmp(f_mntfromname, "/dev/", 5) == 0 &&
+	       strcmp(f_mntfromname + 5, bsd) == 0;
+}
+
 const char *fsrules_fs_from_name(const char *argv0, enum fsrole *role)
 {
 	const struct fsname *s;

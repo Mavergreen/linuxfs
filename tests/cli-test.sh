@@ -45,7 +45,9 @@ case "\$lock" in
   *) mkdir "\$lock.held" 2>/dev/null || { echo "unable to exclusively lock \$lock: Resource temporarily unavailable"; exit 2; }
      trap 'rmdir "\$lock.held"' EXIT ;;
 esac
-echo "linuxfs@x on \$mnt (macfuse, local, nodev, nosuid, synchronous, mounted by me)" >> "$T/mtab"
+# the mount line macFUSE would make: named by fsname=, typed macfuse_<fstypename>
+fsn=\$(echo "\$*" | tr , "\\n" | sed -n "s/^fsname=//p" | tail -n 1); ft=\$(echo "\$*" | tr , "\\n" | sed -n "s/^fstypename=//p" | tail -n 1)
+echo "\${fsn:-linuxfs@x} on \$mnt (macfuse_\${ft:-ext4}, local, nodev, nosuid, synchronous, mounted by me)" >> "$T/mtab"
 while grep -qF " on \$mnt (" "$T/mtab"; do sleep 0.1; done
 exit 0
 EOF
@@ -263,7 +265,28 @@ out=$(LINUXFS_OPEN="$T/bin/open" LINUXFS_DA=1 sh "$L" mount /dev/disk3s1 2>&1); 
 grep -q "^open /dev/rdisk3s1 $T/bin/lklfuse -f -o .* /dev/fd/3 $T/Volumes/helped\$" "$T/calls"
 ok $? "lklfuse gets the raw device's descriptor as /dev/fd/3"
 grep -q "lock=$T/locks/linuxfs-rdisk3s1.lock" "$T/calls"; ok $? "the lock is named for the raw device"
+# spec: item 6 (fsname=/dev/<bsd>) -- a DiskArbitration mount is named for its disk, as HFS+'s is; the CLI tells its own from the
+#       Mac's by the mount's type (one of the six macfuse_<fs>) and mount point, never by the name
+c=$(grep "^open /dev/rdisk3s1 " "$T/calls" | tail -n 1)
+case $c in *",fsname=/dev/disk3s1,"*) r=0 ;; *) r=1 ;; esac; ok $r "a DiskArbitration mount (LINUXFS_DA=1) is fsname=/dev/disk3s1, the block node (got: $c)"
+grep -qF "/dev/disk3s1 on $T/Volumes/helped (macfuse_ext4, " "$T/mtab"; ok $? "so its mount line is /dev/disk3s1 on MP (macfuse_ext4, ...)"
+sh "$L" status | grep -q "	/dev/rdisk3s1	$T/Volumes/helped	ext4	rw\$"; ok $? "status lists it (a guard: status reads its records, not the name)"
+out=$(LINUXFS_OPEN="$T/bin/open" LINUXFS_DA=1 sh "$L" mount /dev/disk3s1 2>&1); rc=$?
+[ $rc -eq 1 ] && echo "$out" | grep -q "already mounted by linuxfs" && ! echo "$out" | grep -q "mounted by the Mac"
+ok $? "mounting it again is refused as linuxfs's own (its lock), not as the Mac's (got $rc: $(echo "$out" | tail -n 1))"
+out=$(FAKE_PROBE=unreadable LINUXFS_OPEN="$T/bin/open" sh "$L" list 2>&1)
+echo "$out" | grep -q "^/dev/disk3s1	ext4	helped	$T/Volumes/helped\$"; ok $? "list shows it mounted where linuxfs mounted it (got: $(echo "$out" | grep disk3s1 | tr '\t' ' '))"
 LINUXFS_OPEN="$T/bin/open" sh "$L" unmount disk3s1 > /dev/null 2>&1; ok $? "unmount by device name"
+# spec: item 6 -- with no record (a mount made before login, as _linuxfs), unmount by mount point takes only one of the six types
+mkdir -p "$T/Volumes/early" "$T/Volumes/hfsvol"
+echo "/dev/disk5s1 on $T/Volumes/early (macfuse_xfs, local, nodev, nosuid, synchronous, mounted by _linuxfs)" >> "$T/mtab"
+echo "/dev/disk5s2 on $T/Volumes/hfsvol (hfs, local, nodev, nosuid, journaled, noowners)" >> "$T/mtab"
+out=$(sh "$L" unmount "$T/Volumes/early" 2>&1); rc=$?
+[ $rc -eq 0 ] && ! grep -qF " on $T/Volumes/early (" "$T/mtab"; ok $? "unmount of a macfuse_xfs mount it has no record of goes through diskutil (got $rc: $out)"
+out=$(sh "$L" unmount "$T/Volumes/hfsvol" 2>&1); rc=$?
+[ $rc -eq 1 ] && echo "$out" | grep -q "not mounted by linuxfs" && grep -qF " on $T/Volumes/hfsvol (" "$T/mtab"
+ok $? "unmount of the Mac's HFS+ volume from a disk is refused, and it stays mounted (got $rc: $out)"
+grep -vF " on $T/Volumes/hfsvol (" "$T/mtab" > "$T/mtab.new"; mv "$T/mtab.new" "$T/mtab"; rmdir "$T/Volumes/hfsvol" "$T/Volumes/early" 2>/dev/null
 # spec: cli/linuxfs --
 #       a whole disk being ejected (the agent, P3-2): what linuxfs mounted from its partitions is unmounted
 mnt=$(LINUXFS_OPEN="$T/bin/open" LINUXFS_DA=1 sh "$L" mount /dev/disk3s1 2>/dev/null)
@@ -729,6 +752,12 @@ printf '%s\n' "$names" | while IFS='	' read -r fs ptype bundle ftn pers fsname s
 done > "$T/mismatch"
 [ ! -s "$T/mismatch" ]; ok $? "bundle_of and fstype_opts agree with --names for all six (off: $(tr '\n' ' ' < "$T/mismatch"))"
 [ "$(printf '%s\n' "$names" | wc -l | tr -d ' ')" = 6 ]; ok $? "the table has six rows"
+# spec: cli/linuxfs ours_type -- linuxfs's mounts are the six bundles' types exactly, never the macfuse_ family
+eval "$(grep '^ours_type()' "$L")"
+printf '%s\n' "$names" | while IFS='	' read -r fs ptype bundle rest; do ours_type "$bundle" || echo "$bundle"; done > "$T/mismatch"
+[ ! -s "$T/mismatch" ]; ok $? "ours_type takes each of the six bundles (off: $(tr '\n' ' ' < "$T/mismatch"))"
+for t in macfuse macfuse_ macfuse_ext4x macfuse_zfs linuxfs_ext4 osxfuse hfs ""; do ours_type "$t" && echo "$t"; done > "$T/mismatch"
+[ ! -s "$T/mismatch" ]; ok $? "and no other type (taken: $(tr '\n' ' ' < "$T/mismatch"))"
 [ -z "$(fstype_opts exfat)" ] && [ -z "$(fstype_opts vfat)" ] && [ -z "$(fstype_opts '')" ]; ok $? "fstype_opts says nothing for other types"
 sh "$L" help 2>&1 | grep -q "linuxfs ignore \[VOLUME\]"; ok $? "usage shows ignore [VOLUME]"
 ! sh "$L" help 2>&1 | grep -q "Automount"; ok $? "usage no longer offers Automount"
