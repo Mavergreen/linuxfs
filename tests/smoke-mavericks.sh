@@ -67,12 +67,32 @@ crashes() { ls "$HOME"/Library/Logs/DiagnosticReports/lklfuse_* /Library/Logs/Di
 mountpoint_of() { "$L" status | awk -F"$tab" -v s="$1" '$2 == s { print $3; exit }'; }
 pid_of() { "$L" status | awk -F"$tab" -v s="$1" '$2 == s { print $1; exit }'; }
 # spec: .superpowers/sdd/2026-11-25-hfs-parity/task-13b-brief.md item 5 -- system.log since the smoke began (push C kept only
-#       its last 3000 lines, the census's last 9 minutes): the lines after LINES of the file whose first line was FIRST;
-#       when newsyslog turned it over since (its first line differs), the rest of LOG.0.bz2 first, then the new file
+#       its last 3000 lines, the census's last 9 minutes): the lines after LINES of the file whose first line was FIRST.
+#       Fix round 1: 10.9 rotates system.log by size at any time (/etc/asl.conf: rotate=seq compress file_max=5M, by
+#       aslmanager), gzipped, newest first: LOG.0.gz, LOG.1.gz, ... So when it turned over since (its first line
+#       differs), the rotated files are walked back, up to LOG.19 (bounded), to the one FIRST began: its rest, the newer
+#       rotated files, then LOG. A .bz2 (newsyslog's) is read where there is no .gz. When none began with FIRST, that is
+#       said, and LOG.0 and LOG follow whole.
+syslog_rotated() {  # LOG N: rotated file N of LOG, decompressed (nothing when there is none)
+  if test -f "$1.$2.gz"; then gzip -dc "$1.$2.gz"; elif test -f "$1.$2.bz2"; then bzcat "$1.$2.bz2"; fi
+}
 syslog_since() {  # LINES FIRST [LOG]
   sl=${3:-/var/log/system.log}
-  if [ "$(head -n 1 "$sl" 2> /dev/null)" = "$2" ]; then tail -n +"$((${1:-0} + 1))" "$sl"
-  else bzcat "$sl.0.bz2" 2> /dev/null | tail -n +"$((${1:-0} + 1))"; cat "$sl"; fi
+  if test "$(head -n 1 "$sl" 2> /dev/null)" = "$2"; then tail -n +"$((${1:-0} + 1))" "$sl"; return; fi
+  sn=0 sf=
+  while test "$sn" -lt 20; do
+    test -f "$sl.$sn.gz" || test -f "$sl.$sn.bz2" || break
+    if test "$(syslog_rotated "$sl" "$sn" 2> /dev/null | head -n 1)" = "$2"; then sf=$sn; break; fi
+    sn=$((sn + 1))
+  done
+  if test -n "$sf"; then
+    syslog_rotated "$sl" "$sf" 2> /dev/null | tail -n +"$((${1:-0} + 1))"
+    while test "$sf" -gt 0; do sf=$((sf - 1)); syslog_rotated "$sl" "$sf" 2> /dev/null; done
+  else
+    echo "# syslog_since: no rotated $sl.N (of $sn) began with the smoke's first line; $sl.0 and $sl whole"
+    syslog_rotated "$sl" 0 2> /dev/null
+  fi
+  cat "$sl"
 }
 finish() {
   for m in "$W"/mnt/*; do mount | grep -qF " on $m (" && { umount -f "$m" || diskutil unmount force "$m"; } > /dev/null 2>&1; done

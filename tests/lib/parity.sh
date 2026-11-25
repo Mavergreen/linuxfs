@@ -290,10 +290,10 @@ census_names_bar() {
   *) notok "census names"; echo "census names: PARITY_NAMES_WANT is '$PARITY_NAMES_WANT', not exact or scanning"; return 1 ;;
   esac
   if test "$_cnb_x" -eq 0 && test "$_cnb_w" -gt 0; then ok "census names: no linuxfs census mount ran $_cnb_o ($_cnb_c)"; return 0; fi
-  notok "census names: no linuxfs census mount ran $_cnb_o ($_cnb_c)"
   if test "$_cnb_x" -gt 0; then
-    echo "census names: $_cnb_x ran $_cnb_o, though PARITY_NAMES_WANT is $PARITY_NAMES_WANT: $(awk -v o="$_cnb_o" '{ m = $0; sub(/^[^:]*: /, "", m); sub(/ .*/, "", m) } m == o { x = $0; sub(/: .*/, "", x); if (k++ < 10) l = l (l == "" ? "" : ", ") x } END { print l }' "$OUT/parity/names-mode.txt")"
-  else echo "census names: none ran $PARITY_NAMES_WANT, so this proves nothing"; fi
+    notok "census names: $_cnb_x ran $_cnb_o, though PARITY_NAMES_WANT is $PARITY_NAMES_WANT ($_cnb_c)"
+    echo "census names: ran $_cnb_o: $(awk -v o="$_cnb_o" '{ m = $0; sub(/^[^:]*: /, "", m); sub(/ .*/, "", m) } m == o { x = $0; sub(/: .*/, "", x); if (k++ < 10) l = l (l == "" ? "" : ", ") x } END { print l }' "$OUT/parity/names-mode.txt")"
+  else notok "census names: none ran $PARITY_NAMES_WANT, so this proves nothing ($_cnb_c)"; fi
   return 1
 }
 
@@ -413,6 +413,9 @@ census_awaited() { bounded $(((PARITY_AWAIT_SECS + 7) * 10)) census_await "$@" >
 #   of Finder's (System Events: it needs assistive access, and without it census_await gives up), the Spotlight pane
 census_await_window() { echo "tell application \"Finder\" to return (POSIX path of (target of front Finder window as alias)) is \"$1/\""; }
 census_await_info='tell application "Finder" to return (class of front window) is information window'
+#   census_await_dialog is any dialog of Finder's (fix round 1): only the trash steps wait for one now (an eject's alert is
+#   invisible to System Events, census_finder_ask), and theirs name no volume to match; nor can it be the other side's:
+#   on HFS+ Finder moves trash-me to its Trash with no dialog, Empty Trash is asked once, and what was up is dismissed
 census_await_dialog='tell application "System Events" to return exists (first window of process "Finder" whose subrole is "AXDialog" or subrole is "AXSystemDialog")'
 census_await_pane='tell application "System Preferences" to return (id of current pane) is "com.apple.preference.spotlight"'
 
@@ -422,7 +425,13 @@ census_await_pane='tell application "System Preferences" to return (id of curren
 #   button, else their OK; never by the default button or Return, which on a busy eject's dialog is Force Eject (a forced
 #   eject of a busy macFUSE volume runs on QEMU first). What each said goes to dialogs.txt. When System Events cannot
 #   (no assistive access, or the script failed or hung) or a dialog has neither button, Finder is restarted, which
-#   closes its dialogs (and cancels nothing a census step still needs). Bounded: 30 s, and the restart's 36.
+#   closes its dialogs (and cancels nothing a census step still needs). Bounded: 30 s, and the restart's 38 (killall 30,
+#   census_pause 6 bounded at 8).
+#   Fix round 1: on 10.9 Finder's eject alerts ("The disk ... wasn't ejected", Try Again / Cancel / Force Eject..., and "...
+#   was ejected") are invisible to System Events (QEMU: neither Finder's windows nor a walk of its UI elements lists
+#   them, on screen though they are). So once a census step asked Finder to eject (census_finder_ask marks it in
+#   $W/census/finder-eject-asked, a file: bounded runs the step in a subshell), the next dismissal restarts Finder whatever System
+#   Events says, and says so, once. A restart is killall: it sends no keystroke, so Force Eject is never pressed.
 census_dialogs_osa='set o to ""
 tell application "System Events"
 	if not (exists process "Finder") then return "none (no Finder)"
@@ -455,13 +464,19 @@ census_finder_dialogs() {
   mkdir -p "$OUT/parity"
   _cfd_o=$(bounded 300 "$AQUA" osascript -e "$census_dialogs_osa" 2>&1 </dev/null); _cfd_rc=$?
   _cfd_t=$(printf '%s\n' "$_cfd_o" | sed '/^ *$/d' | awk '{ s = s (NR > 1 ? "; " : "") $0 } END { print s }')
+  _cfd_r=
   if test "$_cfd_rc" -ne 0; then
-    echo "$1: System Events could not ($_cfd_t): Finder restarted" >>"$OUT/parity/dialogs.txt"; census_finder_restart
+    echo "$1: System Events could not ($_cfd_t): Finder restarted" >>"$OUT/parity/dialogs.txt"; census_finder_restart; _cfd_r=1
   else
     case $_cfd_o in
-    *"left up ("*) echo "$1: $_cfd_t: Finder restarted" >>"$OUT/parity/dialogs.txt"; census_finder_restart ;;
+    *"left up ("*) echo "$1: $_cfd_t: Finder restarted" >>"$OUT/parity/dialogs.txt"; census_finder_restart; _cfd_r=1 ;;
     *) echo "$1: $_cfd_t" >>"$OUT/parity/dialogs.txt" ;;
     esac
+  fi
+  if test -f "$W/census/finder-eject-asked"; then
+    rm -f "$W/census/finder-eject-asked"
+    test -n "$_cfd_r" || census_finder_restart
+    echo "$1: restarted Finder after an eject (alerts invisible to System Events on 10.9)" >>"$OUT/parity/dialogs.txt"
   fi
   return 0
 }
@@ -958,16 +973,24 @@ census_busy_release() {
 #   photographed (STEP) once a Finder dialog is up (census_await, up to PARITY_AWAIT_SECS), and osascript is given 20 s
 #   more: one still waiting is held by a dialog, and is said and stopped. What an earlier step or the other side left
 #   up is dismissed first (census_finder_dialogs: push C's HFS+ dialog showed in ext4's shot). Run it under bounded
-#   (parity does), at 160 s: the dismissal 66, census_dismiss 20, the wait 17, the shot 30, osascript's 20, and the rest.
+#   (parity does), at 160 s: the dismissal 68, census_dismiss 20, the wait 17, the shot 30, osascript's 20, and the rest.
+#   Fix round 1: when SCRIPT ejects or unmounts, its alert is invisible to System Events on 10.9 (census_finder_dialogs),
+#   so a wait for it would always run out: the shot is taken after a fixed 3 s (census_pause, bounded at 5), and that
+#   said in shots.txt; the eject is marked ($W/census/finder-eject-asked) for the next dismissal's Finder restart. Push C's
+#   wrong-side dialog (HFS+'s busy-eject alert in ext4's shot) is closed by that restart, before the other side's ask.
 census_finder_ask() {
   fe_o=$W/census/finder-ask.out
   mkdir -p "$W/census"
   census_finder_dialogs "$1" >/dev/null 2>&1
   census_dismiss "$1"   # before the dialog, which the shot is to show
+  case $3 in *"eject "* | *unmount*) fe_e=1; : >"$W/census/finder-eject-asked" ;; *) fe_e= ;; esac
   "$AQUA" osascript -e "$3" >"$fe_o" 2>&1 </dev/null &
   fe_p=$!
   if test "$2" = "$PARITY_CTL_MP"; then fe_s=hfs fe_n=hfs; else fe_s=fs fe_n=$PARITY_FS; fi
-  census_awaited "$1" "$fe_n" "$census_await_dialog"
+  if test -n "$fe_e"; then
+    census_pause 3; mkdir -p "$OUT/parity"
+    echo "$1 $fe_n: not awaited: Finder's eject alerts are invisible to System Events on 10.9; photographed after 3 s" >>"$OUT/parity/shots.txt"
+  else census_awaited "$1" "$fe_n" "$census_await_dialog"; fi
   census_shot "$1" "$fe_s" nodismiss
   fe_k=0; while kill -0 "$fe_p" 2>/dev/null && test "$fe_k" -lt 20; do fe_k=$((fe_k + 1)); sleep 1; done
   if kill -0 "$fe_p" 2>/dev/null; then kill "$fe_p" 2>/dev/null; echo "osascript still waiting 24 s after Finder's $1 (its dialog)"; fi
@@ -1492,9 +1515,16 @@ end tell' >"$OUT/parity/trash.$tt_fs.empty-trash.txt" 2>&1
 
 # ---- Later: Time Machine (record-only, never checked) ----
 # census_later: Later's Time Machine record: the HFS+ control beside the exFAT control, then beside ext4: Time Machine's
-#   offer photographed 5 s after each attach (tm-offer). No destination is ever set: that would replace the guest's, and
+#   offer photographed 5 s after each attach (tm-offer), not awaited (it may never come for a linuxfs volume, and nothing
+#   says System Events sees it on 10.9, where Finder's own eject alerts are invisible to it), and that said in shots.txt
+#   (census_tm_shot). No destination is ever set: that would replace the guest's, and
 #   backupd could remount a macFUSE volume (QEMU first). Without one, tmutil isexcluded says [Excluded] for every volume
 #   (push A: HFS+, exFAT and ext4 alike), so it is not asked; later.tm-excluded.txt says so.
+census_tm_shot() {   # SIDE NAME
+  census_pause 5; mkdir -p "$OUT/parity"
+  echo "tm-offer $2: not awaited: the offer may never come for linuxfs, and System Events is not known to see it on 10.9; photographed after 5 s" >>"$OUT/parity/shots.txt"
+  census_shot tm-offer "$1" nodismiss
+}
 census_later() {
   census_sysctl later
   echo "tmutil isexcluded: not asked: uninformative with no Time Machine destination, which the census never sets (every volume, HFS+ too, says [Excluded])" >"$OUT/parity/later.tm-excluded.txt"
@@ -1504,13 +1534,13 @@ census_later() {
   census_dismiss tm-offer-pre   # a kext alert left up would cover the offer, which comes after the attach
   census_attach "$cl_h" || { echo "# census_later: no HFS+ control attached"; return 1; }
   cl_hd=$CA_DISK cl_hm=$CA_MP cl_hv=$CA_VOL
-  census_pause 5; census_shot tm-offer hfs nodismiss
+  census_tm_shot hfs hfs
   for cl_k in exfat ext4; do
     if test "$cl_k" = exfat; then cl_img=$cl_x cl_side=apple; else cl_img=$cl_i cl_side=fs; fi
     census_dismiss tm-offer-pre
     census_attach "$cl_img" || { echo "# census_later: no $cl_k attached"; continue; }
     parity_pair "$cl_hd" "$cl_hm" "$cl_hv" "$cl_k" "$CA_DISK" "$CA_MP" "$CA_VOL"
-    census_pause 5; census_shot tm-offer fs nodismiss
+    census_tm_shot fs "$cl_k"
     census_detach "$PARITY_FS_DISK" "$cl_side" "$PARITY_FS_MP"
   done
   census_detach "$cl_hd" apple
@@ -1530,19 +1560,23 @@ census_later() {
 #   1's bounds are attach -nomount 300 s, the UUID wait 60, the pause 6, diskutil unmount 600, ignore 600, diskutil mount
 #   600, the mount wait 130, unignore 600, the fstab edit 30, the counted attach 600 and its mount wait 90 = 3616 s, 60
 #   min, the (usually quick) detaches aside; loop 2's two attaches are about 25.
-#   Task 13b adds, in seconds: census_after at each census_on step's end (and census_later's), 203: census_sweep 137
-#   (hdiutil info 2, its 60 s budget, then the disk begun last: its unmount 2, census_lklfuse_gone 30, a failing
-#   census_detach 42 (two ejects of 10, two census_holders of 10, the pause 2), mount 1) and census_finder_dialogs 66
-#   (osascript 30, then Finder restarted, 30 and 6); census_after after the stall, its sweep alone, 137; a census_awaited
-#   window, pane or dialog wait, 17, in place of a pause 2 s longer than the 1 kept (census_finder_view, names, privacy:
-#   15 net) or of census_refresh's 3 (14 net) or census_finder_ask's 4 s (13 net); census_finder_ask's own dismissal, 66;
-#   census_index_on's -E and second -i on, 60 a pass, and census_spotlight_diag, 10 a pass. So:
-#   census_unicode 13 + (2 names waits 30 + 203) / 60 = 16.9, 17;
-#   census_busy 23 + (2 Finder ejects 2 x (66 + 13) = 158 + 203 + about 45 names-mode reads, 5) / 60 = 29.1, 30;
-#   census_spotlight 24 + (2 refresh waits 28 + 2 panes 30 + 2 x 60 + 2 x 10 + 203) / 60 = 30.7, 31;
-#   census_finder 24 + (7 views 105 + 203) / 60 = 29.1, 30;
-#   census_trash_tags_case 13 + (3 census_finder_ask 3 x 79 = 237 + 203) / 60 = 20.3, 21;
-#   census_later 5 + 203 / 60 = 8.4, 9;
+#   Task 13b adds, in seconds (fix round 1's figures): census_after at each census_on step's end (and census_later's),
+#   205: census_sweep 137 (hdiutil info 2, its 60 s budget, then the disk begun last, at its worst a linuxfs one still
+#   mounted: mount 1, its unmount 2, census_lklfuse_gone 30, a failing census_detach 42 (two ejects of 10, two
+#   census_holders of 10, the pause 2); one with no mount line is less: mount 1, ps 1, census_detach 42) and
+#   census_finder_dialogs 68 (osascript 30, then one Finder restart at most, killall 30 and census_pause 6 bounded at 8:
+#   the restart after an eject asked of Finder is that one); census_after after the stall, its sweep alone, 137; a
+#   census_awaited window, pane or dialog wait, 17, in place of a pause 2 s longer than the 1 kept (census_finder_view,
+#   names, privacy: 15 net) or of census_refresh's 3 (14 net) or census_finder_ask's 4 s (13 net); an eject's
+#   census_finder_ask takes no wait but a census_pause 3 (bounded at 5) for the 4 s, 1 net; census_finder_ask's own
+#   dismissal, 68; census_index_on's -E and second -i on, 60 a pass, and census_spotlight_diag, 10 a pass; tm-offer's
+#   note, nothing. So:
+#   census_unicode 13 + (2 names waits 30 + 205) / 60 = 16.9, 17;
+#   census_busy 23 + (2 Finder ejects 2 x (68 + 1) = 138 + 205 + about 45 names-mode reads, 5) / 60 = 28.8, kept at 30;
+#   census_spotlight 24 + (2 refresh waits 28 + 2 panes 30 + 2 x 60 + 2 x 10 + 205) / 60 = 30.7, 31;
+#   census_finder 24 + (7 views 105 + 205) / 60 = 29.2, 30;
+#   census_trash_tags_case 13 + (3 census_finder_ask 3 x (68 + 13) = 243 + 205) / 60 = 20.5, 21;
+#   census_later 5 + 205 / 60 = 8.4, 9;
 #   a stall iteration 60 + 137 / 60 = 62.3, 63 (counted on each, though only the last is followed by the sweep);
 #   anything else 11
 census_worst_min() {
@@ -1631,9 +1665,12 @@ census_attached() {
 # census_sweep STEP BEFORE: every census disk attached now and not in BEFORE (census_attached's lines before STEP) is
 #   freed, each begun only within PARITY_SWEEP_SECS (60) of the sweep's start: a linuxfs volume still mounted (mount's
 #   linuxfs@rdiskN, whatever DiskArbitration says) is unmounted by its mount point, its lklfuse waited for (30 s), then
-#   the disk ejected (census_detach fs: never by force); a disk of Apple's mounted is ejected (census_detach apple); one
-#   with nothing mounted is ejected or detached (census_detach nomount). What became of each goes to census-sweep.txt
-#   ("STEP: DISK PATH: ..."), what stays attached too.
+#   the disk ejected (census_detach fs: never by force); a disk of Apple's mounted is ejected (census_detach apple). One
+#   with nothing mounted that a live lklfuse may hold (one names /dev/rDISK, or the image is a linuxfs one, or ps
+#   cannot say) is ejected, never detached by force (census_detach fs: a forced detach under a live lklfuse is a pulled
+#   disk, QEMU first); only one of an image of Apple's (the controls and their copies), no lklfuse on it, is ejected or
+#   detached (census_detach nomount). When mount cannot be read, nothing is tried on the disk. What became of each goes
+#   to census-sweep.txt ("STEP: DISK PATH: ..."), what stays attached too.
 PARITY_SWEEP_SECS=${PARITY_SWEEP_SECS:-60}
 census_sweep() {
   mkdir -p "$OUT/parity"
@@ -1648,27 +1685,56 @@ census_sweep() {
     if test $(($(date +%s) - _csw_t0)) -ge "$PARITY_SWEEP_SECS"; then
       echo "$1: $_csw_x: not tried: the sweep's $PARITY_SWEEP_SECS s are up"; continue
     fi
-    echo "$1: $_csw_x: $(census_sweep_disk "${_csw_x%% *}")"
+    echo "$1: $_csw_x: $(census_sweep_disk "${_csw_x%% *}" "${_csw_x#* }")"
   done >>"$OUT/parity/census-sweep.txt"
   IFS=$_csw_ifs
   return 0
 }
-# census_sweep_disk DISK: census_sweep's work on one disk; says what became of it
+# census_apple_image PATH: PATH is an image of Apple's filesystems: a control ($W/ctl/) or a copy of one (census_copy's
+#   names: ctl-fat32, *-hfs, *-hfs-*, *-hfsx-*, *-exfat); anything else is taken as linuxfs
+census_apple_image() {
+  case $1 in "$W/ctl/"*) return 0 ;; esac
+  case ${1##*/} in ctl-fat32.img | *-hfs.img | *-hfs-*.img | *-hfsx-*.img | *-exfat.img) return 0 ;; esac
+  return 1
+}
+# census_lklfuse_on DISK: an lklfuse's command names DISK's raw device (/dev/rDISK, or a slice /dev/rDISKsN): 0 when one
+#   does, 1 when none does, 2 when ps cannot say
+census_lklfuse_on() {
+  _clo_p=$(bounded 100 ps -axww -o command= 2>/dev/null </dev/null) || return 2
+  test -n "$_clo_p" || return 2
+  printf '%s\n' "$_clo_p" | awk -v r="/dev/r${1#/dev/}" '/lklfuse/ && !/awk/ { for (i = 1; i <= NF; i++) if ($i == r || index($i, r "s") == 1) f = 1 } END { exit !f }'
+}
+# census_sweep_disk DISK PATH: census_sweep's work on one disk, attached from image PATH; says what became of it
 census_sweep_disk() {
   _csd_n=${1#/dev/}
-  _csd_ml=$(bounded 100 mount 2>/dev/null </dev/null)
+  _csd_ml=$(bounded 100 mount 2>/dev/null </dev/null) && printf '%s\n' "$_csd_ml" | grep -q ' on / (' ||
+    { echo "mount unreadable; not tried"; return 1; }
   _csd_mp=$(printf '%s\n' "$_csd_ml" | awk -v d="$_csd_n" 'index($0, "linuxfs@r" d " on ") == 1 || index($0, "linuxfs@r" d "s") == 1 { sub(/^[^ ]* on /, ""); sub(/ \([^(]*$/, ""); print; exit }')
   if test -n "$_csd_mp"; then
     _csd_u=$(bounded 600 diskutil unmount "$_csd_mp" 2>&1 </dev/null) ||
       { echo "linuxfs at $_csd_mp: its unmount failed ($(printf '%s' "$_csd_u" | tr '\n' ' ')); left attached"; return 1; }
     bounded 300 census_lklfuse_gone "$_csd_mp" >/dev/null 2>&1 ||
       { echo "linuxfs at $_csd_mp: unmounted by its mount point, but an lklfuse still serves it 30 s on; left attached"; return 1; }
-    if census_detach "$1" fs "$_csd_mp" >/dev/null 2>&1; then echo "linuxfs at $_csd_mp: unmounted by its mount point, then ejected"
+    if census_detach "$1" fs "$_csd_mp" >/dev/null 2>&1; then echo "linuxfs at $_csd_mp: unmounted by its mount point, then ejected"; return 0
     else echo "linuxfs at $_csd_mp: unmounted by its mount point; left attached"; return 1; fi
-  elif printf '%s\n' "$_csd_ml" | awk -v d="$_csd_n" 'index($0, "/dev/" d " on ") == 1 || index($0, "/dev/" d "s") == 1 { f = 1 } END { exit !f }'; then
+  fi
+  # no linuxfs mount line: is a live lklfuse on it, or may one be?
+  if printf '%s\n' "$_csd_ml" | awk -v d="$_csd_n" 'index($0, "/dev/" d " on ") == 1 || index($0, "/dev/" d "s") == 1 { f = 1 } END { exit !f }'; then
+    _csd_a="mounted by Apple's filesystems"
+  else _csd_a="no mount line"; fi
+  census_lklfuse_on "$1"; _csd_l=$?
+  if test "$_csd_l" -eq 0; then _csd_w="an lklfuse names /dev/r$_csd_n"
+  elif test "$_csd_l" -eq 2; then _csd_w="ps could not say whether an lklfuse holds it"
+  elif ! census_apple_image "${2:-}"; then _csd_w="a linuxfs image"
+  else _csd_w=; fi
+  if test -n "$_csd_w"; then
+    if census_detach "$1" fs >/dev/null 2>&1; then echo "$_csd_a, but $_csd_w: ejected"
+    else echo "$_csd_a, but $_csd_w: its eject failed; left attached (never detached by force)"; return 1; fi
+  elif test "$_csd_a" != "no mount line"; then
     if census_detach "$1" apple >/dev/null 2>&1; then echo ejected; else echo "left attached"; return 1; fi
   else
-    if census_detach "$1" nomount >/dev/null 2>&1; then echo "nothing mounted: detached"; else echo "nothing mounted; left attached"; return 1; fi
+    if census_detach "$1" nomount >/dev/null 2>&1; then echo "nothing mounted, no lklfuse on it, an image of Apple's: detached"
+    else echo "nothing mounted, no lklfuse on it, an image of Apple's; left attached"; return 1; fi
   fi
 }
 # census_after STEP BEFORE [nodialogs]: between census steps: census_sweep, then (unless nodialogs) census_finder_dialogs

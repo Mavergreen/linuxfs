@@ -328,10 +328,13 @@ cat > "$T/bin/stub" <<'EOF'
 # census_dry's stub of the Mac's disk tools: a node file per attached disk node (img, vol, mp, uuid, disk), .m when mounted
 me=${0##*/}
 # ps -ax: the host's processes, less any lklfuse (or a "not ok" in some other run's command line), and one fixed
-#   lklfuse line; the rest (ps -p) as it is
+#   lklfuse line (it fails with $STUB/ps-fail); the rest (ps -p) as it is
 if test "$me" = ps; then
   case "$*" in
-  *-ax*) /bin/ps "$@" | grep -v 'lklfuse\|not ok'; echo "stubuser 4242 1 Mon Nov 25 10:00:00 2026 /stub/lklfuse -f stub-lklfuse-line" ;;
+  *-ax*) test ! -f "$STUB/ps-fail" || exit 1
+    /bin/ps "$@" | grep -v 'lklfuse\|not ok'; echo "stubuser 4242 1 Mon Nov 25 10:00:00 2026 /stub/lklfuse -f stub-lklfuse-line"
+    # an lklfuse for each disk in $STUB/lklfuse-holds, its raw device open (as one outliving its unmount would be)
+    test ! -f "$STUB/lklfuse-holds" || while read -r h; do echo "stubuser 4243 1 Mon Nov 25 10:00:00 2026 /stub/lklfuse -f -o fsname=linuxfs@r$h /dev/r$h"; done < "$STUB/lklfuse-holds" ;;
   *) exec /bin/ps "$@" ;;
   esac
   exit 0
@@ -437,6 +440,8 @@ diskutil)
   eject)
     d=${2#/dev/}
     case $(field "$d" vol) in *stuck*) echo "Disk $d couldn't be ejected (stub stuck)"; exit 1 ;; esac
+    # an HFS+ image the sweep's tests name sweep-stuck-hfs-* never ejects either (its volume is the disk's s1)
+    case $(field "${d}s1" vol) in sweep-stuck-hfs-*) echo "Disk $d couldn't be ejected (stub stuck)"; exit 1 ;; esac
     case $(field "$d" vol) in *hfs*) ;; *flaky*)
       if test -f "$STUB/flaky-ejected"; then echo "Disk $d couldn't be ejected (stub flaky)"; exit 1; fi; : > "$STUB/flaky-ejected" ;;
     esac
@@ -448,6 +453,8 @@ diskutil)
     rm -f "$N/$d" "$N/$d.m" "$N/$d.u" "$N/${d}s1" "$N/${d}s1.m"; echo "Disk $d ejected" ;;
   esac ;;
 mount)
+  test ! -f "$STUB/mount-fail" || exit 1
+  echo "/dev/disk0s2 on / (hfs, local, journaled)"
   for f in "$N"/*.m; do
     test -f "$f" || continue
     nd=${f##*/}; nd=${nd%.m}
@@ -780,10 +787,11 @@ expect census_busy_sysctl test -s "$P/busy-ext4.sysctl.txt"
 expect census_names_busy_remounts test "$(grep -c '/vols/busy-ext4: exact' "$P/names-mode.txt")" -ge 21
 # item 2 (Task 13b): census_finder_ask dismisses what its step left up (busy-eject's dialog) before the next side's shot
 expect census_busy_dialogs grep -q '^busy-eject: OK: ' "$P/dialogs.txt"
-# item 3 (Task 13b): each busy-eject shot waits (bounded) for a Finder dialog, after the dismissal before the step
-ask_awaits() { awk '/killall UserNotificationCenter$/ { a = 0 } /AXDialog/ && !/click button/ { a = 1 } /screencapture -x .*busy-eject.png$/ { if (!a) bad = 1; a = 0 } END { exit bad }' "$S/calls"; }
-expect census_busy_eject_awaits ask_awaits
-expect census_busy_eject_awaits_said grep -q '^busy-eject ext4: seen after [0-9]* s$' "$P/shots.txt"
+# item 3 (Task 13b, fix round 1): a busy-eject shot is not awaited: on 10.9 Finder's eject alerts are invisible to System
+#   Events, so a wait for one would always run out; it is taken after a fixed 3 s, and that said
+expect census_busy_eject_not_awaited not grep -q '^busy-eject ext4: seen' "$P/shots.txt"
+expect census_busy_eject_not_awaited_said grep -q '^busy-eject ext4: not awaited: Finder.s eject alerts are invisible to System Events on 10.9; photographed after 3 s$' "$P/shots.txt"
+expect census_busy_eject_restarted grep -q '^busy-eject: restarted Finder after an eject (alerts invisible to System Events on 10.9)$' "$P/dialogs.txt"
 expect census_busy_detached test -z "$(attached)"
 # census_finder_ask dismisses the console's alerts before osascript starts, never between it and its shot (osascript
 #   runs in the background, so its line and the shot's come in either order: a dismissal finds both or neither)
@@ -1018,7 +1026,7 @@ expect census_ttc_apfs_case_only test -z "$(ls "$P" | grep -E '^(trash|tags)\.ap
 expect census_ttc_apfs_detached test -z "$(attached)"
 
 # census_later: Time Machine, the exFAT control against ext4 (each beside HFS+)
-: > "$S/calls"
+: > "$S/calls"; rm -f "$P/shots.txt"
 r=$(census_later 2>&1)
 # tmutil isexcluded with no destination says [Excluded] for every volume: not asked, and said so
 expect census_later_no_isexcluded not grep -q '^tmutil isexcluded' "$S/calls"
@@ -1028,6 +1036,8 @@ tm_dismissed() { awk '/killall UserNotificationCenter$/ { if (a) bad = 1; d = 1;
 expect census_later_dismissed_before_attach tm_dismissed
 expect census_later_no_destination not grep -Eq 'tmutil (setdestination|removedestination)' "$S/calls"
 expect census_later_shots test "$(grep -Ec 'screencapture -x .*/(hfs|exfat|ext4)-tm-offer.png$' "$S/calls")" -eq 3
+# (fix round 1) the offer is not awaited (it may never come for linuxfs), and each shot says so
+expect census_later_tm_not_awaited test "$(grep -Ec '^tm-offer (hfs|exfat|ext4): not awaited: .*; photographed after 5 s$' "$P/shots.txt")" -eq 3
 expect census_later_quiet hasnt "$r" "not ok"
 expect census_later_detached test -z "$(attached)"
 
@@ -1072,6 +1082,26 @@ census_finder_dialogs step-z > /dev/null 2>&1
 rm -f "$S/dialog-force"
 expect census_dialogs_force_left grep -q '^step-z: left up (Force Eject…): .*: Finder restarted$' "$P/dialogs.txt"
 expect census_dialogs_force_restart grep -q '^guest-macosx-aqua killall Finder$' "$S/calls"
+# (fix round 1) on 10.9 Finder's eject alerts are invisible to System Events, so after Finder was asked to eject (in a
+#   subshell, as bounded runs it) the next dismissal restarts Finder whatever System Events says, says so, and only once;
+#   a Finder step that ejects nothing leaves no restart; the eject's shot is not awaited (no System Events wait), but
+#   taken after 3 s; nothing presses a key (Force Eject can never be pressed)
+rm -f "$P/dialogs.txt" "$P/shots.txt"; : > "$S/calls"
+bounded 1600 census_finder_eject "$T/b" FSQ > /dev/null 2>&1
+expect census_eject_shot_not_awaited not grep -q 'return exists (first window' "$S/calls"
+expect census_eject_shot_said grep -q '^busy-eject fsq: not awaited: Finder.s eject alerts are invisible to System Events on 10.9; photographed after 3 s$' "$P/shots.txt"
+: > "$S/calls"; census_finder_dialogs step-e > /dev/null 2>&1
+expect census_eject_restarts grep -q '^guest-macosx-aqua killall Finder$' "$S/calls"
+expect census_eject_restart_said grep -q '^step-e: restarted Finder after an eject (alerts invisible to System Events on 10.9)$' "$P/dialogs.txt"
+: > "$S/calls"; census_finder_dialogs step-f > /dev/null 2>&1
+expect census_eject_restart_once not grep -q 'killall Finder' "$S/calls"
+bounded 1600 census_finder_eject "$T/b" FSQ > /dev/null 2>&1; bounded 1600 census_finder_eject "$T/a" CTL > /dev/null 2>&1
+expect census_eject_restart_between_sides test "$(grep -c 'killall Finder' "$S/calls")" -eq 1
+census_finder_dialogs step-h > /dev/null 2>&1
+bounded 1600 census_finder_ask trash-delete "$T/b" 'tell application "Finder" to delete (POSIX file "/x" as alias)' > /dev/null 2>&1
+: > "$S/calls"; census_finder_dialogs step-g > /dev/null 2>&1
+expect census_no_eject_no_restart not grep -q 'killall Finder' "$S/calls"
+expect census_no_keystrokes test -z "$(grep -n 'keystroke\|key code' "$here/lib/parity.sh" | grep -v '^[0-9]*: *#')"
 : > "$S/calls"; r=$(census_on ext4 true 2>&1)
 expect census_on_dismisses grep -q 'click button "Cancel"' "$S/calls"
 expect census_on_dialogs_said grep -q '^after true ext4: OK: ' "$P/dialogs.txt"
@@ -1099,6 +1129,37 @@ for c in calm hfs stuck; do echo "sweep $c" > "$W/census/sweep-$c.img"; done   #
 rm -f "$P/census-sweep.txt"
 r=$(PARITY_SWEEP_SECS=0; census_on ext4 leave 2>&1)
 expect census_sweep_no_time test "$(grep -c '^after leave ext4: /dev/disk[0-9]* .*: not tried: the sweep.s 0 s are up$' "$P/census-sweep.txt")" -eq 3
+drop_stuck sweep-; rm -f "${W:?}"/census/sweep-*.img
+# (fix round 1) the sweep never detaches by force a disk a live lklfuse may hold: with mount unreadable it tries nothing;
+#   with no mount line, a disk an lklfuse names (/dev/rdiskN), or a linuxfs image's, or any when ps cannot say, is ejected
+#   (census_detach fs), never detached by force; only a disk of Apple's image, no lklfuse on it, is
+sw_one() { hdiutil attach -nomount "$W/census/sweep-$1.img" > /dev/null 2>&1; echo "disk$(cat "$S/disks")"; }
+for c in stuck-hfs-held stuck-hfs-psless stuck-hfs-plain stuck-ext4; do echo "sweep $c" > "$W/census/sweep-$c.img"; done
+: > "$S/calls"
+d=$(sw_one stuck-hfs-held); echo "$d" > "$S/lklfuse-holds"
+r=$(census_sweep_disk "/dev/$d" "$W/census/sweep-stuck-hfs-held.img")
+rm -f "$S/lklfuse-holds"
+expect census_sweep_held_said test "$r" = "no mount line, but an lklfuse names /dev/r$d: its eject failed; left attached (never detached by force)"
+expect census_sweep_held_not_forced not grep -q 'detach -force' "$S/calls"
+expect census_sweep_held_tried grep -q "^diskutil eject /dev/$d\$" "$S/calls"
+d=$(sw_one stuck-hfs-psless); : > "$S/ps-fail"
+r=$(census_sweep_disk "/dev/$d" "$W/census/sweep-stuck-hfs-psless.img")
+rm -f "$S/ps-fail"
+expect census_sweep_psless_said test "$r" = "no mount line, but ps could not say whether an lklfuse holds it: its eject failed; left attached (never detached by force)"
+expect census_sweep_psless_not_forced not grep -q 'detach -force' "$S/calls"
+d=$(sw_one stuck-ext4)
+rm -f "$P/census-sweep.txt"; census_sweep stepq "$(census_attached | grep -v sweep-stuck-ext4)"
+expect census_sweep_fs_image grep -q "^stepq: /dev/$d .*/sweep-stuck-ext4.img: no mount line, but a linuxfs image: its eject failed; left attached (never detached by force)\$" "$P/census-sweep.txt"
+expect census_sweep_fs_image_not_forced not grep -q 'detach -force' "$S/calls"
+: > "$S/mount-fail"; : > "$S/calls"
+r=$(census_sweep_disk "/dev/$d" "$W/census/sweep-stuck-ext4.img")
+rm -f "$S/mount-fail"
+expect census_sweep_mount_unreadable test "$r" = "mount unreadable; not tried"
+expect census_sweep_mount_unreadable_untouched not grep -q '^diskutil \(eject\|unmount\)\|^hdiutil detach' "$S/calls"
+d=$(sw_one stuck-hfs-plain); : > "$S/calls"
+r=$(census_sweep_disk "/dev/$d" "$W/census/sweep-stuck-hfs-plain.img")
+expect census_sweep_apple_forced test "$r" = "nothing mounted, no lklfuse on it, an image of Apple's: detached"
+expect census_sweep_apple_forced_call grep -q "^hdiutil detach -force /dev/$d\$" "$S/calls"
 drop_stuck sweep-; rm -f "${W:?}"/census/sweep-*.img
 expect census_sweep_after_stall test -n "$(sed -n '/^parity_census_all()/,/^}/p' "$here/lib/parity.sh" | grep 'census_after census_stall')"
 expect census_sweep_after_later test -n "$(sed -n '/^parity_census_all()/,/^}/p' "$here/lib/parity.sh" | grep 'census_after census_later')"
@@ -1194,13 +1255,13 @@ nb() { printf '%s\n' "$@" > "$P/names-mode.txt"; census_names_bar 2>&1; }
 r=$(PARITY_NAMES_WANT=exact; nb 'disk3 /Volumes/a: exact (x)' 'disk5 /Volumes/c: none (no names line in L)')
 expect census_names_bar_ok test "$r" = "ok - census names: no linuxfs census mount ran scanning (1 exact, 0 scanning, 1 with no names line, of 2)"
 r=$(PARITY_NAMES_WANT=exact; nb 'disk3 /Volumes/a: exact (x)' 'disk4 /Volumes/b b: scanning (y)')
-expect census_names_bar_scanning_notok has "$r" "^not ok - census names: no linuxfs census mount ran scanning (1 exact, 1 scanning, 0 with no names line, of 2)$"
-expect census_names_bar_scanning_said has "$r" "^census names: 1 ran scanning, though PARITY_NAMES_WANT is exact: disk4 /Volumes/b b$"
+expect census_names_bar_scanning_notok has "$r" "^not ok - census names: 1 ran scanning, though PARITY_NAMES_WANT is exact (1 exact, 1 scanning, 0 with no names line, of 2)$"
+expect census_names_bar_scanning_said has "$r" "^census names: ran scanning: disk4 /Volumes/b b$"
 r=$(PARITY_NAMES_WANT=exact; nb 'disk5 /Volumes/c: none (no names line in L)')
-expect census_names_bar_none_notok has "$r" "^not ok - census names: "
-expect census_names_bar_none_said has "$r" "^census names: none ran exact, so this proves nothing$"
+expect census_names_bar_none_notok has "$r" "^not ok - census names: none ran exact, so this proves nothing (0 exact, 0 scanning, 1 with no names line, of 1)$"
+expect census_names_bar_none_said hasnt "$r" "no linuxfs census mount ran"
 rm -f "$P/names-mode.txt"; r=$(PARITY_NAMES_WANT=exact; census_names_bar 2>&1)
-expect census_names_bar_nofile_notok has "$r" "^not ok - census names: no linuxfs census mount ran scanning (0 exact, 0 scanning, 0 with no names line, of 0)$"
+expect census_names_bar_nofile_notok has "$r" "^not ok - census names: none ran exact, so this proves nothing (0 exact, 0 scanning, 0 with no names line, of 0)$"
 r=$(PARITY_NAMES_WANT=scanning; nb 'disk4 /Volumes/b: scanning (y)')
 expect census_names_bar_older test "$r" = "ok - census names: no linuxfs census mount ran exact (0 exact, 1 scanning, 0 with no names line, of 1)"
 r=$(unset PARITY_NAMES_WANT; nb 'disk4 /Volumes/b: scanning (y)')
@@ -1296,15 +1357,30 @@ expect smoke_type_before_login ascending "$bl" "$(first_line 'mount_type_is "$mp
 expect smoke_names_want ascending "$(first_line 'PARITY_NAMES_WANT=exact')" "$(first_line '^ *parity_census_all$')"
 expect smoke_names_want_by_macfuse grep -q 'if macfuse_at_least 5 5 0 5; then PARITY_NAMES_WANT=exact; else PARITY_NAMES_WANT=scanning; fi' "$sm"
 # item 5 (Task 13b): the smoke returns system.log from its own start (the census's window in it), not its last 3000 lines;
-#   across newsyslog's turnover (the first line differs), the rest of system.log.0.bz2 first, then the new file
+#   across a turnover (the first line differs), the rest of the rotated file FIRST began, those after it, then the new one
 printf '%s\n' first a b > "$T/sl"
-r=$(eval "$(smoke_fn syslog_since)"; printf '%s\n' c d >> "$T/sl"; syslog_since 3 first "$T/sl")
+r=$(eval "$(smoke_fn syslog_rotated; smoke_fn syslog_since)"; printf '%s\n' c d >> "$T/sl"; syslog_since 3 first "$T/sl")
 expect smoke_syslog_since test "$r" = "$(printf '%s\n' c d)"
+# (fix round 1) 10.9's aslmanager rotates system.log by size, gzipped, as system.log.0.gz (newest) to .N.gz: the walk goes
+#   back (bounded) to the file FIRST began; newsyslog's .bz2 is read when there is no .gz
+printf '%s\n' first a b c | gzip > "$T/sl.0.gz"; printf '%s\n' new e > "$T/sl"
+r=$(eval "$(smoke_fn syslog_rotated; smoke_fn syslog_since)"; syslog_since 3 first "$T/sl")
+expect smoke_syslog_rotated test "$r" = "$(printf '%s\n' c new e)"
+printf '%s\n' first a b c | gzip > "$T/sl.1.gz"; printf '%s\n' x y | gzip > "$T/sl.0.gz"
+r=$(eval "$(smoke_fn syslog_rotated; smoke_fn syslog_since)"; syslog_since 3 first "$T/sl")
+expect smoke_syslog_rotated_twice test "$r" = "$(printf '%s\n' c x y new e)"
+printf '%s\n' other | gzip > "$T/sl.1.gz"
+r=$(eval "$(smoke_fn syslog_rotated; smoke_fn syslog_since)"; syslog_since 3 first "$T/sl")
+expect smoke_syslog_lost_said has "$r" "^# syslog_since: "
+expect smoke_syslog_lost_rest has "$r" "^x$"
+expect smoke_syslog_lost_new test "$(printf '%s\n' "$r" | tail -n 2)" = "$(printf '%s\n' new e)"
+expect smoke_syslog_walk_bounded test -n "$(smoke_fn syslog_since | grep -e '-lt 20')"
+rm -f "$T"/sl.*.gz
 if command -v bzip2 > /dev/null 2>&1; then
-  printf '%s\n' first a b c | bzip2 > "$T/sl.0.bz2"; printf '%s\n' new e > "$T/sl"
-  r=$(eval "$(smoke_fn syslog_since)"; syslog_since 3 first "$T/sl")
-  expect smoke_syslog_rotated test "$r" = "$(printf '%s\n' c new e)"
-else echo "ok - smoke_syslog_rotated # SKIP no bzip2"; fi
+  printf '%s\n' first a b c | bzip2 > "$T/sl.0.bz2"
+  r=$(eval "$(smoke_fn syslog_rotated; smoke_fn syslog_since)"; syslog_since 3 first "$T/sl")
+  expect smoke_syslog_rotated_bz2 test "$r" = "$(printf '%s\n' c new e)"
+else echo "ok - smoke_syslog_rotated_bz2 # SKIP no bzip2"; fi
 rm -f "$T/sl" "$T/sl.0.bz2"
 expect smoke_syslog_not_tail test -z "$(grep -n 'tail -n 3000' "$sm")"
 expect smoke_syslog_mark ascending "$(first_line '^PARITY_T0=')" "$(first_line '^LOG0=')" "$(first_line '^installed=')"
