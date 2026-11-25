@@ -605,6 +605,9 @@ static int run_cli(const char *cli, const struct mountreq *req, const char *pw, 
 }
 
 
+#ifndef OPTS_MAX
+#define OPTS_MAX 400	/* mount_macfuse's -o list; the test build shrinks it to force the refusal */
+#endif
 #define PRIV_DIR "/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d"
 #define RUN_USER "_linuxfs"
 #define MOUNT_MACFUSE "/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse"
@@ -1148,7 +1151,7 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 {
 	static const char *const vars[] = { ROOT_CLI_ENV, "LINUXFS_FUSE_FD=" STR(FUSE_FD), "LINUXFS_FUSE_CHAN=" STR(CHAN_FD), NULL };
 	const struct fsname *nm;
-	char opts[400], vol[256], commenv[32], hout_buf[4096], rhelper[PATH_MAX];
+	char opts[OPTS_MAX], vol[256], commenv[32], hout_buf[4096], rhelper[PATH_MAX];
 	char daemon_env[] = "_FUSE_DAEMON_PATH=" PRIV_DIR "/lklfuse";
 	char *hargv[5], *henv[5];
 	const char *helper = mount_helper();
@@ -1162,8 +1165,9 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 	nm = fsrules_name(fs);
 	if (!nm)
 		return refuse(fs, "no such filesystem");
-	snprintf(opts, sizeof opts, "allow_other,local,volname=%s,fsname=linuxfs@%s,noappledouble,fstypename=%s,fssubtype=%d%s", vol, bsd,
-		 nm->fstypename, nm->subtype, ro ? ",rdonly" : "");
+	if (snprintf(opts, sizeof opts, "allow_other,local,volname=%s,fsname=linuxfs@%s,noappledouble,fstypename=%s,fssubtype=%d%s", vol, bsd,
+		     nm->fstypename, nm->subtype, ro ? ",rdonly" : "") >= (int)sizeof opts)
+		return refuse(fs, "the mount options do not fit (a volume name too long)");
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, cs) != 0)
 		return refuse(fs, "cannot make mount_macfuse's socket");
 	if (pipe(hout) != 0 || socketpair(AF_UNIX, SOCK_STREAM, 0, ch) != 0) {

@@ -309,6 +309,10 @@ mkdir -p "$D/drop"
   -DLINUXFS_FS_TEST_DROP -o "$D/drop/mount_macfuse_ext4" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" \
   -framework CoreFoundation -framework DiskArbitration || exit 1
 DM=$D/drop/mount_macfuse_ext4
+mkdir -p "$D/short"
+"$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN \
+  -DLINUXFS_FS_TEST_DROP -DOPTS_MAX=60 -o "$D/short/mount_macfuse_ext4" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" \
+  -framework CoreFoundation -framework DiskArbitration || exit 1
 V=$D/vols; rm -rf "$V"; mkdir -p "$V/NAME" "$V/other"; : > "$V/file"; ln -s "$V/NAME" "$V/link"
 H=/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d
 UID_D=$(id -u daemon)
@@ -376,6 +380,11 @@ fwant ro "allow_other,local,volname=NAME,fsname=linuxfs@$E,noappledouble,fstypen
 mkdir -p "$V/a,b=c"
 fplan "$MF/5.5.0-mavericks.2.plist" "/dev/$E" "$V/a,b=c" > "$M/plan" 2>&1
 grep -qx "helper-argv allow_other,local,volname=a-b-c,fsname=linuxfs@$E,noappledouble,fstypename=ext4,fssubtype=7" "$M/plan"; ok $? "root mount plan: the volume name is the mount point's, made safe for an option list ($(grep '^helper-argv a' "$M/plan"))"
+# spec: tools/fs.c mount_by_root -- options that do not fit are refused, never cut (a cut one would lose a trailing rdonly)
+DM_EXT=$DM; DM=$D/short/mount_macfuse_ext4
+fplan "$F2" -o rdonly "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
+[ $rc = 1 ] && ! grep -q '^helper' "$M/plan" && grep -q 'do not fit' "$M/plan"; ok $? "root mount plan: options that do not fit are refused, not cut (rc $rc: $(tail -1 "$M/plan"))"
+DM=$DM_EXT
 # spec: tools/fs.c mount_by_root -- the mount's options end with the filesystem's fstypename and fssubtype (tools/fsrules.c's names table)
 cp "$DM" "$D/drop/mount_macfuse_ntfs"
 DM_EXT=$DM; DM=$D/drop/mount_macfuse_ntfs
