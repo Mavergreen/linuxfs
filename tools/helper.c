@@ -312,6 +312,52 @@ done:
 	return why;
 }
 
+/* ---- whose disk it is ---- */
+
+/* The test build (LINUXFS_HELPER_TEST, never shipped) takes a node's owner from LINUXFS_HELPER_TEST_NODE_UID when it is set
+ * (a test cannot chown its stand-in), and an opened descriptor's from LINUXFS_HELPER_TEST_FD_NODE_UID, else the same; the
+ * shipped build carries neither name. */
+#ifdef LINUXFS_HELPER_TEST
+#define TEST_ENV(name) (name)
+#else
+#define TEST_ENV(name) NULL
+#endif
+
+/* "another user's disk" when a node owned by UID is not PEER's to have (fsrules_node_owner_ok), else NULL */
+static const char *owner_refusal(uid_t uid, const char *test, uid_t peer)
+{
+#ifdef LINUXFS_HELPER_TEST
+	const char *t = getenv(test) ? getenv(test) : getenv("LINUXFS_HELPER_TEST_NODE_UID");
+
+	if (t)
+		uid = (uid_t)strtoul(t, NULL, 10);
+#else
+	(void)test;
+#endif
+	return fsrules_node_owner_ok(uid, peer) ? NULL : "another user's disk";
+}
+
+/* Why DEV's node may not be handed to PEER, or NULL: checked before anything else is done with it */
+static const char *helper_node_refusal(const char *dev, uid_t peer)
+{
+	struct stat st;
+
+	if (stat(dev, &st) != 0)
+		return why_errno(dev);
+	return owner_refusal(st.st_uid, TEST_ENV("LINUXFS_HELPER_TEST_NODE_UID"), peer);
+}
+
+/* The same of the descriptor itself once opened (review m2): a node detached and reused by another user between the stat
+ * and the open is refused, and never handed out. */
+static const char *helper_fd_refusal(int fd, uid_t peer)
+{
+	struct stat st;
+
+	if (fstat(fd, &st) != 0)
+		return why_errno("cannot check the opened disk");
+	return owner_refusal(st.st_uid, TEST_ENV("LINUXFS_HELPER_TEST_FD_NODE_UID"), peer);
+}
+
 /* ---- --migrate-prefs: Ignore:<LABEL> preferences become fstab entries ---- */
 
 #define MIGRATE_DISKS 64
@@ -320,21 +366,28 @@ done:
  * is only the Linux every unnamed volume gets), and its UUID (the util's -k; empty when none) */
 struct seen_disk { const char *type; char vol[256]; char uuid[40]; };
 
-/* PATH's disk, through the same checks as a probe request (helper_media_refusal before and after the probe), when one of
- * linuxfs's bundles would mount it; 0, or -1. A path that is not a raw disk node is a test's stand-in (no IOKit facts). */
-static int see_disk(const char *path, struct seen_disk *d)
+/* PATH's disk, through the same checks as a probe request (whose disk it is for PEER, helper_media_refusal before and after
+ * the probe), when one of linuxfs's bundles would mount it; 0, or -1. A path that is not a raw disk node is a test's
+ * stand-in (no IOKit facts). Another user's disk is never read (review m5): no oracle for its labels and UUIDs. */
+static int see_disk(const char *path, struct seen_disk *d, uid_t peer)
 {
 	struct media_facts facts = { "", 1, 1 };
 	char label[512];
 	const char *type;
 	int fd, err, raw = helper_device_ok(path);
 
+	if (helper_node_refusal(path, peer))
+		return -1;
 	if (raw && (helper_media_facts(path + 6, &facts) < 0 || helper_media_refusal(facts.content, facts.leaf, facts.ejectable, NULL, 0)))
 		return -1;
 	/* a stand-in opens as a plain file would (a FIFO with no writer blocks: a disk that never answers) */
 	fd = open(path, O_RDONLY | (raw ? O_NONBLOCK : 0) | O_NOCTTY | O_CLOEXEC);
 	if (fd < 0)
 		return -1;
+	if (helper_fd_refusal(fd, peer)) {
+		close(fd);
+		return -1;
+	}
 	type = linuxfs_probe_fd(fd, label, sizeof(label), &err);
 	if (!type || !fstab_bundle_for(type) || helper_media_refusal(facts.content, facts.leaf, facts.ejectable, type, 0)) {
 		close(fd);
@@ -364,7 +417,7 @@ static long long now_ms(void)
 
 /* see_disk in a child, so that a disk that never answers holds up only the child: 0 or -1 as see_disk; -2 when it gave no
  * answer by DEADLINE (now_ms), and the child is killed. */
-static int see_disk_bounded(const char *path, struct seen_disk *d, long long deadline)
+static int see_disk_bounded(const char *path, struct seen_disk *d, long long deadline, uid_t peer)
 {
 	int p[2], r = -1;
 	ssize_t got;
@@ -381,7 +434,7 @@ static int see_disk_bounded(const char *path, struct seen_disk *d, long long dea
 	}
 	if (pid == 0) {
 		close(p[0]);
-		if (see_disk(path, d) == 0)
+		if (see_disk(path, d, peer) == 0)
 			(void)!write(p[1], d, sizeof(*d));
 		_exit(0);
 	}
@@ -409,10 +462,10 @@ static int see_disk_bounded(const char *path, struct seen_disk *d, long long dea
 	return r;
 }
 
-/* The attached disks linuxfs's bundles would mount: /dev's raw disk nodes, or (tests, only when not root) the files named
+/* The attached disks linuxfs's bundles would mount, of those PEER may have (see_disk): /dev's raw disk nodes, or (tests, only when not root) the files named
  * in LINUXFS_TEST_DISKS, colon-separated. The whole scan has SCAN_SECONDS (LINUXFS_SCAN_SECONDS when not root); a disk that
  * does not answer by then ends it, the rest skipped, and sets scan_hung. */
-static int scan_disks(struct seen_disk *d, int max)
+static int scan_disks(struct seen_disk *d, int max, uid_t peer)
 {
 	const char *test = getuid() != 0 ? getenv("LINUXFS_TEST_DISKS") : NULL;
 	const char *secs = getuid() != 0 ? getenv("LINUXFS_SCAN_SECONDS") : NULL;
@@ -446,7 +499,7 @@ static int scan_disks(struct seen_disk *d, int max)
 			if (snprintf(path, sizeof(path), "/dev/%s", e->d_name) >= (int)sizeof(path) || !helper_device_ok(path))
 				continue;
 		}
-		r = see_disk_bounded(path, &d[n], deadline);
+		r = see_disk_bounded(path, &d[n], deadline, peer);
 		if (r == -2) {
 			scan_hung = 1;
 			break;
@@ -460,11 +513,12 @@ static int scan_disks(struct seen_disk *d, int max)
 }
 
 /* NULL when an attached disk is SPEC's volume (UUID=, or LABEL= its volume name) of BUNDLE's type; else why not. A console
- * user may keep only a volume attached now from mounting by itself, never name any volume at all. */
-const char *helper_noauto_attached(const char *spec, const char *bundle)
+ * user may keep only a volume attached now from mounting by itself, never name any volume at all, and only one on a disk
+ * of the Mac's or the user's own (PEER's). */
+const char *helper_noauto_attached(const char *spec, const char *bundle, uid_t peer)
 {
 	static struct seen_disk disks[MIGRATE_DISKS];
-	int i, n = scan_disks(disks, MIGRATE_DISKS);
+	int i, n = scan_disks(disks, MIGRATE_DISKS, peer);
 
 	for (i = 0; i < n; i++) {
 		if (strcmp(fstab_bundle_for(disks[i].type), bundle) != 0)
@@ -477,7 +531,7 @@ const char *helper_noauto_attached(const char *spec, const char *bundle)
 }
 
 /* One Ignore:<RAW> = true from DOM: converted (printed to OUT) or logged. */
-static void migrate_one(FILE *out, const char *dom, const char *raw, struct seen_disk *disks, int *ndisks)
+static void migrate_one(FILE *out, const char *dom, const char *raw, struct seen_disk *disks, int *ndisks, uid_t peer)
 {
 	char name[256], spec[300];
 	const char *why, *bundle = NULL;
@@ -498,7 +552,7 @@ static void migrate_one(FILE *out, const char *dom, const char *raw, struct seen
 		return;
 	}
 	if (*ndisks < 0)
-		*ndisks = scan_disks(disks, MIGRATE_DISKS);
+		*ndisks = scan_disks(disks, MIGRATE_DISKS, peer);
 	for (i = 0; i < *ndisks && !bundle; i++)
 		if (strcmp(disks[i].vol, name) == 0)
 			bundle = fstab_bundle_for(disks[i].type);
@@ -515,8 +569,8 @@ static void migrate_one(FILE *out, const char *dom, const char *raw, struct seen
 }
 
 /* Converts each Ignore:<LABEL> = true of the console user's and the machine's preferences (plist.c reads them as root
- * safely); 0. */
-int helper_migrate(FILE *out)
+ * safely), looking only at disks of the Mac's or PEER's (the console user; the caller, when not root: tests); 0. */
+int helper_migrate(FILE *out, uid_t peer)
 {
 	static struct seen_disk disks[MIGRATE_DISKS];
 	static const char *const dom[2] = { "user", "machine" };
@@ -544,7 +598,7 @@ int helper_migrate(FILE *out)
 					fprintf(stderr, "linuxfs-helper: an Ignore: preference (%s) left as it is: its label is too long\n", dom[j]);
 					continue;
 				}
-				migrate_one(out, dom[j], key + 7, disks, &ndisks);
+				migrate_one(out, dom[j], key + 7, disks, &ndisks, peer);
 			}
 			free(keys);
 		}
@@ -561,21 +615,6 @@ static uid_t console_uid(void)
 	return stat("/dev/console", &st) == 0 ? st.st_uid : (uid_t)-1;
 }
 #endif
-
-/* Why DEV's node may not be handed to PEER (fsrules_node_owner_ok), or NULL. The test build (LINUXFS_HELPER_TEST, never
- * shipped) takes the node's owner from LINUXFS_HELPER_TEST_NODE_UID when it is set: a test cannot chown its stand-in. */
-static const char *helper_node_refusal(const char *dev, uid_t peer)
-{
-	struct stat st;
-
-	if (stat(dev, &st) != 0)
-		return why_errno(dev);
-#ifdef LINUXFS_HELPER_TEST
-	if (getenv("LINUXFS_HELPER_TEST_NODE_UID"))
-		st.st_uid = (uid_t)strtoul(getenv("LINUXFS_HELPER_TEST_NODE_UID"), NULL, 10);
-#endif
-	return fsrules_node_owner_ok(st.st_uid, peer) ? NULL : "another user's disk";
-}
 
 static void reply(int c, const char *msg, int fd)
 {
@@ -652,7 +691,7 @@ void helper_serve(int c, uid_t peer, uid_t console, int test_files)
 			}
 			*bundle++ = '\0';
 		}
-		why = bundle && !fstab_spec_refusal(spec) && !fstab_bundle_refusal(bundle) ? helper_noauto_attached(spec, bundle) : NULL;
+		why = bundle && !fstab_spec_refusal(spec) && !fstab_bundle_refusal(bundle) ? helper_noauto_attached(spec, bundle, peer) : NULL;
 		if (!why)
 			why = helper_noauto(helper_fstab_path(), spec, bundle);
 		if (why)
@@ -708,6 +747,12 @@ void helper_serve(int c, uid_t peer, uid_t console, int test_files)
 		reply(c, msg, -1);
 		return;
 	}
+	if ((why = helper_fd_refusal(fd, peer))) {
+		snprintf(msg, sizeof(msg), "no %s\n", why);
+		reply(c, msg, -1);
+		close(fd);
+		return;
+	}
 	type = linuxfs_probe_fd(fd, label, sizeof(label), &err);
 	if (!type) {
 		snprintf(msg, sizeof(msg), "no %s\n", err ? strerror(err) : "no filesystem linuxfs knows");
@@ -753,7 +798,7 @@ int main(int argc, char **argv)
 		setvbuf(stdout, NULL, _IOLBF, 0);
 		signal(SIGALRM, SIG_DFL);
 		alarm(120);	/* a disk that never answers its probe must not hold up the install */
-		return helper_migrate(stdout);
+		return helper_migrate(stdout, getuid() != 0 ? getuid() : console_uid());
 	}
 	if (argc == 2 && strcmp(argv[1], "--noauto-remove-all") == 0) {
 		const char *why = helper_noauto(helper_fstab_path(), NULL, NULL);

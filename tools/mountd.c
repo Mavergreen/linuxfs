@@ -12,6 +12,7 @@ const char *helper_media_refusal(const char *content, int leaf, int ejectable, c
 
 #define MOUNTD_REQ_MAX 1024
 #define VOLUMES "/Volumes/"
+#define MOUNTD_NAME_MAX 255	/* NAME_MAX: a longer name could never be opened */
 
 /* field F (N bytes) into OUT (LEN bytes) as a string: 1, or 0 when it does not fit */
 static int field(char *out, size_t len, const char *f, size_t n)
@@ -68,7 +69,7 @@ int mountd_parse(const char *buf, size_t len, struct mountd_req *r, const char *
 		return -1;
 	name = q.mnt + strlen(VOLUMES);
 	nlen = strlen(name);
-	if (nlen == 0 || strchr(name, '/') || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+	if (nlen == 0 || nlen > MOUNTD_NAME_MAX || strchr(name, '/') || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
 		return -1;
 	for (i = 0; i < nlen; i++)
 		if ((unsigned char)name[i] < 0x20 || (unsigned char)name[i] == 0x7f)
@@ -93,6 +94,9 @@ enum mountd_verdict mountd_judge(const struct mountd_req *r, const struct mountd
 
 	*rc = 1;
 #define REFUSE(w) do { *why = (w); return MD_REFUSE; } while (0)
+	/* root mounts by itself (the peer check answers it before judging; this keeps "an image only the peer's" true for 0) */
+	if (peer == 0)
+		REFUSE("root mounts by itself");
 	/* 1. DiskArbitration's facts */
 	if (!n)
 		REFUSE("not a filesystem linuxfs mounts");
@@ -155,11 +159,11 @@ int mountd_mnt_facts(const struct stat *opened, const struct stat *entry, const 
 	return -1;
 }
 
-int mountd_adopted(const struct stat *after, const struct stat *entry_after, uid_t peer, const char **why)
+int mountd_adopted(const struct stat *after, const struct stat *entry_after, int empty_after, uid_t peer, const char **why)
 {
 	(void)peer;	/* on -1 the caller gives the directory back to the peer */
 	if (!S_ISDIR(after->st_mode) || after->st_uid != 0 || (after->st_mode & 07777) != 0755 ||
-	    after->st_dev != entry_after->st_dev || after->st_ino != entry_after->st_ino) {
+	    after->st_dev != entry_after->st_dev || after->st_ino != entry_after->st_ino || !empty_after) {
 		*why = "the mount point changed";
 		return -1;
 	}

@@ -204,6 +204,10 @@ out=$(tor 502 --probe "$D/ext4.img"); rc=$?
 test $rc -eq 1 && echo "$out" | grep -qx "linuxfs-open: $D/ext4.img: another user's disk"; ok $? "probe of it: refused (rc $rc: '$(echo "$out" | head -1)')"
 out=$(tor 502 --uuid "$D/ext4.img"); rc=$?
 test $rc -eq 1 && test "$out" = "linuxfs-open: $D/ext4.img: another user's disk"; ok $? "uuid of it: refused (rc $rc: '$out')"
+cp "$F" "$D/fstab.owner"
+out=$(tor 502 --noauto-add "LABEL=helped" macfuse_ext4); rc=$?
+test $rc -eq 1 && test "$out" = "linuxfs-open: no attached linuxfs volume matches" && cmp -s "$F" "$D/fstab.owner"
+ok $? "noauto-add does not see another user's disk, and the fstab is untouched (rc $rc: '$out')"
 out=$(tor "$(id -u)" "$D/ext4.img" "$D/probe" /dev/fd/3); rc=$?
 test $rc -eq 0 && test "$out" = "ext4${T}helped"; ok $? "the caller's own disk: opened, on fd 3 (rc $rc: '$out')"
 out=$(tor 0 "$D/ext4.img" "$D/probe" /dev/fd/3); rc=$?

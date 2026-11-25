@@ -92,6 +92,9 @@ static void answers(const char *req, uid_t peer, uid_t console, const char *want
 	}
 }
 
+/* the opened descriptor's owner, for the test build (LINUXFS_HELPER_TEST_FD_NODE_UID; NULL: as the path's) */
+static const char *fd_node;
+
 /* helper_serve of REQ for PEER (test files, console = PEER) with LINUXFS_HELPER_TEST_NODE_UID=NODE (NULL: unset): its reply
  * begins with WANT, and a descriptor came with it exactly when FD says */
 static void served(const char *req, uid_t peer, const char *node, const char *want, int fd, const char *what)
@@ -110,6 +113,10 @@ static void served(const char *req, uid_t peer, const char *node, const char *wa
 		setenv("LINUXFS_HELPER_TEST_NODE_UID", node, 1);
 	else
 		unsetenv("LINUXFS_HELPER_TEST_NODE_UID");
+	if (fd_node)
+		setenv("LINUXFS_HELPER_TEST_FD_NODE_UID", fd_node, 1);
+	else
+		unsetenv("LINUXFS_HELPER_TEST_FD_NODE_UID");
 	socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
 	write(sv[1], req, strlen(req));
 	helper_serve(sv[0], peer, peer, 1);
@@ -125,6 +132,7 @@ static void served(const char *req, uid_t peer, const char *node, const char *wa
 	close(sv[0]);
 	close(sv[1]);
 	unsetenv("LINUXFS_HELPER_TEST_NODE_UID");
+	unsetenv("LINUXFS_HELPER_TEST_FD_NODE_UID");
 	tapno++;
 	if (n > 0 && strncmp(buf, want, strlen(want)) == 0 && (got >= 0) == fd) {
 		printf("ok %d - %s\n", tapno, what);
@@ -342,6 +350,36 @@ int main(int argc, char **argv)
 		served(open_rw, getuid(), "0", "ok ext4\thelped", 1, "owner: open of a disk whose node is root's: ok, with the descriptor");
 		served(uuid, getuid(), "0", "ok ", 0, "owner: uuid of a disk whose node is root's: ok");
 		served(open_rw, getuid(), NULL, "ok ext4\thelped", 1, "owner: with no stand-in, the file's own owner (the caller): ok");
+		/* m2: the descriptor handed out is checked itself, so a node reused between the stat and the open is refused */
+		fd_node = "502";
+		served(open_rw, getuid(), me, "no another user's disk", 0, "owner (m2): the opened node another user's: refused, no descriptor");
+		served(probe, getuid(), me, "no another user's disk", 0, "owner (m2): probe too");
+		served(uuid, getuid(), me, "no another user's disk", 0, "owner (m2): and uuid");
+		fd_node = "0";
+		served(open_rw, getuid(), me, "ok ext4\thelped", 1, "owner (m2): the opened node root's: ok, with the descriptor");
+		fd_node = NULL;
+		/* m5 (controller's ruling): noauto-add's scan of the attached disks skips another user's, so it is no oracle for
+		 * their labels or UUIDs, and never writes an entry for one */
+		{
+			char dir[] = "/tmp/helper-owner.XXXXXX", f[256];
+
+			mkdtemp(dir);
+			snprintf(f, sizeof(f), "%s/fstab", dir);
+			setenv("LINUXFS_FSTAB", f, 1);
+			setenv("LINUXFS_HELPER_TEST_NODE_UID", "502", 1);
+			answers("noauto-add LABEL=helped macfuse_ext4\n", getuid(), getuid(), "no no attached linuxfs volume matches",
+				"owner (m5): noauto-add does not see another user's disk");
+			iss(slurp(f), "(none)", "owner (m5): and writes no fstab");
+			setenv("LINUXFS_HELPER_TEST_NODE_UID", "0", 1);
+			answers("noauto-add LABEL=helped macfuse_ext4\n", getuid(), getuid(), "ok", "owner (m5): a disk whose node is root's is seen");
+			setenv("LINUXFS_HELPER_TEST_NODE_UID", me, 1);
+			answers("noauto-remove LABEL=helped\n", getuid(), getuid(), "ok", "owner (m5): (its entry removed)");
+			answers("noauto-add LABEL=helped macfuse_ext4\n", getuid(), getuid(), "ok", "owner (m5): and so is the caller's own");
+			unsetenv("LINUXFS_HELPER_TEST_NODE_UID");
+			unsetenv("LINUXFS_FSTAB");
+			unlink(f);
+			rmdir(dir);
+		}
 	}
 	else
 		is(argc, 2, "the ext4 image is named (helper-test.sh does)");

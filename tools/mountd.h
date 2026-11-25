@@ -17,8 +17,8 @@ struct mountd_req { char fs[8], bsd[40], mnt[1024]; int ro, owners; };
 /* Reads exactly one line of LEN bytes, mount<TAB>FS<TAB>BSD<TAB>FLAGS<TAB>MNT<LF>, at most 1024 bytes, no NUL:
  * - FS satisfies fsrules_name, BSD fsrules_valid_bsd;
  * - FLAGS is -, ro, owners, ro,owners or owners,ro;
- * - MNT is /Volumes/ and one component, not . or .., with no byte below 0x20 and no 0x7f (it comes last, so it may hold
- *   spaces, but a tab makes a sixth field).
+ * - MNT is /Volumes/ and one component of at most 255 bytes, not . or .., with no byte below 0x20 and no 0x7f (it comes
+ *   last, so it may hold spaces, but a tab makes a sixth field).
  * 0 with *r filled, or -1 with *why a fixed reason (never the caller's text). */
 int mountd_parse(const char *buf, size_t len, struct mountd_req *r, const char **why);
 
@@ -44,6 +44,7 @@ enum mountd_verdict { MD_MOUNT, MD_USER, MD_REFUSE };
 /* The spec's checks (§1, "Legitimacy"), in order, for request R from PEER of disk D, which the probe named TYPE (NULL: none it
  * knows) with probe FLAGS (FSF_*), under the console user's preferences P; MOUNTED_BSD and MOUNTED_MNT are whether the mount
  * table has anything from the disk (whole or any partition) and anything on MNT:
+ * 0. PEER 0 is refused, "root mounts by itself" (the design's final no for root; mountd_peer's MP_ROOT answers it first);
  * 1. DiskArbitration's facts: D is R's BSD, its kind exactly macfuse_<FS>, no VolumePath, a leaf;
  * 2. whose disk it is: unless fsrules_node_owner_ok(node_uid, PEER), and for an image unless node_uid is PEER, MD_USER
  *    ("not your disk: your own mount"). Root never publishes another user's disk; the user's own path still meets the
@@ -63,8 +64,9 @@ int mountd_mnt_facts(const struct stat *opened, const struct stat *entry, const 
 		     int *adopt, const char **why);
 
 /* After fchown and fchmod: AFTER (fstat of the descriptor) is a directory, uid 0, mode 0755, the same dev and inode as
- * ENTRY_AFTER (a fresh lstat of MNT). 0, or -1 with *why, and then the caller gives the directory back to PEER. */
-int mountd_adopted(const struct stat *after, const struct stat *entry_after, uid_t peer, const char **why);
+ * ENTRY_AFTER (a fresh lstat of MNT), and EMPTY_AFTER (read again through the descriptor: the peer could add an entry
+ * before the fchown, and cannot after it). 0, or -1 with *why, and then the caller gives the directory back to PEER. */
+int mountd_adopted(const struct stat *after, const struct stat *entry_after, int empty_after, uid_t peer, const char **why);
 
 /* A status for the reply: 1..255 as it is, anything else (0 included) 1. */
 int mountd_rc(long rc);

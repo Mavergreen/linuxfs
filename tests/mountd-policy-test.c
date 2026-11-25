@@ -157,7 +157,7 @@ int main(void)
 		big[1024] = '\n';
 		is(mountd_parse(big, 1025, &req, &why), -1, "parse_refuses: 1025 bytes");
 		big[1023] = '\n';
-		is(mountd_parse(big, 1024, &req, &why), 0, "parse: 1024 bytes is not too long");
+		is(mountd_parse(big, 1024, &req, &why), -1, "parse_refuses: 1024 bytes, whose name is over 255 bytes");
 	}
 	refuses("mount\text4\tdisk3s1\t-\t/Volumes/x", "parse_refuses: no trailing LF");
 	refuses("mount\text4\tdisk3s1\t/Volumes/x\n", "parse_refuses: four fields");
@@ -188,6 +188,14 @@ int main(void)
 	refuses("mountx\text4\tdisk3s1\t-\t/Volumes/x\n", "parse_refuses: a verb that only begins with mount");
 	is(parse("mount\text4\tdisk3s1\t-\t/Volumes/caf\xc3\xa9\n"), 0, "parse: a UTF-8 name is accepted");
 	is(parse("mount\text4\tdisk3s1\t-\t/Volumes/...\n"), 0, "parse: ... is a name, not . or ..");
+	{
+		char line[400];
+
+		snprintf(line, sizeof(line), "mount\text4\tdisk3s1\t-\t/Volumes/%0255d\n", 0);
+		is(parse(line), 0, "parse: a name of 255 bytes is accepted");
+		snprintf(line, sizeof(line), "mount\text4\tdisk3s1\t-\t/Volumes/%0256d\n", 0);
+		refuses(line, "parse_refuses: a name of 256 bytes (over NAME_MAX, m1)");
+	}
 
 	/* ---- the peer ---- */
 	is(mountd_peer(501, 501), MP_SERVE, "peer: the console user is served");
@@ -215,6 +223,11 @@ int main(void)
 	starts(why, "not your disk", "judge_owner: and says so");
 	d.node_uid = 502;
 	is(judge(&r, &d, 501, "ext4", 0, &p, 0, 0), MD_USER, "judge_owner: an image another user attached");
+	d.node_uid = 0;
+	is(judge(&r, &d, 0, "ext4", 0, &p, 0, 0) == MD_REFUSE && rc == 1, 1, "judge_owner: peer 0 (root) is refused, even for root's image (m4)");
+	starts(why, "root mounts by itself", "judge_owner: \"root mounts by itself\"");
+	d.image = 0;
+	is(judge(&r, &d, 0, "ext4", 0, &p, 0, 0), MD_REFUSE, "judge_owner: peer 0 is refused for a physical disk too");
 	d.node_uid = 502;
 	d.image = 0;
 	d.has_path = 1;
@@ -299,13 +312,15 @@ int main(void)
 		is(mountd_mnt_facts(&opened, &entry, &vol, 1, 501, &adopt, &why), -1, "mnt_facts: not a directory");
 
 		opened = entry = dir(7, 100, 0, S_IFDIR | 0755);
-		is(mountd_adopted(&opened, &entry, 501, &why), 0, "adopted: root's, 0755, the same entry");
+		is(mountd_adopted(&opened, &entry, 1, 501, &why), 0, "adopted: root's, 0755, the same entry");
 		entry.st_ino = 101;
-		is(mountd_adopted(&opened, &entry, 501, &why), -1, "adopted: the entry swapped after fchown");
+		is(mountd_adopted(&opened, &entry, 1, 501, &why), -1, "adopted: the entry swapped after fchown");
 		opened = entry = dir(7, 100, 0, S_IFDIR | 01777);
-		is(mountd_adopted(&opened, &entry, 501, &why), -1, "adopted: mode 01777");
+		is(mountd_adopted(&opened, &entry, 1, 501, &why), -1, "adopted: mode 01777");
 		opened = entry = dir(7, 100, 501, S_IFDIR | 0755);
-		is(mountd_adopted(&opened, &entry, 501, &why), -1, "adopted: still the peer's");
+		is(mountd_adopted(&opened, &entry, 1, 501, &why), -1, "adopted: still the peer's");
+		opened = entry = dir(7, 100, 0, S_IFDIR | 0755);
+		is(mountd_adopted(&opened, &entry, 0, 501, &why), -1, "adopted: filled before fchown (m3)");
 	}
 
 	/* ---- the status and the reply ---- */
