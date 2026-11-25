@@ -214,6 +214,8 @@ static void unicode_tests(void)
 	conv(lklfuse_nfc, NFD_CAFE "\xe2\x84\xab" "e\xcc\x81", NFC_CAFE "\xe2\x84\xab\xc3\xa9", PATH_MAX,
 	     "NFC composes around a kept U+212B");
 	conv(lklfuse_nfd_hfs, "\xe2\x84\xab", NULL, PATH_MAX, "HFS+ NFD leaves U+212B");
+	/* review N1: a kept character is not composed with the mark after it (full NFC would give U+219A) */
+	conv(lklfuse_nfc, "\xe2\x86\x90\xcc\xb8", NULL, PATH_MAX, "NFC leaves U+2190 U+0338 as given");
 	/* review I1: CoreFoundation drops a leading U+FEFF; the conversions keep it */
 	conv(lklfuse_nfc, "\xef\xbb\xbf" NFD_CAFE, "\xef\xbb\xbf" NFC_CAFE, PATH_MAX, "NFC keeps a leading U+FEFF");
 	conv(lklfuse_nfd_hfs, "\xef\xbb\xbf" NFC_CAFE, "\xef\xbb\xbf" NFD_CAFE, PATH_MAX, "NFD keeps a leading U+FEFF");
@@ -414,6 +416,11 @@ static void unicode_tests(void)
 	is(names_in("/u9", "\xe2\x84\xab"), 1, "U+212B is stored as given");
 	is(opens("/u9/A\xcc\x8a"), 0, "and opens by A U+030A (libfuse's ICU NFD of it)");
 	is(opens("/u9/\xc3\x85"), 0, "and by U+00C5");
+	plant("/u9/\xe2\x86\x9a", "arrow");
+	scans = lklfuse_nf_scans;
+	is_str(content_of("/u9/\xe2\x86\x90\xcc\xb8", buf, sizeof(buf)), "arrow",
+	       "a Linux-made U+219A opens by U+2190 U+0338 (review N1)");
+	is((int)(lklfuse_nf_scans - scans), 1, "through the scan");
 
 	/* review M1: a non-ASCII path over Darwin's PATH_MAX (1024), within LKL's (4096) */
 	{
