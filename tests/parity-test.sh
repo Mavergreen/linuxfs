@@ -100,6 +100,10 @@ touch "$T/b/slow"
 r=$(parity hang.sleep sh -c 'test ! -e "$1/slow" || sleep 5' sh @MP@ 2>&1)
 expect timeout_notok has "$r" "^not ok - parity hang.sleep"
 expect timeout_status grep -q '^== status 124$' "$OUT/parity/hang.sleep.fsx.txt"
+rm "$T/b/slow"
+r=$(parity hang.both sleep 5 2>&1)
+expect timeout_both_notok has "$r" "^not ok - parity hang.both"
+expect timeout_both_message has "$r" "hang.both timed out"
 unset PARITY_BOUND PARITY_MODE_HANG
 
 # stdin: a command reading stdin gets end of file, not the caller's input
@@ -151,5 +155,10 @@ MKFILE_FAIL=1; export MKFILE_FAIL
 parity_control exfat >/dev/null 2>&1; rc=$?
 expect control_mkfile_fails test "$rc" -ne 0 -a ! -e "$W/ctl/exfat.img"
 unset MKFILE_FAIL
+# a failed attach says why on stderr
+hdiutil() { echo "hdiutil: attach failed: resource busy"; return 1; }
+r=$(parity_control fat32 2>&1 >/dev/null); rc=$?
+expect control_attach_fails test "$rc" -ne 0 -a ! -e "$W/ctl/fat32.img"
+expect control_attach_message has "$r" "hdiutil attach of $W/ctl/fat32.img failed: .*resource busy"
 
 test "$fails" -eq 0

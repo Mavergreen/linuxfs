@@ -1,7 +1,8 @@
 # platform: host-agnostic
-#   Parity library, sourced by tests/smoke-mavericks.sh (which provides ok, notok, bounded (tenths of
-#   a second, then 124 and a "hung:" line), OUT and W): runs one step on an HFS+ control volume and on the filesystem under test, then
-#   records or compares what each did. POSIX sh, sed and diff only.
+#   Parity library, sourced by tests/smoke-mavericks.sh, which provides ok, notok, bounded, OUT and W
+#   (bounded takes tenths of a second, and on a timeout prints a "hung:" line and returns 124).
+#   Runs one step on an HFS+ control volume and on the filesystem under test, then records or
+#   compares what each did. POSIX sh, sed and diff only.
 #
 #   parity_control KIND                   makes $W/ctl/KIND.img once, prints its path
 #                                         (KIND: hfs, hfsx, fat32 or exfat)
@@ -30,9 +31,12 @@ parity_control() {
   if test ! -f "$_pc_img"; then
     mkdir -p "$W/ctl" || return 1
     bounded "${PARITY_BOUND:-600}" mkfile 128m "$_pc_img" </dev/null || { rm -f "$_pc_img"; return 1; }
-    _pc_dev=$(bounded "${PARITY_BOUND:-600}" hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$_pc_img" </dev/null |
-      sed -n '1s,^/dev/\(disk[0-9][0-9]*\).*,\1,p')
-    if test -z "$_pc_dev"; then rm -f "$_pc_img"; return 1; fi
+    _pc_out=$(bounded "${PARITY_BOUND:-600}" hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$_pc_img" 2>&1 </dev/null)
+    _pc_dev=$(printf '%s\n' "$_pc_out" | sed -n '1s,^/dev/\(disk[0-9][0-9]*\).*,\1,p')
+    if test -z "$_pc_dev"; then
+      echo "parity_control: hdiutil attach of $_pc_img failed: $_pc_out" >&2
+      rm -f "$_pc_img"; return 1
+    fi
     bounded "${PARITY_BOUND:-600}" diskutil eraseDisk "$_pc_fs" Control GPT "$_pc_dev" </dev/null >&2
     _pc_rc=$?
     bounded "${PARITY_BOUND:-600}" hdiutil detach "$_pc_dev" </dev/null >&2 || _pc_rc=1
@@ -104,10 +108,17 @@ parity() {
   parity_run hfs "$PARITY_CTL_MP" "$PARITY_CTL_VOL" "$PARITY_CTL_DISK" "$@" >"$_pw_dir/$_pw_what.hfs.txt"
   parity_run "$PARITY_FS" "$PARITY_FS_MP" "$PARITY_FS_VOL" "$PARITY_FS_DISK" "$@" >"$_pw_dir/$_pw_what.$PARITY_FS.txt"
   if test "$_pw_mode" = check; then
-    if _pw_d=$(diff -u "$_pw_dir/$_pw_what.hfs.txt" "$_pw_dir/$_pw_what.$PARITY_FS.txt"); then
+    # two timeouts leave identical records, which must not pass
+    if grep -q '^== status 124$' "$_pw_dir/$_pw_what.hfs.txt" "$_pw_dir/$_pw_what.$PARITY_FS.txt"; then
+      _pw_hung=1
+    else
+      _pw_hung=0
+    fi
+    if _pw_d=$(diff -u "$_pw_dir/$_pw_what.hfs.txt" "$_pw_dir/$_pw_what.$PARITY_FS.txt") && test "$_pw_hung" -eq 0; then
       ok "parity $_pw_what"
     else
       notok "parity $_pw_what"
+      test "$_pw_hung" -eq 0 || echo "parity: $_pw_what timed out (status 124)"
       printf '%s\n' "$_pw_d"
     fi
   else
