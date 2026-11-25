@@ -10,7 +10,10 @@ owners_fstab_add() {
 }
 owners_fstab_gone() {
   if grep -qF -- "$2" "$1" 2> /dev/null; then
-    sudo -n sh -c 'grep -vF -- "$2" "$1" > "$1.owners-tmp"; cat "$1.owners-tmp" > "$1" && rm -f "$1.owners-tmp"' _ "$1" "$2" 2> /dev/null
+    # FSTAB is rewritten only from a copy written whole: grep's 1 is fine (every line was ours), its 2 or a copy that
+    #   could not be written leaves FSTAB as it was
+    sudo -n sh -c 'if { grep -vF -- "$2" "$1"; test $? -le 1; } > "$1.owners-tmp"; then cat "$1.owners-tmp" > "$1"; fi
+      rm -f "$1.owners-tmp"' _ "$1" "$2" 2> /dev/null
   fi
   ! grep -qF -- "$2" "$1" 2> /dev/null
 }

@@ -787,6 +787,15 @@ static void caller_owner_tests(void)
 	lkl_sys_mknod("/c/n", S_IFREG | 0644, 0);
 	is(lklfuse_chown_new("/c/n", 501, 20), 1, "a new name LKL made, with one link, is chowned");
 	owned("/c/n", 501, 20, "to the ids given");
+	{	/* a parent that cannot be stat'ed (gone): still the caller's, in the caller's own group, never LKL's 0:0 */
+		unsigned int u = 0, g = 0;
+
+		test_ctx.uid = 501;
+		test_ctx.gid = 20;
+		is(lklfuse_owner_ids("/c/gone/x", &u, &g), 1, "owner=caller, the parent's stat failing: still chowned");
+		is((int)u, 501, "to the caller's uid");
+		is((int)g, 20, "and, with no directory to take it from, the caller's gid");
+	}
 	test_ctx_set = 0;
 	is(lklfuse_mkdir("/c/none", 0755), 0, "owner=caller with no FUSE caller: mkdir");
 	owned("/c/none", 0, 0, "keeps LKL's own ids");

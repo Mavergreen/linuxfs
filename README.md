@@ -65,8 +65,9 @@ UUID=6A698689-F3F0-4B3A-92EF-0C25FD2D3496 none macfuse_ext4 rw,owners
 ```
 
 It takes effect at the next mount. What you then create on the volume is yours: your Mac user id, and the group of the
-folder it is in, as on HFS+ (which also keeps a Linux setgid folder's group). Ids are matched by number only: a Mac user or group whose id is a Linux user's or group's (the Mac's group 20,
-`staff`, is `dialout` on many Linux systems) gets that user's or group's access.
+folder it is in, as on HFS+ (which also keeps a Linux setgid folder's group). Ids are matched by number only: a Mac user
+or group whose id is a Linux user's or group's (the Mac's group 20, `staff`, is `dialout` on many Linux systems) gets
+that user's or group's access.
 
 The Mac uses only the first `/etc/fstab` line that names the volume. If the volume is also ignored (`linuxfs ignore`),
 add `owners` to linuxfs's line instead of writing a second one, so it reads `rw,noauto,owners # linuxfs`; keep the

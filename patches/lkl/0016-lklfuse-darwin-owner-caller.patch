@@ -6,7 +6,8 @@ directory, symlink and node a Mac user then made was LKL's (0:0): the user could
 4755 create left a setuid-root file on the disk for wherever it is next mounted with suid. HFS+ with ownership on
 gives a new node to its creator, in the group of the directory it is made in (BSD's rule). With owner=caller, lklfuse
 does the same: mknod, mkdir, symlink and create chown the new node to fuse_get_context()'s uid and the parent
-directory's gid, which also keeps a Linux setgid directory's group. Only a node the call creates: create chowns by
+directory's gid (the caller's own if that directory cannot be read: never LKL's 0:0), which also keeps a
+Linux setgid directory's group. Only a node the call creates: create chowns by
 its descriptor (0005's O_EXCL loop, unchanged); mknod, mkdir and symlink by name, through an O_PATH|O_NOFOLLOW
 descriptor, and only when the name is LKL's (uid 0) and, unless a directory, its only link. lklfuse serves one
 request at a time (0009), so nothing can put another file under the name in between; the check keeps that true if
@@ -43,14 +44,15 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if (strcmp(lklfuse.owner, "root") == 0) {
  		ret = lkl_sys_newfstatat(LKL_AT_FDCWD, "/", &st, 0);
  		if (ret < 0)
-@@ -895,11 +906,70 @@
+@@ -895,11 +906,72 @@
  	return 0;
  }
  
 +/*
 + * The ids the new node at PATH takes, into *uid and *gid: owner='s, or with owner=caller the FUSE request's uid and the
-+ * group of the directory PATH is in (BSD's rule, as on HFS+; it also keeps a Linux setgid directory's group). 0 when
-+ * none (no owner=, no request to take them from, or the directory gone): the node keeps LKL's own.
++ * group of the directory PATH is in (BSD's rule, as on HFS+; it also keeps a Linux setgid directory's group), or the
++ * request's gid when that directory cannot be read. 0 when none (no owner=, or no request to take them from): the
++ * node keeps LKL's own.
 + */
 +static int lklfuse_owner_ids(const char *path, unsigned int *uid, unsigned int *gid)
 +{
@@ -62,17 +64,18 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +		struct lkl_stat st;
 +		size_t n;
 +
-+		if (!c || !slash)
++		if (!c)
 +			return 0;
-+		n = slash == path ? 1 : (size_t)(slash - path);
-+		if (n >= sizeof(dir))
-+			return 0;
++		/* the caller's always: a directory that cannot be read gives the caller's own group, never LKL's 0:0 */
++		*uid = c->uid;
++		*gid = c->gid;
++		n = !slash ? 0 : slash == path ? 1 : (size_t)(slash - path);
++		if (n == 0 || n >= sizeof(dir))
++			return 1;
 +		memcpy(dir, path, n);
 +		dir[n] = '\0';
-+		if (lkl_sys_newfstatat(LKL_AT_FDCWD, dir, &st, 0) < 0)
-+			return 0;
-+		*uid = c->uid;
-+		*gid = st.st_gid;
++		if (lkl_sys_newfstatat(LKL_AT_FDCWD, dir, &st, 0) == 0)
++			*gid = st.st_gid;
 +		return 1;
 +	}
 +#else
@@ -117,7 +120,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	return lklfuse_err(ret);
  }
  
-@@ -1101,6 +1171,7 @@
+@@ -1101,6 +1173,7 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	int flags = fi->flags;
  	int ret, tries;
@@ -125,7 +128,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  
  	/* an existing entry in any form is opened (EEXIST with O_EXCL); only a new one gets the stored form */
  	if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 1, &path)))
-@@ -1127,7 +1198,8 @@
+@@ -1127,7 +1200,8 @@
  	}
  	if (tries == 4 && (ret = lklfuse_open3(path, true, mode, fi)) != 0)
  		return ret;

@@ -1820,6 +1820,12 @@ r=$(sudo() { test "$1" != -n || shift; "$@"; }; rm -f "$OF"; owners_fstab_add "$
 expect owners_fstab_add_new_file test "$r" = "x $OT"
 r=$(sudo() { return 1; }; printf 'x %s\n' "$OT" > "$OF"; owners_fstab_gone "$OF" "$OT"; echo "gone $?")
 expect owners_fstab_gone_says_left has "$r" "^gone 1$"
+# the copy is written back only when it was written whole: a temp path that cannot be written (here a directory) leaves
+#   FSTAB as it was, and says the line is still there
+r=$(sudo() { test "$1" != -n || shift; "$@"; }; printf 'UUID=A none hfs rw,noauto\nx %s\n' "$OT" > "$OF"; mkdir "$OF.owners-tmp"
+  owners_fstab_gone "$OF" "$OT"; echo "gone $?"; awk '{ print "kept " NR ": " $0 }' "$OF"; rmdir "$OF.owners-tmp")
+expect owners_fstab_gone_tmp_fails has "$r" "^gone 1$"
+expect owners_fstab_gone_tmp_fails_intact test "$(printf '%s\n' "$r" | grep -c '^kept ')" -eq 2 -a -n "$(printf '%s\n' "$r" | grep -x 'kept 1: UUID=A none hfs rw,noauto')"
 expect owners_fstab_in_smoke grep -q '^\. "$tests_dir/lib/owners-fstab.sh"' "$here/smoke-mavericks.sh"
 rm -f "$OF"
 
