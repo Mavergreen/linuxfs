@@ -3,18 +3,22 @@ lklfuse: on Darwin, -o volicon=PATH shows PATH as the volume's icon while the vo
 A Mac volume's icon is its root's .VolumeIcon.icns, shown when the root's Finder Info has kHasCustomIcon. A Linux
 volume has neither, so Finder showed macFUSE's generic icon. linuxfs makes its own at install (the Mac's
 External.icns with Tux, in each bundle's Resources: spec item 6's amendment) and passes it as volicon=. While the
-volume root has no /.VolumeIcon.icns, lookup and getattr of that name answer a read-only regular file (0444, the
-root's owner and group, so mapped as every other file; PATH's size and times; an inode number past every
-filesystem's), open for reading and read serve PATH's bytes (an fh that is never an LKL descriptor, so read,
-release and getattr know it without a path: nullpath_ok), and getxattr com.apple.FinderInfo on / is a 32-byte
-FolderInfo with only kHasCustomIcon (0x0400 in frFlags, bytes 8-9 big-endian), which listxattr of / then names.
-readdir does not list it. Nothing about it can be changed: open for writing or O_TRUNC, create, unlink, rename
-either way, a hard link to it, chmod, chown, truncate, utimens, setxattr and removexattr get EACCES, a node made
-under its name EEXIST. Setting the root's FinderInfo is refused as before (ENOTSUP), never faked. Nothing is
-written to the disk. A real /.VolumeIcon.icns wins: it is looked for on every call (lookups are not cached), so
-one made or removed shows at once, and the root's FinderInfo is then the volume's own. PATH is opened once, at
-start; when it cannot be read, that is said and the volume shows macFUSE's icon. The code is portable; only Darwin
-takes the option. tests/lklfuse-ops-test.c checks each of these, including the real file winning and readdir.
+volume root has no /.VolumeIcon.icns, lookup and getattr of that name answer a regular file (0644, the root's owner
+and group, so mapped as every other file; PATH's size and times; an inode number past every filesystem's), an open
+for reading and read serve PATH's bytes (an fh that is never an LKL descriptor, so read, release and getattr know it
+without a path: nullpath_ok), and getxattr com.apple.FinderInfo on / is a 32-byte FolderInfo with only
+kHasCustomIcon (0x0400 in frFlags, bytes 8-9 big-endian), which listxattr of / then names. readdir does not list it,
+and lklfuse itself writes nothing to the disk. The icon's bytes and attributes cannot be changed, nor can it be
+moved, linked or removed: write or ftruncate through its fh, chmod, chown, utimens, setxattr, removexattr, unlink,
+rename away and a hard link to it get EACCES. But the user may put their own icon there, as on HFS+: making a file
+under the name (create; an open for writing or with O_TRUNC, which is cp's, since the kernel sees a file there;
+truncate; rename or link onto it; mkdir, mknod, symlink) acts on the disk as if the name were free, so a real
+/.VolumeIcon.icns is made, owned as any new file. A real one wins: it is looked for on every call (lookups are not
+cached), so one made or removed shows at once, and the root's FinderInfo is then the volume's own. Setting the
+root's FinderInfo is refused as before (ENOTSUP), never faked. PATH is opened once, at start; when it cannot be
+read, that is said and the volume shows macFUSE's icon. The code is portable; only Darwin takes the option.
+tests/lklfuse-ops-test.c checks each of these, including the real file winning, cp, mv and truncate onto the icon,
+and readdir.
 
 diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 --- a/tools/lkl/lklfuse.c
@@ -45,19 +49,21 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  #endif
  "    -o opts=options        mount options (use \\ to escape , and =)\n"
  );
-@@ -823,6 +828,130 @@
+@@ -823,6 +828,132 @@
  	st->st_ctim.tv_nsec = in->st_ctime_nsec;
  }
  
 +/*
 + * The volume icon (-o volicon=PATH, Darwin's option; linuxfs passes its bundle's linuxfs.icns, made at install). A volume
 + * whose root has no /.VolumeIcon.icns of its own shows that icon, as a Mac volume shows its own: lookup and getattr of
-+ * /.VolumeIcon.icns answer a read-only regular file (0444, the root's owner and group, so mapped as every other file;
-+ * PATH's size and times) whose reads are PATH's bytes, and the root's com.apple.FinderInfo says it has a custom icon
-+ * (kHasCustomIcon). readdir does not list it; nothing about it can be changed (EACCES, and EEXIST for making a node
-+ * under its name), and nothing is ever written to the disk. A real /.VolumeIcon.icns wins: it is looked for on every
-+ * call (lookups are not cached, lklfuse_init), so one made or removed shows at once. The code is portable; elsewhere
-+ * nothing sets volicon, so there is never an icon.
++ * /.VolumeIcon.icns answer a regular file (0644, the root's owner and group, so mapped as every other file; PATH's
++ * size and times) whose reads are PATH's bytes, and the root's com.apple.FinderInfo says it has a custom icon
++ * (kHasCustomIcon). readdir does not list it, and lklfuse itself never writes anything to the disk. Its bytes and
++ * attributes cannot be changed, nor can it be moved, linked or removed (EACCES). But a user may put their own icon
++ * there, as on HFS+: making a file under the name (create, an open for writing or with O_TRUNC, truncate, rename or
++ * link onto it, mkdir, mknod, symlink) acts on the disk as if the name were free, so a real /.VolumeIcon.icns is made.
++ * A real one wins: it is looked for on every call (lookups are not cached, lklfuse_init), so one made or removed shows
++ * at once. The code is portable; elsewhere nothing sets volicon, so there is never an icon.
 + */
 +#define LKLFUSE_VOLICON "/.VolumeIcon.icns"
 +#define LKLFUSE_VOLICON_FH ((uint64_t)-2)	/* the open icon's fh: never an LKL descriptor */
@@ -116,7 +122,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +		return lklfuse_err(ret);
 +	lklfuse_xlat_stat(&root, st);
 +	st->st_ino = LKLFUSE_VOLICON_INO;
-+	st->st_mode = S_IFREG | 0444;
++	st->st_mode = S_IFREG | 0644;
 +	st->st_nlink = 1;
 +	st->st_rdev = 0;
 +	st->st_size = lklfuse_volicon_st.st_size;
@@ -176,7 +182,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  static int lklfuse_getattr(const char *path, struct stat *st,
  			   struct fuse_file_info *fi)
  {
-@@ -835,6 +964,8 @@
+@@ -835,6 +966,8 @@
  	 */
  	char pbuf[LKLFUSE_PATH_MAX];
  
@@ -185,7 +191,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if (fi)
  		ret = lkl_sys_fstat(fi->fh, &lkl_stat);
  	else if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
-@@ -852,6 +983,8 @@
+@@ -852,6 +985,8 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	long ret;
  
@@ -194,31 +200,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
  		return ret;
  	ret = lkl_sys_readlink(path, buf, len);
-@@ -978,39 +1111,55 @@
- static int lklfuse_mknod(const char *path, mode_t mode, dev_t dev)
- {
- 	char pbuf[LKLFUSE_PATH_MAX];
--	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 1, &path);
-+	int ret;
- 
-+	if (lklfuse_volicon_is(path))
-+		return -EEXIST;
-+	ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 1, &path);
- 	return ret ? ret : lklfuse_own(path, lkl_sys_mknod(path, mode, dev));
- }
- 
- static int lklfuse_mkdir(const char *path, mode_t mode)
- {
- 	char pbuf[LKLFUSE_PATH_MAX];
--	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 1, &path);
-+	int ret;
- 
-+	if (lklfuse_volicon_is(path))
-+		return -EEXIST;
-+	ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 1, &path);
- 	return ret ? ret : lklfuse_own(path, lkl_sys_mkdir(path, mode));
- }
- 
+@@ -994,16 +1129,22 @@
  static int lklfuse_unlink(const char *path)
  {
  	char pbuf[LKLFUSE_PATH_MAX];
@@ -243,32 +225,20 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	return ret ? ret : lklfuse_err(lkl_sys_rmdir(path));
  }
  
- static int lklfuse_symlink(const char *oldname, const char *newname)
- {
- 	char obuf[LKLFUSE_PATH_MAX], nbuf[LKLFUSE_PATH_MAX];
--	int ret = lklfuse_nf_store(oldname, obuf, sizeof(obuf), &oldname);
-+	int ret;
-+
-+	if (lklfuse_volicon_is(newname))
-+		return -EEXIST;
-+	ret = lklfuse_nf_store(oldname, obuf, sizeof(obuf), &oldname);
- 
- 	if (!ret)
- 		ret = lklfuse_resolve(newname, nbuf, sizeof(nbuf), 1, &newname);
-@@ -1022,7 +1171,11 @@
+@@ -1022,7 +1163,11 @@
  			  unsigned int flags)
  {
  	char obuf[LKLFUSE_PATH_MAX], nbuf[LKLFUSE_PATH_MAX];
 -	int ret = lklfuse_resolve(oldname, obuf, sizeof(obuf), 0, &oldname);
 +	int ret;
 +
-+	if (lklfuse_volicon_is(oldname) || lklfuse_volicon_is(newname))
++	if (lklfuse_volicon_is(oldname))
 +		return -EACCES;
 +	ret = lklfuse_resolve(oldname, obuf, sizeof(obuf), 0, &oldname);
  
  	if (!ret)
  		ret = lklfuse_resolve(newname, nbuf, sizeof(nbuf), 1, &newname);
-@@ -1036,7 +1189,13 @@
+@@ -1036,7 +1181,11 @@
  static int lklfuse_link(const char *oldname, const char *newname)
  {
  	char obuf[LKLFUSE_PATH_MAX], nbuf[LKLFUSE_PATH_MAX];
@@ -277,13 +247,11 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +
 +	if (lklfuse_volicon_is(oldname))
 +		return -EACCES;
-+	if (lklfuse_volicon_is(newname))
-+		return -EEXIST;
 +	ret = lklfuse_resolve(oldname, obuf, sizeof(obuf), 0, &oldname);
  
  	if (!ret)
  		ret = lklfuse_resolve(newname, nbuf, sizeof(nbuf), 1, &newname);
-@@ -1049,6 +1208,8 @@
+@@ -1049,6 +1198,8 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	int ret;
  
@@ -292,7 +260,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if (fi)
  		ret = lkl_sys_fchmod(fi->fh, mode);
  	else if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
-@@ -1065,6 +1226,8 @@
+@@ -1065,6 +1216,8 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	int ret;
  
@@ -301,25 +269,19 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if (fi)
  		ret = lkl_sys_fchown(fi->fh, uid, gid);
  	else if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
-@@ -1081,6 +1244,8 @@
+@@ -1081,6 +1234,11 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	int ret;
  
-+	if (fi ? lklfuse_volicon_fi(fi) : lklfuse_volicon_is(path))
++	if (lklfuse_volicon_fi(fi))
 +		return -EACCES;
++	/* the icon's size set: the user's own file, made under the name (an empty one, owner= as any new file), then sized */
++	if (!fi && lklfuse_volicon_is(path) && (ret = lklfuse_mknod(path, S_IFREG | 0644, 0)))
++		return ret;
  	if (fi)
  		ret = lkl_sys_ftruncate(fi->fh, off);
  	else if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
-@@ -1175,6 +1340,8 @@
- 	int ret, tries;
- 	unsigned int uid, gid;
- 
-+	if (lklfuse_volicon_is(path))
-+		return -EACCES;
- 	/* an existing entry in any form is opened (EEXIST with O_EXCL); only a new one gets the stored form */
- 	if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 1, &path)))
- 		return ret;
-@@ -1208,8 +1375,15 @@
+@@ -1208,8 +1366,16 @@
  static int lklfuse_open(const char *path, struct fuse_file_info *fi)
  {
  	char pbuf[LKLFUSE_PATH_MAX];
@@ -327,8 +289,9 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +	int ret;
  
 +	if (lklfuse_volicon_is(path)) {
++		/* the kernel sees a file, so cp's O_CREAT reaches here as an open: the user's own icon, made as create makes one */
 +		if ((fi->flags & O_ACCMODE) != O_RDONLY || (fi->flags & O_TRUNC))
-+			return -EACCES;
++			return lklfuse_create(path, 0644, fi);
 +		fi->fh = LKLFUSE_VOLICON_FH;
 +		return 0;
 +	}
@@ -336,7 +299,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	return ret ? ret : lklfuse_open3(path, false, 0, fi);
  }
  
-@@ -1219,6 +1393,8 @@
+@@ -1219,6 +1385,8 @@
  	long ret;
  	ssize_t orig_size = size;
  
@@ -345,7 +308,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	do {
  		ret = lkl_sys_pread64(fi->fh, buf, size, offset);
  		if (ret <= 0)
-@@ -1238,6 +1414,8 @@
+@@ -1238,6 +1406,8 @@
  	long ret;
  	ssize_t orig_size = size;
  
@@ -354,7 +317,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	do {
  		ret = lkl_sys_pwrite64(fi->fh, buf, size, offset);
  		if (ret <= 0)
-@@ -1257,6 +1435,8 @@
+@@ -1257,6 +1427,8 @@
  	struct lkl_statfs lkl_statfs;
  	char pbuf[LKLFUSE_PATH_MAX];
  
@@ -363,7 +326,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
  		return ret;
  	ret = lkl_sys_statfs(path, &lkl_statfs);
-@@ -1285,12 +1465,16 @@
+@@ -1285,12 +1457,16 @@
  
  static int lklfuse_release(const char *path, struct fuse_file_info *fi)
  {
@@ -380,7 +343,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if (datasync)
  		return lklfuse_err(lkl_sys_fdatasync(fi->fh));
  	else
-@@ -1301,8 +1485,11 @@
+@@ -1301,8 +1477,11 @@
  		   size_t size, int flags)
  {
  	char pbuf[LKLFUSE_PATH_MAX];
@@ -393,7 +356,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	return ret ? ret : lklfuse_err(lkl_sys_setxattr(path, name, val, size, lklfuse_xattr_flags(flags)));
  }
  
-@@ -1310,24 +1497,38 @@
+@@ -1310,24 +1489,38 @@
  			  size_t size)
  {
  	char pbuf[LKLFUSE_PATH_MAX];
@@ -435,7 +398,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	return ret ? ret : lklfuse_err(lkl_sys_removexattr(path, name));
  }
  
-@@ -1337,6 +1538,8 @@
+@@ -1337,6 +1530,8 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	int err;
  
@@ -444,7 +407,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if ((err = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
  		return err;
  	dir = lkl_opendir(path, &err);
-@@ -1416,8 +1619,11 @@
+@@ -1416,8 +1611,11 @@
  static int lklfuse_access(const char *path, int mode)
  {
  	char pbuf[LKLFUSE_PATH_MAX];
@@ -452,12 +415,12 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +	int ret;
  
 +	if (lklfuse_volicon_is(path))
-+		return (mode & (W_OK | X_OK)) ? -EACCES : 0;
++		return (mode & X_OK) ? -EACCES : (mode & W_OK) ? lklfuse_access("/", W_OK) : 0;
 +	ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
  	return ret ? ret : lklfuse_err(lkl_sys_access(path, mode));
  }
  
-@@ -1431,6 +1637,8 @@
+@@ -1431,6 +1629,8 @@
  		{ .tv_sec = tv[1].tv_sec, .tv_nsec = tv[1].tv_nsec },
  	};
  
@@ -466,7 +429,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if (fi)
  		ret = lkl_sys_utimensat(fi->fh, NULL, ts, 0);
  	else if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
-@@ -1444,6 +1652,8 @@
+@@ -1444,6 +1644,8 @@
  static int lklfuse_fallocate(const char *path, int mode, off_t offset,
  			     off_t len, struct fuse_file_info *fi)
  {
@@ -475,7 +438,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	return lklfuse_err(lkl_sys_fallocate(fi->fh, mode, offset, len));
  }
  
-@@ -1455,6 +1665,10 @@
+@@ -1455,6 +1657,10 @@
  {
  	lkl_loff_t loff_in = off_in, loff_out = off_out;
  
@@ -486,7 +449,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	return lklfuse_err(lkl_sys_copy_file_range(fi_in->fh, &loff_in, fi_out->fh,
  				       &loff_out, len, flags));
  }
-@@ -1462,6 +1676,8 @@
+@@ -1462,6 +1668,8 @@
  static off_t lklfuse_lseek(const char *path, off_t off, int whence,
  			   struct fuse_file_info *fi)
  {
@@ -495,7 +458,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	return lklfuse_err(lkl_sys_lseek(fi->fh, off, whence));
  }
  
-@@ -1955,6 +2171,8 @@
+@@ -1955,6 +2163,8 @@
  	if (fuse_parse_cmdline(&args, &cli_opts))
  		return 1;
  

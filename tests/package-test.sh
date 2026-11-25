@@ -117,8 +117,14 @@ for prog in lklfuse linuxfs linuxfs-probe linuxfs-open linuxfs-volicon; do
 done
 # spec: item 6's amendment (the volume icon) -- Tux, for the postinstall's linuxfs-volicon, root's like the program that reads it
 grep -qxF "$D/tux.png	100644	0/0" "$T/list" || fail "the payload lacks $D/tux.png (0644)"
+# Simon Budig's terms for the drawing: "redistribution is free but has to include this README/Copyright notice", so it goes beside it
+grep -qxF "$D/tux.README	100644	0/0" "$T/list" || fail "the payload lacks $D/tux.README (0644), Tux's copyright notice"
+mkdir -p "$T/tuxr"; (cd "$T/tuxr" && gzip -dc < "$comp/Payload" | cpio -id --quiet "$D/tux.README" 2>/dev/null)
+{ tr '\n' ' ' < "$T/tuxr/$D/tux.README"; } 2>/dev/null | grep -q 'These drawings are copyrighted by Larry Ewing and Simon Budig (penguin-variant.sk also by Anja Gerwinski), redistribution is free but has to include this README/Copyright notice.' ||
+  fail "$D/tux.README does not carry Simon Budig's README/Copyright notice"
+grep -q 'lewing@isc.tamu.edu.*The GIMP' "$T/tuxr/$D/tux.README" 2>/dev/null || fail "$D/tux.README does not credit Larry Ewing and The GIMP"
 n="$(grep -c "^$D/" "$T/list" || :)"
-[ "$n" -eq 6 ] || fail "$D holds $n entries, not five programs and Tux"
+[ "$n" -eq 7 ] || fail "$D holds $n entries, not five programs, Tux and its notice"
 # spec: item 6's amendment -- no Apple artwork and no composite in the pkg: each Mac makes its own from its own External.icns
 ! grep -q '\.icns	' "$T/list" || fail "the payload has an .icns: $(grep '\.icns	' "$T/list" | tr '\n' ' ')"
 mkdir -p "$T/bundles"; (cd "$T/bundles" && gzip -dc < "$comp/Payload" | cpio -id --quiet "$S/*")

@@ -85,18 +85,22 @@ struct rep {
 	double dpi;
 };
 
+/* A and B hold the same representations, matched one to one (each of B used once), so the sets are equal both ways */
 static int same_reps(const struct rep *a, size_t na, const struct rep *b, size_t nb)
 {
+	char used[MAXREP] = { 0 };
 	size_t i, j;
 
-	if (na != nb)
+	if (na != nb || nb > MAXREP)
 		return 0;
 	for (i = 0; i < na; i++) {
 		for (j = 0; j < nb; j++)
-			if (a[i].w == b[j].w && a[i].h == b[j].h && (int)(a[i].dpi + 0.5) == (int)(b[j].dpi + 0.5))
+			if (!used[j] && a[i].w == b[j].w && a[i].h == b[j].h &&
+			    (int)(a[i].dpi + 0.5) == (int)(b[j].dpi + 0.5))
 				break;
 		if (j == nb)
 			return 0;
+		used[j] = 1;
 	}
 	return 1;
 }

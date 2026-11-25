@@ -1,9 +1,14 @@
 Updater icon: NONE. linuxfs-updater ships the standard macOS application icon by explicit opt-in
 (ALLOW_GENERIC in updater/CMakeLists.txt), so no artwork is embedded.
 
-Deliberate: there is no upstream artwork to carry. LKL publishes no release and no icon, and Tux
-belongs to Larry Ewing and the Linux project; this product is an unofficial community build that must
-not read as official. A stand-in .icns would be exactly the placeholder shipyard's icon gate rejects.
+Deliberate: there is no upstream artwork to carry, and linuxfs has no mark of its own. LKL publishes no
+release and no icon. Tux belongs to Larry Ewing and Simon Budig, and an unofficial community build's
+application icon must not read as the Linux project's. A stand-in .icns would be exactly the placeholder
+shipyard's icon gate rejects.
+
+The volume icon is a separate matter: Finder shows linuxfs volumes as the Mac's own external-disk icon
+with a small Tux in the corner, a maintainer decision (spec item 6's amendment). That Tux is credited,
+with its copyright notice, in art/README; it is drawn on each Mac at install and is not the updater's.
 
 Exit: when an original Mavergreen linuxfs mark exists, add updater/linuxfs.icns, pass ICON to
 mavericks_add_updater_app, and drop ALLOW_GENERIC.

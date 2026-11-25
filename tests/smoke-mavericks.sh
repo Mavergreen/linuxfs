@@ -393,6 +393,13 @@ da_cycle() {
       sh -c 'xattr -px com.apple.FinderInfo "$1" | tr -d " \n" | grep -q "^000000000000000004"' _ "$mp"
     check "$tag: ls -a does not list .VolumeIcon.icns" sh -c '! ls -a "$1" | grep -qx .VolumeIcon.icns' _ "$mp"
     check "$tag: its /.VolumeIcon.icns is the bundle's linuxfs.icns" cmp -s "$mp/.VolumeIcon.icns" "$(volicon_of ext4)"
+    # the user's own icon (fix round 1's ruling): written over it (on a read-write mount), it lands on the disk and wins; removed,
+    #       the linuxfs icon is back
+    if [ "$kind" = rw ]; then
+    check "$tag: writing over /.VolumeIcon.icns makes the volume's own, listed and served" \
+      sh -c 'printf mine > "$1/.VolumeIcon.icns" && test "$(cat "$1/.VolumeIcon.icns")" = mine && ls -a "$1" | grep -qx .VolumeIcon.icns' _ "$mp"
+    check "$tag: removing it brings the linuxfs icon back" sh -c 'rm "$1/.VolumeIcon.icns" && cmp -s "$1/.VolumeIcon.icns" "$2"' _ "$mp" "$(volicon_of ext4)"
+    fi
   fi
   oldmp=$mp
   check "$tag: diskutil unmount" da_unmount "$mp"

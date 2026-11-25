@@ -8,7 +8,7 @@
 #          bundles, version V, under System/Library/Filesystems (linuxfs-fs copied to each bundle's macfuse_<fs>.util, mount_macfuse_<fs>
 #          and fsck_macfuse_<fs>), and Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d with copies of lklfuse, the CLI, the prober
 #          and linuxfs-open for the before-login root path; --version V is then required (exit 2 without it). DIR's linuxfs-volicon goes
-#          in the .d directory too, with art/tux.png: the postinstall, as root, makes each bundle's volume icon with them. Ownership (0/0)
+#          in the .d directory too, with art/tux.png and its copyright notice (art/README, as tux.README): the postinstall, as root, makes each bundle's volume icon with them. Ownership (0/0)
 #          is the packager's.
 set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -67,6 +67,8 @@ for p in linuxfs-probe linuxfs-open; do [ ! -f "$built/$p" ] || put "$built/$p" 
 if [ -f "$built/linuxfs-volicon" ]; then
   put "$built/linuxfs-volicon" "$pd/linuxfs-volicon" 755
   put "$REPO_ROOT/art/tux.png" "$pd/tux.png" 644
+  # Tux's copyright notice, which its terms say must go with it (Simon Budig's README, in art/README)
+  put "$REPO_ROOT/art/README" "$pd/tux.README" 644
 fi
 rmdir "$t/bin" 2>/dev/null || :
 find "$out" -type d -exec chmod 755 {} +

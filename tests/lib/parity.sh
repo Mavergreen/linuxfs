@@ -415,11 +415,12 @@ census_shot() {
   test "${3:-}" = nodismiss || census_dismiss "$1"
   parity_side "$2"; bounded 300 parity_shot "$1" >/dev/null 2>&1
   test "$2" != hfs || return 0
-  # spec: docs/superpowers/specs/2026-11-25-hfs-parity-design.md item 6's amendment -- the icon pair differs from HFS+ by design
-  #       (the linuxfs volume icon), so it is recorded as intended, never as a parity gap
+  # spec: docs/superpowers/specs/2026-11-25-hfs-parity-design.md item 6's amendment -- the icon pair differs from HFS+, as expected:
+  #       census_volume_icon's cp put a real .VolumeIcon.icns on the volume, which wins over the linuxfs icon, and its xattr -wx of
+  #       the root's Finder Info flag fails until item 7 stores Mac xattrs (Task 19), so Finder shows macFUSE's icon there
   if test "$1" = icon; then
     mkdir -p "$OUT/parity"
-    echo "icon $PARITY_FS: differs from hfs-icon.png by design: the linuxfs volume icon (spec: item 6's amendment)" >>"$OUT/parity/shots.txt"
+    echo "icon $PARITY_FS: differs from hfs-icon.png, as expected until item 7 (Task 19): the volume's own .VolumeIcon.icns (census_volume_icon) wins over the linuxfs icon, but its Finder Info flag cannot be stored yet, so Finder shows macFUSE's icon" >>"$OUT/parity/shots.txt"
   fi
   case $1 in desktop-on | desktop-off | privacy | privacy-ro) return 0 ;; esac
   if test -f "$OUT/hfs-$1.png" && cmp -s "$OUT/hfs-$1.png" "$OUT/$PARITY_FS-$1.png"; then

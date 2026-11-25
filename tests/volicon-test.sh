@@ -5,7 +5,8 @@
 #          Builds tools/volicon.c for 10.9 and checks linuxfs-volicon BASE.icns TUX.png OUT.icns (spec: item 6's
 #          amendment, the volume icon): from this Mac's External.icns and art/tux.png, and from a base of only three
 #          sizes, OUT has every representation BASE has (each size at each DPI, so @2x too), each BASE's own but for Tux
-#          in its lower-right corner (tests/volicon-check.c), mode 0644; misuse is exit 2; any failure (no base, a base
+#          in its lower-right corner (tests/volicon-check.c), mode 0644, its read-back check matching the two sets one to
+#          one in both directions (tests/volicon-reps.c); misuse is exit 2; any failure (no base, a base
 #          that is not an .icns, a Tux that is not an image, a directory that is missing or not writable) exits non-zero
 #          and writes nothing: OUT is neither made nor changed, and no temporary file is left.
 set -u
@@ -19,6 +20,7 @@ SDK=$(sh "$SHIPYARD_SCRIPTS/fetch_sdk.sh" 2>/dev/null) || exit 1
 cc() { "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld "$@"; }
 cc -o "$D/volicon" "$ROOT/tools/volicon.c" -framework ApplicationServices -framework CoreFoundation || exit 1
 cc -o "$D/check" "$ROOT/tests/volicon-check.c" -framework ApplicationServices -framework CoreFoundation || exit 1
+cc -o "$D/reps" "$ROOT/tests/volicon-reps.c" -framework ApplicationServices -framework CoreFoundation || exit 1
 # spec: tools/volicon.c TUX_EDGE, TUX_INSET -- Tux's box is 45% of the icon's edge, 6% in from the right and the bottom
 EDGE=0.45 INSET=0.06
 TUX=$ROOT/art/tux.png
@@ -33,6 +35,11 @@ checked() { # BASE OUT WHAT: volicon-check's lines, numbered here
 }
 leftovers() { ls -A "$1" | grep -v "^$2\$" | grep -c .; }
 
+# the read-back check: BASE's representations, matched one to one both ways
+"$D/reps" > "$D/reps.out" 2>&1
+while IFS= read -r line; do
+  case $line in "ok - "*) ok 0 "${line#ok - }" ;; "not ok - "*) ok 1 "${line#not ok - }" ;; *) ok 1 "volicon-reps: $line" ;; esac
+done < "$D/reps.out"
 "$D/volicon" > "$D/out" 2>&1; rc=$?
 [ $rc -eq 2 ] && grep -q '^usage: linuxfs-volicon BASE.icns TUX.png OUT.icns' "$D/out"; ok $? "no arguments: usage, exit 2 (got $rc)"
 "$D/volicon" "$EXT" "$TUX" > "$D/out" 2>&1; rc=$?

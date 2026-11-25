@@ -83,11 +83,15 @@ choices: the Mac keeps that setting by a volume ID that only HFS+ stores, it cha
 
 A linuxfs volume shows the Mac's external-disk icon with a small Tux in its lower-right corner, unless it has a
 `.VolumeIcon.icns` of its own. The installer draws that icon on your Mac, from your Mac's own external-disk icon, into
-each bundle (`Contents/Resources/linuxfs.icns`). Nothing is written to the volume: the icon is shown as a read-only
-`/.VolumeIcon.icns` that `ls -a` does not list. If the installer cannot draw the icon, it says so in
-`/var/log/install.log`, and the volumes show macFUSE's icon.
+each bundle (`Contents/Resources/linuxfs.icns`). Nothing is written to the volume: the icon is shown as a
+`/.VolumeIcon.icns` that `ls -a` does not list and that cannot be changed. Copying or moving your own `.VolumeIcon.icns`
+there puts a real one on the volume, which then wins; removing it brings the linuxfs icon back. Until linuxfs stores
+the Mac's Finder Info on the volume, a volume's own icon file is not flagged as its icon, so Finder shows macFUSE's
+icon for it. If the installer cannot draw the icon, it says so in `/var/log/install.log`, and the volumes show
+macFUSE's icon.
 
-Tux is by Larry Ewing (lewing@isc.tamu.edu), made with The GIMP (`art/README`).
+Tux was drawn by Larry Ewing (lewing@isc.tamu.edu) with The GIMP and vectorized by Simon Budig; the drawings are
+copyrighted by Larry Ewing and Simon Budig. Their notice is in `art/README`, which the pkg installs beside the image.
 
 ### Preferences
 
