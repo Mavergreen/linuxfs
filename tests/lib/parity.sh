@@ -513,7 +513,9 @@ census_stall() {
     for st_loop in 1 2; do
       st_s=0 st_f=0 st_i=0 st_cut=
       while test "$st_i" -lt "$st_n"; do
-        census_due "stall $st_vol loop $st_loop from iteration $((st_i + 1)) of $st_n" >>"$OUT/parity/stall-summary.txt" || { st_cut=1; break; }
+        if ! st_due=$(census_due "stall $st_vol loop $st_loop from iteration $((st_i + 1)) of $st_n"); then
+          printf '%s\n' "$st_due" | tee -a "$OUT/parity/stall-summary.txt"; st_cut=1; break
+        fi
         st_i=$((st_i + 1))
         fl_iter "$st_vol" "$st_loop" "$st_i" "$st_img"
         case $? in 1) st_s=$((st_s + 1)) ;; 2) st_f=$((st_f + 1)) ;; esac
@@ -973,7 +975,11 @@ end tell' >"$OUT/parity/trash.$tt_fs.empty-trash.txt" 2>&1
       parity "tags.$tt_fs.after-remount" xattr -l @MP@/tagged
     else
       echo "# census_trash_tags_case $tt_fs: no remount, so no tags read after one"
-      if test -n "$(census_image_disk "$tt_i")"; then   # its eject failed: it is still mounted; the control comes back
+      tt_live=$(census_image_disk "$tt_i")
+      if test -n "$tt_live" && { test "$tt_live" != "$PARITY_FS_DISK" || test "$(census_info "$PARITY_FS_MP" "Mount Point")" != "$PARITY_FS_MP"; }; then
+        # a new attach that never mounted, and could not be detached: no live linuxfs mount to ask
+        echo "# census_trash_tags_case $tt_fs: $tt_live is attached but not mounted as the pair's volume, so no case step"; return 1
+      elif test -n "$tt_live"; then   # its eject failed: it is still mounted; the control comes back
         census_attach "$tt_h" || { echo "# census_trash_tags_case $tt_fs: no HFS+ control again, so no case step"; return 1; }
         parity_pair "$CA_DISK" "$CA_MP" "$CA_VOL" "$tt_fs" "$PARITY_FS_DISK" "$PARITY_FS_MP" "$PARITY_FS_VOL"
       else

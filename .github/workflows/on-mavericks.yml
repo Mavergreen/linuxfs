@@ -75,8 +75,9 @@ jobs:
     name: Mount, write, read back and automount on Mac OS X 10.9 (mavericks-vm)
     needs: [images]
     runs-on: ubuntu-latest
-    # spec: tests/lib/parity.sh parity_census_all -- the census adds up to about two hours (it starts nothing after
-    #       PARITY_CENSUS_MIN, 130 minutes) to the smoke's half hour
+    # spec: tests/lib/parity.sh PARITY_CENSUS_MIN -- the census begins nothing after PARITY_CENSUS_MIN, 140 minutes from
+    #       the smoke's start: about 5 for boot and installs + 140 + about 10 for the census step already begun + about 5
+    #       before login + about 5 for copyback and uploads = 165, leaving about 15 in reserve
     timeout-minutes: 180
     permissions:
       contents: read

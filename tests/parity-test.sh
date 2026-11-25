@@ -301,10 +301,12 @@ hdiutil)
     log "created disk, id = /dev/$d."
     log "probed disk, id = /dev/$nd, with stub, success."
     case $b in *nouuid*) sed -i.x '/^uuid=/d' "$N/$nd"; rm -f "$N/$nd.x" ;; esac
+    # flaky (a linuxfs image): only its first attach mounts; after its first eject, ejects and detaches fail
+    case $b in *hfs*) ;; *flaky*) if test -f "$STUB/flaky-attached"; then b=nevermount-$b; else : > "$STUB/flaky-attached"; fi ;; esac
     case $b:$nomount in *nevermount*:) echo "/dev/$nd          	Stub" ;; *swept*:1 | *:) : > "$N/$nd.m"; echo "/dev/$nd          	Stub	$mp" ;;
     *) echo "/dev/$nd          	Stub" ;; esac ;;
   detach)
-    for a; do case $a in disk*|/dev/disk*) d=${a#/dev/}; rm -f "$N/$d" "$N/$d.m" "$N/${d}s1" "$N/${d}s1.m" ;; esac; done ;;
+    for a; do case $a in disk*|/dev/disk*) d=${a#/dev/}; case $(field "$d" vol) in *hfs*) ;; *flaky*) test ! -f "$STUB/flaky-ejected" || exit 1 ;; esac; rm -f "$N/$d" "$N/$d.m" "$N/${d}s1" "$N/${d}s1.m" ;; esac; done ;;
   info)
     test ! -f "$STUB/info-fail" || { echo "hdiutil: info failed - stub"; exit 1; }
     echo "framework       : stub"; echo "driver          : stub"
@@ -335,6 +337,9 @@ diskutil)
   eject)
     d=${2#/dev/}
     case $(field "$d" vol) in *stuck*) echo "Disk $d couldn't be ejected (stub stuck)"; exit 1 ;; esac
+    case $(field "$d" vol) in *hfs*) ;; *flaky*)
+      if test -f "$STUB/flaky-ejected"; then echo "Disk $d couldn't be ejected (stub flaky)"; exit 1; fi; : > "$STUB/flaky-ejected" ;;
+    esac
     case $(field "$d" vol) in busy-ext4)
       if test ! -f "$STUB/eject-once"; then : > "$STUB/eject-once"; echo "Disk $d couldn't be ejected (stub busy)"; exit 1; fi ;;
     esac
@@ -443,6 +448,7 @@ expect census_stall_cut grep -q '^hfs loop 1: 0 stalls, 0 automounts, 0 setup fa
 expect census_stall_cut_said grep -q '^# census: out of time (1 min), skipped: stall hfs loop 1 from iteration 1 of 2$' "$P/stall-summary.txt"
 expect census_stall_cut_none test "$(grep -c '^[a-z0-9]*-loop' "$P/stall.txt")" -eq 0
 expect census_stall_cut_recorded has "$r" "^# recorded stall loop 1: hfs 0/0, ext4 0/0"
+expect census_stall_cut_stdout has "$r" "^# census: out of time (1 min), skipped: stall hfs loop 1 from iteration 1 of 2"
 expect census_stall_cut_detached test -z "$(attached)"
 
 # census_busy: 20 write-then-unmount cycles per volume (a busy one says who held it), the held-file cases through parity,
@@ -663,6 +669,15 @@ fl_iter ext4 1 1 "$W/census/nouuid-swept-stuck.img" > /dev/null 2>&1; d=$(cat "$
 expect swept_nouuid_not_forced not forced_on "/dev/disk$d"
 expect swept_nouuid_retried test "$(grep -c "^diskutil eject /dev/disk$d\$" "$S/calls.all")" -ge 2
 rm -f "$S/nodes/disk$d" "$S/nodes/disk$d.m"   # the leftover goes without a stub call, so no forced detach is logged
+# item 7's recovery: the remount's linuxfs attach never mounts and cannot be detached: the case step is skipped, said,
+#   and the stale disk is not ejected again
+echo flaky5 > "$W/img/flaky5.img"; first=disk$(($(cat "$S/disks") + 2))
+r=$(census_trash_tags_case flaky5 2>&1)
+expect census_ttc_stale_said has "$r" "^# census_trash_tags_case flaky5: /dev/disk[0-9]* is attached but not mounted as the pair's volume, so no case step"
+expect census_ttc_stale_no_case test ! -e "$P/case.flaky5.pathconf.flaky5.txt"
+expect census_ttc_stale_not_ejected_again test "$(grep -c "^diskutil eject /dev/$first\$" "$S/calls.all")" -eq 1
+for f in "$S"/nodes/*; do case $f in *.m) ;; *) test -f "$f" || continue; case $(sed -n 's/^vol=//p' "$f") in *flaky5*) rm -f "$f" "$f.m" ;; esac ;; esac; done
+rm -f "$W/img/flaky5.img"
 expect census_waits_bounded test ! -s "$unbounded"
 test ! -s "$unbounded" || sed 's/^/# /' "$unbounded"
 
