@@ -37,7 +37,7 @@
 #   census_trash_tags_case FS             item 7: Finder's delete, .Trashes/<uid> and empty trash; a tag and a label
 #                                         read back, after a remount too; a 128 KiB xattr; pathconf(_PC_CASE_SENSITIVE)
 #                                         against HFS+ and against HFSX (FS apfs, read-only: the pathconf alone)
-#   census_later                          Later: Time Machine and the exFAT control, against ext4
+#   census_later                          Later: Time Machine (isexcluded, its offer) and the exFAT control, against ext4
 #   census_before_login MP                item 5 before login: mdutil -s and .fseventsd only
 #   parity_census_all                     the controls, then all of it (PARITY_STALL_N 50), within PARITY_CENSUS_MIN
 #   Each records sysctl vfs.generic.macfuse once, as $OUT/parity/<census>.sysctl.txt. WHAT prefixes (the items whose
@@ -496,7 +496,8 @@ census_wait_uuid() {
 }
 
 # census_stall: item 3, PARITY_STALL_N iterations (unset or 0: nothing runs) of each loop on the HFS+ control and
-#   on ext4; stall.txt has a line per iteration (the verdict and each probe's time), stall-summary.txt the counts and
+#   on ext4, each iteration begun only while census_due (one out of time stops the rest, and the counts say how many
+#   ran); stall.txt has a line per iteration (the verdict and each probe's time), stall-summary.txt the counts and
 #   Fisher's exact p per loop (tests/lib/fisher.py: the volumes differ when p < 0.05)
 census_stall() {
   st_n=${PARITY_STALL_N:-0}
@@ -510,23 +511,24 @@ census_stall() {
   for st_vol in hfs ext4; do
     eval "st_img=\$st_$st_vol"
     for st_loop in 1 2; do
-      st_s=0 st_f=0 st_i=0
+      st_s=0 st_f=0 st_i=0 st_cut=
       while test "$st_i" -lt "$st_n"; do
+        census_due "stall $st_vol loop $st_loop from iteration $((st_i + 1)) of $st_n" >>"$OUT/parity/stall-summary.txt" || { st_cut=1; break; }
         st_i=$((st_i + 1))
         fl_iter "$st_vol" "$st_loop" "$st_i" "$st_img"
         case $? in 1) st_s=$((st_s + 1)) ;; 2) st_f=$((st_f + 1)) ;; esac
       done
-      eval "st_s_${st_vol}_$st_loop=$st_s st_a_${st_vol}_$st_loop=$((st_n - st_s - st_f))"
-      echo "$st_vol loop $st_loop: $st_s stalls, $((st_n - st_s - st_f)) automounts, $st_f setup failures of $st_n" >>"$OUT/parity/stall-summary.txt"
+      eval "st_s_${st_vol}_$st_loop=$st_s st_a_${st_vol}_$st_loop=$((st_i - st_s - st_f)) st_r_${st_vol}_$st_loop=$st_i"
+      echo "$st_vol loop $st_loop: $st_s stalls, $((st_i - st_s - st_f)) automounts, $st_f setup failures of $st_i${st_cut:+ (stopped early, out of time: $st_n asked)}" >>"$OUT/parity/stall-summary.txt"
     done
   done
   da_debug_off stall
   for st_loop in 1 2; do
-    eval "st_hs=\$st_s_hfs_$st_loop st_ha=\$st_a_hfs_$st_loop st_es=\$st_s_ext4_$st_loop st_ea=\$st_a_ext4_$st_loop"
+    eval "st_hs=\$st_s_hfs_$st_loop st_ha=\$st_a_hfs_$st_loop st_es=\$st_s_ext4_$st_loop st_ea=\$st_a_ext4_$st_loop st_hr=\$st_r_hfs_$st_loop st_er=\$st_r_ext4_$st_loop"
     st_p=$(bounded 300 "$PARITY_PYTHON" "$PARITY_LIB/fisher.py" "$st_hs" "$st_ha" "$st_es" "$st_ea" 2>&1 </dev/null)
     if test "$st_loop" = 1; then st_what="ignore, diskutil mount, unignore, eject, plain attach"; else st_what="attach, eject, attach"; fi
     echo "loop $st_loop ($st_what): Fisher p = $st_p (stalls: hfs $st_hs of $((st_hs + st_ha)), ext4 $st_es of $((st_es + st_ea)) attaches set up)" >>"$OUT/parity/stall-summary.txt"
-    echo "# recorded stall loop $st_loop: hfs $st_hs/$st_n, ext4 $st_es/$st_n, Fisher p = $st_p"
+    echo "# recorded stall loop $st_loop: hfs $st_hs/$st_hr, ext4 $st_es/$st_er, Fisher p = $st_p"
   done
 }
 
@@ -662,7 +664,11 @@ census_busy() {
 PARITY_SYSLOG=${PARITY_SYSLOG:-/var/log/system.log}
 PARITY_SPOT_SECS=${PARITY_SPOT_SECS:-120}   # census_mdfind: once a second; the tests wait less
 PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/AlertStopIcon.icns}
-PARITY_CENSUS_MIN=${PARITY_CENSUS_MIN:-130}
+# The guest job has 180 min. Before the smoke: the VM's boot and the installs, about 5. The census begins nothing after
+#   PARITY_CENSUS_MIN = 140 min from the smoke's start (PARITY_T0, which the smoke sets first): then at most the census
+#   step already begun (about 10: spotlight's two 120 s mdfind waits and remounts, or one stall iteration), before
+#   login (about 5) and the copyback and uploads (about 5) remain: 5 + 140 + 10 + 5 + 5 = 165, leaving 15 to spare.
+PARITY_CENSUS_MIN=${PARITY_CENSUS_MIN:-140}
 
 # census_pair_up CTL-IMAGE FS-IMAGE FS [readonly]: attaches both (the control -readonly when readonly) and makes them
 #   the pair; 1 when either fails, with what did attach ejected
@@ -704,14 +710,17 @@ census_log_since() { tail -n +"$((${1:-0} + 1))" "$PARITY_SYSLOG" 2>/dev/null; }
 census_refusal_re='Operation not permitted|Permission denied|EPERM|EACCES'
 
 # ---- item 5: Spotlight and fsevents ----
-# census_mdfind MP NAME SECONDS-FILE: up to PARITY_SPOT_SECS s for mdfind -onlyin MP to find NAME; the seconds it took go
+# census_mdfind MP NAME SECONDS-FILE: up to PARITY_SPOT_SECS s (by the clock; each mdfind bounded at 10 s) for
+#   mdfind -onlyin MP to find NAME; the seconds it took go
 #   to SECONDS-FILE (they differ between volumes)
 census_mdfind() {
-  _cm_k=0
-  while test "$_cm_k" -lt "$PARITY_SPOT_SECS"; do
-    _cm_f=$(mdfind -onlyin "$1" -name "$2" 2>&1 </dev/null)
+  _cm_t0=$(date +%s)
+  while :; do
+    _cm_f=$(bounded 100 mdfind -onlyin "$1" -name "$2" 2>&1 </dev/null)
+    _cm_k=$(($(date +%s) - _cm_t0))
     if test -n "$_cm_f"; then echo "found: $_cm_f"; echo "$1: found after $_cm_k s" >>"$3"; return 0; fi
-    _cm_k=$((_cm_k + 1)); sleep 1
+    test "$_cm_k" -lt "$PARITY_SPOT_SECS" || break
+    sleep 1
   done
   echo "not found within $PARITY_SPOT_SECS s"; echo "$1: not found within $PARITY_SPOT_SECS s" >>"$3"; return 1
 }
@@ -742,7 +751,7 @@ census_refresh() {
   sleep 3
   echo new >"$1/refresh/new.txt" || return 1
   sleep 3
-  guest-macosx-aqua osascript -e 'tell application "Finder" to count items of (target of front Finder window)' 2>&1 </dev/null; _crf_rc=$?
+  bounded 300 guest-macosx-aqua osascript -e 'tell application "Finder" to count items of (target of front Finder window)' 2>&1 </dev/null; _crf_rc=$?
   if test "$1" = "$PARITY_CTL_MP"; then census_shot refresh hfs; else census_shot refresh fs; fi
   census_osa 'tell application "Finder" to close every window'
   return "$_crf_rc"
@@ -760,7 +769,7 @@ census_privacy_shot() {
 census_spotlight_steps() {
   _ss_t=spotlight.$1.$2
   parity "$_ss_t.mdutil" mdutil -s @MP@
-  census_bound $((PARITY_SPOT_SECS * 10 + 300)) parity "$_ss_t.mdfind" census_mdfind @MP@ "$3" "$OUT/parity/$_ss_t.mdfind-seconds.txt"
+  census_bound $((PARITY_SPOT_SECS * 10 + 400)) parity "$_ss_t.mdfind" census_mdfind @MP@ "$3" "$OUT/parity/$_ss_t.mdfind-seconds.txt"
   parity "$_ss_t.dirs" census_dirs @MP@ .Spotlight-V100 .fseventsd
   parity "$_ss_t.refusals" census_refusals "$4" @MP@
   census_log_since "$4" | grep -E "$census_refusal_re" | census_refusal_uids >"$OUT/parity/$_ss_t.refusals-all.txt"
@@ -789,7 +798,8 @@ census_spotlight() {
     if census_pair_up "$sp_h" "$sp_i" "$sp_fs" $sp_ro; then
       test "$sp_pass" = ro || parity "spotlight.$sp_fs.rw.create" sh -c 'echo spot > "$1/$2"' _ @MP@ "$sp_name"
       census_spotlight_steps "$sp_fs" "$sp_pass" "$sp_name" "${sp_log:-0}"
-      test "$sp_pass" = ro || parity "spotlight.$sp_fs.rw.refresh" census_refresh @MP@
+      # census_refresh's worst: four 30 s bounds (open, count, shot, close) and 6 s of pauses
+      test "$sp_pass" = ro || census_bound 1500 parity "spotlight.$sp_fs.rw.refresh" census_refresh @MP@
       parity "spotlight.$sp_fs.$sp_pass.privacy-off" sudo -n mdutil -i off @MP@
       if census_remount_pair "$sp_h" "$sp_i" $sp_ro; then
         parity "spotlight.$sp_fs.$sp_pass.privacy-remount" mdutil -s @MP@
@@ -940,24 +950,36 @@ census_trash_tags_case() {
   if test "$tt_fs" = apfs; then
     echo "# census_trash_tags_case apfs: read-only, so the case step alone"
   else
-    parity "trash.$tt_fs.finder-delete" census_trash_delete @MP@
+    # census_finder_ask's worst: 4 s, a 30 s shot, 20 s, and the rest
+    census_bound 900 parity "trash.$tt_fs.finder-delete" census_trash_delete @MP@
     if grep -q '^osascript still waiting' "$OUT/parity/trash.$tt_fs.finder-delete.hfs.txt" "$OUT/parity/trash.$tt_fs.finder-delete.$tt_fs.txt"; then
       census_finder_restart   # a dialog was left up
     fi
     parity "trash.$tt_fs.trashes" census_trashes @MP@ "$tt_uid"
-    bounded 450 census_finder_ask trash-empty "$PARITY_CTL_MP" \
+    tt_warn=$(bounded 300 guest-macosx-aqua osascript -e 'tell application "Finder" to get warns before emptying of trash' 2>/dev/null </dev/null)
+    bounded 900 census_finder_ask trash-empty "$PARITY_CTL_MP" \
       'tell application "Finder"
 set warns before emptying of trash to false
 empty trash
 end tell' >"$OUT/parity/trash.$tt_fs.empty-trash.txt" 2>&1
     echo "== status $?" >>"$OUT/parity/trash.$tt_fs.empty-trash.txt"
     grep -q '^osascript still waiting' "$OUT/parity/trash.$tt_fs.empty-trash.txt" && census_finder_restart
+    case $tt_warn in true|false) census_osa "tell application \"Finder\" to set warns before emptying of trash to $tt_warn" ;; esac
     parity "trash.$tt_fs.after-empty" census_trashes @MP@ "$tt_uid"
     parity "tags.$tt_fs.set" census_tag_set @MP@
     parity "tags.$tt_fs.read" xattr -l @MP@/tagged
     parity "tags.$tt_fs.oversized" census_xattr_big @MP@
-    census_remount_pair "$tt_h" "$tt_i" || { echo "# census_trash_tags_case $tt_fs: no remount"; return 1; }
-    parity "tags.$tt_fs.after-remount" xattr -l @MP@/tagged
+    if census_remount_pair "$tt_h" "$tt_i"; then
+      parity "tags.$tt_fs.after-remount" xattr -l @MP@/tagged
+    else
+      echo "# census_trash_tags_case $tt_fs: no remount, so no tags read after one"
+      if test -n "$(census_image_disk "$tt_i")"; then   # its eject failed: it is still mounted; the control comes back
+        census_attach "$tt_h" || { echo "# census_trash_tags_case $tt_fs: no HFS+ control again, so no case step"; return 1; }
+        parity_pair "$CA_DISK" "$CA_MP" "$CA_VOL" "$tt_fs" "$PARITY_FS_DISK" "$PARITY_FS_MP" "$PARITY_FS_VOL"
+      else
+        census_pair_up "$tt_h" "$tt_i" "$tt_fs" || { echo "# census_trash_tags_case $tt_fs: cannot attach both again, so no case step"; return 1; }
+      fi
+    fi
   fi
   parity "case.$tt_fs.pathconf" "$PARITY_PYTHON" -c "$census_py_pathconf" @MP@
   tt_hd=$PARITY_CTL_DISK tt_hm=$PARITY_CTL_MP tt_hv=$PARITY_CTL_VOL
@@ -971,23 +993,9 @@ end tell' >"$OUT/parity/trash.$tt_fs.empty-trash.txt" 2>&1
 }
 
 # ---- Later: Time Machine (record-only, never checked) ----
-# census_tm_destination MP: sudo tmutil setdestination MP; whether destinationinfo then lists MP; if it does, that
-#   destination is removed again
-census_tm_destination() {
-  sudo -n tmutil setdestination "$1" 2>&1 </dev/null; echo "setdestination: exit $?"
-  _tm_id=$(tmutil destinationinfo 2>/dev/null </dev/null | awk -v m="$1" '
-    /^=+$/ { if (hit && id != "") { print id; done = 1; exit } hit = 0; id = ""; next }
-    /^Mount Point/ { v = $0; sub(/^Mount Point *: */, "", v); hit = (v == m) }
-    /^ID/ { v = $0; sub(/^ID *: */, "", v); id = v }
-    END { if (!done && hit && id != "") print id }')
-  if test -z "$_tm_id"; then echo "a Time Machine destination: no"; return 0; fi
-  echo "a Time Machine destination: yes"
-  sudo -n tmutil removedestination "$_tm_id" 2>&1 </dev/null; echo "removedestination: exit $?"
-}
-
 # census_later: Later's Time Machine record: the HFS+ control beside the exFAT control (later.exfat.*), then beside
-#   ext4 (later.ext4.*): tmutil isexcluded, census_tm_destination, and Time Machine's offer photographed 5 s after
-#   each attach (tm-offer)
+#   ext4 (later.ext4.*): tmutil isexcluded, and Time Machine's offer photographed 5 s after each attach (tm-offer).
+#   No destination is ever set: that would replace the guest's, and backupd could remount a macFUSE volume (QEMU first).
 census_later() {
   census_sysctl later
   cl_c=$(parity_control hfs) && cl_cx=$(parity_control exfat) && cl_h=$(census_copy "$cl_c" later-hfs) &&
@@ -1002,34 +1010,49 @@ census_later() {
     parity_pair "$cl_hd" "$cl_hm" "$cl_hv" "$cl_k" "$CA_DISK" "$CA_MP" "$CA_VOL"
     census_pause 5; census_shot tm-offer fs
     parity "later.$cl_k.tm-excluded" tmutil isexcluded @MP@
-    parity "later.$cl_k.tm-destination" census_tm_destination @MP@
     census_detach "$PARITY_FS_DISK" "$cl_side" "$PARITY_FS_MP"
   done
   census_detach "$cl_hd" apple
 }
 
 # ---- all of it ----
-# census_due WHAT...: true while the census is within PARITY_CENSUS_MIN minutes of its start (CA_T0); else it says it
-#   skips WHAT. A census step is never cut short: the guest job's timeout would lose every record, the smoke's too.
+# census_due WHAT...: true while within PARITY_CENSUS_MIN minutes of CA_T0 (the smoke's start; with no CA_T0, always);
+#   else it says it skips WHAT. A census step is never cut short: the guest job's timeout would lose every record, the
+#   smoke's too.
 census_due() {
+  test -n "${CA_T0:-}" || return 0
   test $(($(date +%s) - CA_T0)) -lt $((PARITY_CENSUS_MIN * 60)) && return 0
   echo "# census: out of time ($PARITY_CENSUS_MIN min), skipped: $*"; return 1
 }
 # census_on FS CMD...: CMD, when there is time and FS's image ($W/img/FS.img); NTFS with NTFSTakeover on, so linuxfs
-#   mounts it rather than Apple's ntfs
+#   mounts it rather than Apple's ntfs, and put back as it was after
 census_on() {
   census_due "$2" "$1" || return 1
   test -f "$W/img/$1.img" || { echo "# census: no $W/img/$1.img, so no $2 $1"; return 1; }
   _con_fs=$1; shift
-  test "$_con_fs" != ntfs || bounded 300 defaults write dev.mavergreen.linuxfs NTFSTakeover -bool true >/dev/null 2>&1 </dev/null
+  if test "$_con_fs" = ntfs; then
+    _con_old=$(bounded 300 defaults read dev.mavergreen.linuxfs NTFSTakeover 2>/dev/null </dev/null)
+    bounded 300 defaults write dev.mavergreen.linuxfs NTFSTakeover -bool true >/dev/null 2>&1 </dev/null
+  fi
   "$@"; _con_rc=$?
-  test "$_con_fs" != ntfs || bounded 300 defaults delete dev.mavergreen.linuxfs NTFSTakeover >/dev/null 2>&1 </dev/null
+  if test "$_con_fs" = ntfs; then   # as it was
+    case $_con_old in
+    1) set -- write dev.mavergreen.linuxfs NTFSTakeover -bool true ;;
+    0) set -- write dev.mavergreen.linuxfs NTFSTakeover -bool false ;;
+    *) set -- delete dev.mavergreen.linuxfs NTFSTakeover ;;
+    esac
+    bounded 300 defaults "$@" >/dev/null 2>&1 </dev/null
+  fi
   census_clean
   return "$_con_rc"
 }
+# census_info_ok TEXT: TEXT is hdiutil info's own answer (its framework and driver lines head it)
+census_info_ok() { printf '%s\n' "$1" | grep -q '^framework *:' && printf '%s\n' "$1" | grep -q '^driver *:'; }
 # census_clean: the census's copies no longer attached removed (each is up to 320 MB, on the guest's own disk)
+#   (nothing, when hdiutil info fails or does not answer as itself)
 census_clean() {
-  _ccl_att=$(bounded 600 hdiutil info 2>/dev/null </dev/null | awk '/^image-path/ { sub(/^image-path[ \t]*:[ \t]*/, ""); print }')
+  _ccl_i=$(bounded 600 hdiutil info 2>/dev/null </dev/null) && census_info_ok "$_ccl_i" || { echo "# census: hdiutil info failed, so no copy is removed"; return 1; }
+  _ccl_att=$(printf '%s\n' "$_ccl_i" | awk '/^image-path/ { sub(/^image-path[ \t]*:[ \t]*/, ""); print }')
   for _ccl_f in "$W"/census/*.img; do
     test -f "$_ccl_f" || continue
     printf '%s\n' "$_ccl_att" | grep -qxF -- "$_ccl_f" || rm -f "$_ccl_f"
@@ -1039,7 +1062,9 @@ census_clean() {
 #   detached by force), into $OUT/parity/census-left-attached.txt ("none" when none is) and said
 census_left_attached() {
   mkdir -p "$OUT/parity" || return 1
-  _cla=$(bounded 600 hdiutil info 2>/dev/null </dev/null | awk -v c="$W/census/" -v k="$W/ctl/" '
+  _cla_i=$(bounded 600 hdiutil info 2>/dev/null </dev/null) && census_info_ok "$_cla_i" ||
+    { echo "unknown: hdiutil info failed" >"$OUT/parity/census-left-attached.txt"; echo "# census: hdiutil info failed, so what is left attached is unknown"; return 1; }
+  _cla=$(printf '%s\n' "$_cla_i" | awk -v c="$W/census/" -v k="$W/ctl/" '
     /^image-path/ { p = $0; sub(/^image-path[ \t]*:[ \t]*/, "", p); cur = (index(p, c) == 1 || index(p, k) == 1); next }
     cur && /^\/dev\/disk[0-9]+[ \t]/ { print $1 " " p; cur = 0 }')
   if test -z "$_cla"; then echo none >"$OUT/parity/census-left-attached.txt"; echo "# census: no census disk is left attached"; return 0; fi
@@ -1049,10 +1074,11 @@ census_left_attached() {
 
 # parity_census_all: the census, record-only: the four controls made, then item 3 (PARITY_STALL_N, 50 unless set; first,
 #   as the longest), items 1 and 7 on ext4, btrfs, xfs, f2fs and NTFS, items 4 and 5 on ext4, item 6 on those and APFS,
-#   item 7's case step on APFS too, then Later. A census not begun within PARITY_CENSUS_MIN (130) minutes is skipped.
+#   item 7's case step on APFS too, then Later. Nothing is begun past PARITY_CENSUS_MIN (140) minutes from the smoke's
+#   start (PARITY_T0; the census's own start without it).
 parity_census_all() {
   : "${PARITY_STALL_N:=50}"
-  CA_T0=$(date +%s)
+  CA_T0=${PARITY_T0:-$(date +%s)}
   for ca_k in hfs hfsx fat32 exfat; do parity_control "$ca_k" >/dev/null || echo "# census: cannot make the $ca_k control"; done
   census_due census_stall && { census_stall; census_clean; }
   for ca_fs in ext4 btrfs xfs f2fs ntfs; do census_on "$ca_fs" census_unicode "$ca_fs"; done

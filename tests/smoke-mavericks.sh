@@ -24,6 +24,8 @@
 #          the console session: the steps that need it go through /usr/local/bin/guest-macosx-aqua.
 #          Exits 77 where it cannot run (not 10.9, product not installed, wrong arguments); the job treats 77 as failure.
 set -u
+# spec: tests/lib/parity.sh PARITY_CENSUS_MIN -- the census's deadline counts from the smoke's start
+PARITY_T0=$(date +%s)
 case "$(sw_vers -productVersion 2>/dev/null)" in 10.9*) ;; *) echo "not Mac OS X 10.9 -- skipping"; exit 77 ;; esac
 [ $# -eq 3 ] || { echo "usage: smoke-mavericks.sh VERSION IN OUT -- skipping"; exit 77; }
 P=/usr/local/mavergreen/linuxfs

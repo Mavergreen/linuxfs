@@ -306,6 +306,8 @@ hdiutil)
   detach)
     for a; do case $a in disk*|/dev/disk*) d=${a#/dev/}; rm -f "$N/$d" "$N/$d.m" "$N/${d}s1" "$N/${d}s1.m" ;; esac; done ;;
   info)
+    test ! -f "$STUB/info-fail" || { echo "hdiutil: info failed - stub"; exit 1; }
+    echo "framework       : stub"; echo "driver          : stub"
     for f in "$N"/*; do case $f in *.m) continue ;; esac; test -f "$f" || continue
       echo "image-path      : $(field "${f##*/}" img)"; echo "/dev/$(field "${f##*/}" disk)	GUID_partition_scheme"; done ;;
   esac ;;
@@ -353,14 +355,13 @@ mdfind) test ! -e "$2/$4" || echo "$2/$4" ;;
 tmutil)
   case $1 in
   isexcluded) echo "[Excluded]    $2" ;;
-  setdestination) echo "$2" > "$STUB/tmdest" ;;
-  destinationinfo)
-    if test -s "$STUB/tmdest"; then printf '%s\n' ==================================================== "Name          : Stub" "Kind          : Local" "Mount Point   : $(cat "$STUB/tmdest")" "ID            : STUB-ID"
-    else echo "tmutil: No destinations configured."; fi ;;
-  removedestination) : > "$STUB/tmdest" ;;
   esac ;;
 defaults)
-  case $1:$3 in write:NTFSTakeover) : > "$STUB/takeover" ;; delete:NTFSTakeover) rm -f "$STUB/takeover" ;; esac ;;
+  case $1:$3 in
+  write:NTFSTakeover) if test "$5" = true; then echo 1; else echo 0; fi > "$STUB/takeover" ;;
+  delete:NTFSTakeover) rm -f "$STUB/takeover" ;;
+  read:NTFSTakeover) cat "$STUB/takeover" 2> /dev/null || exit 1 ;;
+  esac ;;
 xattr)
   case $1 in -w) echo "${#3}" >> "$STUB/xattr-sizes" ;; -l) echo "com.apple.FinderInfo: stub" ;; -px) echo "00 00 04 00" ;; esac ;;
 guest-macosx-aqua)
@@ -368,7 +369,11 @@ guest-macosx-aqua)
   screencapture) : > "$3" ;;
   defaults) test "$2" != read || exit 1 ;;
   osascript)
-    case "$*" in *ejectable*) echo "true|true|false|1.34217728E+8|1.0E+8|Mac OS Extended format" ;; *"count items"*) echo 1 ;; esac ;;
+    case "$*" in
+    *ejectable*) echo "true|true|false|1.34217728E+8|1.0E+8|Mac OS Extended format" ;;
+    *"count items"*) echo 1 ;;
+    *"get warns before emptying"*) echo true ;;
+    esac ;;
   esac ;;
 esac
 exit 0
@@ -432,6 +437,13 @@ expect census_stall_recorded has "$r" "^# recorded stall loop 2: hfs 0/2, ext4 2
 expect census_stall_quiet hasnt "$r" "not ok"
 expect census_stall_sysctl test -s "$P/stall.sysctl.txt"
 expect census_stall_detached test -z "$(attached)"
+# past the deadline, no further iteration begins, and the counts say how many ran
+r=$(CA_T0=$(($(date +%s) - 120)); PARITY_CENSUS_MIN=1; PARITY_STALL_N=2; census_stall 2>&1)
+expect census_stall_cut grep -q '^hfs loop 1: 0 stalls, 0 automounts, 0 setup failures of 0 (stopped early, out of time: 2 asked)$' "$P/stall-summary.txt"
+expect census_stall_cut_said grep -q '^# census: out of time (1 min), skipped: stall hfs loop 1 from iteration 1 of 2$' "$P/stall-summary.txt"
+expect census_stall_cut_none test "$(grep -c '^[a-z0-9]*-loop' "$P/stall.txt")" -eq 0
+expect census_stall_cut_recorded has "$r" "^# recorded stall loop 1: hfs 0/0, ext4 0/0"
+expect census_stall_cut_detached test -z "$(attached)"
 
 # census_busy: 20 write-then-unmount cycles per volume (a busy one says who held it), the held-file cases through parity,
 #   and the forced ones on the HFS+ side only
@@ -470,6 +482,11 @@ for p in rw ro; do
   for f in refusals-all processes lsof mdfind-seconds; do expect "census_spotlight_${p}_$f" test -e "$P/spotlight.ext4.$p.$f.txt"; done
   expect "census_spotlight_${p}_found" grep -q '^found: <MP>/parity-spot-' "$P/spotlight.ext4.$p.mdfind.ext4.txt"
 done
+# not found: mdfind is asked until PARITY_SPOT_SECS have passed by the clock, then that is said and recorded
+mkdir -p "$T/nofind"; : > "$T/nofind.secs"
+t0=$(date +%s); rnf=$(PARITY_SPOT_SECS=1; bounded 100 census_mdfind "$T/nofind" nothing "$T/nofind.secs" 2>&1); t1=$(date +%s)
+expect census_mdfind_not_found test "$rnf" = "not found within 1 s" -a "$(cat "$T/nofind.secs")" = "$T/nofind: not found within 1 s"
+expect census_mdfind_by_clock test $((t1 - t0)) -ge 1
 expect census_spotlight_refresh test -s "$P/spotlight.ext4.rw.refresh.hfs.txt" -a -s "$P/spotlight.ext4.rw.refresh.ext4.txt" -a ! -e "$P/spotlight.ext4.ro.refresh.ext4.txt"
 expect census_spotlight_dirs grep -q '^.fseventsd: no$' "$P/spotlight.ext4.rw.dirs.ext4.txt"
 expect census_spotlight_refusal_uid grep -q '^#   pid 1: uid 0 root$' "$P/spotlight.ext4.rw.refusals-all.txt"
@@ -518,6 +535,7 @@ done
 expect census_ttc_empty_record test -s "$P/trash.ext4.empty-trash.txt"
 expect census_ttc_delete grep -q 'to delete (POSIX file ".*/vols/trash-ext4/trash-me" as alias)' "$S/calls"
 expect census_ttc_empty grep -q 'empty trash' "$S/calls"
+expect census_ttc_warns_restored test "$(grep 'warns before emptying' "$S/calls" | tail -n 1)" = 'guest-macosx-aqua osascript -e tell application "Finder" to set warns before emptying of trash to true'
 expect census_ttc_shot test "$(grep -Ec 'screencapture -x .*/(hfs|ext4)-trash-delete.png$' "$S/calls")" -eq 2
 expect census_ttc_tag grep -q '^xattr -wx com.apple.metadata:_kMDItemUserTags 62706c6973743030a10156506172697479080a0000000000000101000000000000000200000000000000000000000000000011 .*/vols/trash-ext4/tagged$' "$S/calls"
 expect census_ttc_label grep -q 'set label index of (POSIX file ".*/vols/trash-ext4/tagged" as alias) to 2' "$S/calls"
@@ -527,6 +545,14 @@ expect census_ttc_hfsx grep -q '^hdiutil attach -imagekey diskimage-class=CRawDi
 expect census_ttc_pathconf grep -Eq '^(pathconf\(_PC_CASE_SENSITIVE\) = -?[0-9]+|errno [0-9]+)$' "$P/case.ext4.pathconf.ext4.txt"
 expect census_ttc_quiet hasnt "$r" "not ok"
 expect census_ttc_detached test -z "$(attached)"
+# a failed remount (the linuxfs eject fails) skips only the read after it: the control comes back for the case steps
+echo stuck4 > "$W/img/stuck4.img"
+r=$(census_trash_tags_case stuck4 2>&1)
+expect census_ttc_remount_fails has "$r" "^# census_trash_tags_case stuck4: no remount, so no tags read after one"
+expect census_ttc_remount_fails_case test -s "$P/case.stuck4.pathconf.hfs.txt" -a -s "$P/case.stuck4.pathconf-hfsx.stuck4.txt"
+expect census_ttc_remount_fails_no_read test ! -e "$P/tags.stuck4.after-remount.stuck4.txt"
+for f in "$S"/nodes/*; do case $f in *.m) ;; *) test "$(sed -n 's/^vol=//p' "$f")" != trash-stuck4 || rm -f "$f" "$f.m" ;; esac; done
+rm -f "$W/img/stuck4.img"
 r=$(census_trash_tags_case apfs 2>&1)
 expect census_ttc_apfs_case test -s "$P/case.apfs.pathconf.apfs.txt" -a -s "$P/case.apfs.pathconf-hfsx.apfs.txt"
 expect census_ttc_apfs_case_only test -z "$(ls "$P" | grep -E '^(trash|tags)\.apfs\.')"
@@ -536,10 +562,9 @@ expect census_ttc_apfs_detached test -z "$(attached)"
 : > "$S/calls"
 r=$(census_later 2>&1)
 for k in exfat ext4; do
-  for s in tm-excluded tm-destination; do expect "census_later_${k}_$s" test -s "$P/later.$k.$s.hfs.txt" -a -s "$P/later.$k.$s.$k.txt"; done
+  expect "census_later_${k}_tm-excluded" test -s "$P/later.$k.tm-excluded.hfs.txt" -a -s "$P/later.$k.tm-excluded.$k.txt"
 done
-expect census_later_destination grep -q '^a Time Machine destination: yes$' "$P/later.ext4.tm-destination.ext4.txt"
-expect census_later_removed grep -q '^sudo -n tmutil removedestination STUB-ID$' "$S/calls"
+expect census_later_no_destination not grep -Eq 'tmutil (setdestination|removedestination)' "$S/calls"
 expect census_later_shots test "$(grep -Ec 'screencapture -x .*/(hfs|exfat|ext4)-tm-offer.png$' "$S/calls")" -eq 3
 expect census_later_quiet hasnt "$r" "not ok"
 expect census_later_detached test -z "$(attached)"
@@ -558,7 +583,7 @@ census_attach "$W/census/left-stuck.img" > /dev/null 2>&1; left=disk$(cat "$S/di
 ran=$T/ran; : > "$ran"
 r=$(
   unset PARITY_STALL_N
-  tk() { if test -f "$S/takeover"; then echo on; else echo off; fi; }
+  tk() { if test "$(cat "$S/takeover" 2> /dev/null)" = 1; then echo on; else echo off; fi; }
   census_stall() { echo "stall $# $PARITY_STALL_N" >> "$ran"; }
   census_unicode() { echo "unicode $1 $(tk)" >> "$ran"; }
   census_busy() { echo "busy $1 $(tk)" >> "$ran"; }
@@ -583,6 +608,25 @@ expect census_all_cleans test ! -e "$W/census/old.img" -a -e "$W/census/left-stu
 r=$(PARITY_CENSUS_MIN=0; census_stall() { echo stall >> "$ran"; }; census_later() { echo later >> "$ran"; }; parity_census_all 2>&1)
 expect census_all_out_of_time test ! -s "$ran"
 expect census_all_out_of_time_said has "$r" "^# census: out of time (0 min), skipped: census_stall"
+# the deadline counts from the smoke's start, PARITY_T0
+: > "$ran"
+r=$(PARITY_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=9; census_stall() { echo stall >> "$ran"; }; census_later() { echo later >> "$ran"; }; parity_census_all 2>&1)
+expect census_all_from_smoke_start test ! -s "$ran"
+r=$(PARITY_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=11; census_stall() { echo stall >> "$ran"; }; census_later() { echo later >> "$ran"; }; parity_census_all 2>&1)
+expect census_all_within test "$(head -n 1 "$ran")" = stall
+# NTFSTakeover is put back as it was, not deleted
+echo 0 > "$S/takeover"
+r=$(census_on ntfs cat "$S/takeover" 2>&1)
+expect census_on_takeover_during test "$r" = 1
+expect census_on_takeover_restored test "$(cat "$S/takeover")" = 0
+rm -f "$S/takeover"
+# when hdiutil info fails, census_clean removes nothing and the leftovers are unknown, not none
+echo old > "$W/census/old2.img"; : > "$S/info-fail"
+r=$(census_clean 2>&1; census_left_attached 2>&1)
+expect census_clean_info_fails test -e "$W/census/old2.img"
+expect census_clean_info_fails_said has "$r" "^# census: hdiutil info failed, so no copy is removed"
+expect census_left_info_fails grep -q '^unknown: hdiutil info failed$' "$P/census-left-attached.txt"
+rm -f "$S/info-fail" "$W/census/old2.img"
 rm -f "$S/nodes/$left" "$S/nodes/$left.m"
 census_left_attached > /dev/null 2>&1
 expect census_all_none_left grep -q '^none$' "$P/census-left-attached.txt"
@@ -592,6 +636,7 @@ expect census_all_none_left grep -q '^none$' "$P/census-left-attached.txt"
 sm=$here/smoke-mavericks.sh wf=$here/../.github/workflows/on-mavericks.yml
 first_line() { grep -n -- "$1" "$sm" | head -n 1 | cut -d: -f1; }
 bl=$(first_line '---- before login')
+expect smoke_t0_first ascending "$(first_line '^PARITY_T0=\$(date +%s)$')" "$(first_line '^installed=')"
 expect smoke_sources_parity ascending "$(first_line '^ *\. ".*/lib/parity\.sh"')" "$bl"
 expect smoke_runs_census ascending "$(first_line '^ *parity_census_all$')" "$bl"
 expect smoke_before_login_census ascending "$bl" "$(first_line 'census_before_login "\$mp"')"
