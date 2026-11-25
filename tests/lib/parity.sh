@@ -817,8 +817,11 @@ PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Content
 #   busy census about 5, or about 9 with a stuck disk at each of its six re-attaches; one trash/tags/case census about
 #   3; one stall iteration under 1. Push A's census, its Finder steps not
 #   run, took 50 min (the stall 30 of them); with them, and stuck disks in both busy censuses, about 90 are expected,
-#   well inside 135. Push B's smoke sets PARITY_STALL_N=0 (item 3's loop waits for push C): about 60, plus item 2's
-#   Finder restart and getinfo-format shot in each census_finder (about 15 s typical, 2.5 of census_finder's 24 at worst).
+#   well inside 135. Push C's smoke sets PARITY_STALL_N=50 (push B's set 0): the stall's 30 min come first,
+#   about 90 in all, plus item 2's Finder restart and getinfo-format shot in each census_finder (about 15 s typical, 2.5 of
+#   census_finder's 24 at worst). The stall's worst is counted per iteration: census_stall asks census_due "stall ..."
+#   (11 min at worst, the default) before each of its 200 iterations, so none begins after minute 135 and the step ends by
+#   146 like every other: 5 + 146 + 5 + 5 = 161 of 180, under the 165 allowed.
 PARITY_CENSUS_MIN=${PARITY_CENSUS_MIN:-135}
 
 # census_pair_up CTL-IMAGE FS-IMAGE FS [readonly]: attaches both (the control -readonly when readonly) and makes them

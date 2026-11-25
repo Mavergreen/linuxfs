@@ -356,6 +356,13 @@ hdiutil)
     nomount= verbose= img=
     for a; do case $a in -nomount) nomount=1 ;; -verbose) verbose=1 ;; *.img) img=$a ;; esac; done
     b=${img##*/}; b=${b%.img}
+    # a plain attach of a retry-once image stalls the first time; of a retry-always image, every time
+    case $b in *retry-once* | *retry-always*)
+      if test -z "$nomount"; then
+        case $b in *retry-once*) test ! -f "$STUB/retried-$b" || b=${b}-ok ;; esac
+        case $b in *-ok) ;; *) : > "$STUB/retried-$b"; echo "hdiutil: attach failed - no mountable file systems" >&2; exit 1 ;; esac
+      fi ;;
+    esac
     case $b in *stall-ext4*)
       if test -n "$verbose"; then
         k=$(($(cat "$STUB/stallcount" 2> /dev/null || echo 0) + 1)); echo $k > "$STUB/stallcount"
@@ -983,9 +990,8 @@ expect smoke_runs_census ascending "$(first_line '^ *parity_census_all$')" "$bl"
 expect smoke_before_login_census ascending "$bl" "$(first_line 'census_before_login "\$mp"')"
 expect workflow_parity_upload grep -q '^ *images-after/parity/\*\*$' "$wf"
 expect workflow_guest_timeout awk '/^  guest:/ { g = 1 } /^  fsck:/ { g = 0 } g && /^    timeout-minutes: 180$/ { f = 1 } END { exit !f }' "$wf"
-# push B's census runs without item 3's loop (it waits for push C)
-expect smoke_stall_off ascending "$(first_line '^ *PARITY_STALL_N=0$')" "$(first_line '^ *parity_census_all$')"
-
+# push C's census runs item 3's loop, 50 iterations, before the census
+expect smoke_stall_on ascending "$(first_line '^ *PARITY_STALL_N=50$')" "$(first_line '^ *parity_census_all$')"
 # item 2 in the smoke: the six names exactly, never the macfuse_ prefix as a family, and no bundle under its old linuxfs name left
 # smoke_fn NAME: the smoke's definition of the function NAME (one line, or up to its closing brace)
 smoke_fn() { awk -v n="$1() " 'index($0, n) == 1 { p = 1; print; if ($0 !~ /[{] *(#.*)?$/) exit; next } p { print } p && /^}/ { exit }' "$sm"; }
@@ -1065,5 +1071,26 @@ for f in "$S"/nodes/*; do case $f in *.m) ;; *) test -f "$f" || continue; case $
 rm -f "$W/img/flaky5.img"
 expect census_waits_bounded test ! -s "$unbounded"
 test ! -s "$unbounded" || sed 's/^/# /' "$unbounded"
+
+# da_attach_retry (tests/lib/attach-retry.sh): a plain attach that stalls with "no mountable file systems" is tried once more,
+#   printed and recorded; any other failure, and a second stall, are not retried again
+. "$here/lib/attach-retry.sh"
+image_disk() { census_image_disk "$1"; }
+echo ar > "$W/img/retry-once.img"; echo ar > "$W/img/retry-always.img"; echo ar > "$W/img/plain-ar.img"
+rm -f "$P/attach-retries.txt"
+r=$(da_attach_retry "$W/img/plain-ar.img" 2>&1); rc=$?
+expect attach_retry_none_rc test "$rc" -eq 0
+expect attach_retry_none_quiet hasnt "$r" "retrying"
+expect attach_retry_none_unrecorded test ! -e "$P/attach-retries.txt"
+r=$(da_attach_retry "$W/img/retry-once.img" 2>&1); rc=$?
+expect attach_retry_once_rc test "$rc" -eq 0
+expect attach_retry_once_said has "$r" "^# retrying hdiutil attach: hdiutil: attach failed - no mountable file systems$"
+expect attach_retry_once_recorded grep -q "retry-once.img: no mountable file systems$" "$P/attach-retries.txt"
+r=$(da_attach_retry "$W/img/retry-always.img" 2>&1); rc=$?
+expect attach_retry_always_fails test "$rc" -ne 0
+expect attach_retry_always_once test "$(printf '%s\n' "$r" | grep -c '^# retrying hdiutil attach')" -eq 1
+expect attach_retry_always_recorded test "$(grep -c "retry-always.img" "$P/attach-retries.txt")" -eq 1
+expect attach_retry_counted test "$(attach_retries)" -eq 2
+rm -f "$W/img"/retry-*.img "$W/img/plain-ar.img"
 
 test "$fails" -eq 0

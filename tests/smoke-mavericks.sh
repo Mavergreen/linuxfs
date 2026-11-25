@@ -11,7 +11,7 @@
 #       ReadOnly in the user's plist (read by the root mount program) mounts read-only; a label with a slash or a control
 #       character gets a safe /Volumes name; the encrypted APFS fixture shows the password dialog (screenshot), times out
 #       with no mount, mounts through --password-stdin and the keeper's --offer, then from the login keychain with no dialog;
-#       then the HFS+ parity census (tests/lib/parity.sh parity_census_all; PARITY_STALL_N=0, item 3's loop off until push C), which records, and gates only the items it
+#       then the HFS+ parity census (tests/lib/parity.sh parity_census_all; PARITY_STALL_N=50: item 3's loop, 50 attaches per loop and volume), which records, and gates only the items it
 #       checks (item 1, Unicode names: on HFS+ and each linuxfs volume, created, listed and opened by both forms alike);
 #       last, before login (the user's console session ended), an attached ext4 disk is mounted by root (as macfuse_ext4) with allow_other and
 #       served by lklfuse as _linuxfs (with a macFUSE that cannot serve /dev/fd/N the mount program refuses, and that is what is
@@ -175,9 +175,11 @@ check "apfs: not one byte of the image changed" cmp "$W/apfs.before" "$img"
 AQUA=/usr/local/bin/guest-macosx-aqua
 UUID_PART=6C696E75-7866-7370-6172-740000000001   # tests/lib/gpt-wrap.py's partition GUID: the keychain account of its volume
 info() { diskutil info "$1" 2> /dev/null | sed -n "s/^ *$2: *//p" | head -n 1; }
+# spec: tests/lib/attach-retry.sh da_attach_retry -- item 3: Apple's plain-attach stall is retried once, printed and counted
+. "$(cd "$(dirname "$0")" && pwd)/lib/attach-retry.sh"
 # spec: tests/smoke-mavericks.sh header -- attach IMAGE with automount (no -nomount); disks = every /dev/disk node it made, disk = the whole disk
 da_attach() {
-  out=$(bounded 3000 hdiutil attach -imagekey diskimage-class=CRawDiskImage "$1" 2>&1) || { echo "$out" | sed 's/^/# /'; return 1; }
+  da_attach_retry "$1" || { echo "$out" | sed 's/^/# /'; return 1; }
   disks=$(printf '%s\n' "$out" | awk '/^\/dev\/disk/ { print $1 }' | tr '\n' ' ')
   disk=${disks%% *}; [ -n "$disk" ]
 }
@@ -513,9 +515,8 @@ check "no lklfuse runs as root, after everything" no_root_lklfuse
 tests_dir=$(cd "$(dirname "$0")" && pwd)
 if [ -f "$tests_dir/lib/parity.sh" ]; then
   . "$tests_dir/lib/parity.sh"
-  # spec: tests/lib/parity.sh census_stall -- push B: the whole census in its current modes, without item 3's loop,
-  #       which waits for push C
-  PARITY_STALL_N=0
+  # spec: tests/lib/parity.sh census_stall -- push C: item 3's loop, 50 iterations of each loop on each volume
+  PARITY_STALL_N=50
   parity_census_all
   check "no lklfuse runs as root, after the census" no_root_lklfuse
 else notok "no $tests_dir/lib/parity.sh: the census cannot run"; fi
