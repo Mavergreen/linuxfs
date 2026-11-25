@@ -31,8 +31,31 @@ static int parse(struct mountreq *m, int argc, char **argv)
 	return fsrules_parse_mount(argc, argv, m);
 }
 
-int main(void)
+/* The six names, exactly as the Global Constraints table has them. */
+static const struct { const char *fs, *probe_type, *bundle, *fstypename, *personality, *fsname; int subtype; } want_names[] = {
+	{ "ext4", "ext4", "macfuse_ext4", "ext4", "ext4", "Linux ext4 (linuxfs)", 7 },
+	{ "ntfs", "ntfs3", "macfuse_ntfs", "ntfs", "NTFS-linuxfs", "Windows NTFS (linuxfs)", 8 },
+	{ "btrfs", "btrfs", "macfuse_btrfs", "btrfs", "btrfs", "Linux btrfs (linuxfs)", 9 },
+	{ "xfs", "xfs", "macfuse_xfs", "xfs", "XFS", "Linux XFS (linuxfs)", 10 },
+	{ "f2fs", "f2fs", "macfuse_f2fs", "f2fs", "F2FS", "Linux F2FS (linuxfs)", 11 },
+	{ "apfs", "apfs", "macfuse_apfs", "apfs", "APFS", "APFS (linuxfs)", 12 },
+};
+
+/* --names: one TSV row per entry, for the scripts that must agree with the table */
+static int print_names(void)
 {
+	const struct fsname *n;
+	size_t i;
+
+	for (i = 0; (n = fsrules_name_at(i)) != NULL; i++)
+		printf("%s\t%s\t%s\t%s\t%s\t%s\t%d\n", n->fs, n->probe_type, n->bundle, n->fstypename, n->personality, n->fsname, n->subtype);
+	return 0;
+}
+
+int main(int argc, char **argv)
+{
+	int names_mode = argc > 1 && strcmp(argv[1], "--names") == 0;
+	size_t k;
 	enum fsrole r;
 	static const char *const linux_fs[] = { "ext4", "btrfs", "xfs", "f2fs", "apfs" };
 	static const char *const types[] = { "ext4", "btrfs", "xfs", "f2fs", "apfs", "ntfs3", "exfat", "vfat", "hfs" };
@@ -41,30 +64,57 @@ int main(void)
 	char out[512], label[700];
 	int i, j, claimed_ok, others_ok;
 
+	if (names_mode)
+		return print_names();
 	r = FS_FSCK;
-	iss(fsrules_fs_from_name("/S/L/F/linuxfs_ext4.fs/Contents/Resources/linuxfs_ext4.util", &r), "ext4", "a util path names ext4");
+	iss(fsrules_fs_from_name("/S/L/F/macfuse_ext4.fs/Contents/Resources/macfuse_ext4.util", &r), "ext4", "a util path names ext4");
 	is(r == FS_UTIL, 1, "and its role is FS_UTIL");
-	iss(fsrules_fs_from_name("mount_linuxfs_ntfs", &r), "ntfs", "mount_linuxfs_ntfs names ntfs");
+	iss(fsrules_fs_from_name("mount_macfuse_ntfs", &r), "ntfs", "mount_macfuse_ntfs names ntfs");
 	is(r == FS_MOUNT, 1, "and its role is FS_MOUNT");
-	iss(fsrules_fs_from_name("/sbin/fsck_linuxfs_apfs", &r), "apfs", "fsck_linuxfs_apfs names apfs");
+	iss(fsrules_fs_from_name("/sbin/fsck_macfuse_apfs", &r), "apfs", "fsck_macfuse_apfs names apfs");
 	is(r == FS_FSCK, 1, "and its role is FS_FSCK");
-	iss(fsrules_fs_from_name("linuxfs_btrfs.util", &r), "btrfs", "btrfs");
-	iss(fsrules_fs_from_name("linuxfs_xfs.util", &r), "xfs", "xfs");
-	iss(fsrules_fs_from_name("linuxfs_f2fs.util", &r), "f2fs", "f2fs");
-	iss(fsrules_fs_from_name("linuxfs_hfs.util", &r), NULL, "an unknown filesystem is NULL");
+	iss(fsrules_fs_from_name("macfuse_btrfs.util", &r), "btrfs", "btrfs");
+	iss(fsrules_fs_from_name("macfuse_xfs.util", &r), "xfs", "xfs");
+	iss(fsrules_fs_from_name("macfuse_f2fs.util", &r), "f2fs", "f2fs");
+	iss(fsrules_fs_from_name("macfuse_hfs.util", &r), NULL, "an unknown filesystem is NULL");
 	iss(fsrules_fs_from_name("mount_linuxfs", &r), NULL, "mount_linuxfs with no filesystem is NULL");
 	iss(fsrules_fs_from_name("mount_linuxfs_", &r), NULL, "an empty filesystem is NULL");
-	iss(fsrules_fs_from_name("mount_linuxfs_hfs", &r), NULL, "mount_linuxfs_hfs is NULL");
-	iss(fsrules_fs_from_name("fsck_linuxfs_hfs", &r), NULL, "fsck_linuxfs_hfs is NULL");
+	iss(fsrules_fs_from_name("mount_macfuse_hfs", &r), NULL, "mount_macfuse_hfs is NULL");
+	iss(fsrules_fs_from_name("fsck_macfuse_hfs", &r), NULL, "fsck_macfuse_hfs is NULL");
 	iss(fsrules_fs_from_name("mount_hfs", &r), NULL, "another program is NULL");
-	iss(fsrules_fs_from_name("mount_linuxfs_ext4", NULL), "ext4", "a NULL role is tolerated");
+	iss(fsrules_fs_from_name("mount_macfuse_ext4", NULL), "ext4", "a NULL role is tolerated");
 	r = FS_UTIL;
-	iss(fsrules_fs_from_name("mount_linuxfs_hfs", &r), NULL, "a failed lookup");
+	iss(fsrules_fs_from_name("mount_macfuse_hfs", &r), NULL, "a failed lookup");
 	is(r == FS_UTIL, 1, "leaves the role alone");
-	iss(fsrules_fs_from_name("linuxfs_ext4", &r), NULL, "a util without .util is NULL");
-	iss(fsrules_fs_from_name("linuxfs_ext4.util/", &r), NULL, "a trailing slash is NULL");
+	iss(fsrules_fs_from_name("macfuse_ext4", &r), NULL, "a util without .util is NULL");
+	iss(fsrules_fs_from_name("macfuse_ext4.util/", &r), NULL, "a trailing slash is NULL");
 	iss(fsrules_fs_from_name(NULL, &r), NULL, "no name is NULL");
 
+	for (k = 0; k < 6; k++) {
+		const struct fsname *n = fsrules_name_at(k);
+		int same = n && strcmp(n->fs, want_names[k].fs) == 0 && strcmp(n->probe_type, want_names[k].probe_type) == 0 &&
+			   strcmp(n->bundle, want_names[k].bundle) == 0 && strcmp(n->fstypename, want_names[k].fstypename) == 0 &&
+			   strcmp(n->personality, want_names[k].personality) == 0 && strcmp(n->fsname, want_names[k].fsname) == 0 &&
+			   n->subtype == want_names[k].subtype;
+
+		is(same, 1, want_names[k].fs);
+		is(n && strlen(n->fstypename) <= 6, 1, "its fstypename is at most 6 bytes");
+		is(fsrules_name(want_names[k].fs) == n, 1, "fsrules_name finds it by fs");
+		iss(fsrules_fs_of_type(want_names[k].bundle), want_names[k].fs, "fsrules_fs_of_type maps its macfuse_ name back");
+	}
+	is(fsrules_name_at(6) == NULL, 1, "there are six entries");
+	is(fsrules_name("zfs") == NULL, 1, "fsrules_name of another is NULL");
+	is(fsrules_name(NULL) == NULL, 1, "fsrules_name of NULL is NULL");
+	iss(fsrules_fs_of_type("macfuse_ntfs"), "ntfs", "macfuse_ntfs is ntfs");
+	iss(fsrules_fs_of_type("macfuse"), NULL, "plain macfuse is no type of ours");
+	iss(fsrules_fs_of_type("macfuse_zfs"), NULL, "macfuse_zfs is not");
+	iss(fsrules_fs_of_type("macfuse_ext4x"), NULL, "macfuse_ext4x is not");
+	iss(fsrules_fs_of_type("linuxfs_ext4"), NULL, "the old name is not");
+	iss(fsrules_fs_of_type("osxfuse"), NULL, "osxfuse is not");
+	iss(fsrules_fs_of_type(NULL), NULL, "NULL is not");
+	iss(fsrules_fs_from_name("mount_linuxfs_ext4", &r), NULL, "mount_linuxfs_ext4 names nothing now");
+	iss(fsrules_fs_from_name("linuxfs_ext4.util", &r), NULL, "linuxfs_ext4.util names nothing now");
+	iss(fsrules_fs_from_name("fsck_linuxfs_ext4", &r), NULL, "fsck_linuxfs_ext4 names nothing now");
 	iss(fsrules_probe_type("ntfs"), "ntfs3", "ntfs is probed as ntfs3");
 	iss(fsrules_probe_type("ext4"), "ext4", "ext4 is probed as ext4");
 	iss(fsrules_probe_type("apfs"), "apfs", "apfs is probed as apfs");

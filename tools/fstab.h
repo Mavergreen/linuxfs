@@ -17,10 +17,10 @@
  * non-empty label of at most 1000 bytes with no newline, #, backslash, DEL or byte below 0x20 other than tab. */
 const char *fstab_spec_refusal(const char *spec);
 
-/* Why BUNDLE may not be written, or NULL when it may: linuxfs_ext4, _btrfs, _xfs, _f2fs, _apfs or _ntfs. */
+/* Why BUNDLE may not be written, or NULL when it may: macfuse_ext4, _btrfs, _xfs, _f2fs, _apfs or _ntfs. */
 const char *fstab_bundle_refusal(const char *bundle);
 
-/* The bundle for what tools/probe.c names a filesystem (ntfs3 is linuxfs_ntfs), or NULL when no bundle mounts it. */
+/* The bundle for what tools/probe.c names a filesystem (ntfs3 is macfuse_ntfs), or NULL when no bundle mounts it. */
 const char *fstab_bundle_for(const char *probe_type);
 
 /* SPEC as fstab spells it (a label's space as \040, its tab as \011) into OUT; 0, or -1 when SPEC is refused or does not fit. */

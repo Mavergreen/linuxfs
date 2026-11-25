@@ -97,15 +97,15 @@ HOME=$H2 LINUXFS_KEYCHAIN=off "$D/agent" 2> "$D/symlink.log"; rc=$?
 [ $rc = 1 ] && grep -q 'not a directory of this user' "$D/symlink.log" && [ ! -e "$H2/elsewhere/keychain.sock" ]; ok $? "a symlinked socket directory: the agent exits 1 and logs the refusal (rc $rc)"
 rm -rf "$H2"
 # spec: tools/agent.c --
-#       the login sweep: 15 s after start (here 2 s) it mounts the linuxfs_ disks nothing mounted; a disk with no
-#       linuxfs_ kind (this Mac has no bundles, so an attached image has none) is left alone
+#       the login sweep: 15 s after start (here 2 s) it mounts the macfuse_<fs> disks nothing mounted; a disk with no
+#       macfuse_<fs> kind (this Mac has no bundles, so an attached image has none) is left alone
 dev=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$D/blank.img" | awk 'NR == 1 { print $1 }')
 echo "# attached $dev"
 : > "$D/cli.calls"; SWEEP=2 agent; sleep 7
 i=0; while ! grep -q 'login sweep looked' "$D/agent.log" && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
 looked=$(sed -n 's/.*login sweep looked at \([0-9]*\) disks.*/\1/p' "$D/agent.log" | tail -n 1)
 [ "${looked:-0}" -ge 1 ]; ok $? "the sweep ran, and looked at the attached disk among the others (${looked:-none} disks)"
-[ ! -s "$D/cli.calls" ]; ok $? "and ran nothing for a disk with no linuxfs_ kind (calls: $(tr '\n' '|' < "$D/cli.calls"))"
+[ ! -s "$D/cli.calls" ]; ok $? "and ran nothing for a disk with no macfuse_<fs> kind (calls: $(tr '\n' '|' < "$D/cli.calls"))"
 # spec: tools/agent.c -- at login, one notice for each Ignore:<LABEL> the install could not convert to /etc/fstab (the user's and
 #       the machine's), once: the labels told of are kept in the user's IgnoreNotified
 kill $ap 2>/dev/null; wait $ap 2>/dev/null

@@ -1,6 +1,6 @@
 /*
- * linuxfs-fs: the one program inside each filesystem bundle (/System/Library/Filesystems/linuxfs_<fs>.fs), copied
- * under three names -- linuxfs_<fs>.util (probe), mount_linuxfs_<fs>, fsck_linuxfs_<fs> -- that picks its role and
+ * linuxfs-fs: the one program inside each filesystem bundle (/System/Library/Filesystems/macfuse_<fs>.fs), copied
+ * under three names -- macfuse_<fs>.util (probe), mount_macfuse_<fs>, fsck_macfuse_<fs> -- that picks its role and
  * its filesystem from argv[0]. DiskArbitration runs it as root with a bare environment, so everything here is C
  * and nothing is ever executed. Decisions come from fsrules.c; superblocks from probe.c.
  *
@@ -189,7 +189,7 @@ static int fsck(const char *fs, int argc, char **argv)
 		syslog(LOG_NOTICE, "fsck_%s: verify/repair refused (phase 1)", fs);
 		return 8;
 	}
-	fprintf(stderr, "usage: fsck_linuxfs_%s -q|-n|-y device\n", fs);
+	fprintf(stderr, "usage: fsck_macfuse_%s -q|-n|-y device\n", fs);
 	syslog(LOG_NOTICE, "fsck_%s: unknown arguments", fs);
 	return 8;
 }
@@ -1004,7 +1004,7 @@ static int recv_device(int sock, int secs, int watch)
 }
 
 /* What is mounted on MNT, judged by the topmost mount, the one unmount(MNT) would hit: 0 nothing; 1 root's own mount, from
- * linuxfs@BSD, a macfuse (or osxfuse) file system; -1 something else, which is never root's to unmount. The mount table is read
+ * linuxfs@BSD, one of our six macfuse_<fs> file systems; -1 something else, which is never root's to unmount. The mount table is read
  * with MNT_NOWAIT, last entry first (a later mount on the same path is on top), rather than by statfs(MNT), which asks the file
  * system and so could hang on a dead macFUSE mount: no wait to bound. */
 static int mounted_on(const char *mnt, const char *bsd)
@@ -1017,8 +1017,7 @@ static int mounted_on(const char *mnt, const char *bsd)
 	n = getmntinfo(&m, MNT_NOWAIT);
 	for (i = n - 1; i >= 0; i--)
 		if (strcmp(m[i].f_mntonname, mnt) == 0)
-			return strcmp(m[i].f_mntfromname, from) == 0 &&
-			       (strncmp(m[i].f_fstypename, "macfuse", 7) == 0 || strncmp(m[i].f_fstypename, "osxfuse", 7) == 0) ? 1 : -1;
+			return strcmp(m[i].f_mntfromname, from) == 0 && fsrules_fs_of_type(m[i].f_fstypename) ? 1 : -1;
 	return 0;
 }
 
@@ -1147,6 +1146,7 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 			 gid_t gid, char **args)
 {
 	static const char *const vars[] = { ROOT_CLI_ENV, "LINUXFS_FUSE_FD=" STR(FUSE_FD), "LINUXFS_FUSE_CHAN=" STR(CHAN_FD), NULL };
+	const struct fsname *nm;
 	char opts[400], vol[256], commenv[32], hout_buf[4096], rhelper[PATH_MAX];
 	char daemon_env[] = "_FUSE_DAEMON_PATH=" PRIV_DIR "/lklfuse";
 	char *hargv[5], *henv[5];
@@ -1158,7 +1158,11 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 	time_t deadline, cli_end = 0;
 
 	fsrules_volname(strrchr(req->mnt, '/') + 1, vol, sizeof vol);
-	snprintf(opts, sizeof opts, "allow_other,local,volname=%s,fsname=linuxfs@%s,noappledouble%s", vol, bsd, ro ? ",rdonly" : "");
+	nm = fsrules_name(fs);
+	if (!nm)
+		return refuse(fs, "no such filesystem");
+	snprintf(opts, sizeof opts, "allow_other,local,volname=%s,fsname=linuxfs@%s,noappledouble,fstypename=%s,fssubtype=%d%s", vol, bsd,
+		 nm->fstypename, nm->subtype, ro ? ",rdonly" : "");
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, cs) != 0)
 		return refuse(fs, "cannot make mount_macfuse's socket");
 	if (pipe(hout) != 0 || socketpair(AF_UNIX, SOCK_STREAM, 0, ch) != 0) {
@@ -1574,7 +1578,7 @@ static int mount_role(const char *fs, int argc, char **argv)
 	openlog("linuxfs-mount", LOG_PID, LOG_DAEMON);
 	log_request(fs, argc, argv);
 	if (fsrules_parse_mount(argc - 1, argv + 1, &req) != 0) {
-		fprintf(stderr, "usage: mount_linuxfs_%s [-o options] device mountpoint\n", fs);
+		fprintf(stderr, "usage: mount_macfuse_%s [-o options] device mountpoint\n", fs);
 		syslog(LOG_NOTICE, "mount_%s: bad arguments", fs);
 		return 1;
 	}

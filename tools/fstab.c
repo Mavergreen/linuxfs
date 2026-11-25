@@ -50,26 +50,22 @@ const char *fstab_spec_refusal(const char *spec)
 
 const char *fstab_bundle_refusal(const char *bundle)
 {
-	char util[64];
+	size_t i;
 
-	/* fsrules knows the filesystems: linuxfs_<fs>.util names one exactly when <fs> is ours */
-	if (!bundle || strncmp(bundle, "linuxfs_", 8) != 0 || strchr(bundle, '/') ||
-	    snprintf(util, sizeof util, "%s.util", bundle) >= (int)sizeof util || !fsrules_fs_from_name(util, NULL))
-		return "not a linuxfs bundle (linuxfs_ext4, _btrfs, _xfs, _f2fs, _apfs or _ntfs)";
-	return NULL;
+	/* fsrules' table names the six, exactly: no prefix is matched as a family */
+	for (i = 0; bundle && fsrules_name_at(i); i++)
+		if (strcmp(bundle, fsrules_name_at(i)->bundle) == 0)
+			return NULL;
+	return "not a linuxfs bundle (macfuse_ext4, _btrfs, _xfs, _f2fs, _apfs or _ntfs)";
 }
 
 const char *fstab_bundle_for(const char *probe_type)
 {
-	static const struct { const char *type, *bundle; } map[] = {
-		{ "ext4", "linuxfs_ext4" }, { "btrfs", "linuxfs_btrfs" }, { "xfs", "linuxfs_xfs" },
-		{ "f2fs", "linuxfs_f2fs" }, { "apfs", "linuxfs_apfs" }, { "ntfs3", "linuxfs_ntfs" },
-	};
 	size_t i;
 
-	for (i = 0; probe_type && i < sizeof map / sizeof map[0]; i++)
-		if (strcmp(probe_type, map[i].type) == 0)
-			return map[i].bundle;
+	for (i = 0; probe_type && fsrules_name_at(i); i++)
+		if (strcmp(probe_type, fsrules_name_at(i)->probe_type) == 0)
+			return fsrules_name_at(i)->bundle;
 	return NULL;
 }
 

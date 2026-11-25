@@ -52,25 +52,29 @@ int main(void)
 	is_parsed("find\t../etc", "refused", "a BSD name that is not one is refused");
 	is_parsed("find disk9", "refused", "a space is not the separator");
 
-	is(agent_sweeps("linuxfs_ext4", 0), 1, "the sweep takes a linuxfs_ disk with no volume path");
-	is(agent_sweeps("linuxfs_apfs", 0), 1, "whatever its filesystem");
-	is(agent_sweeps("linuxfs_ext4", 1), 0, "not one that is already mounted");
+	is(agent_sweeps("macfuse_ext4", 0), 1, "the sweep takes a macfuse_<fs> disk with no volume path");
+	is(agent_sweeps("macfuse_apfs", 0), 1, "whatever its filesystem");
+	is(agent_sweeps("macfuse_ext4", 1), 0, "not one that is already mounted");
 	is(agent_sweeps("hfs", 0), 0, "not the Mac's own filesystems");
 	is(agent_sweeps("ntfs", 0), 0, "not NTFS the Mac reads");
 	is(agent_sweeps("", 0), 0, "not a disk with no kind");
 	is(agent_sweeps(NULL, 0), 0, "nor a missing one");
+	is(agent_sweeps("macfuse_btrfs", 0), 1, "btrfs too");
+	is(agent_sweeps("macfuse_zfs", 0), 0, "not a macfuse_ name that is none of the six");
+	is(agent_sweeps("linuxfs_btrfs", 0), 0, "not the old name");
+	is(agent_sweeps("macfuse", 0), 0, "not plain macfuse");
 	is(agent_sweeps("linuxfs", 0), 0, "a kind that only starts like ours is not ours");
 	{
 		/* spec: tools/agent.c -- the sweep skips a volume /etc/fstab keeps from mounting by itself (linuxfs ignore) */
-		const char *f = "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF none linuxfs_ext4 rw,noauto # linuxfs\n"
-				"LABEL=my\\040data none linuxfs_ntfs rw,noauto # linuxfs\nLABEL=Mac none hfs rw,noauto\n";
+		const char *f = "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF none macfuse_ext4 rw,noauto # linuxfs\n"
+				"LABEL=my\\040data none macfuse_ntfs rw,noauto # linuxfs\nLABEL=Mac none hfs rw,noauto\n";
 		size_t n = strlen(f);
 
-		is(agent_sweeps_volume("linuxfs_ext4", 0, f, n, "0123ABCD-4567-89EF-0123-456789ABCDEF", "x"), 0, "not a volume with linuxfs's noauto entry for its UUID");
-		is(agent_sweeps_volume("linuxfs_ntfs", 0, f, n, NULL, "my data"), 0, "nor one with an entry for its volume name");
-		is(agent_sweeps_volume("linuxfs_ext4", 0, f, n, "FFFFFFFF-4567-89EF-0123-456789ABCDEF", "Mac"), 1, "another program's entry does not count");
-		is(agent_sweeps_volume("linuxfs_ext4", 0, "", 0, NULL, NULL), 1, "with no fstab, a linuxfs_ disk with no volume path is swept");
-		is(agent_sweeps_volume("linuxfs_ext4", 1, "", 0, NULL, NULL), 0, "but not one already mounted");
+		is(agent_sweeps_volume("macfuse_ext4", 0, f, n, "0123ABCD-4567-89EF-0123-456789ABCDEF", "x"), 0, "not a volume with linuxfs's noauto entry for its UUID");
+		is(agent_sweeps_volume("macfuse_ntfs", 0, f, n, NULL, "my data"), 0, "nor one with an entry for its volume name");
+		is(agent_sweeps_volume("macfuse_ext4", 0, f, n, "FFFFFFFF-4567-89EF-0123-456789ABCDEF", "Mac"), 1, "another program's entry does not count");
+		is(agent_sweeps_volume("macfuse_ext4", 0, "", 0, NULL, NULL), 1, "with no fstab, a macfuse_<fs> disk with no volume path is swept");
+		is(agent_sweeps_volume("macfuse_ext4", 1, "", 0, NULL, NULL), 0, "but not one already mounted");
 		is(agent_sweeps_volume("hfs", 0, "", 0, NULL, NULL), 0, "nor the Mac's own");
 	}
 	{

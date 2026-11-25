@@ -123,32 +123,36 @@ out=$(cr device --fuse-chan 6:3 "$e" /bin/echo ran); echo "$out" | grep -q '^not
 "$D/open" --uuid "$D/zero.img" > /dev/null 2>&1; [ $? -eq 1 ]; ok $? "a disk with no filesystem has no UUID: exit 1"
 # spec: tools/helper.c -- /etc/fstab edits over the socket (LINUXFS_FSTAB here), through linuxfs-open
 printf '# the Mac'"'"'s\nLABEL=Backup none hfs ro\n' > "$F"
-"$D/open" --noauto-add "LABEL=my data" linuxfs_ext4; ok $? "linuxfs-open --noauto-add LABEL=<label> BUNDLE exits 0"
+"$D/open" --noauto-add "LABEL=my data" macfuse_ext4; ok $? "linuxfs-open --noauto-add LABEL=<label> BUNDLE exits 0"
 [ "$(cat "$F")" = "# the Mac's
 LABEL=Backup none hfs ro
-LABEL=my\\040data none linuxfs_ext4 rw,noauto # linuxfs" ]; ok $? "the helper appends the escaped entry, keeping the rest ($(tr '\n' '|' < "$F"))"
-out=$("$D/open" --noauto-add "LABEL=a#b" linuxfs_ext4 2>&1); rc=$?
+LABEL=my\\040data none macfuse_ext4 rw,noauto # linuxfs" ]; ok $? "the helper appends the escaped entry, keeping the rest ($(tr '\n' '|' < "$F"))"
+out=$("$D/open" --noauto-add "LABEL=a#b" macfuse_ext4 2>&1); rc=$?
 [ $rc -eq 1 ] && echo "$out" | grep -q "a label with #"; ok $? "a refusal is printed and exits 1 (got $rc: '$out')"
 "$D/open" --noauto-remove "LABEL=my data"; ok $? "linuxfs-open --noauto-remove LABEL=<label> exits 0"
 [ "$(cat "$F")" = "# the Mac's
 LABEL=Backup none hfs ro" ]; ok $? "and the entry is gone"
+# spec: tools/helper.c -- a line written under the old bundle name (linuxfs_ext4) is still linuxfs's: unignore (--noauto-remove SPEC) clears it
+cp "$F" "$D/fstab.keep"; echo "LABEL=oldname none linuxfs_ext4 rw,noauto # linuxfs" >> "$F"
+"$D/open" --noauto-remove "LABEL=oldname"; ok $? "linuxfs-open --noauto-remove of a spec under the old linuxfs_ext4 name exits 0"
+cmp -s "$F" "$D/fstab.keep"; ok $? "and that old-name line is gone, the rest kept ($(tr '\n' '|' < "$F"))"
 "$D/open" --noauto-add "LABEL=x" > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "--noauto-add with no bundle is misuse (exit 2)"
 # spec: tools/helper.c -- noauto-add only for a volume attached now: the helper itself (root) probes the attached disks for one of
 #       the stated bundle's type with that UUID or volume name; a console user cannot keep any other volume from mounting
-out=$("$D/open" --noauto-add "LABEL=nowhere" linuxfs_ext4 2>&1); rc=$?
+out=$("$D/open" --noauto-add "LABEL=nowhere" macfuse_ext4 2>&1); rc=$?
 [ $rc -eq 1 ] && echo "$out" | grep -q "no attached linuxfs volume matches" && ! grep -q nowhere "$F"; ok $? "noauto-add for a volume not attached is refused (got $rc: '$out')"
-out=$("$D/open" --noauto-add "LABEL=helped" linuxfs_btrfs 2>&1); rc=$?
+out=$("$D/open" --noauto-add "LABEL=helped" macfuse_btrfs 2>&1); rc=$?
 [ $rc -eq 1 ] && echo "$out" | grep -q "no attached linuxfs volume matches"; ok $? "noauto-add with another filesystem's bundle is refused (got $rc: '$out')"
-"$D/open" --noauto-add "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF" linuxfs_ext4 && grep -q "^UUID=0123ABCD-4567-89EF-0123-456789ABCDEF none linuxfs_ext4" "$F"; ok $? "noauto-add by the attached disk's UUID is done"
+"$D/open" --noauto-add "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF" macfuse_ext4 && grep -q "^UUID=0123ABCD-4567-89EF-0123-456789ABCDEF none macfuse_ext4" "$F"; ok $? "noauto-add by the attached disk's UUID is done"
 "$D/open" --noauto-remove "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF"
-out=$(LINUXFS_TEST_DISKS= "$D/open" --noauto-add "LABEL=helped" linuxfs_ext4 2>&1); [ "$out" = "" ]; ok $? "the helper's disks are its own, not the client's environment (got '$out')"
+out=$(LINUXFS_TEST_DISKS= "$D/open" --noauto-add "LABEL=helped" macfuse_ext4 2>&1); [ "$out" = "" ]; ok $? "the helper's disks are its own, not the client's environment (got '$out')"
 # spec: tools/helper.c -- the disk scan (noauto-add's, the migration's) is bounded: each disk is probed in a child, and past the
 #       scan's deadline (10 s; LINUXFS_SCAN_SECONDS when not root) the rest are skipped, "(a disk did not answer)"
 mkfifo "$D/hang"
 HS=$D/hang.sock; LINUXFS_TEST_DISKS="$D/hang:$D/ext4.img" LINUXFS_SCAN_SECONDS=1 "$D/helper" --socket "$HS" --test-files --timeout 5 & hp2=$!
 i=0; while [ ! -S "$HS" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
 cp "$F" "$D/fstab.before"
-start=$(date +%s); out=$(LINUXFS_HELPER_SOCKET=$HS LINUXFS_OPEN_TIMEOUT=10 "$D/open" --noauto-add "LABEL=helped" linuxfs_ext4 2>&1); rc=$?; took=$(($(date +%s) - start))
+start=$(date +%s); out=$(LINUXFS_HELPER_SOCKET=$HS LINUXFS_OPEN_TIMEOUT=10 "$D/open" --noauto-add "LABEL=helped" macfuse_ext4 2>&1); rc=$?; took=$(($(date +%s) - start))
 kill $hp2; wait $hp2 2>/dev/null
 [ $rc -eq 1 ] && [ "$out" = "linuxfs-open: no attached linuxfs volume matches (a disk did not answer)" ] && [ $took -le 3 ]; ok $? "a disk that never answers ends the scan at its deadline, saying so (got $rc in ${took}s: '$out')"
 cmp -s "$F" "$D/fstab.before"; ok $? "and the fstab is untouched"
@@ -165,18 +169,18 @@ plist "$D/machine.plist" "<key>Ignore:a#b</key><true/><key>ReadOnly</key><true/>
 M=$D/mfstab; : > "$M"
 out=$(LINUXFS_FSTAB=$M LINUXFS_PREFS_USER=$D/user.plist LINUXFS_PREFS_MACHINE=$D/machine.plist "$D/helper" --migrate-prefs 2> "$D/migrate.err"); rc=$?
 [ $rc -eq 0 ] && [ "$out" = "user${T}helped" ]; ok $? "--migrate-prefs converts Ignore:helped (attached as $e) and prints it (got $rc: '$out')"
-[ "$(cat "$M")" = "LABEL=helped none linuxfs_ext4 rw,noauto # linuxfs" ]; ok $? "as a LABEL= entry with the probed disk's bundle ($(cat "$M"))"
+[ "$(cat "$M")" = "LABEL=helped none macfuse_ext4 rw,noauto # linuxfs" ]; ok $? "as a LABEL= entry with the probed disk's bundle ($(cat "$M"))"
 grep -q "nowhere" "$D/migrate.err" && grep -q "a#b" "$D/migrate.err" && grep -q "too long" "$D/migrate.err" && ! grep -q kept "$D/migrate.err"; ok $? "a label with no disk attached, not writable, or too long is logged and left ($(tr '\n' '|' < "$D/migrate.err"))"
 out=$(LINUXFS_FSTAB=$M LINUXFS_PREFS_USER=$D/none.plist LINUXFS_PREFS_MACHINE=$D/none.plist "$D/helper" --migrate-prefs 2>&1); rc=$?
 [ $rc -eq 0 ] && [ -z "$out" ]; ok $? "with no preferences there is nothing to migrate (got $rc: '$out')"
 # spec: tools/helper.c -- noauto-remove-all (pre-uninstall runs --noauto-remove-all as root): every linuxfs line goes, no other
 printf '# the Mac'"'"'s\nLABEL=Backup none hfs ro\n' > "$F"
-"$D/open" --noauto-add "LABEL=my data" linuxfs_ext4 && "$D/open" --noauto-add "LABEL=helped" linuxfs_ext4 && echo "LABEL=after none hfs ro" >> "$F"
+"$D/open" --noauto-add "LABEL=my data" macfuse_ext4 && "$D/open" --noauto-add "LABEL=helped" macfuse_ext4 && echo "LABEL=after none hfs ro" >> "$F"
 "$D/open" --noauto-remove-all; ok $? "linuxfs-open --noauto-remove-all exits 0"
 [ "$(cat "$F")" = "# the Mac's
 LABEL=Backup none hfs ro
 LABEL=after none hfs ro" ]; ok $? "every linuxfs line is gone, the others kept in order ($(tr '\n' '|' < "$F"))"
-"$D/open" --noauto-add "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF" linuxfs_ext4
+"$D/open" --noauto-add "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF" macfuse_ext4
 "$D/helper" --noauto-remove-all; rc=$?
 [ $rc -eq 0 ] && ! grep -q linuxfs "$F" && grep -q "LABEL=after none hfs ro" "$F"; ok $? "linuxfs-helper --noauto-remove-all does the same, without the socket (rc $rc)"
 LINUXFS_FSTAB=$D/no-fstab "$D/helper" --noauto-remove-all; rc=$?

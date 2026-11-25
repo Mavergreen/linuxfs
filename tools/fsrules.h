@@ -9,7 +9,23 @@
 
 enum fsrole { FS_UTIL, FS_MOUNT, FS_FSCK };
 
-/* The filesystem a program's name stands for: linuxfs_<fs>.util, mount_linuxfs_<fs> or fsck_linuxfs_<fs>
+/* The one table of names: what each filesystem is called to DiskArbitration (bundle, personality), to macFUSE
+ * (fstypename, which is the statfs f_fstypename without the "macfuse_" a Mac shows as its own, and fssubtype) and to
+ * Finder (fsname, the kind Get Info shows). fstypename is at most 6 bytes: macFUSE joins it to "macfuse_" in a
+ * 16-byte field. Entries are in the order ext4, ntfs, btrfs, xfs, f2fs, apfs. */
+struct fsname { const char *fs, *probe_type, *bundle, *fstypename, *personality, *fsname; int subtype; };
+
+/* The entry for <fs> (ext4, ntfs, btrfs, xfs, f2fs or apfs), else NULL. */
+const struct fsname *fsrules_name(const char *fs);
+
+/* Entry I, 0..5, then NULL. */
+const struct fsname *fsrules_name_at(size_t i);
+
+/* The fs whose bundle name is F_FSTYPENAME (statfs's f_fstypename of its volumes, "macfuse_ext4"), or NULL: only the six
+ * exact names match, never "macfuse" or a longer or other name. */
+const char *fsrules_fs_of_type(const char *f_fstypename);
+
+/* The filesystem a program's name stands for: macfuse_<fs>.util, mount_macfuse_<fs> or fsck_macfuse_<fs>
  * (any directory before it). NULL for anything else, or an <fs> that is not ext4, btrfs, xfs, f2fs, apfs or
  * ntfs; *role is then untouched. role may be NULL. */
 const char *fsrules_fs_from_name(const char *argv0, enum fsrole *role);
@@ -47,7 +63,7 @@ enum fsaccess fsrules_access(const char *probed_type, unsigned flags, int ro, in
 
 struct mountreq { int ro; const char *dev, *mnt; };
 
-/* mount_linuxfs_<fs>'s arguments: [-o a,b]... (or -oa,b) DEV MNT. `rdonly` or `ro` sets ro; every other option is ignored (10.9 passes noowners, whether the mount was asked for or automatic).
+/* mount_macfuse_<fs>'s arguments: [-o a,b]... (or -oa,b) DEV MNT. `rdonly` or `ro` sets ro; every other option is ignored (10.9 passes noowners, whether the mount was asked for or automatic).
  * 0, or -1 on misuse. */
 int fsrules_parse_mount(int argc, char **argv, struct mountreq *m);
 

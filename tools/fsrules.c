@@ -3,23 +3,52 @@
 #include <string.h>
 #include "fsrules.h"
 
-static const char *const filesystems[] = { "ext4", "btrfs", "xfs", "f2fs", "apfs", "ntfs" };
+static const struct fsname names[] = {
+	{ "ext4", "ext4", "macfuse_ext4", "ext4", "ext4", "Linux ext4 (linuxfs)", 7 },
+	{ "ntfs", "ntfs3", "macfuse_ntfs", "ntfs", "NTFS-linuxfs", "Windows NTFS (linuxfs)", 8 },
+	{ "btrfs", "btrfs", "macfuse_btrfs", "btrfs", "btrfs", "Linux btrfs (linuxfs)", 9 },
+	{ "xfs", "xfs", "macfuse_xfs", "xfs", "XFS", "Linux XFS (linuxfs)", 10 },
+	{ "f2fs", "f2fs", "macfuse_f2fs", "f2fs", "F2FS", "Linux F2FS (linuxfs)", 11 },
+	{ "apfs", "apfs", "macfuse_apfs", "apfs", "APFS", "APFS (linuxfs)", 12 },
+};
+#define NNAMES (sizeof names / sizeof *names)
 
-/* The entry of `filesystems` that is s[0..n), or NULL. */
-static const char *known(const char *s, size_t n)
+const struct fsname *fsrules_name_at(size_t i)
+{
+	return i < NNAMES ? &names[i] : NULL;
+}
+
+/* The entry whose fs is s[0..n), or NULL. */
+static const struct fsname *known(const char *s, size_t n)
 {
 	size_t i;
 
-	for (i = 0; i < sizeof filesystems / sizeof *filesystems; i++)
-		if (strlen(filesystems[i]) == n && strncmp(filesystems[i], s, n) == 0)
-			return filesystems[i];
+	for (i = 0; s && i < NNAMES; i++)
+		if (strlen(names[i].fs) == n && strncmp(names[i].fs, s, n) == 0)
+			return &names[i];
+	return NULL;
+}
+
+const struct fsname *fsrules_name(const char *fs)
+{
+	return fs ? known(fs, strlen(fs)) : NULL;
+}
+
+const char *fsrules_fs_of_type(const char *f_fstypename)
+{
+	size_t i;
+
+	for (i = 0; f_fstypename && i < NNAMES; i++)
+		if (strcmp(names[i].bundle, f_fstypename) == 0)
+			return names[i].fs;
 	return NULL;
 }
 
 const char *fsrules_fs_from_name(const char *argv0, enum fsrole *role)
 {
-	const char *b, *s;
+	const struct fsname *s;
 	enum fsrole r;
+	const char *b;
 	size_t n;
 
 	if (!argv0)
@@ -27,20 +56,20 @@ const char *fsrules_fs_from_name(const char *argv0, enum fsrole *role)
 	b = strrchr(argv0, '/');
 	b = b ? b + 1 : argv0;
 	n = strlen(b);
-	if (strncmp(b, "mount_linuxfs_", 14) == 0) {
+	if (strncmp(b, "mount_macfuse_", 14) == 0) {
 		s = known(b + 14, n - 14);
 		r = FS_MOUNT;
-	} else if (strncmp(b, "fsck_linuxfs_", 13) == 0) {
+	} else if (strncmp(b, "fsck_macfuse_", 13) == 0) {
 		s = known(b + 13, n - 13);
 		r = FS_FSCK;
-	} else if (strncmp(b, "linuxfs_", 8) == 0 && n > 8 + 5 && strcmp(b + n - 5, ".util") == 0) {
+	} else if (strncmp(b, "macfuse_", 8) == 0 && n > 8 + 5 && strcmp(b + n - 5, ".util") == 0) {
 		s = known(b + 8, n - 8 - 5);
 		r = FS_UTIL;
 	} else
 		return NULL;
 	if (s && role)
 		*role = r;
-	return s;
+	return s ? s->fs : NULL;
 }
 
 const char *fsrules_probe_type(const char *fs)
@@ -57,7 +86,7 @@ void fsrules_default_prefs(struct fsprefs *p)
 
 int fsrules_claims(const char *fs, const char *probed_type, int removable, const struct fsprefs *p)
 {
-	if (!fs || !probed_type || !p || !known(fs, strlen(fs)))
+	if (!fs || !probed_type || !p || !fsrules_name(fs))
 		return 0;
 	if (strcmp(fs, "ntfs") == 0)
 		return strcmp(probed_type, "ntfs3") == 0 && p->ntfs_takeover && removable;

@@ -15,7 +15,7 @@
  * A request it does not understand is dropped with no answer. `linuxfs-agent --offer DISK` sends an offer, exits 0 when
  * the agent says ok and 1 when no agent answers within 5 s.
  * Login sweep: once, 15 s after it starts (LINUXFS_SWEEP_DELAY seconds instead, unless root), for every disk whose
- * DiskArbitration volume kind starts with linuxfs_ and that has no volume path (DiskArbitration did not mount it, say
+ * DiskArbitration volume kind is one of the six macfuse_<fs> names and that has no volume path (DiskArbitration did not mount it, say
  * because the keychain was not ready), it runs `linuxfs automount DISK` -- unless /etc/fstab has linuxfs's noauto entry
  * for the volume's UUID or name (linuxfs ignore), which is why DiskArbitration left it alone.
  * At start (login), one notice for each Ignore:<LABEL> = true preference (the user's or the machine's) still there: the
@@ -47,6 +47,7 @@
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
+#include "fsrules.h"
 #include "fstab.h"
 
 extern char **environ;
@@ -91,10 +92,10 @@ int agent_parse_request(char *line, char **verb, char **bsd)
 	return 0;
 }
 
-/* Whether the login sweep mounts a disk: DiskArbitration gave it a linuxfs_ volume kind and no volume path. */
+/* Whether the login sweep mounts a disk: DiskArbitration gave it one of the six macfuse_<fs> volume kinds and no volume path. */
 int agent_sweeps(const char *kind, int has_path)
 {
-	return kind && strncmp(kind, "linuxfs_", 8) == 0 && !has_path;
+	return fsrules_fs_of_type(kind) != NULL && !has_path;
 }
 
 /* And when FSTAB (LEN bytes of /etc/fstab) has no linuxfs noauto entry for the volume's UUID or name (either may be NULL). */

@@ -14,7 +14,7 @@ SDK=$(sh "$SHIPYARD_SCRIPTS/fetch_sdk.sh" 2>/dev/null) || exit 1
 "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN \
   -o "$D/linuxfs-fs" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" \
   -framework CoreFoundation -framework DiskArbitration || exit 1
-for n in linuxfs_ext4.util linuxfs_ntfs.util linuxfs_btrfs.util fsck_linuxfs_ext4 mount_linuxfs_ext4 bogus.util; do cp "$D/linuxfs-fs" "$D/$n"; done
+for n in macfuse_ext4.util macfuse_ntfs.util macfuse_btrfs.util fsck_macfuse_ext4 mount_macfuse_ext4 bogus.util; do cp "$D/linuxfs-fs" "$D/$n"; done
 sh "$ROOT/build/linux-host.sh" sh -c "cd '$D' && sh '$ROOT/tests/lib/probe-images.sh' '$D' && blkid -s UUID -o value ext4.img > ext4.uuid && blkid -s UUID -o value btrfs.img > btrfs.uuid" || exit 1
 n=0 bad=0
 ok() { n=$((n + 1)); if [ "$1" = 0 ]; then echo "ok $n - $2"; else echo "not ok $n - $2"; bad=1; fi; }
@@ -32,74 +32,74 @@ plist "$D/takeoff.plist" "<key>NTFSTakeover</key><true/><key>Automount</key><fal
 printf 'this is not a plist' > "$D/corrupt.plist"
 u() { # BIN ARGS... : the util with the test prefs (USERP, MACHP)
   x=$1; shift; LINUXFS_PREFS_USER=${USERP:-$D/none.plist} LINUXFS_PREFS_MACHINE=${MACHP:-$D/none2.plist} "$D/$x" "$@"; }
-out=$(u linuxfs_ext4.util -p "$E" removable writable); rc=$?
+out=$(u macfuse_ext4.util -p "$E" removable writable); rc=$?
 [ $rc = 255 ] && [ "$out" = "my data" ]; ok $? "ext4 util -p on the ext4 disk prints the label and exits 255 (rc $rc, '$out')"
-out=$(u linuxfs_ext4.util -p "$E" fixed readonly); rc=$?
+out=$(u macfuse_ext4.util -p "$E" fixed readonly); rc=$?
 [ $rc = 255 ] && [ "$out" = "my data" ]; ok $? "ext4 is claimed fixed and readonly too (rc $rc)"
-out=$(u linuxfs_btrfs.util -p "$E" removable writable); rc=$?
+out=$(u macfuse_btrfs.util -p "$E" removable writable); rc=$?
 [ $rc = 254 ] && [ -z "$out" ]; ok $? "btrfs util on the ext4 disk exits 254 and prints nothing (rc $rc)"
-out=$(u linuxfs_btrfs.util -p "$B" removable writable); rc=$?
+out=$(u macfuse_btrfs.util -p "$B" removable writable); rc=$?
 [ $rc = 255 ] && [ "$out" = backup ]; ok $? "btrfs util on the btrfs disk exits 255 (rc $rc, '$out')"
 # spec: tools/fs.c -- -k as 10.9's hfs.util does it, which DiskArbitration reads (its fstab UUID= lookup needs it): the UUID,
 #       uppercase, with no newline, and exit 253 (FSUR_IO_SUCCESS, not -p's 255: DiskArbitration drops the UUID otherwise)
-out=$(u linuxfs_ext4.util -k "$E"); rc=$?
+out=$(u macfuse_ext4.util -k "$E"); rc=$?
 want=$(tr a-f A-F < "$D/ext4.uuid")
 [ $rc = 253 ] && [ "$out" = "$want" ]; ok $? "-k prints the UUID blkid gave, exit 253 (rc $rc, '$out', want '$want')"
-[ "$(u linuxfs_ext4.util -k "$E" | wc -c | tr -d ' ')" = 36 ]; ok $? "-k prints the 36 characters alone, no newline"
-out=$(u linuxfs_btrfs.util -k "$B"); rc=$?
+[ "$(u macfuse_ext4.util -k "$E" | wc -c | tr -d ' ')" = 36 ]; ok $? "-k prints the 36 characters alone, no newline"
+out=$(u macfuse_btrfs.util -k "$B"); rc=$?
 [ $rc = 253 ] && [ "$out" = "$(tr a-f A-F < "$D/btrfs.uuid")" ]; ok $? "-k on btrfs prints its UUID too"
-out=$(u linuxfs_btrfs.util -k "$E"); rc=$?
+out=$(u macfuse_btrfs.util -k "$E"); rc=$?
 [ $rc = 254 ] && [ -z "$out" ]; ok $? "-k for another filesystem's disk exits 254"
-out=$(u linuxfs_ntfs.util -k "$T"); rc=$?
+out=$(u macfuse_ntfs.util -k "$T"); rc=$?
 [ $rc = 254 ]; ok $? "-k on NTFS (no UUID) exits 254 (rc $rc)"
-u linuxfs_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
+u macfuse_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
 [ $rc = 254 ]; ok $? "NTFS util with no prefs exits 254 (rc $rc)"
-USERP=$D/empty.plist u linuxfs_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
+USERP=$D/empty.plist u macfuse_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
 [ $rc = 254 ]; ok $? "NTFS util with a plist lacking NTFSTakeover exits 254 (rc $rc)"
-out=$(USERP=$D/take.plist u linuxfs_ntfs.util -p "$T" removable writable); rc=$?
+out=$(USERP=$D/take.plist u macfuse_ntfs.util -p "$T" removable writable); rc=$?
 [ $rc = 255 ] && [ "$out" = Windows ]; ok $? "NTFSTakeover=true: NTFS removable exits 255, prints the label (rc $rc, '$out')"
-USERP=$D/takestr.plist u linuxfs_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
+USERP=$D/takestr.plist u macfuse_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
 [ $rc = 255 ]; ok $? "NTFSTakeover as the string YES counts (rc $rc)"
-USERP=$D/take.plist u linuxfs_ntfs.util -p "$T" fixed writable >/dev/null; rc=$?
+USERP=$D/take.plist u macfuse_ntfs.util -p "$T" fixed writable >/dev/null; rc=$?
 [ $rc = 254 ]; ok $? "NTFSTakeover=true but fixed: exits 254 (rc $rc)"
-USERP=$D/takeoff.plist u linuxfs_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
+USERP=$D/takeoff.plist u macfuse_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
 [ $rc = 255 ]; ok $? "a stale Automount=false is not read: NTFSTakeover=true still claims (rc $rc)"
-USERP=$D/corrupt.plist MACHP=$D/take.plist u linuxfs_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
+USERP=$D/corrupt.plist MACHP=$D/take.plist u macfuse_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
 [ $rc = 255 ]; ok $? "a corrupt user plist counts as absent: the machine's NTFSTakeover=true holds (rc $rc)"
-USERP=$D/empty.plist MACHP=$D/take.plist u linuxfs_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
+USERP=$D/empty.plist MACHP=$D/take.plist u macfuse_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
 [ $rc = 255 ]; ok $? "prefs fall back key by key: a user plist lacking the key leaves the machine's NTFSTakeover=true (rc $rc)"
-USERP=$D/missing.plist MACHP=$D/missing2.plist u linuxfs_ext4.util -p "$E" removable writable >/dev/null; rc=$?
+USERP=$D/missing.plist MACHP=$D/missing2.plist u macfuse_ext4.util -p "$E" removable writable >/dev/null; rc=$?
 [ $rc = 255 ]; ok $? "missing plists use the defaults: ext4 still claimed (rc $rc)"
 ln -sf "$D/take.plist" "$D/link.plist"
-USERP=$D/link.plist u linuxfs_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
+USERP=$D/link.plist u macfuse_ntfs.util -p "$T" removable writable >/dev/null; rc=$?
 [ $rc = 254 ]; ok $? "a symlinked user plist is refused, as absent (rc $rc)"
 # spec: tools/fs.c util -- a stale Ignore:<LABEL> is not read: DiskArbitration applies /etc/fstab's noauto, per volume
 plist "$D/ign.plist" "<key>Ignore:my data</key><true/>"
-out=$(USERP=$D/ign.plist MACHP=$D/ign.plist u linuxfs_ext4.util -p "$E" removable writable); rc=$?
+out=$(USERP=$D/ign.plist MACHP=$D/ign.plist u macfuse_ext4.util -p "$E" removable writable); rc=$?
 [ $rc = 255 ] && [ "$out" = "my data" ]; ok $? "the probe does not consult Ignore:<LABEL>: still claimed (rc $rc, '$out')"
 for bad_args in "-p diskX removable writable" "-p ../disk2 removable writable" "-p ${E}s removable writable" "-p $E sometimes writable" "-p $E" "-z" ""; do
   # shellcheck disable=SC2086
-  u linuxfs_ext4.util $bad_args >/dev/null 2>&1; rc=$?
+  u macfuse_ext4.util $bad_args >/dev/null 2>&1; rc=$?
   [ $rc = 254 ]; ok $? "bad arguments '$bad_args' exit 254 (rc $rc)"
 done
-u linuxfs_ext4.util -p disk99999 removable writable >/dev/null 2>&1; rc=$?
+u macfuse_ext4.util -p disk99999 removable writable >/dev/null 2>&1; rc=$?
 [ $rc = 254 ]; ok $? "a disk that does not exist exits 254 (rc $rc)"
 u bogus.util -p "$E" removable writable >/dev/null 2>&1; rc=$?
 [ $rc = 254 ]; ok $? "an unknown program name exits 254 (rc $rc)"
-u fsck_linuxfs_ext4 -q "/dev/r$E" >/dev/null 2>&1; rc=$?
+u fsck_macfuse_ext4 -q "/dev/r$E" >/dev/null 2>&1; rc=$?
 [ $rc = 0 ]; ok $? "fsck -q exits 0 (rc $rc)"
-out=$(u fsck_linuxfs_ext4 -n "/dev/r$E" 2>&1); rc=$?
+out=$(u fsck_macfuse_ext4 -n "/dev/r$E" 2>&1); rc=$?
 [ $rc = 8 ] && [ "$out" = "Verify and Repair for ext4 come with its tools" ]; ok $? "fsck -n exits 8 and says why (rc $rc, '$out')"
-u fsck_linuxfs_ext4 -y "/dev/r$E" >/dev/null 2>&1; rc=$?
+u fsck_macfuse_ext4 -y "/dev/r$E" >/dev/null 2>&1; rc=$?
 [ $rc = 8 ]; ok $? "fsck -y exits 8 (rc $rc)"
-u fsck_linuxfs_ext4 >/dev/null 2>&1; rc=$?
+u fsck_macfuse_ext4 >/dev/null 2>&1; rc=$?
 [ $rc = 8 ]; ok $? "fsck with no flag exits 8 (rc $rc)"
-out=$(u fsck_linuxfs_ext4 -z "/dev/r$E" 2>&1 >/dev/null); rc=$?
+out=$(u fsck_macfuse_ext4 -z "/dev/r$E" 2>&1 >/dev/null); rc=$?
 [ $rc = 8 ] && case $out in usage:*) true ;; *) false ;; esac; ok $? "fsck with an unknown flag exits 8 with a usage line on stderr (rc $rc, '$out')"
-u fsck_linuxfs_ext4 -qn "/dev/r$E" >/dev/null 2>&1; rc=$?
+u fsck_macfuse_ext4 -qn "/dev/r$E" >/dev/null 2>&1; rc=$?
 [ $rc = 8 ]; ok $? "fsck flags are parsed exactly: -qn is not -q (rc $rc)"
 # spec: tools/fs.c mount role -- as the console user, with stand-ins for the CLI, the keychain keeper and the dialog
-M=$D/mount; mkdir -p "$M"; MD=$D/mount_linuxfs_ext4
+M=$D/mount; mkdir -p "$M"; MD=$D/mount_macfuse_ext4
 PWHOME=$(/usr/bin/python -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')
 cat > "$M/cli" <<'EOS'
 #!/bin/sh
@@ -306,9 +306,9 @@ done
 #           the drop; it prints the plan instead of dropping and exec'ing) stands in. The shipped build has no such code.
 mkdir -p "$D/drop"
 "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN \
-  -DLINUXFS_FS_TEST_DROP -o "$D/drop/mount_linuxfs_ext4" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" \
+  -DLINUXFS_FS_TEST_DROP -o "$D/drop/mount_macfuse_ext4" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" \
   -framework CoreFoundation -framework DiskArbitration || exit 1
-DM=$D/drop/mount_linuxfs_ext4
+DM=$D/drop/mount_macfuse_ext4
 V=$D/vols; rm -rf "$V"; mkdir -p "$V/NAME" "$V/other"; : > "$V/file"; ln -s "$V/NAME" "$V/link"
 H=/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d
 UID_D=$(id -u daemon)
@@ -342,7 +342,7 @@ fwant() { # RW HELPER-OPTIONS DEV MNT [ARGV-FLAGS]: the plan the brief prescribe
 }
 F2=$MF/5.5.0-mavericks.2.plist
 fplan "$F2" "$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
-fwant rw "allow_other,local,volname=NAME,fsname=linuxfs@$E,noappledouble" "$E" "$V/NAME" > "$M/want"
+fwant rw "allow_other,local,volname=NAME,fsname=linuxfs@$E,noappledouble,fstypename=ext4,fssubtype=7" "$E" "$V/NAME" > "$M/want"
 [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root plan: a device named without /dev/ is accepted and passed as /dev/DEV (rc $rc)"
 env -i LINUXFS_FS_TEST_USER=no_such_user_xyz LINUXFS_FS_TEST_VOLUMES="$V" "$DM" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
 [ $rc = 1 ] && [ ! -s "$M/plan" ] || { [ $rc = 1 ] && ! grep -q '^env' "$M/plan"; }; ok $? "root plan: no _linuxfs user: exit 1, nothing planned (rc $rc)"
@@ -368,14 +368,21 @@ plan "/dev/disk99999" "$V/NAME" 2>&1 >/dev/null | grep -q '^linuxfs-mount: refus
 FP_ENV="LINUXFS_CLI=/bin/false LINUXFS_OPEN=/bin/false LINUXFS_LKLFUSE=/bin/false" fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1
 grep -qx "env LINUXFS_OPEN=$H/linuxfs-open" "$M/plan" && grep -qx "env LINUXFS_LKLFUSE=$H/lklfuse" "$M/plan"; ok $? "root plan: a caller's LINUXFS_OPEN and LINUXFS_LKLFUSE are not passed on"
 fplan "$MF/5.5.0-mavericks.2.plist" -o nodev -o noowners -o nosuid "/dev/$E" "$V/NAME" > "$M/plan" 2>"$M/plan.err"; rc=$?
-fwant rw "allow_other,local,volname=NAME,fsname=linuxfs@$E,noappledouble" "$E" "$V/NAME" > "$M/want"
+fwant rw "allow_other,local,volname=NAME,fsname=linuxfs@$E,noappledouble,fstypename=ext4,fssubtype=7" "$E" "$V/NAME" > "$M/want"
 [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root mount plan: mount_macfuse's fixed path, argv, the libfuse handshake's environment, the CLI's channel as fd 6, LINUXFS_FUSE_FD=4, LINUXFS_FUSE_CHAN=6 (rc $rc: $(diff "$M/plan" "$M/want" | head -4 | tr '\n' ';'))"
 fplan "$MF/5.5.0-mavericks.2.plist" -o owners,rdonly "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
-fwant ro "allow_other,local,volname=NAME,fsname=linuxfs@$E,noappledouble,rdonly" "$E" "$V/NAME" --ro > "$M/want"
+fwant ro "allow_other,local,volname=NAME,fsname=linuxfs@$E,noappledouble,fstypename=ext4,fssubtype=7,rdonly" "$E" "$V/NAME" --ro > "$M/want"
 [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root mount plan: rdonly (and an ignored -o owners) adds rdonly to mount_macfuse's options and --ro to the CLI's, and no --asked (rc $rc: $(diff "$M/plan" "$M/want" | head -4 | tr '\n' ';'))"
 mkdir -p "$V/a,b=c"
 fplan "$MF/5.5.0-mavericks.2.plist" "/dev/$E" "$V/a,b=c" > "$M/plan" 2>&1
-grep -qx "helper-argv allow_other,local,volname=a-b-c,fsname=linuxfs@$E,noappledouble" "$M/plan"; ok $? "root mount plan: the volume name is the mount point's, made safe for an option list ($(grep '^helper-argv a' "$M/plan"))"
+grep -qx "helper-argv allow_other,local,volname=a-b-c,fsname=linuxfs@$E,noappledouble,fstypename=ext4,fssubtype=7" "$M/plan"; ok $? "root mount plan: the volume name is the mount point's, made safe for an option list ($(grep '^helper-argv a' "$M/plan"))"
+# spec: tools/fs.c mount_by_root -- the mount's options end with the filesystem's fstypename and fssubtype (tools/fsrules.c's names table)
+cp "$DM" "$D/drop/mount_macfuse_ntfs"
+DM_EXT=$DM; DM=$D/drop/mount_macfuse_ntfs
+fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
+fwant rw "allow_other,local,volname=NAME,fsname=linuxfs@$E,noappledouble,fstypename=ntfs,fssubtype=8" "$E" "$V/NAME" > "$M/want"
+[ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root mount plan: an NTFS mount ends ,fstypename=ntfs,fssubtype=8 (rc $rc: $(diff "$M/plan" "$M/want" | head -4 | tr '\n' ';'))"
+DM=$DM_EXT
 fplan "$F2" "/dev/$E" "$V/NAME" 2>&1 >/dev/null | grep -q .; [ $? -ne 0 ]; ok $? "root mount plan: a good run writes nothing to stderr"
 # spec: tools/fsrules.h fsrules_access -- root decides read-only before the kernel mount, by the CLI's rule (the probe's type and
 #       flags, ReadOnly, APFSWrite, DiskArbitration's rdonly), so the mount matches what lklfuse serves; an encrypted
@@ -397,12 +404,12 @@ plist "$D/apfswrite.plist" "<key>APFSWrite</key><true/>"
 plist "$D/readonly.plist" "<key>ReadOnly</key><true/>"
 fro() { # DEV WHAT [MACHINE-PREFS]: root's mount of DEV is read-only (rdonly, --ro), the device still opened read-write
   MACHP=${3:-} fplan "$F2" "/dev/$1" "$V/NAME" > "$M/plan" 2>&1; rc=$?
-  fwant rw "allow_other,local,volname=NAME,fsname=linuxfs@$1,noappledouble,rdonly" "$1" "$V/NAME" --ro > "$M/want"
+  fwant rw "allow_other,local,volname=NAME,fsname=linuxfs@$1,noappledouble,fstypename=ext4,fssubtype=7,rdonly" "$1" "$V/NAME" --ro > "$M/want"
   [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root mount plan: $2: rdonly to mount_macfuse, --ro to the CLI (rc $rc: $(diff "$M/plan" "$M/want" | head -4 | tr '\n' ';'))"
 }
 frw() { # DEV WHAT [MACHINE-PREFS]: root's mount of DEV is read-write
   MACHP=${3:-} fplan "$F2" "/dev/$1" "$V/NAME" > "$M/plan" 2>&1; rc=$?
-  fwant rw "allow_other,local,volname=NAME,fsname=linuxfs@$1,noappledouble" "$1" "$V/NAME" > "$M/want"
+  fwant rw "allow_other,local,volname=NAME,fsname=linuxfs@$1,noappledouble,fstypename=ext4,fssubtype=7" "$1" "$V/NAME" > "$M/want"
   [ $rc = 0 ] && cmp -s "$M/plan" "$M/want"; ok $? "root mount plan: $2: read-write (rc $rc: $(diff "$M/plan" "$M/want" | head -4 | tr '\n' ';'))"
 }
 fro "$TD" "a dirty NTFS volume"
@@ -457,7 +464,7 @@ hfd=$(sed -n 's/^env _FUSE_COMMFD=//p' "$D/drop/mhelper.log")
 [ "$(grep '^env ' "$D/drop/mhelper.log" | sort | tr '\n' ' ')" = "$(printf 'env _FUSE_CALL_BY_LIB=1\nenv _FUSE_COMMFD=%s\nenv _FUSE_COMMVERS=2\nenv _FUSE_DAEMON_PATH=%s/lklfuse\n' "$hfd" "$H" | sort | tr '\n' ' ')" ]
 ok $? "the helper's environment is the handshake's four variables and nothing else ($(grep '^env ' "$D/drop/mhelper.log" | tr '\n' ' '))"
 [ "$(sed -n 's/^fds //p' "$D/drop/mhelper.log")" = "0 1 2 $hfd" ]; ok $? "the helper holds 0-2 and its socket only, never the disk ($(sed -n 's/^fds //p' "$D/drop/mhelper.log"))"
-[ "$(grep '^argv ' "$D/drop/mhelper.log" | tr '\n' '|')" = "argv -o|argv allow_other,local,volname=NAME,fsname=linuxfs@$E,noappledouble|argv $V/NAME|" ]; ok $? "the helper's argv is -o OPTIONS MNT"
+[ "$(grep '^argv ' "$D/drop/mhelper.log" | tr '\n' '|')" = "argv -o|argv allow_other,local,volname=NAME,fsname=linuxfs@$E,noappledouble,fstypename=ext4,fssubtype=7|argv $V/NAME|" ]; ok $? "the helper's argv is -o OPTIONS MNT"
 # spec: tools/fs.c mount_by_root -- every other descriptor is closed: descriptors the mount program inherited (3, 4, 5, 9) are gone
 #       in the CLI and in the helper, and with stdin closed the device still lands on fd 3 and nothing on 0-2
 hs "" ok 4</dev/null 5</dev/null 9</dev/null 3</dev/null; fdl=$(sed -n 's/^fds: //p' "$M/fdcli.log" | sed 's/ *255//')

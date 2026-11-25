@@ -1,6 +1,6 @@
 #!/bin/sh
 # platform: host-agnostic
-#   usage: fsrules-test.sh
+#   usage: fsrules-test.sh [--names]
 #          Builds tools/fsrules.c with its test and runs it: the bundles' portable rules (program name to
 #          filesystem, which probe answers are claimed, mount's arguments, volume names). On Linux it builds
 #          with cc; on a Mac with clang22 and the 10.9 SDK, so both builds are tested.
@@ -18,4 +18,4 @@ else
   "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -std=c99 -O2 -Wall -Werror -fuse-ld=lld \
     -o "$D/fsrules-test" "$ROOT/tests/fsrules-test.c" "$ROOT/tools/fsrules.c" || exit 1
 fi
-"$D/fsrules-test"
+"$D/fsrules-test" "$@"

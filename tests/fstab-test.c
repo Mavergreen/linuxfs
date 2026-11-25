@@ -44,10 +44,10 @@ static const char *edit(const char *in, const char *spec, const char *bundle, in
 int main(void)
 {
 	static char big[FSTAB_MAX + 1];
-	static const char *const ok_bundles[] = { "linuxfs_ext4", "linuxfs_btrfs", "linuxfs_xfs", "linuxfs_f2fs", "linuxfs_apfs", "linuxfs_ntfs" };
+	static const char *const ok_bundles[] = { "macfuse_ext4", "macfuse_btrfs", "macfuse_xfs", "macfuse_f2fs", "macfuse_apfs", "macfuse_ntfs" };
 	char e[256], label[1100];
 	int ch, i, all;
-	const char *mine = "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF none linuxfs_ext4 rw,noauto # linuxfs\n";
+	const char *mine = "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF none macfuse_ext4 rw,noauto # linuxfs\n";
 	const char *other = "# a comment\nUUID=0123ABCD-4567-89EF-0123-456789ABCDEF none hfs rw,noauto\nLABEL=Backup none hfs ro\n";
 
 	/* specs */
@@ -83,15 +83,19 @@ int main(void)
 	for (all = 1, i = 0; i < 6; i++)
 		all &= fstab_bundle_refusal(ok_bundles[i]) == NULL;
 	is(all, 1, "the six bundles may be written");
-	is(fstab_bundle_refusal("linuxfs_hfs") != NULL, 1, "another linuxfs_ name is refused");
+	is(fstab_bundle_refusal("macfuse_hfs") != NULL, 1, "another macfuse_ name is refused");
+	is(fstab_bundle_refusal("macfuse_zfs") != NULL, 1, "macfuse_zfs is refused");
+	is(fstab_bundle_refusal("macfuse") != NULL, 1, "plain macfuse is refused");
+	is(fstab_bundle_refusal("linuxfs_ext4") != NULL, 1, "the old name linuxfs_ext4 is refused");
 	is(fstab_bundle_refusal("hfs") != NULL, 1, "the Mac's own filesystem is refused");
-	is(fstab_bundle_refusal("linuxfs_ext4 rw") != NULL, 1, "a bundle with more after it is refused");
-	is(fstab_bundle_refusal("../linuxfs_ext4") != NULL, 1, "a bundle with a directory is refused");
+	is(fstab_bundle_refusal("macfuse_ext4 rw") != NULL, 1, "a bundle with more after it is refused");
+	is(fstab_bundle_refusal("../macfuse_ext4") != NULL, 1, "a bundle with a directory is refused");
 	is(fstab_bundle_refusal("") != NULL, 1, "an empty bundle is refused");
 	is(fstab_bundle_refusal(NULL) != NULL, 1, "no bundle is refused");
-	iss(fstab_bundle_for("ext4"), "linuxfs_ext4", "ext4 is linuxfs_ext4's");
-	iss(fstab_bundle_for("ntfs3"), "linuxfs_ntfs", "ntfs3 is linuxfs_ntfs's");
-	iss(fstab_bundle_for("apfs"), "linuxfs_apfs", "apfs is linuxfs_apfs's");
+	iss(fstab_bundle_for("ext4"), "macfuse_ext4", "ext4 is macfuse_ext4's");
+	iss(fstab_bundle_for("ntfs3"), "macfuse_ntfs", "ntfs3 is macfuse_ntfs's");
+	iss(fstab_bundle_for("apfs"), "macfuse_apfs", "apfs is macfuse_apfs's");
+	iss(fstab_bundle_for("ntfs3") , "macfuse_ntfs", "ntfs3 maps to macfuse_ntfs");
 	iss(fstab_bundle_for("vfat"), NULL, "vfat is the Mac's");
 	iss(fstab_bundle_for("exfat"), NULL, "exfat is the Mac's");
 	iss(fstab_bundle_for("ntfs"), NULL, "a name the probe never gives has no bundle");
@@ -107,17 +111,17 @@ int main(void)
 	is(fstab_escape("LABEL=a b", e, 12), -1, "nor one that does not fit");
 
 	/* edits */
-	iss(edit("", "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF", "linuxfs_ext4", &ch), mine, "an add to an empty fstab writes the one line");
+	iss(edit("", "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF", "macfuse_ext4", &ch), mine, "an add to an empty fstab writes the one line");
 	is(ch, 1, "and changes it");
-	iss(edit(mine, "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF", "linuxfs_ext4", &ch), mine, "adding it again keeps the fstab as it is");
+	iss(edit(mine, "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF", "macfuse_ext4", &ch), mine, "adding it again keeps the fstab as it is");
 	is(ch, 0, "and says nothing changed");
-	iss(edit(other, "LABEL=my data", "linuxfs_ntfs", &ch),
+	iss(edit(other, "LABEL=my data", "macfuse_ntfs", &ch),
 	    "# a comment\nUUID=0123ABCD-4567-89EF-0123-456789ABCDEF none hfs rw,noauto\nLABEL=Backup none hfs ro\n"
-	    "LABEL=my\\040data none linuxfs_ntfs rw,noauto # linuxfs\n", "an add keeps every other line and appends, the label escaped");
-	iss(edit("LABEL=Backup none hfs ro", "LABEL=x", "linuxfs_xfs", &ch), "LABEL=Backup none hfs ro\nLABEL=x none linuxfs_xfs rw,noauto # linuxfs\n",
+	    "LABEL=my\\040data none macfuse_ntfs rw,noauto # linuxfs\n", "an add keeps every other line and appends, the label escaped");
+	iss(edit("LABEL=Backup none hfs ro", "LABEL=x", "macfuse_xfs", &ch), "LABEL=Backup none hfs ro\nLABEL=x none macfuse_xfs rw,noauto # linuxfs\n",
 	    "a last line with no newline gets one before the new line");
-	iss(edit(mine, "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF", "linuxfs_btrfs", &ch),
-	    "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF none linuxfs_btrfs rw,noauto # linuxfs\n", "adding a spec with another bundle replaces its line");
+	iss(edit(mine, "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF", "macfuse_btrfs", &ch),
+	    "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF none macfuse_btrfs rw,noauto # linuxfs\n", "adding a spec with another bundle replaces its line");
 	is(ch, 1, "and changes it");
 	{
 		char in[1024];
@@ -127,53 +131,61 @@ int main(void)
 		is(ch, 1, "and changes it");
 		iss(edit(other, "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF", NULL, &ch), other, "removing what is not there keeps the fstab");
 		is(ch, 0, "and says nothing changed");
-		snprintf(in, sizeof in, "LABEL=my\\040data none linuxfs_ext4 rw,noauto # linuxfs\n%sLABEL=my\\040data2 none linuxfs_ext4 rw,noauto # linuxfs\n", other);
+		snprintf(in, sizeof in, "LABEL=my\\040data none macfuse_ext4 rw,noauto # linuxfs\n%sLABEL=my\\040data2 none macfuse_ext4 rw,noauto # linuxfs\n", other);
 		iss(edit(in, "LABEL=my data", NULL, &ch), "# a comment\nUUID=0123ABCD-4567-89EF-0123-456789ABCDEF none hfs rw,noauto\nLABEL=Backup none hfs ro\n"
-		    "LABEL=my\\040data2 none linuxfs_ext4 rw,noauto # linuxfs\n", "a remove by label takes that label's line only, matched escaped");
+		    "LABEL=my\\040data2 none macfuse_ext4 rw,noauto # linuxfs\n", "a remove by label takes that label's line only, matched escaped");
 		snprintf(in, sizeof in, "LABEL=x none hfs rw # linuxfs is not here\n");
 		iss(edit(in, "LABEL=x", NULL, &ch), in, "a line that only mentions linuxfs is not linuxfs's");
 	}
 	{
 		char in[1024];
 
-		snprintf(in, sizeof in, "%sLABEL=my\\040data none linuxfs_ntfs rw,noauto # linuxfs\n%s%s", mine, other, mine);
+		snprintf(in, sizeof in, "%sLABEL=my\\040data none macfuse_ntfs rw,noauto # linuxfs\n%s%s", mine, other, mine);
 		iss(edit(in, NULL, NULL, &ch), other, "no spec and no bundle removes every linuxfs line and keeps every other");
 		is(ch, 1, "and changes it");
 		iss(edit(other, NULL, NULL, &ch), other, "with none there, the fstab is kept");
 		is(ch, 0, "and nothing changed");
-		iss(edit(other, NULL, "linuxfs_ext4", &ch), "(refused)", "a bundle with no spec is refused");
+		{
+			char old[512];
+
+			/* a line written under the old bundle name is still ours (the tag), so unignore clears it */
+			snprintf(old, sizeof old, "%sUUID=0123ABCD-4567-89EF-0123-456789ABCDEF none linuxfs_ext4 rw,noauto # linuxfs\n", other);
+			iss(edit(old, "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF", NULL, &ch), other, "a remove by spec takes a line of the old linuxfs_ext4 name");
+			is(ch, 1, "and changes it");
+		}
+		iss(edit(other, NULL, "macfuse_ext4", &ch), "(refused)", "a bundle with no spec is refused");
 	}
 	{
 		/* spec: tools/fstab.c -- a linuxfs line ends in whitespace then "# linuxfs", before an optional \r (an fstab edited
 		 * on Windows); "X# linuxfs" is somebody else's */
-		const char *crlf = "LABEL=a none linuxfs_ext4 rw,noauto # linuxfs\r\n";
+		const char *crlf = "LABEL=a none macfuse_ext4 rw,noauto # linuxfs\r\n";
 		const char *glued = "LABEL=a none hfs rw,noauto#   # linuxfs\nLABEL=b none hfs rw,noauto,x# linuxfs\n";
 
 		iss(edit(crlf, "LABEL=a", NULL, &ch), "", "a CRLF linuxfs line is ours: removed by its spec");
 		iss(edit(crlf, NULL, NULL, &ch), "", "and by noauto-remove-all");
-		iss(edit(crlf, "LABEL=a", "linuxfs_ext4", &ch), crlf, "and adding it again keeps it, not doubled");
+		iss(edit(crlf, "LABEL=a", "macfuse_ext4", &ch), crlf, "and adding it again keeps it, not doubled");
 		is(ch, 0, "unchanged");
 		iss(edit("LABEL=b none hfs ro\r\n", NULL, NULL, &ch), "LABEL=b none hfs ro\r\n", "another CRLF line is kept as it is");
 		iss(edit("LABEL=b none hfs rw,noauto,x# linuxfs\n", NULL, NULL, &ch), "LABEL=b none hfs rw,noauto,x# linuxfs\n",
 		    "a line with no space or tab before # linuxfs is not ours");
 		iss(edit(glued, "LABEL=b", NULL, &ch), glued, "nor removed by its spec");
-		iss(edit("LABEL=c none linuxfs_xfs rw,noauto\t# linuxfs\n", "LABEL=c", NULL, &ch), "", "a tab before # linuxfs is ours");
+		iss(edit("LABEL=c none macfuse_xfs rw,noauto\t# linuxfs\n", "LABEL=c", NULL, &ch), "", "a tab before # linuxfs is ours");
 		iss(edit("# linuxfs\n", NULL, NULL, &ch), "# linuxfs\n", "a line that is only the tag is not ours");
 		iss(edit(" # linuxfs\n\t# linuxfs\r\n", NULL, NULL, &ch), " # linuxfs\n\t# linuxfs\r\n", "nor is the tag indented, with no first field");
-		iss(edit("  LABEL=d none linuxfs_ext4 rw,noauto # linuxfs\n", "LABEL=d", NULL, &ch), "", "an indented entry of ours is ours");
+		iss(edit("  LABEL=d none macfuse_ext4 rw,noauto # linuxfs\n", "LABEL=d", NULL, &ch), "", "an indented entry of ours is ours");
 	}
-	iss(edit("", "LABEL=a#b", "linuxfs_ext4", &ch), "(refused)", "an edit with a refused spec is refused");
-	iss(edit("", "LABEL=ab", "linuxfs_hfs", &ch), "(refused)", "an edit with a refused bundle is refused");
+	iss(edit("", "LABEL=a#b", "macfuse_ext4", &ch), "(refused)", "an edit with a refused spec is refused");
+	iss(edit("", "LABEL=ab", "macfuse_hfs", &ch), "(refused)", "an edit with a refused bundle is refused");
 	memset(big, '#', FSTAB_MAX - 10);
 	big[FSTAB_MAX - 11] = '\n';
 	big[FSTAB_MAX - 10] = '\0';
-	iss(edit(big, "LABEL=ab", "linuxfs_ext4", &ch), "(refused)", "an add that would make the fstab over 64 KiB is refused");
-	is(fstab_edit("", 0, "LABEL=ab", "linuxfs_ext4", out, 10, &ch), -1, "so is one that does not fit OUT");
+	iss(edit(big, "LABEL=ab", "macfuse_ext4", &ch), "(refused)", "an add that would make the fstab over 64 KiB is refused");
+	is(fstab_edit("", 0, "LABEL=ab", "macfuse_ext4", out, 10, &ch), -1, "so is one that does not fit OUT");
 
 	/* lookups */
 	{
-		const char *f = "# x\nUUID=0123ABCD-4567-89EF-0123-456789ABCDEF none linuxfs_ext4 rw,noauto # linuxfs\n"
-				"LABEL=my\\040data none linuxfs_ntfs rw,noauto # linuxfs\nLABEL=Backup none hfs rw,noauto\n";
+		const char *f = "# x\nUUID=0123ABCD-4567-89EF-0123-456789ABCDEF none macfuse_ext4 rw,noauto # linuxfs\n"
+				"LABEL=my\\040data none macfuse_ntfs rw,noauto # linuxfs\nLABEL=Backup none hfs rw,noauto\n";
 
 		is(fstab_has_noauto(f, strlen(f), "0123ABCD-4567-89EF-0123-456789ABCDEF", NULL), 1, "a volume with linuxfs's UUID entry has one");
 		is(fstab_has_noauto(f, strlen(f), "0123abcd-4567-89ef-0123-456789abcdef", "x"), 1, "matched in any case");

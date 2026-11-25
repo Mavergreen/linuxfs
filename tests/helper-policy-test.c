@@ -161,7 +161,7 @@ int main(void)
 	/* ---- /etc/fstab: noauto-add SPEC BUNDLE, noauto-remove SPEC ---- */
 	{
 		char dir[] = "/tmp/helper-fstab.XXXXXX", f[256], tmp[300], big[FSTAB_MAX + 16], other[256], link[256];
-		const char *line = "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF none linuxfs_ext4 rw,noauto # linuxfs\n";
+		const char *line = "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF none macfuse_ext4 rw,noauto # linuxfs\n";
 		const char *mac = "# the Mac's\nUUID=0123ABCD-4567-89EF-0123-456789ABCDEF none hfs rw,noauto\nLABEL=Backup none hfs ro";
 		struct stat st, st2;
 
@@ -173,10 +173,10 @@ int main(void)
 		setenv("LINUXFS_FSTAB", f, 1);
 		iss(helper_fstab_path(), f, "LINUXFS_FSTAB names another, when not root");
 
-		iss(helper_noauto(f, "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF", "linuxfs_ext4"), NULL, "an add with no fstab yet is done");
+		iss(helper_noauto(f, "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF", "macfuse_ext4"), NULL, "an add with no fstab yet is done");
 		iss(slurp(f), line, "and makes the fstab with the one line");
 		is(stat(f, &st) == 0 && (st.st_mode & 07777) == 0644 && S_ISREG(st.st_mode), 1, "mode 0644, a regular file");
-		iss(helper_noauto(f, "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF", "linuxfs_ext4"), NULL, "adding it again is ok");
+		iss(helper_noauto(f, "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF", "macfuse_ext4"), NULL, "adding it again is ok");
 		is(stat(f, &st2) == 0 && st2.st_ino == st.st_ino, 1, "and leaves the file alone (not rewritten)");
 		iss(helper_noauto(f, "UUID=0123ABCD-4567-89EF-0123-456789ABCDEF", NULL), NULL, "a remove is done");
 		iss(slurp(f), "", "and takes the line away");
@@ -186,24 +186,24 @@ int main(void)
 		is(access(f, F_OK) != 0, 1, "which makes none");
 
 		spit(f, mac);
-		iss(helper_noauto(f, "LABEL=my data\there", "linuxfs_ntfs"), NULL, "an add to an fstab with other lines is done");
-		snprintf(big, sizeof big, "%s\nLABEL=my\\040data\\011here none linuxfs_ntfs rw,noauto # linuxfs\n", mac);
+		iss(helper_noauto(f, "LABEL=my data\there", "macfuse_ntfs"), NULL, "an add to an fstab with other lines is done");
+		snprintf(big, sizeof big, "%s\nLABEL=my\\040data\\011here none macfuse_ntfs rw,noauto # linuxfs\n", mac);
 		iss(slurp(f), big, "every other line is kept byte for byte; the label's space and tab are escaped");
 		iss(helper_noauto(f, "LABEL=my data\there", NULL), NULL, "and removed by the same label");
 		snprintf(big, sizeof big, "%s\n", mac);
 		iss(slurp(f), big, "leaving the others as they were");
 		is(entries(dir), 1, "no temporary file is left behind");
 		spit(tmp, "stale");
-		iss(helper_noauto(f, "LABEL=y", "linuxfs_xfs"), NULL, "a stale temporary file from a crash does not stop an add");
-		is(entries(dir) == 1 && strstr(slurp(f), "LABEL=y none linuxfs_xfs rw,noauto # linuxfs\n") != NULL, 1, "the add is whole, and the stale file gone");
+		iss(helper_noauto(f, "LABEL=y", "macfuse_xfs"), NULL, "a stale temporary file from a crash does not stop an add");
+		is(entries(dir) == 1 && strstr(slurp(f), "LABEL=y none macfuse_xfs rw,noauto # linuxfs\n") != NULL, 1, "the add is whole, and the stale file gone");
 
 		spit(f, mac);
-		is(helper_noauto(f, "LABEL=a\nb", "linuxfs_ext4") != NULL, 1, "a label with a newline is refused");
-		is(helper_noauto(f, "LABEL=a#b", "linuxfs_ext4") != NULL, 1, "a label with # is refused");
-		is(helper_noauto(f, "LABEL=a\033b", "linuxfs_ext4") != NULL, 1, "a label with a control byte is refused");
-		is(helper_noauto(f, "UUID=0123abcd-4567-89ef-0123-456789abcdef", "linuxfs_ext4") != NULL, 1, "a lowercase UUID is refused");
+		is(helper_noauto(f, "LABEL=a\nb", "macfuse_ext4") != NULL, 1, "a label with a newline is refused");
+		is(helper_noauto(f, "LABEL=a#b", "macfuse_ext4") != NULL, 1, "a label with # is refused");
+		is(helper_noauto(f, "LABEL=a\033b", "macfuse_ext4") != NULL, 1, "a label with a control byte is refused");
+		is(helper_noauto(f, "UUID=0123abcd-4567-89ef-0123-456789abcdef", "macfuse_ext4") != NULL, 1, "a lowercase UUID is refused");
 		is(helper_noauto(f, "UUID=nope", NULL) != NULL, 1, "a bad UUID is refused for a remove too");
-		is(helper_noauto(f, "LABEL=a", "linuxfs_hfs") != NULL, 1, "a bundle that is not linuxfs's is refused");
+		is(helper_noauto(f, "LABEL=a", "macfuse_hfs") != NULL, 1, "a bundle that is not linuxfs's is refused");
 		is(helper_noauto(f, "LABEL=a", "hfs") != NULL, 1, "the Mac's own bundle is refused");
 		iss(slurp(f), mac, "and none of those touched the fstab");
 		memset(big, '#', FSTAB_MAX + 1);
@@ -213,16 +213,16 @@ int main(void)
 		is(strlen(slurp(f)), FSTAB_MAX + 1, "and left as it was");
 		unlink(f);
 		mkdir(f, 0755);
-		is(helper_noauto(f, "LABEL=a", "linuxfs_ext4") != NULL, 1, "an fstab that is a directory is refused");
+		is(helper_noauto(f, "LABEL=a", "macfuse_ext4") != NULL, 1, "an fstab that is a directory is refused");
 		rmdir(f);
 		mkfifo(f, 0644);
-		is(helper_noauto(f, "LABEL=a", "linuxfs_ext4") != NULL, 1, "an fstab that is a FIFO is refused (and not waited on)");
+		is(helper_noauto(f, "LABEL=a", "macfuse_ext4") != NULL, 1, "an fstab that is a FIFO is refused (and not waited on)");
 		unlink(f);
 		snprintf(other, sizeof other, "%s/elsewhere", dir);
 		spit(other, mac);
 		snprintf(link, sizeof link, "%s", f);
 		symlink(other, link);
-		is(helper_noauto(f, "LABEL=a", "linuxfs_ext4") != NULL, 1, "an fstab that is a symlink is refused");
+		is(helper_noauto(f, "LABEL=a", "macfuse_ext4") != NULL, 1, "an fstab that is a symlink is refused");
 		iss(slurp(other), mac, "and what it points at is untouched");
 		is(lstat(f, &st) == 0 && S_ISLNK(st.st_mode), 1, "and the symlink is still a symlink");
 		unlink(f);
@@ -235,40 +235,40 @@ int main(void)
 		if (!getenv("LINUXFS_TEST_DISKS"))
 			printf("# LINUXFS_TEST_DISKS is not set: run me from helper-test.sh\n");
 		/* noauto-add only for an attached volume of the bundle's type, by its UUID or volume name */
-		answers("noauto-add LABEL=nowhere linuxfs_ext4\n", getuid(), getuid(), "no no attached linuxfs volume matches", "noauto-add with no such disk attached is refused");
-		answers("noauto-add LABEL=helped linuxfs_btrfs\n", getuid(), getuid(), "no no attached linuxfs volume matches", "noauto-add for a disk of another type is refused");
-		answers("noauto-add UUID=0123ABCD-4567-89EF-0123-456789ABCDEE linuxfs_ext4\n", getuid(), getuid(), "no no attached linuxfs volume matches", "noauto-add by a UUID no disk has is refused");
-		answers("noauto-add LABEL=Linux linuxfs_ext4\n", getuid(), getuid(), "no no attached linuxfs volume matches", "LABEL=Linux matches no volume that has another label");
+		answers("noauto-add LABEL=nowhere macfuse_ext4\n", getuid(), getuid(), "no no attached linuxfs volume matches", "noauto-add with no such disk attached is refused");
+		answers("noauto-add LABEL=helped macfuse_btrfs\n", getuid(), getuid(), "no no attached linuxfs volume matches", "noauto-add for a disk of another type is refused");
+		answers("noauto-add UUID=0123ABCD-4567-89EF-0123-456789ABCDEE macfuse_ext4\n", getuid(), getuid(), "no no attached linuxfs volume matches", "noauto-add by a UUID no disk has is refused");
+		answers("noauto-add LABEL=Linux macfuse_ext4\n", getuid(), getuid(), "no no attached linuxfs volume matches", "LABEL=Linux matches no volume that has another label");
 		iss(slurp(f), mac, "and none of them touched the fstab");
-		answers("noauto-add LABEL=helped linuxfs_ext4\n", getuid(), getuid(), "ok", "noauto-add for the attached disk's volume name and type is done");
-		answers("noauto-add UUID=0123abcd-4567-89EF-0123-456789ABCDEF linuxfs_ext4\n", getuid(), getuid(), "no ", "a lowercase UUID is still refused");
+		answers("noauto-add LABEL=helped macfuse_ext4\n", getuid(), getuid(), "ok", "noauto-add for the attached disk's volume name and type is done");
+		answers("noauto-add UUID=0123abcd-4567-89EF-0123-456789ABCDEF macfuse_ext4\n", getuid(), getuid(), "no ", "a lowercase UUID is still refused");
 		answers("noauto-remove LABEL=helped\n", getuid(), getuid(), "ok", "and removed");
 		snprintf(big, sizeof big, "%s\n", mac);
 		iss(slurp(f), big, "the fstab is the Mac's again (ended by a newline)");
 		spit(f, mac);
-		answers("noauto-add LABEL=my data linuxfs_ext4\n", getuid(), getuid(), "ok", "noauto-add LABEL=<label with a space> BUNDLE is done");
-		is(strstr(slurp(f), "\nLABEL=my\\040data none linuxfs_ext4 rw,noauto # linuxfs\n") != NULL, 1, "the bundle is the last word, the rest the spec");
-		answers("noauto-add LABEL=my data linuxfs_ext4\n", getuid(), getuid(), "ok", "noauto-add again is ok");
+		answers("noauto-add LABEL=my data macfuse_ext4\n", getuid(), getuid(), "ok", "noauto-add LABEL=<label with a space> BUNDLE is done");
+		is(strstr(slurp(f), "\nLABEL=my\\040data none macfuse_ext4 rw,noauto # linuxfs\n") != NULL, 1, "the bundle is the last word, the rest the spec");
+		answers("noauto-add LABEL=my data macfuse_ext4\n", getuid(), getuid(), "ok", "noauto-add again is ok");
 		answers("noauto-remove LABEL=my data\n", getuid(), getuid(), "ok", "noauto-remove LABEL=<label> is done");
 		snprintf(big, sizeof big, "%s\n", mac);
 		iss(slurp(f), big, "and the fstab is back to the Mac's lines");
 		answers("noauto-remove LABEL=my data\n", getuid(), getuid(), "ok", "noauto-remove of a missing entry is ok");
 		answers("noauto-add LABEL=x\n", getuid(), getuid(), "no ", "noauto-add with no bundle is refused");
-		answers("noauto-add LABEL=x linuxfs_hfs\n", getuid(), getuid(), "no ", "noauto-add with a bundle not ours is refused");
-		answers("noauto-add LABEL=a#b linuxfs_ext4\n", getuid(), getuid(), "no a label with #", "noauto-add with # in the label is refused, saying why");
-		answers("noauto-add LABEL=a\nb linuxfs_ext4\n", getuid(), getuid(), "no a request is one line", "a request with more after its line is refused");
+		answers("noauto-add LABEL=x macfuse_hfs\n", getuid(), getuid(), "no ", "noauto-add with a bundle not ours is refused");
+		answers("noauto-add LABEL=a#b macfuse_ext4\n", getuid(), getuid(), "no a label with #", "noauto-add with # in the label is refused, saying why");
+		answers("noauto-add LABEL=a\nb macfuse_ext4\n", getuid(), getuid(), "no a request is one line", "a request with more after its line is refused");
 		answers("noauto-remove \n", getuid(), getuid(), "no ", "noauto-remove with no spec is refused");
-		answers("noauto-add LABEL=x linuxfs_ext4\n", 502, 501, "no only the user at the console", "noauto-add from another user is refused");
+		answers("noauto-add LABEL=x macfuse_ext4\n", 502, 501, "no only the user at the console", "noauto-add from another user is refused");
 		iss(slurp(f), big, "and none of the refused requests touched the fstab");
 		/* noauto-remove-all (uninstall): every linuxfs line goes, no other */
-		answers("noauto-add LABEL=helped linuxfs_ext4\n", getuid(), getuid(), "ok", "an entry to remove");
-		answers("noauto-add UUID=0123ABCD-4567-89EF-0123-456789ABCDEF linuxfs_ext4\n", getuid(), getuid(), "ok", "and another");
+		answers("noauto-add LABEL=helped macfuse_ext4\n", getuid(), getuid(), "ok", "an entry to remove");
+		answers("noauto-add UUID=0123ABCD-4567-89EF-0123-456789ABCDEF macfuse_ext4\n", getuid(), getuid(), "ok", "and another");
 		answers("noauto-remove-all extra\n", getuid(), getuid(), "no ", "noauto-remove-all takes nothing after it");
 		answers("noauto-remove-all\n", 502, 501, "no only the user at the console", "noauto-remove-all from another user is refused");
 		answers("noauto-remove-all\n", getuid(), getuid(), "ok", "noauto-remove-all is done");
 		iss(slurp(f), big, "every linuxfs line is gone and the Mac's lines are as they were");
 		answers("noauto-remove-all\n", getuid(), getuid(), "ok", "and with none left it is ok");
-		iss(helper_noauto(f, NULL, "linuxfs_ext4"), "a bundle needs a volume", "a bundle with no spec is refused");
+		iss(helper_noauto(f, NULL, "macfuse_ext4"), "a bundle needs a volume", "a bundle with no spec is refused");
 		unlink(f);
 		rmdir(dir);
 		unsetenv("LINUXFS_FSTAB");
