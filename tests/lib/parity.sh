@@ -189,7 +189,7 @@ census_attach() {
   test "${2:-}" != nomount || return 0
   # shellcheck disable=SC2086  # the nodes are words
   if ! _ca_m=$(bounded 900 census_wait_mounted $CA_NODES); then
-    echo "# census: $1 attached as $CA_DISK, not mounted within 60 s"; census_detach "$CA_DISK"; return 1
+    echo "# census: $1 attached as $CA_DISK, not mounted within 60 s"; census_detach_checked "$CA_DISK" fs; return 1
   fi
   CA_DEV=$(printf '%s\n' "$_ca_m" | sed -n 1p) CA_MP=$(printf '%s\n' "$_ca_m" | sed -n 2p)
   CA_VOL=${CA_MP##*/}
@@ -212,6 +212,15 @@ census_detach() {
   _cd_o=$(bounded 600 diskutil eject "$1" 2>&1 </dev/null) && return 0
   echo "# census: diskutil eject $1 failed again; left attached: $(printf '%s' "$_cd_o" | tr '\n' ' ')"
   return 1
+}
+
+# census_detach_checked DISK SIDE: census_detach of DISK as SIDE, with its mount point, when any node of it (the whole
+#   disk, s1 to s4) is mounted; as nomount when none is
+census_detach_checked() {
+  for _cdc_n in "$1" "${1}s1" "${1}s2" "${1}s3" "${1}s4"; do
+    if test "$(census_info "$_cdc_n" Mounted)" = Yes; then census_detach "$1" "$2" "$(census_info "$_cdc_n" "Mount Point")"; return; fi
+  done
+  census_detach "$1" nomount
 }
 
 # census_image_disk IMAGE: the whole disk IMAGE is attached as, if it is
@@ -391,6 +400,11 @@ fl_plain() {
   PA_VERDICT="stalled after $(($(date +%s) - pa_t0)) s: attached as $PA_DISK, never mounted"; return 1
 }
 
+# fl_detach SIDE: fl_plain's disk detached; one that never mounted (a stall) is checked, so it may go as nomount
+fl_detach() {
+  if test -n "$PA_MP"; then census_detach "$PA_DISK" "$1" "$PA_MP"; else census_detach_checked "$PA_DISK" "$1"; fi >>"$OUT/parity/stall-detach.txt"
+}
+
 # fl_iter VOLUME(hfs|ext4) LOOP(1|2) NUMBER IMAGE: one iteration, appended to stall.txt; 1 for a stall, 2 for a setup failure
 #   loop 1: attach -nomount, the noauto entry (HFS+: written by hand; ext4: linuxfs ignore), diskutil mount, the entry
 #           taken away (linuxfs unignore), eject, then the plain attach that is counted
@@ -404,7 +418,7 @@ fl_iter() {
     # shellcheck disable=SC2086  # the nodes are words
     it_dv=$(bounded 900 census_wait_uuid $CA_NODES) || it_dv=
     it_dev=$(printf '%s\n' "$it_dv" | sed -n 1p) it_fu=$(printf '%s\n' "$it_dv" | sed -n 2p)
-    if test -z "$it_fu"; then census_detach "$it_disk" nomount; echo "$it_tag: setup failed: no Volume UUID" >>"$OUT/parity/stall.txt"; return 2; fi
+    if test -z "$it_fu"; then census_detach_checked "$it_disk" "$it_side"; echo "$it_tag: setup failed: no Volume UUID" >>"$OUT/parity/stall.txt"; return 2; fi
     census_pause 6   # as round 4 did: the agent's sweep may mount it first
     it_how=nomount
     if test "$(census_info "$it_dev" Mounted)" = Yes; then
@@ -430,14 +444,14 @@ fl_iter() {
     it_first="ignore, diskutil mount (exit $it_s3), unignore, eject"
   else
     fl_plain "$it_img" "$W/census/fl-first.log"; it_first="first attach: $PA_VERDICT"
-    census_detach "$PA_DISK" "$it_side" "$PA_MP" >>"$OUT/parity/stall-detach.txt"
+    fl_detach "$it_side"
   fi
   it_dal=$(census_dalog_size); : "${it_dal:=0}"
   da_mark "$it_tag: plain attach"
   fl_plain "$it_img" "$W/census/fl-plain.log"; it_ok=$?
   it_probe=$(census_dalog_since "$it_dal" | census_probe_times | tr '\n' ',' | sed 's/,$//; s/,/, /g')
   if test "$it_ok" -ne 0; then census_dalog_since "$it_dal" | tail -n 400 >"$OUT/parity/stall-$it_tag.dalog"; fi
-  census_detach "$PA_DISK" "$it_side" "$PA_MP" >>"$OUT/parity/stall-detach.txt"
+  fl_detach "$it_side"
   echo "$it_tag: $PA_VERDICT | probe ${it_probe:-none} | ${it_fu:+uuid $it_fu | }$it_first$it_via" >>"$OUT/parity/stall.txt"
   return "$it_ok"
 }

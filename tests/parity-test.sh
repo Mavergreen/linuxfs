@@ -293,7 +293,9 @@ hdiutil)
     printf 'img=%s\nvol=%s\nmp=%s\nuuid=UUID-%s\ndisk=%s\n' "$img" "$b" "$mp" "$b" "$d" > "$N/$nd"
     log "created disk, id = /dev/$d."
     log "probed disk, id = /dev/$nd, with stub, success."
-    if test -z "$nomount"; then : > "$N/$nd.m"; echo "/dev/$nd          	Stub	$mp"; else echo "/dev/$nd          	Stub"; fi ;;
+    case $b in *nouuid*) sed -i.x '/^uuid=/d' "$N/$nd"; rm -f "$N/$nd.x" ;; esac
+    case $b:$nomount in *nevermount*:) echo "/dev/$nd          	Stub" ;; *swept*:1 | *:) : > "$N/$nd.m"; echo "/dev/$nd          	Stub	$mp" ;;
+    *) echo "/dev/$nd          	Stub" ;; esac ;;
   detach)
     for a; do case $a in disk*|/dev/disk*) d=${a#/dev/}; rm -f "$N/$d" "$N/$d.m" "$N/${d}s1" "$N/${d}s1.m" ;; esac; done ;;
   info)
@@ -311,7 +313,7 @@ diskutil)
     echo "   Volume Name:              $(field "$nd" vol)"
     if test -f "$N/$nd.m"; then echo "   Mounted:                  Yes"; echo "   Mount Point:              $(field "$nd" mp)"
     else echo "   Mounted:                  No"; fi
-    echo "   Volume UUID:              $(field "$nd" uuid)" ;;
+    test -z "$(field "$nd" uuid)" || echo "   Volume UUID:              $(field "$nd" uuid)" ;;
   mount)
     nd=$(node_of "$2"); test -n "$nd" || exit 1; : > "$N/$nd.m"; echo "Volume $(field "$nd" vol) on $nd mounted" ;;
   unmount)
@@ -323,6 +325,7 @@ diskutil)
     rm -f "$N/$nd.m"; echo "Volume $(field "$nd" vol) on $nd unmounted" ;;
   eject)
     d=${2#/dev/}
+    case $(field "$d" vol) in *stuck*) echo "Disk $d couldn't be ejected (stub stuck)"; exit 1 ;; esac
     case $(field "$d" vol) in busy-ext4)
       if test ! -f "$STUB/eject-once"; then : > "$STUB/eject-once"; echo "Disk $d couldn't be ejected (stub busy)"; exit 1; fi ;;
     esac
@@ -434,6 +437,20 @@ for d in $(sort -u "$S/fsdisks"); do
   grep -Eq "^(hdiutil detach -force|diskutil unmountDisk force|diskutil unmount force) (/dev/)?$d(s1)?\$" "$S/calls.all" && forced="$forced $d"
 done
 expect census_no_force_on_fs test -z "$forced" -a -s "$S/fsdisks"
+# a disk that never mounted may be detached by force when its eject fails; a mounted linuxfs disk never is:
+#   census_attach's "not mounted within 60 s", a stalled plain attach in fl_iter, and fl_iter's no-UUID path (swept or not)
+forced_on() { grep -q "^hdiutil detach -force $1\$" "$S/calls.all"; }
+for c in nevermount-stuck-a nevermount-stuck-b nouuid-stuck nouuid-swept-stuck; do echo "$c" > "$W/census/$c.img"; done
+census_attach "$W/census/nevermount-stuck-a.img" > /dev/null 2>&1; d=$(cat "$S/disks")
+expect never_mounted_attach_forced forced_on "/dev/disk$d"
+fl_iter ext4 2 1 "$W/census/nevermount-stuck-b.img" > /dev/null 2>&1; d=$(cat "$S/disks")
+expect never_mounted_stall_forced forced_on "/dev/disk$d"
+fl_iter ext4 1 1 "$W/census/nouuid-stuck.img" > /dev/null 2>&1; d=$(cat "$S/disks")
+expect never_mounted_nouuid_forced forced_on "/dev/disk$d"
+fl_iter ext4 1 1 "$W/census/nouuid-swept-stuck.img" > /dev/null 2>&1; d=$(cat "$S/disks")
+expect swept_nouuid_not_forced not forced_on "/dev/disk$d"
+expect swept_nouuid_retried grep -q "^diskutil eject /dev/disk$d\$" "$S/calls.all"
+hdiutil detach -force "disk$d" > /dev/null 2>&1
 expect census_waits_bounded test ! -s "$unbounded"
 test ! -s "$unbounded" || sed 's/^/# /' "$unbounded"
 
