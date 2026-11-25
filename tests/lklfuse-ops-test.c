@@ -900,7 +900,10 @@ static void volicon_tests(void)
 	is(lklfuse_release(NULL, &fi), 0, "volicon: release");
 	is_str(content_of(V, b, 8), "\x03\x0a\x11\x18\x1f\x26\x2d", "volicon: content_of reads it too");
 	/* the icon's own bytes and attributes cannot be changed, nor the icon moved, linked or removed */
-	is(lklfuse_unlink(V), -EACCES, "volicon: unlink of the icon alone: EACCES");
+	/* (fix round 2) unlink of the icon alone: ENOENT, the name is free on the disk, so unlink-then-create replacers
+	 * (install, ln -sf, cp -f, rsync) go on */
+	is(lklfuse_unlink(V), -ENOENT, "volicon: unlink of the icon alone: ENOENT, nothing of that name on the disk");
+	is(lklfuse_getattr(V, &st, NULL) == 0 && st.st_ino == LKLFUSE_VOLICON_INO, 1, "volicon: and the icon is still shown");
 	is(lklfuse_rename(V, "/vi-moved", 0), -EACCES, "volicon: rename away: EACCES");
 	is(lklfuse_link(V, "/vi-link"), -EACCES, "volicon: a hard link to it: EACCES");
 	is(lklfuse_chmod(V, 0644, NULL), -EACCES, "volicon: chmod: EACCES");
@@ -929,10 +932,42 @@ static void volicon_tests(void)
 	is(lklfuse_getattr(V, &st, NULL) == 0 && st.st_size == 4 && st.st_ino != LKLFUSE_VOLICON_INO, 1, "volicon: its attributes too");
 	is(lklfuse_unlink(V), 0, "volicon: the real one can be removed");
 	is(lklfuse_getattr(V, &st, NULL) == 0 && (int)st.st_size == (int)sizeof(icon), 1, "volicon: and the icon is back");
+	/* (fix round 2) a write-open without O_TRUNC edits the icon in place: the real file made starts as the icon's bytes */
 	fi.flags = O_RDWR;
-	is(lklfuse_open(V, &fi), 0, "volicon: a read-write open makes a real, empty file");
+	is(lklfuse_open(V, &fi), 0, "volicon: a read-write open (no O_TRUNC) makes a real file");
+	is(lklfuse_write(NULL, "\xff", 1, 5, &fi), 1, "volicon: a 1-byte patch at offset 5");
+	is(lklfuse_release(NULL, &fi), 0, "volicon: and closes it");
+	memset(got, 0, sizeof(got));
+	is(lklfuse_getattr(V, &st, NULL) == 0 && st.st_ino != LKLFUSE_VOLICON_INO && st.st_size == (off_t)sizeof(icon), 1,
+	   "volicon: the real file has the icon's size");
+	fi.flags = O_RDONLY;
+	is(lklfuse_open(V, &fi), 0, "volicon: open it to read");
+	is(lklfuse_read(NULL, got, sizeof(got), 0, &fi), (int)sizeof(icon), "volicon: read it whole");
 	lklfuse_release(NULL, &fi);
-	is(lklfuse_getattr(V, &st, NULL) == 0 && st.st_size == 0, 1, "volicon: empty");
+	icon[5] = (char)0xff;
+	is(memcmp(got, icon, sizeof(icon)), 0, "volicon: its bytes are the icon's, with the patch landed");
+	icon[5] = (char)(5 * 7 + 3);
+	lkl_sys_unlink(V);
+	fi.flags = O_WRONLY;
+	is(lklfuse_open(V, &fi), 0, "volicon: a lock-only write-open (no O_TRUNC, no write)");
+	lklfuse_release(NULL, &fi);
+	memset(got, 0, sizeof(got));
+	fi.flags = O_RDONLY;
+	is(lklfuse_open(V, &fi) == 0 && lklfuse_getattr(V, &st, NULL) == 0 && st.st_ino != LKLFUSE_VOLICON_INO, 1,
+	   "volicon: makes a real file");
+	is(lklfuse_read(NULL, got, sizeof(got), 0, &fi), (int)sizeof(icon), "volicon: which holds the icon's bytes whole");
+	lklfuse_release(NULL, &fi);
+	is(memcmp(got, icon, sizeof(icon)), 0, "volicon: unchanged");
+	lkl_sys_unlink(V);
+	/* ln -sf, install, cp -f: unlink (ENOENT, gone) then make the name */
+	is(lklfuse_unlink(V) == -ENOENT && lklfuse_symlink("elsewhere", V) == 0, 1, "volicon: ln -sf over the icon: unlink then symlink");
+	is(lklfuse_readlink(V, b, sizeof(b)) == 0 && strcmp(b, "elsewhere") == 0, 1, "volicon: the symlink is what is there");
+	lkl_sys_unlink(V);
+	fi.flags = O_WRONLY;
+	is(lklfuse_unlink(V) == -ENOENT && lklfuse_create(V, 0644, &fi) == 0, 1, "volicon: install over the icon: unlink then create");
+	is(lklfuse_write(NULL, "inst", 4, 0, &fi), 4, "volicon: install writes it");
+	lklfuse_release(NULL, &fi);
+	is_str(content_of(V, b, sizeof(b)), "inst", "volicon: and it is served");
 	lkl_sys_unlink(V);
 	fi.flags = O_RDONLY | O_TRUNC;
 	is(lklfuse_open(V, &fi), 0, "volicon: an O_TRUNC open makes a real, empty file");

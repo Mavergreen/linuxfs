@@ -1199,9 +1199,14 @@ expect census_later_quiet hasnt "$r" "not ok"
 expect census_later_detached test -z "$(attached)"
 
 # item 3 (Task 13b): census_await says how long it waited, or that it gave up (the shot is taken anyway)
+#   (Task 16c fix round 2) seen on the first try is counted in the stub's osascript calls, exactly one, not read from the
+#   clock: a whole-second date +%s around one stubbed round could say 1 s whenever the round crossed a second boundary
 rm -f "$P/shots.txt"
+aw_calls() { grep -c 'osascript -e tell application "Finder" to return (POSIX path of (target of front Finder window as alias)) is "/x/"$' "$S/calls" || :; }
+n0=$(aw_calls)
 r=$(bounded 100 census_await stepq hfs 'tell application "Finder" to return (POSIX path of (target of front Finder window as alias)) is "/x/"' 2>&1); rc=$?
-expect census_await_seen test "$rc" -eq 0 -a "$(cat "$P/shots.txt")" = "stepq hfs: seen after 0 s"
+expect census_await_seen test "$rc" -eq 0 -a "$(($(aw_calls) - n0))" -eq 1
+expect census_await_seen_said grep -Eq '^stepq hfs: seen after [0-9]+ s$' "$P/shots.txt"
 : > "$S/no-window"
 r=$(bounded 100 census_await stepr fsq 'tell application "Finder" to return (POSIX path of (target of front Finder window as alias)) is "/x/"' 2>&1); rc=$?
 rm -f "$S/no-window"
