@@ -809,15 +809,16 @@ PARITY_SYSLOG=${PARITY_SYSLOG:-/var/log/system.log}
 PARITY_SPOT_SECS=${PARITY_SPOT_SECS:-120}   # census_mdfind: once a second; the tests wait less
 PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/AlertStopIcon.icns}
 # The guest job has 180 min. Before the smoke: the VM's boot and the installs, about 5. The census begins nothing after
-#   PARITY_CENSUS_MIN = 135 min from the smoke's start (PARITY_T0, which the smoke sets first): then at most the census
-#   step already begun (about 11: spotlight's 120 s mdfind waits, remounts, Finder's refresh and the Privacy shots; a
-#   busy census with Finder's eject, about 5, or about 9 with a stuck disk at each of its six re-attaches: two ejects,
-#   two census_holders, a copy of up to 320 MiB, an attach, about 30 s each; one trash/tags/case census, about 3, the
-#   xattr probe bounded at 2 of it; one stall iteration, under 1), before login (about 5) and the copyback and
-#   uploads (about 5) remain: 5 + 135 + 11 + 5 + 5 = 161, leaving 19 to spare. Push A's census, its Finder steps not
+#   PARITY_CENSUS_MIN = 135 min from the smoke's start (PARITY_T0, which the smoke sets first), and begins a step only if
+#   at its worst (census_worst_min: the console hung, spotlight and census_finder 24 min) it ends by 135 + 11 = 146:
+#   census_finder and spotlight begin by 122, busy by 129, unicode and trash/tags/case by 133. Then before login
+#   (about 5) and the copyback and uploads (about 5) remain: 5 + 146 + 5 + 5 = 161, leaving 19 to spare. Typical
+#   steps are shorter: spotlight about 11 (its 120 s mdfind waits, remounts, Finder's refresh, the Privacy shots); a
+#   busy census about 5, or about 9 with a stuck disk at each of its six re-attaches; one trash/tags/case census about
+#   3; one stall iteration under 1. Push A's census, its Finder steps not
 #   run, took 50 min (the stall 30 of them); with them, and stuck disks in both busy censuses, about 90 are expected,
 #   well inside 135. Push B's smoke sets PARITY_STALL_N=0 (item 3's loop waits for push C): about 60, plus item 2's
-#   Finder restart and getinfo-format shot in each census_finder (about 15 s typical, 2.5 min with every bound hit).
+#   Finder restart and getinfo-format shot in each census_finder (about 15 s typical, 2.5 of census_finder's 24 at worst).
 PARITY_CENSUS_MIN=${PARITY_CENSUS_MIN:-135}
 
 # census_pair_up CTL-IMAGE FS-IMAGE FS [readonly]: attaches both (the control -readonly when readonly) and makes them
@@ -1235,13 +1236,34 @@ census_later() {
 }
 
 # ---- all of it ----
-# census_due WHAT...: true while within PARITY_CENSUS_MIN minutes of CA_T0 (the smoke's start; with no CA_T0, always);
-#   else it says it skips WHAT. A census step is never cut short: the guest job's timeout would lose every record, the
-#   smoke's too.
+# census_worst_min CMD: the minutes census step CMD may take at its worst, with the console hung (every AppleScript, aqua
+#   call and screenshot at its bound; disks attaching and ejecting as usual). Counted from each function's bounds:
+#   census_unicode, ext4's (two Finder steps of 60 s a side on ext4 and on FAT32, the pair window and its shots), 13;
+#   census_busy (a stuck disk at each re-attach, about 9, and TextEdit, Finder's eject and seven quits), 17;
+#   census_spotlight (two passes' mdfind at 160 s a side, the refresh at 150 s a side, two Privacy panes), 24;
+#   census_finder (seven Get Info and window views of about 113 s, two Desktop passes, three restarts), 24;
+#   census_trash_tags_case (Finder's delete and empty trash, two restarts, the label, the xattr climb), 13;
+#   census_later (three dismissals and shots), 5; anything else, the stall's iterations among them, 11
+census_worst_min() {
+  case $1 in
+  census_spotlight | census_finder) echo 24 ;;
+  census_busy) echo 17 ;;
+  census_unicode | census_trash_tags_case) echo 13 ;;
+  census_later) echo 5 ;;
+  *) echo 11 ;;
+  esac
+}
+# census_due WHAT...: true while within PARITY_CENSUS_MIN minutes of CA_T0 (the smoke's start; with no CA_T0, always),
+#   and while WHAT's first word, at its worst (census_worst_min), would end by PARITY_CENSUS_MIN + 11; else it says it
+#   skips WHAT. A census step is never cut short: the guest job's timeout would lose every record, the smoke's too.
 census_due() {
   test -n "${CA_T0:-}" || return 0
-  test $(($(date +%s) - CA_T0)) -lt $((PARITY_CENSUS_MIN * 60)) && return 0
-  echo "# census: out of time ($PARITY_CENSUS_MIN min), skipped: $*"; return 1
+  _cdu_e=$(($(date +%s) - CA_T0)) _cdu_w=$(census_worst_min "$1") _cdu_end=$((PARITY_CENSUS_MIN + 11))
+  if test "$_cdu_e" -ge $((PARITY_CENSUS_MIN * 60)); then
+    echo "# census: out of time ($PARITY_CENSUS_MIN min), skipped: $*"; return 1
+  fi
+  test $((_cdu_e + _cdu_w * 60)) -le $((_cdu_end * 60)) && return 0
+  echo "# census: $1 may take $_cdu_w min, past the census's end ($_cdu_end min), skipped: $*"; return 1
 }
 # census_on FS CMD...: CMD, when there is time and FS's image ($W/img/FS.img); NTFS with NTFSTakeover on, so linuxfs
 #   mounts it rather than Apple's ntfs, and put back as it was after

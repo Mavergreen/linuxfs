@@ -354,8 +354,10 @@ noauto_cycle() {  # TAG IMAGE device|label|spaced LABEL FS
   fi
   echo "# $tag: linuxfs ignore lists: $(bounded 600 "$L" ignore | tr '\n' '|')"
   check "$tag: /etc/fstab has linuxfs's noauto entry" sh -c 'grep -q " rw,noauto # linuxfs\$" /etc/fstab'
-  # spec: tools/fstab.c -- item 2: the entry names the bundle, macfuse_$fs, as its type
-  check "$tag: the entry's type is macfuse_$fs" awk -v t="macfuse_$fs" '$3 == t && / rw,noauto # linuxfs$/ { f = 1 } END { exit !f }' /etc/fstab
+  # spec: tools/fstab.c -- item 2: the entry names the bundle, macfuse_$fs, as its type (spaced: the smoke wrote it, so
+  #       this only confirms the hand-written line; the other cases test what linuxfs ignore writes)
+  if test "$how" = spaced; then whose="the smoke's hand-written entry"; else whose="linuxfs ignore's entry"; fi
+  check "$tag: $whose has type macfuse_$fs" awk -v t="macfuse_$fs" '$3 == t && / rw,noauto # linuxfs$/ { f = 1 } END { exit !f }' /etc/fstab
   cleanup_disk
   log0=$(wc -l < /var/log/system.log 2> /dev/null | tr -d ' ')
   out=$(bounded 600 hdiutil attach -imagekey diskimage-class=CRawDiskImage "$img" 2>&1); rc=$?

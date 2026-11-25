@@ -899,6 +899,21 @@ expect census_all_takeover_off test ! -f "$S/takeover"
 expect census_all_left grep -q "^/dev/$left .*/census/left-stuck.img\$" "$P/census-left-attached.txt"
 expect census_all_left_said has "$r" "^# census: left attached .*left-stuck.img"
 expect census_all_cleans test ! -e "$W/census/old.img" -a -e "$W/census/left-stuck.img"
+# a step begins only when, at its worst (the console hung: every AppleScript at its bound), it ends by
+#   PARITY_CENSUS_MIN + 11; a step whose worst is 11 or less keeps the plain cutoff
+expect census_worst_table test "$(for c in census_unicode census_busy census_spotlight census_finder census_trash_tags_case census_later census_stall stall; do census_worst_min "$c"; done | tr '\n' ' ')" = '13 17 24 24 13 5 11 11 '
+r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=20; census_due census_finder ext4 2>&1); rc=$?
+expect census_due_worst_skips test "$rc" -ne 0
+expect census_due_worst_said has "$r" "^# census: census_finder may take 24 min, past the census's end (31 min), skipped: census_finder ext4$"
+r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=24; census_due census_finder ext4 2>&1)
+expect census_due_worst_fits test -z "$r"
+r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=11; census_due census_stall 2>&1)
+expect census_due_plain_cutoff test -z "$r"
+r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=10; census_due census_stall 2>&1)
+expect census_due_plain_cutoff_said has "$r" "^# census: out of time (10 min), skipped: census_stall$"
+: > "$ran"
+r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=20; census_finder() { echo finder >> "$ran"; }; census_on ext4 census_finder ext4 2>&1)
+expect census_on_worst_skips test ! -s "$ran"
 : > "$ran"
 r=$(PARITY_CENSUS_MIN=0; census_stall() { echo stall >> "$ran"; }; census_later() { echo later >> "$ran"; }; parity_census_all 2>&1)
 expect census_all_out_of_time test ! -s "$ran"
