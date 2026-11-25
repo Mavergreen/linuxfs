@@ -703,8 +703,10 @@ fl_detach() {
 #   loop 1: attach -nomount, the noauto entry (HFS+: written by hand; ext4: linuxfs ignore), diskutil mount, the entry
 #           taken away (linuxfs unignore), eject, then the plain attach that is counted
 #   loop 2: a plain attach, eject, then the plain attach that is counted
+#   Fix round 3: a detach that leaves the disk attached sets FL_LEFT (census_stall then ends the volume's loops); when it
+#   is the setup's (before the counted attach), the iteration is a setup failure: "IMAGE left attached"
 fl_iter() {
-  it_vol=$1 it_tag=$1-loop$2-$3 it_img=$4 it_via= it_fu= it_s3= it_mp=
+  it_vol=$1 it_tag=$1-loop$2-$3 it_img=$4 it_via= it_fu= it_s3= it_mp= FL_LEFT=
   if test "$1" = hfs; then it_side=apple; else it_side=fs; fi
   if test "$2" = 1; then
     census_attach "$it_img" nomount || { echo "$it_tag: setup failed: no disk from attach -nomount" >>"$OUT/parity/stall.txt"; return 2; }
@@ -712,7 +714,7 @@ fl_iter() {
     # shellcheck disable=SC2086  # the nodes are words
     it_dv=$(bounded 900 census_wait_uuid $CA_NODES) || it_dv=
     it_dev=$(printf '%s\n' "$it_dv" | sed -n 1p) it_fu=$(printf '%s\n' "$it_dv" | sed -n 2p)
-    if test -z "$it_fu"; then census_detach_checked "$it_disk" "$it_side"; echo "$it_tag: setup failed: no Volume UUID" >>"$OUT/parity/stall.txt"; return 2; fi
+    if test -z "$it_fu"; then census_detach_checked "$it_disk" "$it_side" || FL_LEFT=1; echo "$it_tag: setup failed: no Volume UUID" >>"$OUT/parity/stall.txt"; return 2; fi
     census_pause 6   # as round 4 did: the agent's sweep may mount it first
     it_how=nomount
     if test "$(census_info "$it_dev" Mounted)" = Yes; then
@@ -724,7 +726,7 @@ fl_iter() {
       bounded 6000 "$L" ignore "$it_disk" >/dev/null 2>&1 </dev/null
     fi
     if ! grep -q "^UUID=$it_fu " "$PARITY_FSTAB" 2>/dev/null; then
-      census_detach "$it_disk" "$it_how" "$it_mp"; echo "$it_tag: setup failed: no noauto entry for UUID $it_fu" >>"$OUT/parity/stall.txt"; return 2
+      census_detach "$it_disk" "$it_how" "$it_mp" || FL_LEFT=1; echo "$it_tag: setup failed: no noauto entry for UUID $it_fu" >>"$OUT/parity/stall.txt"; return 2
     fi
     da_mark "$it_tag: diskutil mount"
     bounded 6000 diskutil mount "$it_dev" >/dev/null 2>&1 </dev/null; it_s3=$?
@@ -734,18 +736,19 @@ fl_iter() {
       bounded 300 sudo -n sh -c 'grep -v "^UUID=$2 " "$1" > "$1.parity"; cat "$1.parity" > "$1"; rm -f "$1.parity"' _ "$PARITY_FSTAB" "$it_fu" </dev/null
       test "$it_vol" = hfs || it_via=" | unignore left the entry: the harness took it away"
     fi
-    census_detach "$it_disk" "$it_side" "$it_mp" >>"$OUT/parity/stall-detach.txt"
+    census_detach "$it_disk" "$it_side" "$it_mp" >>"$OUT/parity/stall-detach.txt" || FL_LEFT=1
     it_first="ignore, diskutil mount (exit $it_s3), unignore, eject"
   else
     fl_plain "$it_img" "$W/census/fl-first.log"; it_first="first attach: $PA_VERDICT"
-    fl_detach "$it_side"
+    fl_detach "$it_side" || FL_LEFT=1
   fi
+  if test -n "$FL_LEFT"; then echo "$it_tag: setup failed: ${it_img##*/} left attached" >>"$OUT/parity/stall.txt"; return 2; fi
   it_dal=$(census_dalog_size); : "${it_dal:=0}"
   da_mark "$it_tag: plain attach"
   fl_plain "$it_img" "$W/census/fl-plain.log"; it_ok=$?
   it_probe=$(census_dalog_since "$it_dal" | census_probe_times | tr '\n' ',' | sed 's/,$//; s/,/, /g')
   if test "$it_ok" -ne 0; then census_dalog_since "$it_dal" | tail -n 400 >"$OUT/parity/stall-$it_tag.dalog"; fi
-  fl_detach "$it_side"
+  fl_detach "$it_side" || FL_LEFT=1
   echo "$it_tag: $PA_VERDICT | probe ${it_probe:-none} | ${it_fu:+uuid $it_fu | }$it_first$it_via" >>"$OUT/parity/stall.txt"
   return "$it_ok"
 }
@@ -769,7 +772,11 @@ census_wait_uuid() {
 # census_stall: item 3, PARITY_STALL_N iterations (unset or 0: nothing runs) of each loop on the HFS+ control and
 #   on ext4, each iteration begun only while census_due (one out of time stops the rest, and the counts say how many
 #   ran); stall.txt has a line per iteration (the verdict and each probe's time), stall-summary.txt the counts and
-#   Fisher's exact p per loop (tests/lib/fisher.py: the volumes differ when p < 0.05)
+#   Fisher's exact p per loop (tests/lib/fisher.py: the volumes differ when p < 0.05).
+#   Fix round 3: an iteration that leaves its disk attached (FL_LEFT, and the image still attached: a linuxfs disk is
+#   never detached by force) ends that volume's loops, loop 2 too: every later attach of the same image would measure
+#   the leftover and count a stall. It is said ("VOL stopped: IMAGE left attached at iteration N of loop L; the rest not
+#   measured"), and Fisher's p is not computed for a loop it cut short or kept from running, with that reason.
 census_stall() {
   st_n=${PARITY_STALL_N:-0}
   case $st_n in '' | *[!0-9]*) st_n=0 ;; esac
@@ -779,29 +786,47 @@ census_stall() {
     { echo "# census_stall: no images"; return 1; }
   : >"$OUT/parity/stall.txt"; : >"$OUT/parity/stall-summary.txt"; : >"$OUT/parity/stall-detach.txt"
   da_debug_on
+  st_x_hfs= st_x_ext4= st_xl_hfs=3 st_xl_ext4=3
   for st_vol in hfs ext4; do
     eval "st_img=\$st_$st_vol"
     for st_loop in 1 2; do
-      st_s=0 st_f=0 st_i=0 st_cut=
-      while test "$st_i" -lt "$st_n"; do
+      st_s=0 st_f=0 st_i=0 st_cut= st_stop=
+      eval "st_x=\$st_x_$st_vol"
+      test -z "$st_x" || st_stop=" (not run: ${st_img##*/} left attached in loop 1)"
+      while test -z "$st_x" && test "$st_i" -lt "$st_n"; do
         if ! st_due=$(census_due "stall $st_vol loop $st_loop from iteration $((st_i + 1)) of $st_n"); then
           printf '%s\n' "$st_due" | tee -a "$OUT/parity/stall-summary.txt"; st_cut=1; break
         fi
         st_i=$((st_i + 1))
         fl_iter "$st_vol" "$st_loop" "$st_i" "$st_img"
         case $? in 1) st_s=$((st_s + 1)) ;; 2) st_f=$((st_f + 1)) ;; esac
+        if test -n "$FL_LEFT" && test -n "$(census_image_disk "$st_img")"; then
+          st_x="stopped: ${st_img##*/} left attached at iteration $st_i of loop $st_loop"
+          eval "st_x_$st_vol=\$st_x st_xl_$st_vol=$st_loop"
+          echo "$st_vol $st_x; the rest not measured" >>"$OUT/parity/stall-summary.txt"
+          st_stop=" (stopped: ${st_img##*/} left attached)"; break
+        fi
       done
       eval "st_s_${st_vol}_$st_loop=$st_s st_a_${st_vol}_$st_loop=$((st_i - st_s - st_f)) st_r_${st_vol}_$st_loop=$st_i"
-      echo "$st_vol loop $st_loop: $st_s stalls, $((st_i - st_s - st_f)) automounts, $st_f setup failures of $st_i${st_cut:+ (stopped early, out of time: $st_n asked)}" >>"$OUT/parity/stall-summary.txt"
+      echo "$st_vol loop $st_loop: $st_s stalls, $((st_i - st_s - st_f)) automounts, $st_f setup failures of $st_i${st_cut:+ (stopped early, out of time: $st_n asked)}$st_stop" >>"$OUT/parity/stall-summary.txt"
     done
   done
   da_debug_off stall
   for st_loop in 1 2; do
     eval "st_hs=\$st_s_hfs_$st_loop st_ha=\$st_a_hfs_$st_loop st_es=\$st_s_ext4_$st_loop st_ea=\$st_a_ext4_$st_loop st_hr=\$st_r_hfs_$st_loop st_er=\$st_r_ext4_$st_loop"
-    st_p=$(bounded 300 "$PARITY_PYTHON" "$PARITY_LIB/fisher.py" "$st_hs" "$st_ha" "$st_es" "$st_ea" 2>&1 </dev/null)
+    st_why=
+    for st_vol in hfs ext4; do
+      eval "st_x=\$st_x_$st_vol st_xl=\$st_xl_$st_vol"
+      test -z "$st_x" || test "$st_xl" -gt "$st_loop" || st_why="${st_why:+$st_why; }$st_vol $st_x"
+    done
+    if test -n "$st_why"; then st_p="not computed ($st_why)"; st_pl="Fisher p not computed: $st_why"
+    else
+      st_p=$(bounded 300 "$PARITY_PYTHON" "$PARITY_LIB/fisher.py" "$st_hs" "$st_ha" "$st_es" "$st_ea" 2>&1 </dev/null)
+      st_pl="Fisher p = $st_p"
+    fi
     if test "$st_loop" = 1; then st_what="ignore, diskutil mount, unignore, eject, plain attach"; else st_what="attach, eject, attach"; fi
-    echo "loop $st_loop ($st_what): Fisher p = $st_p (stalls: hfs $st_hs of $((st_hs + st_ha)), ext4 $st_es of $((st_es + st_ea)) attaches set up)" >>"$OUT/parity/stall-summary.txt"
-    echo "# recorded stall loop $st_loop: hfs $st_hs/$st_hr, ext4 $st_es/$st_er, Fisher p = $st_p"
+    echo "loop $st_loop ($st_what): $st_pl (stalls: hfs $st_hs of $((st_hs + st_ha)), ext4 $st_es of $((st_es + st_ea)) attaches set up)" >>"$OUT/parity/stall-summary.txt"
+    echo "# recorded stall loop $st_loop: hfs $st_hs/$st_hr, ext4 $st_es/$st_er, Fisher p $(if test -n "$st_why"; then echo "not computed ($st_why)"; else echo "= $st_p"; fi)"
   done
 }
 
@@ -1092,8 +1117,8 @@ PARITY_SPOT_SECS=${PARITY_SPOT_SECS:-120}   # census_mdfind: once a second; the 
 PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/AlertStopIcon.icns}
 # The guest job has 180 min. Before the smoke: the VM's boot and the installs, about 5. The census begins nothing after
 #   PARITY_CENSUS_MIN = 135 min from the smoke's start (PARITY_T0, which the smoke sets first), and begins a step only if
-#   at its worst (census_worst_min: the console hung; since Task 13b spotlight 31, busy and census_finder 30, the sweep
-#   and dismissal after each counted in) it ends by 135 + 11 = 146: spotlight begins by 115, census_finder and busy by
+#   at its worst (census_worst_min: the console hung; since Task 13b spotlight and busy 31, census_finder 30, the sweep
+#   and dismissal after each counted in) it ends by 135 + 11 = 146: spotlight and busy begin by 115, census_finder by
 #   116, trash/tags/case by 125, unicode by 129, a stall iteration by 83. Then before login
 #   (about 5) and the copyback and uploads (about 5) remain: 5 + 146 + 5 + 5 = 161, leaving 19 to spare. Typical
 #   steps are shorter: spotlight about 11 (its 120 s mdfind waits, remounts, Finder's refresh, the Privacy shots); a
@@ -1586,7 +1611,8 @@ census_later() {
 #   dismissal, 68; census_index_on's -E and second -i on, 60 a pass, and census_spotlight_diag, 10 a pass; tm-offer's
 #   note, nothing. So:
 #   census_unicode 13 + (2 names waits 30 + 205) / 60 = 16.9, 17;
-#   census_busy 23 + (2 Finder ejects 2 x (68 + 31) = 198 + 205 + about 45 names-mode reads, 5) / 60 = 29.8, 30;
+#   census_busy 23 + (2 Finder ejects 2 x (68 + 31) = 198 + 205 + about 45 names-mode reads, 5) / 60 = 29.8, 31 (fix round 3:
+#   one minute over, since 29.8 leaves too thin a margin under 30);
 #   census_spotlight 24 + (2 refresh waits 28 + 2 panes 30 + 2 x 60 + 2 x 10 + 205) / 60 = 30.7, 31;
 #   census_finder 24 + (7 views 105 + 205) / 60 = 29.2, 30;
 #   census_trash_tags_case 13 + (3 census_finder_ask 3 x (68 + 13) = 243 + 205) / 60 = 20.5, 21;
@@ -1596,7 +1622,8 @@ census_later() {
 census_worst_min() {
   case $1 in
   census_spotlight) echo 31 ;;
-  census_busy | census_finder) echo 30 ;;
+  census_busy) echo 31 ;;
+  census_finder) echo 30 ;;
   census_trash_tags_case) echo 21 ;;
   census_unicode) echo 17 ;;
   census_later) echo 9 ;;

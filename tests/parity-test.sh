@@ -440,6 +440,8 @@ diskutil)
   eject)
     d=${2#/dev/}
     case $(field "$d" vol) in *stuck*) echo "Disk $d couldn't be ejected (stub stuck)"; exit 1 ;; esac
+    # with $STUB/stall-stuck, the stall's ext4 copy never ejects
+    case $(field "$d" vol) in *stall-ext4*) test ! -f "$STUB/stall-stuck" || { echo "Disk $d couldn't be ejected (stub stall-stuck)"; exit 1; } ;; esac
     # an HFS+ image the sweep's tests name sweep-stuck-hfs-* never ejects either (its volume is the disk's s1)
     case $(field "${d}s1" vol) in sweep-stuck-hfs-*) echo "Disk $d couldn't be ejected (stub stuck)"; exit 1 ;; esac
     case $(field "$d" vol) in *hfs*) ;; *flaky*)
@@ -739,6 +741,22 @@ expect census_stall_cut_none test "$(grep -c '^[a-z0-9]*-loop' "$P/stall.txt")" 
 expect census_stall_cut_recorded has "$r" "^# recorded stall loop 1: hfs 0/0, ext4 0/0"
 expect census_stall_cut_stdout has "$r" "^# census: out of time (1 min), skipped: stall hfs loop 1 from iteration 1 of 2"
 expect census_stall_cut_detached test -z "$(attached)"
+# (fix round 3) a stall disk left attached (a linuxfs one is never detached by force) ends its volume's loops: each later
+#   attach of the same image would measure the leftover, and count it a stall. The iteration whose setup left it is a
+#   setup failure, not a stall; it is said, and Fisher's p is not computed for a loop it cut short (or kept from running)
+: > "$S/stall-stuck"; : > "$S/calls"
+r=$(PARITY_STALL_N=3 census_stall 2>&1)
+rm -f "$S/stall-stuck"
+expect census_stall_left_said grep -q '^ext4 stopped: stall-ext4.img left attached at iteration 1 of loop 1; the rest not measured$' "$P/stall-summary.txt"
+expect census_stall_left_one_attach test "$(grep -c '^hdiutil attach .*stall-ext4.img$' "$S/calls")" -eq 1
+expect census_stall_left_setup grep -q '^ext4-loop1-1: setup failed: stall-ext4.img left attached$' "$P/stall.txt"
+expect census_stall_left_loop1 grep -q '^ext4 loop 1: 0 stalls, 0 automounts, 1 setup failures of 1 (stopped: stall-ext4.img left attached)$' "$P/stall-summary.txt"
+expect census_stall_left_loop2 grep -q '^ext4 loop 2: 0 stalls, 0 automounts, 0 setup failures of 0 (not run: stall-ext4.img left attached in loop 1)$' "$P/stall-summary.txt"
+expect census_stall_left_no_stalls not grep -q '^ext4-loop[12]-[23]: ' "$P/stall.txt"
+expect census_stall_left_hfs_ran grep -q '^hfs loop 2: .* of 3$' "$P/stall-summary.txt"
+expect census_stall_left_fisher test "$(grep -c '^loop [12] .*: Fisher p not computed: ext4 stopped: stall-ext4.img left attached at iteration 1 of loop 1 ' "$P/stall-summary.txt")" -eq 2
+expect census_stall_left_recorded has "$r" "^# recorded stall loop 2: hfs 0/3, ext4 0/0, Fisher p not computed (ext4 stopped: stall-ext4.img left attached at iteration 1 of loop 1)$"
+for f in "$S"/nodes/*; do case $f in *.m | *.u) ;; *) test -f "$f" || continue; case $(sed -n "s/^vol=//p" "$f") in *stall-ext4*) rm -f "$f" "$f.m" "$f.u" ;; esac ;; esac; done   # drop_stuck, defined later
 
 # census_busy: 20 write-then-unmount cycles per volume (a busy one says who held it), the held-file cases through parity,
 #   and the forced ones on the HFS+ side only. Item 4 is checked (PARITY_MODE_BUSY defaults to check), but for the steps
@@ -1209,7 +1227,7 @@ expect census_all_cleans test ! -e "$W/census/old.img" -a -e "$W/census/left-stu
 # a step begins only when, at its worst (the console hung: every AppleScript at its bound), it ends by
 #   PARITY_CENSUS_MIN + 11; a step whose worst is 11 or less keeps the plain cutoff
 expect census_worst_default test "$(census_worst_min zzz)" -eq 11
-expect census_worst_table test "$(for c in census_unicode census_busy census_spotlight census_finder census_trash_tags_case census_later census_stall stall; do census_worst_min "$c"; done | tr '\n' ' ')" = '17 30 31 30 21 9 63 63 '
+expect census_worst_table test "$(for c in census_unicode census_busy census_spotlight census_finder census_trash_tags_case census_later census_stall stall; do census_worst_min "$c"; done | tr '\n' ' ')" = '17 31 31 30 21 9 63 63 '
 r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=20; census_due census_finder ext4 2>&1); rc=$?
 expect census_due_worst_skips test "$rc" -ne 0
 expect census_due_worst_said has "$r" "^# census: census_finder may take 30 min, past the census's end (31 min), skipped: census_finder ext4$"
@@ -1440,8 +1458,10 @@ expect never_mounted_attach_not_forced not forced_on "/dev/disk$d"
 expect never_mounted_attach_retried test "$(grep -c "^diskutil eject /dev/disk$d\$" "$S/calls.all")" -ge 2
 fl_iter ext4 2 1 "$W/census/nevermount-stuck-b.img" > /dev/null 2>&1; d=$(cat "$S/disks")
 expect never_mounted_stall_not_forced not forced_on "/dev/disk$d"
+expect never_mounted_stall_retried test "$(grep -c "^diskutil eject /dev/disk$d\$" "$S/calls.all")" -ge 2
 fl_iter ext4 1 1 "$W/census/nouuid-stuck.img" > /dev/null 2>&1; d=$(cat "$S/disks")
 expect never_mounted_nouuid_not_forced not forced_on "/dev/disk$d"
+expect never_mounted_nouuid_retried test "$(grep -c "^diskutil eject /dev/disk$d\$" "$S/calls.all")" -ge 2
 fl_iter ext4 1 1 "$W/census/nouuid-swept-stuck.img" > /dev/null 2>&1; d=$(cat "$S/disks")
 expect swept_nouuid_not_forced not forced_on "/dev/disk$d"
 expect swept_nouuid_retried test "$(grep -c "^diskutil eject /dev/disk$d\$" "$S/calls.all")" -ge 2
