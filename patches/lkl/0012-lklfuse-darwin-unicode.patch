@@ -12,17 +12,24 @@ whose getattr said ENOENT, and a revoked vnode's open gives ENXIO).
 
 On Darwin, for the filesystems that store names as given:
 - every path-taking callback resolves its path one component at a time: the NFC form, the name as given, then
-  HFS+'s NFD form; a non-ASCII name found by none of them is looked for by scanning its directory, comparing NFC
-  forms (an ASCII miss, the usual lookup before a create, never scans). A name on disk is never rewritten;
+  HFS+'s NFD form; a non-ASCII name found by none of them is looked for by scanning its directory, comparing full
+  NFC forms, which also match libfuse's ICU NFD of HFS+'s excluded characters (U+2126 as U+03A9). An ASCII miss, the
+  usual lookup before a create, never scans. A name on disk is never rewritten;
 - a new entry (create, mknod, mkdir, symlink, link, rename's target) is stored NFC on ext2/3/4, btrfs, xfs, f2fs and
   ntfs3, and as given on apfs (as macOS does there); an existing entry in another form is used instead, so O_CREAT
   opens it, O_EXCL gives EEXIST and rename replaces it;
 - a symlink's target is stored NFC, since Linux resolves it byte for byte;
-- readdir and readlink hand names out in HFS+'s NFD (CFStringGetFileSystemRepresentation, which leaves
-  U+2000-U+2FFF, U+F900-U+FAFF and U+2F800-U+2FAFF composed), or as stored when that would be over NAME_MAX.
+- readdir and readlink hand names out in HFS+'s NFD (CFStringGetFileSystemRepresentation), or as stored when that
+  would be over NAME_MAX;
+- like HFS+ (TN1150), both conversions leave U+2000-U+2FFF, U+F900-U+FAFF and U+2F800-U+2FAFF as given, so
+  singletons such as U+2126 and U+212B are stored as created (10.9's CoreFoundation would decompose U+2F800-U+2FAFF,
+  and NFC would replace the singletons); and U+FEFF is never handed to CoreFoundation at a string's start, where it
+  would be dropped as a byte order mark, so a U+FEFF-led name is never taken for its sibling without one.
 Other filesystems (vfat, exfat) are unchanged for now. The conversions are CoreFoundation's (CFStringNormalize), so
-lklfuse links it; lklfuse runs in the foreground on Darwin and never forks after using it. tests/lklfuse-ops-test.c
-checks the conversions and each case above on an ext4 image, without a mount.
+lklfuse links it, run by run between the kept characters (all starters, so nothing reorders across them). The paths
+it rewrites are sized by LKL's PATH_MAX (4096), not Darwin's (1024). lklfuse runs in the foreground on Darwin and never
+forks after using CoreFoundation. tests/lklfuse-ops-test.c checks the conversions and each case above on an ext4
+image, without a mount.
 
 Darwin only: on Linux the resolver, the stored form and the shown form are the name itself.
 
@@ -37,15 +44,20 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  #include <unistd.h>
  #include <pthread.h>
  #include <signal.h>
-@@ -138,6 +139,7 @@
+@@ -136,8 +137,12 @@
+ 	}
+ }
  
++/* LKL's PATH_MAX, for the paths lklfuse rewrites (Darwin's own PATH_MAX is 1024) */
++#define LKLFUSE_PATH_MAX 4096
++
  #ifdef __APPLE__
  #include <sys/xattr.h>
 +#include <CoreFoundation/CoreFoundation.h>
  
  #define st_atim st_atimespec
  #define st_mtim st_mtimespec
-@@ -267,10 +269,297 @@
+@@ -267,10 +272,341 @@
  #endif
  	return f;
  }
@@ -56,10 +68,10 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 + * filesystems store bytes as given, where Linux's own programs write NFC. So:
 + * - new names are stored NFC (NF_STORE_NFC), or as given where macOS itself would (APFS, NF_AS_GIVEN);
 + * - a name is found in any form: each component is tried as NFC, as given, then as HFS+'s NFD, and a non-ASCII
-+ *   name found by none of them is looked for by scanning its directory, comparing NFC forms; a name already on disk
-+ *   is never rewritten;
-+ * - readdir and readlink hand names out as HFS+ would (its NFD, which leaves U+2000-U+2FFF, U+F900-U+FAFF and
-+ *   U+2F800-U+2FAFF composed), unless that is over NAME_MAX.
++ *   name found by none of them is looked for by scanning its directory, comparing full NFC forms; a name already on
++ *   disk is never rewritten;
++ * - like HFS+, the conversions leave U+2000-U+2FFF, U+F900-U+FAFF and U+2F800-U+2FAFF as given, and U+FEFF too;
++ * - readdir and readlink hand names out as HFS+ would (its NFD), unless that is over NAME_MAX.
 + * Without this, a create by NFC landed on disk and then failed with ENXIO: libfuse's next getattr of the new node
 + * came with its NFD path, missed, and macFUSE's kernel side dropped the vnode. CoreFoundation is Apple's own table;
 + * lklfuse never forks once it has used it (on Darwin it runs in the foreground).
@@ -89,21 +101,52 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +	return 1;
 +}
 +
-+/* NULL for invalid UTF-8 */
-+static CFStringRef lklfuse_cfstring(const char *in)
++/*
++ * The byte length of a code point at C that the conversions keep as it is, or 0:
++ * - U+FEFF, which CoreFoundation drops at the start of a string (it takes it for a byte order mark), always;
++ * - with HFS, the ranges HFS+ never decomposes (TN1150: U+2000-U+2FFF, U+F900-U+FAFF, U+2F800-U+2FAFF). HFS+ stores
++ *   them as given, so NFC keeps them too (U+2126, U+212B and the CJK compatibility ideographs are singletons that
++ *   NFC would replace), and 10.9's CFStringGetFileSystemRepresentation decomposes U+2F800-U+2FAFF, which HFS+ does
++ *   not.
++ * All of them are starters (the range's few combining marks, which have no decompositions, are left in their runs), so
++ * a run between two of them converts on its own: nothing reorders or composes across them.
++ */
++static int lklfuse_nf_kept(const char *c, int hfs)
 +{
-+	return CFStringCreateWithBytes(NULL, (const UInt8 *)in, strlen(in), kCFStringEncodingUTF8, false);
++	const unsigned char *p = (const unsigned char *)c;
++
++	if (p[0] == 0xef && p[1] == 0xbb && p[2] == 0xbf)
++		return 3;
++	if (!hfs)
++		return 0;
++	if (p[0] == 0xe2 && (p[1] & 0xc0) == 0x80 && (p[2] & 0xc0) == 0x80) {
++		unsigned int cp = 0x2000 | (p[1] & 0x3f) << 6 | (p[2] & 0x3f);
++
++		/* the combining marks in the range, none of which decomposes: they stay in their run */
++		if ((cp >= 0x20d0 && cp <= 0x20ff) || (cp >= 0x2cef && cp <= 0x2cf1) || cp == 0x2d7f ||
++		    (cp >= 0x2de0 && cp <= 0x2dff))
++			return 0;
++		return 3;
++	}
++	if (p[0] == 0xef && p[1] >= 0xa4 && p[1] <= 0xab && (p[2] & 0xc0) == 0x80)
++		return 3;
++	if (p[0] == 0xf0 && p[1] == 0xaf && p[2] >= 0xa0 && p[2] <= 0xab && (p[3] & 0xc0) == 0x80)
++		return 4;
++	return 0;
 +}
 +
-+/* IN's NFC form: IN itself for ASCII, invalid UTF-8 or a name already NFC; else BUF, or NULL when it does not fit */
-+static const char *lklfuse_nfc(const char *in, char *buf, size_t len)
++/* CoreFoundation's conversions of IN's first INLEN bytes, into BUF: its length, -1 when it does not fit, -2 for
++ * invalid UTF-8 */
++typedef long (*lklfuse_cf_conv)(const char *in, size_t inlen, char *buf, size_t len);
++
++static long lklfuse_cf_nfc(const char *in, size_t inlen, char *buf, size_t len)
 +{
-+	CFStringRef s;
++	CFStringRef s = CFStringCreateWithBytes(NULL, (const UInt8 *)in, inlen, kCFStringEncodingUTF8, false);
 +	CFMutableStringRef m;
 +	Boolean ok = false;
 +
-+	if (lklfuse_ascii(in) || !(s = lklfuse_cfstring(in)))
-+		return in;
++	if (!s)
++		return -2;
 +	m = CFStringCreateMutableCopy(NULL, 0, s);
 +	CFRelease(s);
 +	if (m) {
@@ -111,13 +154,9 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +		ok = CFStringGetCString(m, buf, len, kCFStringEncodingUTF8);
 +		CFRelease(m);
 +	}
-+	if (!ok)
-+		return NULL;
-+	return strcmp(buf, in) == 0 ? in : buf;
++	return ok ? (long)strlen(buf) : -1;
 +}
 +
-+/* CoreFoundation's file system form of IN's first INLEN bytes, into BUF: its length, -1 when it does not fit, -2 for
-+ * invalid UTF-8 */
 +static long lklfuse_cf_fsrep(const char *in, size_t inlen, char *buf, size_t len)
 +{
 +	CFStringRef s = CFStringCreateWithBytes(NULL, (const UInt8 *)in, inlen, kCFStringEncodingUTF8, false);
@@ -130,29 +169,24 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +	return ok ? (long)strlen(buf) : -1;
 +}
 +
-+/* U+2F800-U+2FAFF: HFS+ leaves them composed, and 10.9's CFStringGetFileSystemRepresentation does not */
-+static int lklfuse_hfs_kept(const char *c)
-+{
-+	const unsigned char *p = (const unsigned char *)c;
-+
-+	return p[0] == 0xf0 && p[1] == 0xaf && p[2] >= 0xa0 && p[2] <= 0xab && (p[3] & 0xc0) == 0x80;
-+}
-+
-+/* IN as HFS+ stores it (its NFD variant), with lklfuse_nfc's results */
-+static const char *lklfuse_nfd_hfs(const char *in, char *buf, size_t len)
++/*
++ * IN converted by CONV run by run, the kept code points copied as they are: IN itself for ASCII, invalid UTF-8 or a
++ * name already in that form; else BUF, or NULL when it does not fit
++ */
++static const char *lklfuse_nf_runs(const char *in, char *buf, size_t len, lklfuse_cf_conv conv, int hfs)
 +{
 +	const char *p, *q;
 +	size_t n = 0;
 +	long r;
++	int k = 0;
 +
 +	if (lklfuse_ascii(in))
 +		return in;
-+	/* each run between two kept characters on its own: they are starters, so nothing reorders across them */
 +	for (p = in; *p; p = q) {
-+		for (q = p; *q && !lklfuse_hfs_kept(q); q++)
++		for (q = p; *q && !(k = lklfuse_nf_kept(q, hfs)); q++)
 +			;
 +		if (q > p) {
-+			r = lklfuse_cf_fsrep(p, q - p, buf + n, len - n);
++			r = conv(p, q - p, buf + n, len - n);
 +			if (r == -2)
 +				return in;
 +			if (r < 0)
@@ -160,11 +194,11 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +			n += r;
 +		}
 +		if (*q) {
-+			if (n + 4 >= len)
++			if (n + k >= len)
 +				return NULL;
-+			memcpy(buf + n, q, 4);
-+			n += 4;
-+			q += 4;
++			memcpy(buf + n, q, k);
++			n += k;
++			q += k;
 +		}
 +	}
 +	if (n >= len)
@@ -173,10 +207,31 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +	return strcmp(buf, in) == 0 ? in : buf;
 +}
 +
-+/* the entry of directory DIR whose NFC form is NFC, into OUT: 0, or -ENOENT */
-+static int lklfuse_nf_scan(const char *dir, const char *nfc, char *out, size_t len)
++/* IN's NFC form, as a new name is stored (HFS+'s excluded ranges as given) */
++static const char *lklfuse_nfc(const char *in, char *buf, size_t len)
 +{
-+	char b[PATH_MAX];
++	return lklfuse_nf_runs(in, buf, len, lklfuse_cf_nfc, 1);
++}
++
++/* IN as HFS+ stores it: its NFD variant */
++static const char *lklfuse_nfd_hfs(const char *in, char *buf, size_t len)
++{
++	return lklfuse_nf_runs(in, buf, len, lklfuse_cf_fsrep, 1);
++}
++
++/*
++ * IN's full NFC form, the key two spellings of one name share: libfuse spells a name by ICU's NFD, which does
++ * decompose HFS+'s excluded ranges (U+2126 as U+03A9)
++ */
++static const char *lklfuse_nf_key(const char *in, char *buf, size_t len)
++{
++	return lklfuse_nf_runs(in, buf, len, lklfuse_cf_nfc, 0);
++}
++
++/* the entry of directory DIR whose key is KEY, into OUT: 0, or -ENOENT */
++static int lklfuse_nf_scan(const char *dir, const char *key, char *out, size_t len)
++{
++	char b[LKLFUSE_PATH_MAX];
 +	struct lkl_dir *d;
 +	struct lkl_linux_dirent64 *de;
 +	const char *n;
@@ -189,8 +244,8 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +	while ((de = lkl_readdir(d))) {
 +		if (lklfuse_ascii(de->d_name))
 +			continue;
-+		n = lklfuse_nfc(de->d_name, b, sizeof(b));
-+		if (n && strcmp(n, nfc) == 0 && strlen(de->d_name) < len) {
++		n = lklfuse_nf_key(de->d_name, b, sizeof(b));
++		if (n && strcmp(n, key) == 0 && strlen(de->d_name) < len) {
 +			strcpy(out, de->d_name);
 +			ret = 0;
 +			break;
@@ -207,8 +262,9 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 + */
 +static int lklfuse_resolve(const char *path, char *buf, size_t len, int create, const char **out)
 +{
-+	char comp[PATH_MAX], nfc[PATH_MAX], nfd[PATH_MAX], found[PATH_MAX];
-+	const char *p, *e, *r, *cand[3], *name;
++	char comp[LKLFUSE_PATH_MAX], nfc[LKLFUSE_PATH_MAX], nfd[LKLFUSE_PATH_MAX], key[LKLFUSE_PATH_MAX];
++	char found[LKLFUSE_PATH_MAX];
++	const char *p, *e, *r, *cand[3], *name, *k;
 +	struct lkl_stat st;
 +	size_t n = 0, clen;
 +	int i, j, last, hit, enoent, missing = 0;
@@ -259,8 +315,8 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +				}
 +			}
 +			buf[n] = '\0';
-+			if (!hit && enoent && cand[0] &&
-+			    lklfuse_nf_scan(buf, cand[0], found, sizeof(found)) == 0) {
++			if (!hit && enoent && (k = lklfuse_nf_key(comp, key, sizeof(key))) &&
++			    lklfuse_nf_scan(buf, k, found, sizeof(found)) == 0) {
 +				name = found;
 +				hit = 1;
 +			}
@@ -295,7 +351,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +/* a symlink's target as handed out, in place in BUF (LEN bytes): HFS+'s form, or as stored when that does not fit */
 +static void lklfuse_nf_show_target(char *buf, size_t len)
 +{
-+	char shown[PATH_MAX];
++	char shown[LKLFUSE_PATH_MAX];
 +	const char *s;
 +
 +	if (lklfuse_nf == NF_OFF)
@@ -343,11 +399,11 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  #endif
  
  static void lklfuse_xlat_stat(const struct lkl_stat *in, struct stat *st)
-@@ -303,8 +592,12 @@
+@@ -303,8 +639,12 @@
  	 * With nullpath_ok, path will be provided only if the struct
  	 * fuse_file_info argument is NULL.
  	 */
-+	char pbuf[PATH_MAX];
++	char pbuf[LKLFUSE_PATH_MAX];
 +
  	if (fi)
  		ret = lkl_sys_fstat(fi->fh, &lkl_stat);
@@ -356,11 +412,11 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	else
  		ret = lkl_sys_lstat(path, &lkl_stat);
  	if (!ret)
-@@ -315,8 +608,11 @@
+@@ -315,8 +655,11 @@
  
  static int lklfuse_readlink(const char *path, char *buf, size_t len)
  {
-+	char pbuf[PATH_MAX];
++	char pbuf[LKLFUSE_PATH_MAX];
  	long ret;
  
 +	if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
@@ -368,7 +424,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	ret = lkl_sys_readlink(path, buf, len);
  	if (ret < 0)
  		return lklfuse_err(ret);
-@@ -326,6 +622,8 @@
+@@ -326,6 +669,8 @@
  
  	buf[ret] = 0;
  
@@ -377,12 +433,12 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	return 0;
  }
  
-@@ -369,33 +667,57 @@
+@@ -369,33 +714,57 @@
  
  static int lklfuse_mknod(const char *path, mode_t mode, dev_t dev)
  {
 -	return lklfuse_own(path, lkl_sys_mknod(path, mode, dev));
-+	char pbuf[PATH_MAX];
++	char pbuf[LKLFUSE_PATH_MAX];
 +	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 1, &path);
 +
 +	return ret ? ret : lklfuse_own(path, lkl_sys_mknod(path, mode, dev));
@@ -391,7 +447,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  static int lklfuse_mkdir(const char *path, mode_t mode)
  {
 -	return lklfuse_own(path, lkl_sys_mkdir(path, mode));
-+	char pbuf[PATH_MAX];
++	char pbuf[LKLFUSE_PATH_MAX];
 +	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 1, &path);
 +
 +	return ret ? ret : lklfuse_own(path, lkl_sys_mkdir(path, mode));
@@ -400,7 +456,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  static int lklfuse_unlink(const char *path)
  {
 -	return lklfuse_err(lkl_sys_unlink(path));
-+	char pbuf[PATH_MAX];
++	char pbuf[LKLFUSE_PATH_MAX];
 +	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
 +
 +	return ret ? ret : lklfuse_err(lkl_sys_unlink(path));
@@ -409,7 +465,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  static int lklfuse_rmdir(const char *path)
  {
 -	return lklfuse_err(lkl_sys_rmdir(path));
-+	char pbuf[PATH_MAX];
++	char pbuf[LKLFUSE_PATH_MAX];
 +	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
 +
 +	return ret ? ret : lklfuse_err(lkl_sys_rmdir(path));
@@ -418,7 +474,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  static int lklfuse_symlink(const char *oldname, const char *newname)
  {
 -	return lklfuse_own(newname, lkl_sys_symlink(oldname, newname));
-+	char obuf[PATH_MAX], nbuf[PATH_MAX];
++	char obuf[LKLFUSE_PATH_MAX], nbuf[LKLFUSE_PATH_MAX];
 +	int ret = lklfuse_nf_store(oldname, obuf, sizeof(obuf), &oldname);
 +
 +	if (!ret)
@@ -430,7 +486,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  static int lklfuse_rename(const char *oldname, const char *newname,
  			  unsigned int flags)
  {
-+	char obuf[PATH_MAX], nbuf[PATH_MAX];
++	char obuf[LKLFUSE_PATH_MAX], nbuf[LKLFUSE_PATH_MAX];
 +	int ret = lklfuse_resolve(oldname, obuf, sizeof(obuf), 0, &oldname);
 +
 +	if (!ret)
@@ -440,12 +496,12 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	/* libfuse: *flags* may be `RENAME_EXCHANGE` or `RENAME_NOREPLACE` */
  	return lklfuse_err(lkl_sys_renameat2(LKL_AT_FDCWD, oldname, LKL_AT_FDCWD, newname,
  				 lklfuse_rename_flags(flags)));
-@@ -403,16 +725,24 @@
+@@ -403,16 +772,24 @@
  
  static int lklfuse_link(const char *oldname, const char *newname)
  {
 -	return lklfuse_err(lkl_sys_link(oldname, newname));
-+	char obuf[PATH_MAX], nbuf[PATH_MAX];
++	char obuf[LKLFUSE_PATH_MAX], nbuf[LKLFUSE_PATH_MAX];
 +	int ret = lklfuse_resolve(oldname, obuf, sizeof(obuf), 0, &oldname);
 +
 +	if (!ret)
@@ -456,7 +512,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  static int lklfuse_chmod(const char *path, mode_t mode,
  			 struct fuse_file_info *fi)
  {
-+	char pbuf[PATH_MAX];
++	char pbuf[LKLFUSE_PATH_MAX];
  	int ret;
  
  	if (fi)
@@ -466,11 +522,11 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	else
  		ret = lkl_sys_fchmodat(LKL_AT_FDCWD, path, mode);
  
-@@ -422,10 +752,13 @@
+@@ -422,10 +799,13 @@
  static int lklfuse_chown(const char *path, uid_t uid, gid_t gid,
  			 struct fuse_file_info *fi)
  {
-+	char pbuf[PATH_MAX];
++	char pbuf[LKLFUSE_PATH_MAX];
  	int ret;
  
  	if (fi)
@@ -480,11 +536,11 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	else
  		ret = lkl_sys_fchownat(LKL_AT_FDCWD, path, uid, gid,
  				LKL_AT_SYMLINK_NOFOLLOW);
-@@ -435,10 +768,13 @@
+@@ -435,10 +815,13 @@
  static int lklfuse_truncate(const char *path, off_t off,
  			    struct fuse_file_info *fi)
  {
-+	char pbuf[PATH_MAX];
++	char pbuf[LKLFUSE_PATH_MAX];
  	int ret;
  
  	if (fi)
@@ -494,11 +550,11 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	else
  		ret = lkl_sys_truncate(path, off);
  
-@@ -524,9 +860,13 @@
+@@ -524,9 +907,13 @@
  static int lklfuse_create(const char *path, mode_t mode,
  	                  struct fuse_file_info *fi)
  {
-+	char pbuf[PATH_MAX];
++	char pbuf[LKLFUSE_PATH_MAX];
  	int flags = fi->flags;
  	int ret, tries;
  
@@ -508,35 +564,35 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if (!lklfuse.set_owner)
  		return lklfuse_open3(path, true, mode, fi);
  	/*
-@@ -555,7 +895,10 @@
+@@ -555,7 +942,10 @@
  
  static int lklfuse_open(const char *path, struct fuse_file_info *fi)
  {
 -	return lklfuse_open3(path, false, 0, fi);
-+	char pbuf[PATH_MAX];
++	char pbuf[LKLFUSE_PATH_MAX];
 +	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
 +
 +	return ret ? ret : lklfuse_open3(path, false, 0, fi);
  }
  
  static int lklfuse_read(const char *path, char *buf, size_t size, off_t offset,
-@@ -600,7 +943,10 @@
+@@ -600,7 +990,10 @@
  {
  	long ret;
  	struct lkl_statfs lkl_statfs;
-+	char pbuf[PATH_MAX];
++	char pbuf[LKLFUSE_PATH_MAX];
  
 +	if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
 +		return ret;
  	ret = lkl_sys_statfs(path, &lkl_statfs);
  	if (ret < 0)
  		return lklfuse_err(ret);
-@@ -642,30 +988,45 @@
+@@ -642,30 +1035,45 @@
  static int lklfuse_setxattr(const char *path, const char *name, const char *val,
  		   size_t size, int flags)
  {
 -	return lklfuse_err(lkl_sys_setxattr(path, name, val, size, lklfuse_xattr_flags(flags)));
-+	char pbuf[PATH_MAX];
++	char pbuf[LKLFUSE_PATH_MAX];
 +	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
 +
 +	return ret ? ret : lklfuse_err(lkl_sys_setxattr(path, name, val, size, lklfuse_xattr_flags(flags)));
@@ -546,7 +602,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  			  size_t size)
  {
 -	return lklfuse_err(lkl_sys_getxattr(path, name, val, size));
-+	char pbuf[PATH_MAX];
++	char pbuf[LKLFUSE_PATH_MAX];
 +	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
 +
 +	return ret ? ret : lklfuse_err(lkl_sys_getxattr(path, name, val, size));
@@ -555,7 +611,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  static int lklfuse_listxattr(const char *path, char *list, size_t size)
  {
 -	return lklfuse_err(lkl_sys_listxattr(path, list, size));
-+	char pbuf[PATH_MAX];
++	char pbuf[LKLFUSE_PATH_MAX];
 +	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
 +
 +	return ret ? ret : lklfuse_err(lkl_sys_listxattr(path, list, size));
@@ -564,7 +620,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  static int lklfuse_removexattr(const char *path, const char *name)
  {
 -	return lklfuse_err(lkl_sys_removexattr(path, name));
-+	char pbuf[PATH_MAX];
++	char pbuf[LKLFUSE_PATH_MAX];
 +	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
 +
 +	return ret ? ret : lklfuse_err(lkl_sys_removexattr(path, name));
@@ -573,7 +629,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  static int lklfuse_opendir(const char *path, struct fuse_file_info *fi)
  {
  	struct lkl_dir *dir;
-+	char pbuf[PATH_MAX];
++	char pbuf[LKLFUSE_PATH_MAX];
  	int err;
  
 +	if ((err = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
@@ -581,7 +637,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	dir = lkl_opendir(path, &err);
  	if (!dir)
  		return lklfuse_err(err);
-@@ -705,11 +1066,13 @@
+@@ -705,11 +1113,13 @@
  
  	while ((de = lkl_readdir(dir))) {
  		struct stat st = { 0, };
@@ -596,12 +652,12 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  			break;
  	}
  
-@@ -740,12 +1103,16 @@
+@@ -740,12 +1150,16 @@
  
  static int lklfuse_access(const char *path, int mode)
  {
 -	return lklfuse_err(lkl_sys_access(path, mode));
-+	char pbuf[PATH_MAX];
++	char pbuf[LKLFUSE_PATH_MAX];
 +	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
 +
 +	return ret ? ret : lklfuse_err(lkl_sys_access(path, mode));
@@ -610,11 +666,11 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  static int lklfuse_utimens(const char *path, const struct timespec tv[2],
  			   struct fuse_file_info *fi)
  {
-+	char pbuf[PATH_MAX];
++	char pbuf[LKLFUSE_PATH_MAX];
  	int ret;
  	struct __lkl__kernel_timespec ts[2] = {
  		{ .tv_sec = tv[0].tv_sec, .tv_nsec = tv[0].tv_nsec },
-@@ -754,6 +1121,8 @@
+@@ -754,6 +1168,8 @@
  
  	if (fi)
  		ret = lkl_sys_utimensat(fi->fh, NULL, ts, 0);
@@ -623,7 +679,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	else
  		ret = lkl_sys_utimensat(-1, path, ts, LKL_AT_SYMLINK_NOFOLLOW);
  
-@@ -1102,6 +1471,10 @@
+@@ -1102,6 +1518,10 @@
  		goto out_umount;
  	}
  

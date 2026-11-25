@@ -206,6 +206,19 @@ static void unicode_tests(void)
 	conv(lklfuse_nfd_hfs, "\xf0\xaf\xa0\x80", NULL, PATH_MAX, "HFS+ NFD leaves U+2F800 (U+2F800-U+2FAFF)");
 	conv(lklfuse_nfd_hfs, NFC_CAFE "\xf0\xaf\xa0\x80\xc3\xa9", NFD_CAFE "\xf0\xaf\xa0\x80" "e\xcc\x81", PATH_MAX,
 	     "HFS+ NFD decomposes around a kept U+2F800");
+	/* controller ruling (fix round 1): NFC keeps HFS+'s excluded ranges too, so singletons are stored as given */
+	conv(lklfuse_nfc, "\xe2\x84\xa6", NULL, PATH_MAX, "NFC leaves U+2126 (OHM SIGN) as given");
+	conv(lklfuse_nfc, "\xe2\x84\xab", NULL, PATH_MAX, "NFC leaves U+212B (ANGSTROM SIGN) as given");
+	conv(lklfuse_nfc, "\xef\xa4\x80", NULL, PATH_MAX, "NFC leaves U+F900 as given");
+	conv(lklfuse_nfc, "\xf0\xaf\xa0\x80", NULL, PATH_MAX, "NFC leaves U+2F800 as given");
+	conv(lklfuse_nfc, NFD_CAFE "\xe2\x84\xab" "e\xcc\x81", NFC_CAFE "\xe2\x84\xab\xc3\xa9", PATH_MAX,
+	     "NFC composes around a kept U+212B");
+	conv(lklfuse_nfd_hfs, "\xe2\x84\xab", NULL, PATH_MAX, "HFS+ NFD leaves U+212B");
+	/* review I1: CoreFoundation drops a leading U+FEFF; the conversions keep it */
+	conv(lklfuse_nfc, "\xef\xbb\xbf" NFD_CAFE, "\xef\xbb\xbf" NFC_CAFE, PATH_MAX, "NFC keeps a leading U+FEFF");
+	conv(lklfuse_nfd_hfs, "\xef\xbb\xbf" NFC_CAFE, "\xef\xbb\xbf" NFD_CAFE, PATH_MAX, "NFD keeps a leading U+FEFF");
+	conv(lklfuse_nfc, "\xef\xbb\xbf" "abc", NULL, PATH_MAX, "NFC of U+FEFF abc is the input itself");
+	conv(lklfuse_nfd_hfs, "\xef\xbb\xbf" "abc", NULL, PATH_MAX, "NFD of U+FEFF abc is the input itself");
 	conv(lklfuse_nfc, "\xff\xfe", NULL, PATH_MAX, "NFC of invalid UTF-8 is the input itself");
 	conv(lklfuse_nfd_hfs, "\xff\xfe", NULL, PATH_MAX, "NFD of invalid UTF-8 is the input itself");
 	conv(lklfuse_nfc, "/e\xcc\x81/" NFD_CAFE, "/\xc3\xa9/" NFC_CAFE, PATH_MAX, "NFC of a whole path");
@@ -360,6 +373,73 @@ static void unicode_tests(void)
 	is(lklfuse_rename("/u1/h" NFD_CAFE, "/u1/r" NFD_CAFE, 0), 0, "rename by NFD");
 	is(names_in("/u1", "r" NFC_CAFE), 1, "rename: the new name lands NFC");
 	is(names_in("/u1", NULL), 2, "rename: the old name is gone");
+
+	/* review M2: opendir, readlink and symlink's link path by non-ASCII paths */
+	is(readdir_of("/e\xcc\x81", &s), 0, "opendir by an NFD path");
+	is(s.n == 1 && strcmp(s.names[0], "f") == 0, 1, "and readdir lists the NFC directory");
+	is(lkl_sys_mkdir("/u8", 0755), 0, "mkdir /u8");
+	is(lklfuse_symlink("x", "/u8/l" NFD_CAFE), 0, "symlink with an NFD link path");
+	is(names_in("/u8", "l" NFC_CAFE), 1, "symlink: the link lands NFC");
+	is(lklfuse_readlink("/u8/l" NFD_CAFE, buf, sizeof(buf)), 0, "readlink by an NFD path");
+	is_str(buf, "x", "readlink by an NFD path: the target");
+
+	/* review I1: a U+FEFF-led name is its own name, never its sibling without the U+FEFF */
+	is(lkl_sys_mkdir("/b", 0755), 0, "mkdir /b");
+	plant("/b/\xef\xbb\xbf\xc3\xa9", "bom");
+	plant("/b/\xc3\xa9", "plain");
+	is(readdir_of("/b", &s), 0, "bom: readdir");
+	is(s.n == 2 && (strcmp(s.names[0], "\xef\xbb\xbf" "e\xcc\x81") == 0 ||
+			strcmp(s.names[1], "\xef\xbb\xbf" "e\xcc\x81") == 0), 1, "bom: readdir shows the U+FEFF");
+	is_str(content_of("/b/\xef\xbb\xbf" "e\xcc\x81", buf, sizeof(buf)), "bom", "bom: opens its own file by NFD");
+	is(lklfuse_unlink("/b/\xef\xbb\xbf" "e\xcc\x81"), 0, "bom: unlink by the U+FEFF name");
+	is(names_in("/b", "\xc3\xa9"), 1, "bom: the sibling is left");
+	is(names_in("/b", NULL), 1, "bom: and only the sibling");
+	is_str(content_of("/b/\xc3\xa9", buf, sizeof(buf)), "plain", "bom: the sibling's content unchanged");
+	f = (struct fuse_file_info){ .flags = O_WRONLY | O_EXCL };
+	is(lklfuse_create("/b/\xef\xbb\xbf" "e\xcc\x81", 0644, &f), 0, "bom: O_EXCL create beside the sibling");
+	lklfuse_release("/b/\xef\xbb\xbf" "e\xcc\x81", &f);
+	is(names_in("/b", "\xef\xbb\xbf\xc3\xa9"), 1, "bom: create keeps the U+FEFF (and stores NFC)");
+	is(names_in("/b", NULL), 2, "bom: two entries");
+
+	/* controller ruling: singletons are stored as given, and still found by libfuse's ICU NFD spelling */
+	is(lkl_sys_mkdir("/u9", 0755), 0, "mkdir /u9");
+	f = (struct fuse_file_info){ .flags = O_WRONLY };
+	is(lklfuse_create("/u9/\xe2\x84\xa6", 0644, &f), 0, "create U+2126");
+	lklfuse_release("/u9/\xe2\x84\xa6", &f);
+	is(names_in("/u9", "\xe2\x84\xa6"), 1, "U+2126 is stored as given");
+	is(opens("/u9/\xce\xa9"), 0, "and opens by U+03A9 (libfuse's ICU NFD of it)");
+	f = (struct fuse_file_info){ .flags = O_WRONLY };
+	is(lklfuse_create("/u9/\xe2\x84\xab", 0644, &f), 0, "create U+212B");
+	lklfuse_release("/u9/\xe2\x84\xab", &f);
+	is(names_in("/u9", "\xe2\x84\xab"), 1, "U+212B is stored as given");
+	is(opens("/u9/A\xcc\x8a"), 0, "and opens by A U+030A (libfuse's ICU NFD of it)");
+	is(opens("/u9/\xc3\x85"), 0, "and by U+00C5");
+
+	/* review M1: a non-ASCII path over Darwin's PATH_MAX (1024), within LKL's (4096) */
+	{
+		char nfcp[4096] = "", nfdp[4096] = "", comp[256];
+		int d;
+
+		comp[0] = '\0';
+		for (i = 0; i < 100; i++)
+			strcat(comp, "\xc3\xa9");
+		for (d = 0; d < 6; d++) {
+			strcat(nfcp, "/");
+			strcat(nfcp, comp);
+			lkl_sys_mkdir(nfcp, 0755);
+			strcat(nfdp, "/");
+			for (i = 0; i < 100; i++)
+				strcat(nfdp, "e\xcc\x81");
+		}
+		is(strlen(nfcp) > 1024 && strlen(nfdp) > 1024, 1, "long_path: both spellings are over 1024 bytes");
+		is(lklfuse_getattr(nfdp, &st, NULL), 0, "long_path: getattr by the NFD spelling");
+		strcat(nfdp, "/f");
+		f = (struct fuse_file_info){ .flags = O_WRONLY };
+		is(lklfuse_create(nfdp, 0644, &f), 0, "long_path: create under it");
+		lklfuse_release(nfdp, &f);
+		strcat(nfcp, "/f");
+		is(lkl_sys_access(nfcp, 0), 0, "long_path: it lands under the NFC directories");
+	}
 }
 #endif
 
