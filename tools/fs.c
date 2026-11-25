@@ -586,13 +586,15 @@ static int ask_dialog(const char *header, const char *message, char *pw, size_t 
 /* the CLI, with the password (or none): its exit status, its captured output in out */
 static int run_cli(const char *cli, const struct mountreq *req, const char *pw, char *out, size_t outlen)
 {
-	char *argv[8];
+	char *argv[9];	/* cli da-mount --ro --owners --password-stdin DEV MNT NULL */
 	int n = 0, rc;
 
 	argv[n++] = (char *)cli;
 	argv[n++] = "da-mount";
 	if (req->ro)
 		argv[n++] = "--ro";
+	if (req->owners)
+		argv[n++] = "--owners";
 	if (pw)
 		argv[n++] = "--password-stdin";
 	argv[n++] = (char *)req->dev;
@@ -1167,8 +1169,11 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 	/* fsname=/dev/BSD, as HFS+'s mount is named: DiskArbitration ties the volume to its disk only through f_mntfromname (with
 	 * linuxfs@BSD it lost the tie at the next mount or unmount of any volume, and its ejects failed 0x10: item 4), and so do
 	 * diskutil info and Finder's external-disk presentation (item 6) */
-	if (snprintf(opts, sizeof opts, "allow_other,local,volname=%s,fsname=/dev/%s,noappledouble,fstypename=%s,fssubtype=%d%s", vol, bsd,
-		     nm->fstypename, nm->subtype, ro ? ",rdonly" : "") >= (int)sizeof opts)
+	/* nosuid always: DiskArbitration asks it for every external disk, and only mount_macfuse running as a user gets it by
+	 * itself. With owners (item 6, "Ignore ownership"), every user sees Linux's own ids through allow_other, so the kernel
+	 * checks them (default_permissions): lklfuse, LKL's root, checks nothing itself. */
+	if (snprintf(opts, sizeof opts, "allow_other,nosuid%s,local,volname=%s,fsname=/dev/%s,noappledouble,fstypename=%s,fssubtype=%d%s",
+		     req->owners ? ",default_permissions" : "", vol, bsd, nm->fstypename, nm->subtype, ro ? ",rdonly" : "") >= (int)sizeof opts)
 		return refuse(fs, "the mount options do not fit");
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, cs) != 0)
 		return refuse(fs, "cannot make mount_macfuse's socket");
@@ -1543,6 +1548,8 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 	args[n++] = "da-mount";
 	if (ro)
 		args[n++] = "--ro";
+	if (req->owners)
+		args[n++] = "--owners";
 	args[n++] = devarg;
 	args[n++] = (char *)req->mnt;
 	args[n] = NULL;
@@ -1589,7 +1596,14 @@ static int mount_role(const char *fs, int argc, char **argv)
 		syslog(LOG_NOTICE, "mount_%s: bad arguments", fs);
 		return 1;
 	}
-	syslog(LOG_NOTICE, "mount_%s: parsed ro=%d", fs, req.ro);
+	syslog(LOG_NOTICE, "mount_%s: parsed ro=%d owners=%d", fs, req.ro, req.owners);
+	/* mount -u: vsdbutil's, to change ownership in place (diskutil enableOwnership). macFUSE's kernel refuses MNT_UPDATE
+	 * (ENOTSUP), and this is no second mount on the same mount point */
+	if (req.update) {
+		fprintf(stderr, "mount_macfuse_%s: update (mount -u) is not supported: macFUSE cannot change a mount; unmount and mount again\n", fs);
+		syslog(LOG_NOTICE, "mount_%s: refused: update (mount -u)", fs);
+		return 1;
+	}
 #ifdef LINUXFS_FS_TEST_DROP
 	if (1)
 #else

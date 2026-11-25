@@ -884,6 +884,23 @@ int main(int argc, char **argv)
 		lklfuse.file = file;
 		close(n);
 	}
+	{
+		/* spec: item 6 (capacity) -- statfs as Linux has it: macFUSE takes frsize for the block size, and Finder and df
+		 * read the same counts (an ext4 image keeps 5% for root, so bfree and bavail differ) */
+		struct lkl_statfs l;
+		struct statvfs v;
+
+		memset(&v, 0, sizeof(v));
+		is(lkl_sys_statfs("/", &l) == 0 && lklfuse_statfs("/", &v) == 0, 1, "statfs: LKL's and lklfuse's");
+		is((unsigned long long)v.f_frsize == (unsigned long long)l.f_frsize && v.f_frsize > 0, 1, "statfs: f_frsize is LKL's");
+		is((unsigned long long)v.f_blocks * v.f_frsize == (unsigned long long)l.f_blocks * l.f_frsize, 1,
+		   "statfs: f_blocks*f_frsize is LKL's size");
+		is((unsigned long long)v.f_bavail * v.f_frsize == (unsigned long long)l.f_bavail * l.f_frsize, 1,
+		   "statfs: f_bavail*f_frsize is LKL's available");
+		is((unsigned long long)v.f_bfree * v.f_frsize == (unsigned long long)l.f_bfree * l.f_frsize, 1,
+		   "statfs: f_bfree*f_frsize is LKL's free");
+		is(v.f_bavail < v.f_bfree, 1, "statfs: available is below free (root's reserve), not swapped with it");
+	}
 #ifdef __APPLE__
 	unicode_tests();
 	destroy_tests(argv[1]);

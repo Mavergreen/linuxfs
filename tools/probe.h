@@ -17,7 +17,7 @@ const char *linuxfs_probe_flags(void);
  * <TAB>FLAGS when there are any (EXTRA empty when only FLAGS are). 0, or -1 when it does not fit in len. */
 int linuxfs_probe_line(char *out, size_t len, const char *type, const char *label);
 /* After linuxfs_probe_fd: writes the filesystem's UUID, uppercase 8-4-4-4-12, to out (outlen at least 37) and returns 0;
- * -1 when it has none (ntfs3, f2fs, vfat, exfat), it is all zero (as blkid), or out is too small. APFS's is the container's.
+ * -1 when it has none (ntfs3, vfat, exfat), it is all zero (as blkid), or out is too small. APFS's is the container's.
  * An APFS Fusion container's second (tier2) device deliberately has none: two disks sharing one UUID would confuse
  * DiskArbitration, and tier2 never mounts on its own. */
 int linuxfs_probe_uuid(char *out, size_t outlen);

@@ -165,13 +165,60 @@ int main(int argc, char **argv)
 		char *a[] = { "-o", "nodev", "-o", "noowners", "-o", "nosuid", "/dev/disk2", "/Volumes/X" };
 		is(parse(&m, 8, a), 0, "repeated -o and DEV MNT parse");
 		is(m.ro, 0, "not read-only");
+		is(m.owners, 0, "noowners (what 10.9's DiskArbitration passes an external disk with no vsdb or fstab say) is owners 0");
+		is(m.update, 0, "and not an update");
 		iss(m.dev, "/dev/disk2", "dev");
 		iss(m.mnt, "/Volumes/X", "mnt");
 	}
 	{
 		char *a[] = { "-o", "nodev", "-o", "owners", "/dev/disk2", "/Volumes/X" };
 		is(parse(&m, 6, a), 0, "owners parses");
-		is(m.ro, 0, "and is ignored: 10.9 passes noowners, asked for or not, so there is nothing to ask");
+		is(m.ro, 0, "and is not read-only");
+		is(m.owners, 1, "-o owners is owners 1");
+	}
+	{
+		/* DiskArbitration puts an fstab or vsdb entry's options after its own nodev,noowners,nosuid: the last one wins, as
+		 * mount(8)'s getmntopts has it */
+		char *a[] = { "-o", "nodev", "-o", "noowners", "-o", "nosuid", "-o", "owners", "/dev/disk2", "/Volumes/X" };
+		is(parse(&m, 10, a), 0, "noowners then owners parses");
+		is(m.owners, 1, "the later owners wins");
+	}
+	{
+		char *a[] = { "-o", "owners,nodev,noowners", "/dev/disk2", "/Volumes/X" };
+		is(parse(&m, 4, a), 0, "owners then noowners in one list parses");
+		is(m.owners, 0, "the later noowners wins");
+	}
+	{
+		char *a[] = { "-o", "perm", "/dev/disk2", "/Volumes/X" };
+		is(parse(&m, 4, a), 0, "perm parses");
+		is(m.owners, 1, "perm is owners (mount(8)'s other name for it)");
+	}
+	{
+		char *a[] = { "-o", "owners,noperm", "/dev/disk2", "/Volumes/X" };
+		is(parse(&m, 4, a), 0, "owners,noperm parses");
+		is(m.owners, 0, "noperm is noowners");
+	}
+	{
+		char *a[] = { "-o", "ownersx,xowners,owner", "/dev/disk2", "/Volumes/X" };
+		is(parse(&m, 4, a), 0, "near-misses parse");
+		is(m.owners, 0, "and none of them is owners");
+	}
+	{
+		char *a[] = { "/dev/disk2", "/Volumes/X" };
+		m.owners = 1;
+		is(fsrules_parse_mount(2, a, &m), 0, "no -o parses");
+		is(m.owners, 0, "with no owners asked for, owners is 0 (today's mapping)");
+	}
+	{
+		/* vsdbutil (diskutil enableOwnership) runs mount -u -o perm,...: mount(8) passes it as -o ...,update */
+		char *a[] = { "-o", "perm,nosuid,nodev,update", "/dev/disk2", "/Volumes/X" };
+		is(parse(&m, 4, a), 0, "an update parses");
+		is(m.update, 1, "and says so");
+	}
+	{
+		char *a[] = { "-o", "noupdate", "/dev/disk2", "/Volumes/X" };
+		is(parse(&m, 4, a), 0, "noupdate parses");
+		is(m.update, 0, "and is not an update");
 	}
 	{
 		char *a[] = { "-o", "rdonly,nodev", "/dev/disk2", "/Volumes/X" };

@@ -9,7 +9,7 @@
 #          linuxfs ignore [VOLUME]
 #          linuxfs unignore VOLUME
 #          linuxfs automount DISK
-#   internal: linuxfs da-mount [--ro] [--password-stdin] DEVICE MOUNTPOINT   (only with LINUXFS_DA=1: the bundle's mount program;
+#   internal: linuxfs da-mount [--ro] [--owners] [--password-stdin] DEVICE MOUNTPOINT   (only with LINUXFS_DA=1: the bundle's mount program;
 #          before login also LINUXFS_OPEN_INHERITED=1, the device on fd 3, LINUXFS_FUSE_FD=N and LINUXFS_FUSE_CHAN=C: root's
 #          channel is on fd C; once everything that can fail before lklfuse starts has passed, linuxfs-open says "ready" on it,
 #          root mounts macFUSE on MOUNTPOINT and sends the device back, and lklfuse serves that mount through /dev/fd/N)
@@ -32,6 +32,7 @@ set -u
 #   (15+ mounts). `_spotlight` (uid 89) could not be tested: `mdutil -i on` fails with -400 in the CI guest even on HFS+. So
 #   allow_root, which lets root's fseventsd and mds in. If a later run shows uid 89 refused, this becomes allow_other.
 SHARE_OPT=allow_root
+da_owners=   # da-mount --owners; set only there, never from the environment
 PREFIX=${LINUXFS_PREFIX:-/usr/local/mavergreen/linuxfs}
 LKLFUSE=${LINUXFS_LKLFUSE:-$PREFIX/libexec/lklfuse}
 PROBE=${LINUXFS_PROBE:-$PREFIX/libexec/linuxfs-probe}
@@ -376,7 +377,14 @@ cmd_mount() {
       if [ "${LINUXFS_ALL_USERS:-}" != 1 ]; then sh_opt=$(share_opt); [ -z "$sh_opt" ] || opts="$opts,$sh_opt"; fi ;;
     esac
   fi
-  if [ -n "$ids" ]; then :
+  # da-mount --owners (spec: item 6, "Ignore ownership" unchecked): Linux's own ids, which the kernel checks (default_permissions;
+  # lklfuse, LKL's root, checks nothing itself). With root's device, root gave default_permissions to mount_macfuse.
+  if [ -n "$da_owners" ]; then
+    if [ -z "$fusefd" ]; then
+      [ "${LINUXFS_ALL_USERS:-}" != 1 ] || opts="$opts,allow_other"
+      opts="$opts,default_permissions"
+    fi
+  elif [ -n "$ids" ]; then :
   elif [ "${LINUXFS_ALL_USERS:-}" = 1 ]; then [ -n "$fusefd" ] || opts="$opts,allow_other"; opts="$opts,uid=99,gid=99"
   else opts="$opts,uid=$(id -u),gid=$(id -g),owner=root"; fi
   [ -z "$ro" ] || opts="$opts,ro"
@@ -518,14 +526,14 @@ cmd_automount() {
 
 # For the bundle's mount program (LINUXFS_DA=1), on DiskArbitration's existing mount point. Exit 3: NTFS without NTFSTakeover,
 # or a Fusion second device, or a main device whose second never came. DiskArbitration passes the same options for a plug-in
-# and for diskutil mount (10.9 passes noowners either way), so nothing here depends on how the mount was asked for: a volume
-# that is not to mount by itself has an /etc/fstab noauto entry, and DiskArbitration never runs the mount program for it
-# at plug-in.
+# and for diskutil mount (noowners for an external disk, then an /etc/fstab or vsdb entry's own, such as owners), so nothing
+# here depends on how the mount was asked for: a volume that is not to mount by itself has an /etc/fstab noauto entry, and
+# DiskArbitration never runs the mount program for it at plug-in. --owners: the mount was asked for with owners (spec: item 6).
 cmd_da_mount() {
   [ "${LINUXFS_DA:-}" = 1 ] || usage
   ro= pws=
-  while [ "${1:-}" = --ro ] || [ "${1:-}" = --password-stdin ]; do
-    case $1 in --ro) ro=1 ;; --password-stdin) pws=1 ;; esac; shift
+  while [ "${1:-}" = --ro ] || [ "${1:-}" = --password-stdin ] || [ "${1:-}" = --owners ]; do
+    case $1 in --ro) ro=1 ;; --password-stdin) pws=1 ;; --owners) da_owners=1 ;; esac; shift
   done
   [ $# -eq 2 ] || usage
   # LINUXFS_FUSE_FD: the macFUSE device root mounted with, inherited with the disk (fd 3); never fd 0-3, nor 5 (the password's)

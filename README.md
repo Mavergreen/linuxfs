@@ -52,6 +52,22 @@ A volume you mount (a disk after login, or `linuxfs mount IMAGE`) is open to roo
 macFUSE lets you share it: you are an admin (in macFUSE's `admin_group`, 80 by default), or its `allow_other` tunable is
 1. Then linuxfs passes macFUSE's `allow_root` option (and only that), so root's processes can reach the volume and Spotlight and fsevents work, as on an HFS+ disk. Non-admin users mount with no Spotlight or fsevents unless the `allow_other` tunable is 1, which lets them use `allow_root` too. That tunable also lets any user mount with `allow_other`, which opens a volume to every local user, as an HFS+ disk with "Ignore ownership" does; linuxfs does that only for a disk mounted for all users (`LINUXFS_ALL_USERS`).
 
+### Ownership
+
+A disk's files appear to be yours, as on an external HFS+ disk with "Ignore ownership on this volume" checked, which is
+how the Mac mounts every external disk until told otherwise. To see Linux's own owners instead, with the Mac checking
+permissions against them, give the volume an `/etc/fstab` line with `owners` (edit it with `sudo vifs`; the UUID is
+`diskutil info`'s Volume UUID, and the type is the volume's bundle):
+
+```
+UUID=6A698689-F3F0-4B3A-92EF-0C25FD2D3496 none macfuse_ext4 rw,owners
+```
+
+It takes effect at the next mount. Get Info's "Ignore ownership on this volume" checkbox and `diskutil enableOwnership`
+do not work on a linuxfs volume, and Finder shows the box unchecked even though ownership is ignored. These are limits
+of Mac OS X 10.9 and macFUSE, not choices: the Mac keeps that setting by a volume ID that only HFS+ stores, it changes
+a mounted volume in place (`mount -u`), which macFUSE refuses, and macFUSE has no mount option for the flag Finder reads.
+
 ### Preferences
 
 `linuxfs prefs` shows them; `linuxfs prefs KEY on|off` sets one for you. Keys: `ReadOnly`, `NTFSTakeover` and

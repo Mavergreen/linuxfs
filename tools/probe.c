@@ -415,8 +415,9 @@ static const char *probe(char *lab, size_t lablen)
 		exfat_label(lab, lablen);
 		return "exfat";
 	}
-	/* f2fs: volume_name, 512 UTF-16LE units, at 124 in the superblock (f2fs_super_block, include/linux/f2fs_fs.h) */
+	/* f2fs: uuid at 108 and volume_name, 512 UTF-16LE units, at 124 in the superblock (f2fs_super_block, include/linux/f2fs_fs.h) */
 	if (has(1024, 2048) && le32(1024) == 0xF2F52010) {
+		uuid_off = 1024 + 108;	/* uuid, just before volume_name */
 		label_utf16(buf + 1024 + 124, 512, lab, lablen);
 		return "f2fs";
 	}

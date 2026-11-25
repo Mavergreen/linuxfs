@@ -67,10 +67,13 @@ enum fsaccess { FSA_RW, FSA_RO, FSA_REFUSE };
 enum fsaccess fsrules_access(const char *probed_type, unsigned flags, int ro, int before_login, const struct fsprefs *p,
 			     const char **why);
 
-struct mountreq { int ro; const char *dev, *mnt; };
+struct mountreq { int ro, owners, update; const char *dev, *mnt; };
 
-/* mount_macfuse_<fs>'s arguments: [-o a,b]... (or -oa,b) DEV MNT. `rdonly` or `ro` sets ro; every other option is ignored (10.9 passes noowners, whether the mount was asked for or automatic).
- * 0, or -1 on misuse. */
+/* mount_macfuse_<fs>'s arguments: [-o a,b]... (or -oa,b) DEV MNT. `rdonly` or `ro` sets ro. `owners` or `perm` sets owners
+ * and `noowners` or `noperm` clears it, the last one given winning, as in mount(8): 10.9's DiskArbitration passes noowners
+ * for every external disk, then any `owners` from an /etc/fstab entry or the vsdb (/var/db/volinfo.database) for the
+ * volume's UUID. With neither, owners is 0. `update` (mount -u, which vsdbutil runs to change ownership in place) sets
+ * update. Every other option is ignored. 0, or -1 on misuse. */
 int fsrules_parse_mount(int argc, char **argv, struct mountreq *m);
 
 /* A volume's name from its label, by cli/linuxfs's safe_name: / : , = \ and control characters become -, leading dots go, at most

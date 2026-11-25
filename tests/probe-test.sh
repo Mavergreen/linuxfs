@@ -59,11 +59,12 @@ want apfs-magic.img "apfs${T}" 0
 want ext-bogus.img unknown 1
 n=$((n + 1)); "$D/probe" "$D/missing" > /dev/null 2>&1; rc=$?
 if [ $rc -eq 2 ]; then echo "ok $n - an unreadable path exits 2"; else echo "not ok $n - missing file exit $rc, want 2"; bad=1; fi
-# spec: tools/probe.c linuxfs_probe_uuid -- filesystem UUIDs (-k): equal to blkid's, case-insensitively; none for ntfs, f2fs, vfat, exfat
+# spec: tools/probe.c linuxfs_probe_uuid -- filesystem UUIDs (-k): equal to blkid's, case-insensitively; none for ntfs, vfat, exfat
+#       (item 6: f2fs reports its own, as every other filesystem a bundle claims does, so DiskArbitration knows it by one)
 uuid() { # IMAGE: the expected UUID, from blkid on Linux
   if [ "$(uname -s)" = Linux ]; then blkid -s UUID -o value "$D/$1"; else sh "$ROOT/build/linux-host.sh" blkid -s UUID -o value "$D/$1"; fi
 }
-for i in ext4 btrfs xfs apfs; do
+for i in ext4 btrfs xfs apfs f2fs; do
   n=$((n + 1)); want_u=$(uuid $i.img | tr a-f A-F); got=$("$D/probe-uuid" "$D/$i.img"); rc=$?
   if [ -n "$want_u" ] && [ "$got" = "$want_u" ] && [ $rc -eq 0 ]; then echo "ok $n - $i.img: UUID $got"
   else echo "not ok $n - $i.img: UUID got '$got' ($rc), want '$want_u'"; bad=1; fi
@@ -79,7 +80,7 @@ for i in ntfs zero; do
 done
 n=$((n + 1)); "$D/probe" --uuid "$D/missing" > /dev/null 2>&1; rc=$?
 if [ $rc -eq 2 ]; then echo "ok $n - linuxfs-probe --uuid of an unreadable path exits 2"; else echo "not ok $n - --uuid missing exit $rc, want 2"; bad=1; fi
-for i in ntfs f2fs vfat exfat fat32; do
+for i in ntfs vfat exfat fat32; do
   n=$((n + 1)); got=$("$D/probe-uuid" "$D/$i.img"); rc=$?
   if [ -z "$got" ] && [ $rc -eq 1 ]; then echo "ok $n - $i.img: no UUID"
   else echo "not ok $n - $i.img: UUID got '$got' ($rc), want none (1)"; bad=1; fi
