@@ -415,6 +415,24 @@ expect census_xattr_sizes_default test "$r" = "131072 131073 262144 1048576 4194
 # census_py_xattr: the sizes in order, stopping at the first refusal, which is said
 r=$("$PARITY_PYTHON" -c "$census_py_xattr" "$T/no-such-file" 131072 262144 2>&1)
 expect census_py_xattr_stops test "$(printf '%s\n' "$r" | sed 's/errno 2 .*/errno 2/')" = "$(printf '%s\n' '131072 bytes: errno 2' 'stopped at the first refusal')" -o "$r" = "$(printf '%s\n' '131072 bytes: no setxattr in this Python' '262144 bytes: no setxattr in this Python')"
+# each size is written on its own space: the attribute is removed before each write (a fake xattr module logs the calls),
+#   and a refusal (ENOSPC here) stops the climb
+mkdir -p "$T/pyx"; : > "$T/pyx.log"; : > "$T/pyx-file"
+cat > "$T/pyx/xattr.py" <<'EOF'
+import errno, os
+def _log(s):
+    f = open(os.environ["PYX_LOG"], "a"); f.write(s + "\n"); f.close()
+def setxattr(p, n, v, options=0):
+    _log("set %d" % len(v))
+    if len(v) >= 3: raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+def removexattr(p, n, options=0):
+    _log("remove")
+    raise KeyError(n)   # as 10.9's module does when there is none
+EOF
+r=$(PYX_LOG=$T/pyx.log PYTHONPATH=$T/pyx "$PARITY_PYTHON" -c "$census_py_xattr" "$T/pyx-file" 1 2 3 4 2>&1)
+expect census_py_xattr_each_alone test "$(tr '\n' ' ' < "$T/pyx.log")" = "remove set 1 remove set 2 remove set 3 remove "
+expect census_py_xattr_enospc_stops test "$(printf '%s\n' "$r" | sed 's/ (.*//')" = "$(printf '%s\n' '1 bytes: ok' '2 bytes: ok' '3 bytes: errno 28' 'stopped at the first refusal')"
+rm -rf "$T/pyx" "$T/pyx.log" "$T/pyx-file"
 
 # census_py_create: a name that cannot be made says its errno, and the next name is still tried
 mkdir -p "$T/uc"; : > "$T/uc/file"
@@ -524,7 +542,7 @@ expect census_busy_stuck_lsof_dev grep -q '^#   COMMAND PID USER (stub lsof lsof
 expect census_busy_stuck_lklfuse grep -q '^# census: lklfuse processes' "$P/eject-failed.txt"
 expect census_busy_stuck_fresh has "$r" "^# census_busy stuck6: .* left attached; the steps go on with a fresh copy"
 expect census_busy_stuck_quiet hasnt "$r" "not ok"
-expect census_busy_stuck_df grep -q '^# census: df -k .*: [0-9]* KiB free, floor 1 KiB and the image' "$P/eject-failed.txt"
+expect census_busy_stuck_df grep -q '^# census: df -k .*: [0-9]* KiB free, floor 1 KiB and [0-9]* KiB to copy' "$P/eject-failed.txt"
 expect census_busy_stuck_lklfuse_count grep -q '^# census: lklfuse processes now: [0-9]*$' "$P/eject-failed.txt"
 stuck_disks() { for f in "$S"/nodes/*; do case $f in *.m) ;; *) test -f "$f" || continue; case $(sed -n 's/^vol=//p' "$f") in *$1*) sed -n 's/^disk=//p' "$f" ;; esac ;; esac; done; }
 drop_stuck() { for f in "$S"/nodes/*; do case $f in *.m) ;; *) test -f "$f" || continue; case $(sed -n 's/^vol=//p' "$f") in *$1*) rm -f "$f" "$f.m" ;; esac ;; esac; done; }
@@ -653,6 +671,9 @@ expect census_ttc_remount_fails_case test -s "$P/case.stuck4.pathconf.hfs.txt" -
 expect census_ttc_remount_fails_no_read test ! -e "$P/tags.stuck4.after-remount.stuck4.txt"
 for f in "$S"/nodes/*; do case $f in *.m) ;; *) test "$(sed -n 's/^vol=//p' "$f")" != trash-stuck4 || rm -f "$f" "$f.m" ;; esac; done
 rm -f "$W/img/stuck4.img"
+# the oversized probe is bounded at 1 min a side (2 min for the step), so a trash/tags/case census stays in its envelope
+r=$(census_xattr_big() { echo "${PARITY_BOUND:-unset}" > "$T/xb-bound"; }; census_trash_tags_case btrfs 2>&1)
+expect census_ttc_oversized_bound test "$(cat "$T/xb-bound" 2>/dev/null)" = 600
 r=$(census_trash_tags_case apfs 2>&1)
 expect census_ttc_apfs_case test -s "$P/case.apfs.pathconf.apfs.txt" -a -s "$P/case.apfs.pathconf-hfsx.apfs.txt"
 expect census_ttc_apfs_case_only test -z "$(ls "$P" | grep -E '^(trash|tags)\.apfs\.')"
@@ -711,6 +732,15 @@ expect census_all_cleans test ! -e "$W/census/old.img" -a -e "$W/census/left-stu
 r=$(PARITY_CENSUS_MIN=0; census_stall() { echo stall >> "$ran"; }; census_later() { echo later >> "$ran"; }; parity_census_all 2>&1)
 expect census_all_out_of_time test ! -s "$ran"
 expect census_all_out_of_time_said has "$r" "^# census: out of time (0 min), skipped: census_stall"
+# before any copy, $W's free space is checked and recorded; under the floor and the census's own copies, nothing runs
+: > "$ran"
+r=$(PARITY_FREE_FLOOR_KB=999999999999; census_stall() { echo stall >> "$ran"; }; census_later() { echo later >> "$ran"; }; parity_census_all 2>&1)
+expect census_all_room_short test ! -s "$ran"
+expect census_all_room_said has "$r" "^# census: .* KiB free on .*, under the floor .*: no census"
+expect census_all_room_recorded grep -q '^# census: df -k .* KiB free, floor 999999999999 KiB and [0-9]* KiB to copy' "$P/census-room.txt"
+: > "$ran"
+r=$(census_stall() { echo stall >> "$ran"; }; census_later() { echo later >> "$ran"; }; PARITY_CENSUS_MIN=0; parity_census_all 2>&1)
+expect census_all_room_ok grep -q '^# census: df -k .* KiB free, floor 1 KiB' "$P/census-room.txt"
 # the deadline counts from the smoke's start, PARITY_T0
 : > "$ran"
 r=$(PARITY_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=9; census_stall() { echo stall >> "$ran"; }; census_later() { echo later >> "$ran"; }; parity_census_all 2>&1)

@@ -615,22 +615,24 @@ census_busy_cycles() {
   echo "$bc_busy"
 }
 
-# census_room IMAGE: whether $W has room for one more copy of IMAGE and PARITY_FREE_FLOOR_KB besides; df -k's free
-#   KiB, the floor and the lklfuse count go to eject-failed.txt, and CR_SAID says it. The floor, 2 GiB: what the run
-#   still writes after census_busy is at most the next census's copies at once (trash: HFS+, HFSX and xfs, 576 MiB),
-#   the before-login mount and the finish's gzip of $W/img and copyback (under 1 GiB); 2 GiB keeps that with room over.
+# census_kib FILE: FILE's size in KiB, rounded up (0 when it is missing)
+census_kib() { _ck=$(wc -c <"$1" 2>/dev/null | tr -d ' '); echo $(((${_ck:-0} + 1023) / 1024)); }
+# census_room KIB RECORD: whether $W has room for KIB more and PARITY_FREE_FLOOR_KB besides; df -k's free KiB, the floor
+#   and the lklfuse count are appended to RECORD, and CR_SAID says it. The floor, 2 GiB: what the run still writes after
+#   a census step is at most the next census's copies at once (trash: HFS+, HFSX and xfs, 576 MiB), the before-login
+#   mount and the finish's gzip of $W/img and copyback (under 1 GiB); 2 GiB keeps that with room over.
 PARITY_FREE_FLOOR_KB=${PARITY_FREE_FLOOR_KB:-2097152}
 census_room() {
-  _cro_i=$(($(wc -c <"$1" 2>/dev/null || echo 0) / 1024 + 1))
+  mkdir -p "$OUT/parity"
   _cro_f=$(bounded 300 df -P -k "$W" 2>/dev/null </dev/null | awk 'NR == 2 { print $4 }')
   _cro_l=$(bounded 100 ps -axww -o command= 2>/dev/null </dev/null | awk '/lklfuse/ && !/awk/' | grep -c .)
   {
-    echo "# census: df -k $W: ${_cro_f:-unknown} KiB free, floor $PARITY_FREE_FLOOR_KB KiB and the image $_cro_i KiB"
+    echo "# census: df -k $W: ${_cro_f:-unknown} KiB free, floor $PARITY_FREE_FLOOR_KB KiB and $1 KiB to copy"
     echo "# census: lklfuse processes now: $_cro_l"
-  } >>"$OUT/parity/eject-failed.txt"
+  } >>"$2"
   case $_cro_f in '' | *[!0-9]*) CR_SAID="free space on $W unknown (df -k)"; return 1 ;; esac
-  if test "$_cro_f" -lt $((PARITY_FREE_FLOOR_KB + _cro_i)); then
-    CR_SAID="$_cro_f KiB free on $W, under the floor $PARITY_FREE_FLOOR_KB KiB and the image $_cro_i KiB"; return 1
+  if test "$_cro_f" -lt $((PARITY_FREE_FLOOR_KB + $1)); then
+    CR_SAID="$_cro_f KiB free on $W, under the floor $PARITY_FREE_FLOOR_KB KiB and $1 KiB to copy"; return 1
   fi
   CR_SAID="$_cro_f KiB free on $W"
 }
@@ -642,7 +644,7 @@ census_busy_up() {
   if test "$(census_info "$PARITY_CTL_DEV" Mounted)" = Yes && test "$(census_info "$PARITY_FS_DEV" Mounted)" = Yes; then return 0; fi
   census_detach "$(census_image_disk "$cb_h")" apple
   if ! census_detach "$(census_image_disk "$cb_i")" fs "$PARITY_FS_MP"; then
-    census_room "$W/img/$cb_fs.img" || { echo "# census_busy $cb_fs: $CR_SAID: no fresh copy, so the busy steps stop" | tee -a "$OUT/parity/eject-failed.txt"; return 1; }
+    census_room "$(census_kib "$W/img/$cb_fs.img")" "$OUT/parity/eject-failed.txt" || { echo "# census_busy $cb_fs: $CR_SAID: no fresh copy, so the busy steps stop" | tee -a "$OUT/parity/eject-failed.txt"; return 1; }
     cb_n=$((cb_n + 1))
     cb_i=$(census_copy "$W/img/$cb_fs.img" "busy-$cb_fs-$cb_n") || return 1
     echo "# census_busy $cb_fs: its disk is left attached; the steps go on with a fresh copy, ${cb_i##*/}"
@@ -743,8 +745,8 @@ PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Content
 #   PARITY_CENSUS_MIN = 135 min from the smoke's start (PARITY_T0, which the smoke sets first): then at most the census
 #   step already begun (about 11: spotlight's 120 s mdfind waits, remounts, Finder's refresh and the Privacy shots; a
 #   busy census with Finder's eject, about 5, or about 9 with a stuck disk at each of its six re-attaches: two ejects,
-#   two census_holders, a copy of up to 320 MiB, an attach, about 30 s each; one trash/tags/case census, about 3 with
-#   the xattr probe's up to 128 MiB writes; one stall iteration, under 1), before login (about 5) and the copyback and
+#   two census_holders, a copy of up to 320 MiB, an attach, about 30 s each; one trash/tags/case census, about 3, the
+#   xattr probe bounded at 2 of it; one stall iteration, under 1), before login (about 5) and the copyback and
 #   uploads (about 5) remain: 5 + 135 + 11 + 5 + 5 = 161, leaving 19 to spare. Push A's census, its Finder steps not
 #   run, took 50 min (the stall 30 of them); with them, and stuck disks in both busy censuses, about 90 are expected,
 #   well inside 135.
@@ -1021,8 +1023,9 @@ census_tag_set() {
   "$AQUA" osascript -e "tell application \"Finder\" to set label index of (POSIX file \"$1/tagged\" as alias) to 2" 2>&1 </dev/null
   echo "label (Finder): exit $?"
 }
-# census_py_xattr FILE N...: setxattr user.parity-big of N bytes on FILE, for each N in order: "N bytes: ok", or its errno
-#   and then "stopped at the first refusal" (no larger size is tried); the attribute is removed after. By Python's xattr
+# census_py_xattr FILE N...: setxattr user.parity-big of N bytes on FILE, for each N in order, the attribute removed
+#   before each (so each size has the volume's space to itself) and after the last: "N bytes: ok", or its errno and
+#   then "stopped at the first refusal" (no larger size is tried). By Python's xattr
 #   (10.9's /usr/bin/python has it) or os.setxattr (Python 3 on Linux), as no exec argument carries 1 MiB (10.9's
 #   ARG_MAX is 256 KiB). One value is held at a time: memory peaks at the largest N tried.
 census_py_xattr='import os, sys
@@ -1035,10 +1038,16 @@ except ImportError:
     s = getattr(os, "setxattr", None)
     put = s and (lambda v: s(p, "user.parity-big", v))
     rm = lambda: os.removexattr(p, "user.parity-big")
+def clear():
+    try:
+        rm()
+    except (IOError, OSError, KeyError):   # the 10.9 xattr module raises KeyError when there is none
+        pass
 for n in sys.argv[2:]:
     n = int(n)
     if not put:
         print("%d bytes: no setxattr in this Python" % n); continue
+    clear()
     try:
         v = b"x" * n; put(v); v = None; print("%d bytes: ok" % n)
     except (IOError, OSError) as e:
@@ -1046,14 +1055,11 @@ for n in sys.argv[2:]:
     except MemoryError:
         print("%d bytes: no memory for the value in this Python" % n); print("stopped at the first refusal"); break
 if put:
-    try:
-        rm()
-    except (IOError, OSError):
-        pass'
+    clear()'
 # The sizes, ascending. 10.9's VFS caps an xattr at INT32_MAX (XATTR_MAXSIZE in Kernel.framework's sys/xattr.h, checked
 #   on a 10.9 box), so HFS+ is bounded by its free space, not a size: 4 MiB was accepted on the dev box. 64 MiB and a
-#   byte pass the 64 MiB cap later xnu has; 128 MiB is the whole control image, so HFS+ must refuse it (ENOSPC, or
-#   whatever it says). Memory: one 128 MiB value at most; time: bounded by census_bound in census_trash_tags_case.
+#   byte pass the 64 MiB cap later xnu has, on the control's own space (about 124 MiB free; each size is written
+#   alone); 128 MiB is the whole control image, so HFS+ must refuse it (ENOSPC, or whatever it says). Memory: one 128 MiB value at most; time: bounded by census_bound in census_trash_tags_case.
 PARITY_XATTR_SIZES=${PARITY_XATTR_SIZES:-131072 131073 262144 1048576 4194304 16777216 67108864 67108865 134217728}
 # census_xattr_big MP: census_py_xattr on MP/big-xattr with PARITY_XATTR_SIZES, to find HFS+'s limit and its error
 census_xattr_big() {
@@ -1099,8 +1105,8 @@ end tell' >"$OUT/parity/trash.$tt_fs.empty-trash.txt" 2>&1
     parity "trash.$tt_fs.after-empty" census_trashes @MP@ "$tt_uid"
     parity "tags.$tt_fs.set" census_tag_set @MP@
     parity "tags.$tt_fs.read" xattr -l @MP@/tagged
-    # up to 128 MiB written to a disk image: 3 min a side
-    census_bound 1800 parity "tags.$tt_fs.oversized" census_xattr_big @MP@
+    # up to 128 MiB written to a disk image (0.94 s on the dev box): 1 min a side, 2 for the step
+    census_bound 600 parity "tags.$tt_fs.oversized" census_xattr_big @MP@
     if census_remount_pair "$tt_h" "$tt_i"; then
       parity "tags.$tt_fs.after-remount" xattr -l @MP@/tagged
     else
@@ -1214,10 +1220,16 @@ census_left_attached() {
 # parity_census_all: the census, record-only: the four controls made, then item 3 (PARITY_STALL_N, 50 unless set; first,
 #   as the longest), items 1 and 7 on ext4, btrfs, xfs, f2fs and NTFS, item 4 on ext4 and xfs, item 5 on ext4, item 6 on
 #   those and APFS, item 7's case step on APFS too, then Later. Nothing is begun past PARITY_CENSUS_MIN (135) minutes
-#   from the smoke's start (PARITY_T0; the census's own start without it).
+#   from the smoke's start (PARITY_T0; the census's own start without it). Nothing runs when $W lacks room for the
+#   controls, one census's copies and PARITY_FREE_FLOOR_KB (census-room.txt says so).
 parity_census_all() {
   : "${PARITY_STALL_N:=50}"
   CA_T0=${PARITY_T0:-$(date +%s)}
+  # room for the four 128 MiB controls and one census's copies at once (two controls and the largest image)
+  ca_big=0; for ca_f in "$W"/img/*.img; do ca_k=$(census_kib "$ca_f"); test "$ca_k" -le "$ca_big" || ca_big=$ca_k; done
+  if ! census_room $((6 * 131072 + ca_big)) "$OUT/parity/census-room.txt"; then
+    echo "# census: $CR_SAID: no census" | tee -a "$OUT/parity/census-room.txt"; census_left_attached; return 1
+  fi
   for ca_k in hfs hfsx fat32 exfat; do parity_control "$ca_k" >/dev/null || echo "# census: cannot make the $ca_k control"; done
   census_due census_stall && { census_stall; census_clean; }
   for ca_fs in ext4 btrfs xfs f2fs ntfs; do census_on "$ca_fs" census_unicode "$ca_fs"; done
