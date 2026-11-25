@@ -58,7 +58,7 @@ it, and linuxfs passes it only when the `allow_other` tunable is 1. Root's fseve
 disk, so neither works on it. A disk mounted before login is open to every user, root's processes included.
 
 `linuxfs unmount --force` unmounts your own mount with `umount -f`, and any other linuxfs mount (one made before login)
-with `diskutil unmount force`. `linuxfs list`, `linuxfs status` and `linuxfs unmount DEVICE` show and unmount those too.
+with `diskutil unmount force`. `linuxfs list`, `linuxfs status` and `linuxfs unmount DEVICE` (a volume's, or a whole disk's, as `diskutil unmountDisk`) show and unmount those too.
 
 ### Ownership
 

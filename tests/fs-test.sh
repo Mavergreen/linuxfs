@@ -324,25 +324,26 @@ EOS
 chmod +x "$R/open" "$R/lklfuse"
 real() { # ARGS...: the mount role (user path) running the real CLI, whose lklfuse exits at once: nothing can mount here, so the CLI says
 #   so (exit 1: an lklfuse that ends before its mount appears is a failure, whatever its status), and an argv it takes is rc 1, not 2
-  rm -f "$R/lk.log"
+  rm -f "$R/lk.log" "$R"/logs/*.log
   mt env LINUXFS_CLI="$ROOT/cli/linuxfs" LINUXFS_OPEN="$R/open" LINUXFS_LKLFUSE="$R/lklfuse" LINUXFS_PROBE="$R/open" \
     LINUXFS_STATE="$R/state" LINUXFS_LOGS="$R/logs" LINUXFS_LOCKS="$R/locks" LINUXFS_DOMAIN=test.fsreal \
     LINUXFS_MACHINE_DOMAIN="$R/no-machine" LK_LOG="$R/lk.log" REAL_PROBE="$D/linuxfs-probe" "$@"; }
+phantom() { grep -q 'lklfuse exited (status 0) before the mount appeared' "$R/logs/rdisk9.log"; }   # rc 1 for exactly that reason (r0 M1)
 real "$MD" /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
-[ $rc = 1 ] && grep -q "^lklfuse: .*$R/mnt" "$R/lk.log"; ok $? "the real CLI accepts the plain da-mount argv (rc $rc)"
+[ $rc = 1 ] && phantom && grep -q "^lklfuse: .*$R/mnt" "$R/lk.log"; ok $? "the real CLI accepts the plain da-mount argv (rc $rc)"
 plist "$R/stale.plist" "<key>Automount</key><false/><key>Ignore:lbl</key><true/>"
 real env LINUXFS_DOMAIN="$R/stale" "$MD" /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
-[ $rc = 1 ] && grep -q "^lklfuse: .*$R/mnt" "$R/lk.log"; ok $? "a stale Automount=false and Ignore:<LABEL> are not read: the real CLI mounts (rc $rc)"
+[ $rc = 1 ] && phantom && grep -q "^lklfuse: .*$R/mnt" "$R/lk.log"; ok $? "a stale Automount=false and Ignore:<LABEL> are not read: the real CLI mounts (rc $rc)"
 real "$MD" -o owners /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
-[ $rc = 1 ] && grep -q "^lklfuse: .*,default_permissions,owner=caller" "$R/lk.log" && ! grep -q "uid=\|gid=\|owner=root" "$R/lk.log"; ok $? "the real CLI takes da-mount --owners: Linux's ids, checked by the kernel, new files the creator's (rc $rc: $(cat "$R/lk.log" 2>/dev/null))"
+[ $rc = 1 ] && phantom && grep -q "^lklfuse: .*,default_permissions,owner=caller" "$R/lk.log" && ! grep -q "uid=\|gid=\|owner=root" "$R/lk.log"; ok $? "the real CLI takes da-mount --owners: Linux's ids, checked by the kernel, new files the creator's (rc $rc: $(cat "$R/lk.log" 2>/dev/null))"
 real "$MD" -o noowners /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
-[ $rc = 1 ] && grep -q "^lklfuse: .*,uid=[0-9]*,gid=[0-9]*,owner=root" "$R/lk.log" && ! grep -q "default_permissions" "$R/lk.log"; ok $? "and with noowners keeps today's mapping (rc $rc: $(cat "$R/lk.log" 2>/dev/null))"
+[ $rc = 1 ] && phantom && grep -q "^lklfuse: .*,uid=[0-9]*,gid=[0-9]*,owner=root" "$R/lk.log" && ! grep -q "default_permissions" "$R/lk.log"; ok $? "and with noowners keeps today's mapping (rc $rc: $(cat "$R/lk.log" 2>/dev/null))"
 real "$MD" -o rdonly /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
-[ $rc = 1 ] && grep -q "^lklfuse: .*,ro " "$R/lk.log"; ok $? "the real CLI accepts da-mount --ro and mounts read-only (rc $rc)"
+[ $rc = 1 ] && phantom && grep -q "^lklfuse: .*,ro " "$R/lk.log"; ok $? "the real CLI accepts da-mount --ro and mounts read-only (rc $rc)"
 kc saved pw
 real env FAKE_PROBE=apfs FAKE_ENCRYPTED=pw "$MD" -o owners /dev/disk9 "$R/mnt" >/dev/null 2>&1; rc=$?
 kcstop
-[ $rc = 1 ] && grep -q "^pw: pw\$" "$R/lk.log" && grep -q "passfd=5" "$R/lk.log"; ok $? "the real CLI accepts da-mount --password-stdin and lklfuse gets the password on fd 5 (rc $rc: $(tr '\n' '|' < "$R/lk.log" 2>/dev/null))"
+[ $rc = 1 ] && phantom && grep -q "^pw: pw\$" "$R/lk.log" && grep -q "passfd=5" "$R/lk.log"; ok $? "the real CLI accepts da-mount --password-stdin and lklfuse gets the password on fd 5 (rc $rc: $(tr '\n' '|' < "$R/lk.log" 2>/dev/null))"
 # spec: tools/fs.c -- misuse
 for bad_args in "" "/dev/disk9" "-o /dev/disk9 /tmp/m" "/dev/disk9 /tmp/m extra" "-x /dev/disk9 /tmp/m"; do
   # shellcheck disable=SC2086

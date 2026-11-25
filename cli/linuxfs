@@ -95,6 +95,13 @@ ours_from() { # DEV
     [ "$_s" = "$1" ] && ours_type "$_t" && { printf '%s\n' "$_m"; break; }
   done
 }
+# The mount points of linuxfs's mounts (the six types) from the partitions of whole disk DISK (/dev/diskN: /dev/diskNsM exactly).
+ours_parts() { # DISK
+  mount_lines | while IFS="$tab" read -r _s _m _t; do
+    case ${_s#"$1s"} in "$_s"|''|*[!0-9]*) continue ;; esac
+    ! ours_type "$_t" || printf '%s\n' "$_m"
+  done
+}
 # Who the topmost mount on MP is "mounted by" (mount's words; nothing for root's own mounts, which mount does not say it of).
 mounted_by() { # MP
   mount_lines_opts | awk -F"$tab" -v m="$1" '$2 == m { o = $4 } END { n = split(o, a, ", "); for (i = 1; i <= n; i++) if (a[i] ~ /^mounted by /) { sub(/^mounted by /, "", a[i]); print a[i] } }'
@@ -481,8 +488,10 @@ cmd_unmount() {
   elif [ -f "$t" ]; then t=$(cd "$(dirname "$t")" && pwd)/$(basename "$t"); fi
   rec=$(records | awk -F"$tab" -v t="$t" '$2 == t || $3 == t { print; exit }')
   case $rec,$t in
-    ,/dev/rdisk*)   # a whole disk (being ejected): the volumes linuxfs mounted from its partitions
-      parts=$(records | awk -F"$tab" -v p="${t}s" 'index($2, p) == 1 && substr($2, length(p) + 1) ~ /^[0-9]+$/ { print $3 }')
+    ,/dev/rdisk*)   # a whole disk (being ejected): the volumes linuxfs mounted from its partitions, this user's (records) and any other's
+      # (root's, before login: the mount table's six types from /dev/diskNsM), as diskutil unmountDisk does
+      parts=$( { records | awk -F"$tab" -v p="${t}s" 'index($2, p) == 1 && substr($2, length(p) + 1) ~ /^[0-9]+$/ { print $3 }'
+        ours_parts "$blk"; } | awk '!seen[$0]++')
       if [ -n "$parts" ]; then
         r=0
         while IFS= read -r m; do ( cmd_unmount ${force:+--force} "$m" ) || r=1; done <<EOF

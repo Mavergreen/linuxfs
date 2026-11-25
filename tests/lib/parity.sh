@@ -99,7 +99,7 @@ PARITY_MODE_SPOTLIGHT_DA=${PARITY_MODE_SPOTLIGHT_DA:-check}
 #   refused it: push D), so root's fseventsd and mds are refused there again, as in push C, until the mount daemon (Task 16l) lets
 #   them in. The three steps that need that, all on the census's DiskArbitration pairs, take PARITY_MODE_FSEVENTS_DA while
 #   PARITY_MODE_SPOTLIGHT is check: census_spotlight's .fseventsd, census_refusals_bar and census_busy_fsevents. Record until Task
-#   16l flips it to check.
+#   16l flips it to check. Root's mds is refused there too, so census_index_mode records the indexing steps while it is record.
 PARITY_MODE_FSEVENTS_DA=${PARITY_MODE_FSEVENTS_DA:-record}
 # census_fsevents_mode: for a step that needs root's processes let in on a DiskArbitration volume, CFM, the mode it takes
 #   (PARITY_MODE_FSEVENTS_DA while PARITY_MODE_SPOTLIGHT is check, else PARITY_MODE_SPOTLIGHT's), and CFM_VAR, whose it is
@@ -1428,11 +1428,17 @@ census_spotlight_diag() {
 
 # spec: .superpowers/sdd/2026-11-25-hfs-parity/progress.md "Ruling (Task 15)" -- census_index_mode MP: after census_index_on,
 #   whether the indexing steps are checked: CS_INDEX_MODE check when PARITY_MODE_SPOTLIGHT is check and mdutil -s MP (the
-#   HFS+ control) says indexing is enabled, else record; CS_INDEX_WHY says why
+#   HFS+ control) says indexing is enabled, else record; CS_INDEX_WHY says why. (Task 16e fix round 1, r0 M3) Root's mds is refused
+#   on a DiskArbitration volume as root's fseventsd is, so the indexing steps are recorded too while PARITY_MODE_FSEVENTS_DA is
+#   record (Task 16l flips them back with it)
 census_index_mode() {
   _cim=$(bounded 300 mdutil -s "$1" 2>&1 </dev/null | parity_norm "$1" "" | tr '\n\t' '  ' | sed 's/  */ /g; s/^ //; s/ $//')
   if test "${PARITY_MODE_SPOTLIGHT:-record}" != check; then CS_INDEX_MODE=record CS_INDEX_WHY="PARITY_MODE_SPOTLIGHT is ${PARITY_MODE_SPOTLIGHT:-record}"
-  elif printf '%s\n' "$_cim" | grep -q 'Indexing enabled'; then CS_INDEX_MODE=check CS_INDEX_WHY="indexing is on for the HFS+ control"
+  elif printf '%s\n' "$_cim" | grep -q 'Indexing enabled'; then
+    CS_INDEX_MODE=check CS_INDEX_WHY="indexing is on for the HFS+ control"
+    if test "${PARITY_MODE_FSEVENTS_DA:-record}" = record; then
+      CS_INDEX_MODE=record CS_INDEX_WHY="$CS_INDEX_WHY, but root's mds is not let into a DiskArbitration volume until the mount daemon (PARITY_MODE_FSEVENTS_DA is record)"
+    fi
   else CS_INDEX_MODE=record CS_INDEX_WHY="indexing could not be turned on for the HFS+ control (mdutil -s: $_cim)"; fi
 }
 CS_INDEX_MODE=record

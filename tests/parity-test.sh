@@ -1872,6 +1872,20 @@ rm -f "$S/fsevents-refused" "$T/bf.log"
 for p in rw ro; do expect "fsevents_da_check_${p}_fseventsd" has "$r" "^not ok - parity spotlight.ext4.$p.fseventsd\$"; done
 expect fsevents_da_check_refusals has "$r" "^not ok - spotlight: no refusals for linuxfs volumes ([1-9][0-9]* lines"
 expect fsevents_da_check_busy has "$r" "^not ok - parity spotlight.ext4.busy-fsevents "
+# (r0 M3) root's mds is refused on DiskArbitration volumes as root's fseventsd is: with indexing on for the HFS+ control, the indexing
+#   steps (index and da) are recorded too while PARITY_MODE_FSEVENTS_DA is record, said why; under check (Task 16l) they are checked
+rm -f "$OUT"/*-refresh.png "$OUT"/*-privacy.png "$OUT"/*-privacy-ro.png
+: > "$S/calls"
+r=$(unset PARITY_MODE_FSEVENTS_DA; . "$here/lib/parity.sh"; census_spotlight ext4 2>&1)
+for p in rw ro; do
+  for s in mdutil mdfind store privacy-off privacy-remount; do expect "fsevents_da_index_record_${p}_$s" has "$r" "^# recorded spotlight.ext4.$p.$s\$"; done
+  expect "fsevents_da_index_record_${p}_said" has "$r" "^# spotlight.ext4.$p: the indexing steps are recorded: indexing is on for the HFS+ control, but root's mds is not let into a DiskArbitration volume until the mount daemon (PARITY_MODE_FSEVENTS_DA is record)\$"
+done
+expect fsevents_da_index_record_refresh has "$r" "^# recorded spotlight.ext4.rw.refresh$"
+expect fsevents_da_index_record_quiet hasnt "$r" "not ok"
+rm -f "$OUT"/*-refresh.png "$OUT"/*-privacy.png "$OUT"/*-privacy-ro.png
+r=$(PARITY_MODE_FSEVENTS_DA=check; census_spotlight ext4 2>&1)
+for s in mdfind store mdutil; do expect "fsevents_da_index_check_$s" has "$r" "^ok - parity spotlight.ext4.rw.$s\$"; done
 # PARITY_MODE_SPOTLIGHT record still records them; a mode that is neither is not ok, named
 r=$(PARITY_MODE_SPOTLIGHT=record PARITY_MODE_FSEVENTS_DA=check; printf 'xfs: fsevents: .fseventsd no\n' > "$T/bf.log"; census_busy_fsevents spotlight.xfs.busy-fsevents xfs "$T/bf.log" 2>&1)
 expect fsevents_da_spotlight_record has "$r" "^# recorded spotlight.xfs.busy-fsevents"

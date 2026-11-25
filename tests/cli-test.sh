@@ -888,6 +888,18 @@ echo "/dev/disk3s1 on /Volumes/x (macfuse_ext4, local, nodev, nosuid, mounted by
 sh "$L" unmount --force /Volumes/x > /dev/null 2>&1; rc=$?
 [ $rc -eq 0 ] && grep -qx "umount -f /Volumes/x" "$T/calls" && [ ! -s "$T/ucalls" ]; ok $? "force_own_mount: unmount --force of this user's own mount runs umount -f (rc $rc: $(tr '\n' '|' < "$T/calls"))"
 grep -vF " on /Volumes/x (" "$T/mtab" > "$T/mtab.new"; mv "$T/mtab.new" "$T/mtab"
+# (r0 M2) a whole disk, as diskutil unmountDisk: root's mounts from its partitions too, exactly its own (disk3sN, not disk33s1)
+printf '%s\n' "$rootline" "/dev/disk3s2 on /Volumes/y (macfuse_xfs, local, nodev, nosuid)" "/dev/disk33s1 on /Volumes/z (macfuse_ext4, local)" >> "$T/mtab"
+: > "$T/ucalls"
+sh "$L" unmount disk3 > /dev/null 2>&1; rc=$?
+[ $rc -eq 0 ] && grep -qx "unmount /Volumes/x" "$T/ucalls" && grep -qx "unmount /Volumes/y" "$T/ucalls" && ! grep -q z "$T/ucalls" && grep -qF " on /Volumes/z (" "$T/mtab"
+ok $? "unmount_disk_root: unmount of a whole disk unmounts root's mounts from its partitions, and no other disk's (rc $rc: $(tr '\n' '|' < "$T/ucalls"))"
+echo "$rootline" >> "$T/mtab"; : > "$T/ucalls"
+DA /dev/disk3s4 "$T/dam" > /dev/null 2>&1   # (disk3s2 is the Mac's NTFS mount, above)
+sh "$L" unmount --force disk3 > /dev/null 2>&1; rc=$?
+[ $rc -eq 0 ] && grep -qx "unmount force /Volumes/x" "$T/ucalls" && grep -q "^umount -f $T/dam\$" "$T/calls" && [ "$(sh "$L" status | grep -c "/dev/rdisk3s4")" = 0 ]
+ok $? "unmount_disk_root: --force: root's with diskutil's force, the user's own (a record) with umount -f (rc $rc: $(tr '\n' '|' < "$T/ucalls"))"
+grep -vF " on /Volumes/z (" "$T/mtab" > "$T/mtab.new"; mv "$T/mtab.new" "$T/mtab"
 DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1
 out=$(sh "$L" status 2>&1)
 [ "$(echo "$out" | grep -c "	$T/dam	")" = 1 ] && ! echo "$out" | grep -q '^-	'; ok $? "status lists a recorded DiskArbitration mount once, by its record (got: $(echo "$out" | tr '\t\n' ' |'))"
