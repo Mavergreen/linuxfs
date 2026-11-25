@@ -716,9 +716,8 @@ fl_iter() {
     it_dev=$(printf '%s\n' "$it_dv" | sed -n 1p) it_fu=$(printf '%s\n' "$it_dv" | sed -n 2p)
     if test -z "$it_fu"; then census_detach_checked "$it_disk" "$it_side" || FL_LEFT=1; echo "$it_tag: setup failed: no Volume UUID" >>"$OUT/parity/stall.txt"; return 2; fi
     census_pause 6   # as round 4 did: the agent's sweep may mount it first
-    it_how=nomount
     if test "$(census_info "$it_dev" Mounted)" = Yes; then
-      it_how=$it_side it_mp=$(census_info "$it_dev" "Mount Point"); bounded 6000 diskutil unmount "$it_dev" >/dev/null 2>&1 </dev/null
+      it_mp=$(census_info "$it_dev" "Mount Point"); bounded 6000 diskutil unmount "$it_dev" >/dev/null 2>&1 </dev/null
     fi
     if test "$it_vol" = hfs; then
       bounded 300 sudo -n sh -c 'printf "%s\n" "$2" >> "$1"' _ "$PARITY_FSTAB" "UUID=$it_fu none hfs rw,noauto" </dev/null
@@ -726,7 +725,7 @@ fl_iter() {
       bounded 6000 "$L" ignore "$it_disk" >/dev/null 2>&1 </dev/null
     fi
     if ! grep -q "^UUID=$it_fu " "$PARITY_FSTAB" 2>/dev/null; then
-      census_detach "$it_disk" "$it_how" "$it_mp" || FL_LEFT=1; echo "$it_tag: setup failed: no noauto entry for UUID $it_fu" >>"$OUT/parity/stall.txt"; return 2
+      census_detach_checked "$it_disk" "$it_side" || FL_LEFT=1; echo "$it_tag: setup failed: no noauto entry for UUID $it_fu" >>"$OUT/parity/stall.txt"; return 2
     fi
     da_mark "$it_tag: diskutil mount"
     bounded 6000 diskutil mount "$it_dev" >/dev/null 2>&1 </dev/null; it_s3=$?

@@ -465,7 +465,7 @@ mount)
   done ;;
 linuxfs)
   case $1 in
-  ignore) d=${2#/dev/}; echo "UUID=$(field "$d" uuid) none macfuse_ext4 rw,noauto # linuxfs" >> "$PARITY_FSTAB" ;;
+  ignore) test ! -f "$STUB/ignore-fails" || exit 1; d=${2#/dev/}; echo "UUID=$(field "$d" uuid) none macfuse_ext4 rw,noauto # linuxfs" >> "$PARITY_FSTAB" ;;
   unignore) d=${2#/dev/}; grep -v "^UUID=$(field "$d" uuid) " "$PARITY_FSTAB" > "$PARITY_FSTAB.t"; cat "$PARITY_FSTAB.t" > "$PARITY_FSTAB"; rm -f "$PARITY_FSTAB.t" ;;
   esac ;;
 sudo)
@@ -1462,11 +1462,19 @@ expect never_mounted_stall_retried test "$(grep -c "^diskutil eject /dev/disk$d\
 fl_iter ext4 1 1 "$W/census/nouuid-stuck.img" > /dev/null 2>&1; d=$(cat "$S/disks")
 expect never_mounted_nouuid_not_forced not forced_on "/dev/disk$d"
 expect never_mounted_nouuid_retried test "$(grep -c "^diskutil eject /dev/disk$d\$" "$S/calls.all")" -ge 2
+# (fix round 4) fl_iter's "no noauto entry" setup failure (linuxfs ignore wrote none) on a disk never mounted: ejected,
+#   retried, never forced
+echo noentry-stuck > "$W/census/noentry-stuck.img"; : > "$S/ignore-fails"
+fl_iter ext4 1 1 "$W/census/noentry-stuck.img" > /dev/null 2>&1; d=$(cat "$S/disks")
+rm -f "$S/ignore-fails"
+expect never_mounted_noentry_said grep -q '^ext4-loop1-1: setup failed: no noauto entry for UUID UUID-noentry-stuck$' "$P/stall.txt"
+expect never_mounted_noentry_not_forced not forced_on "/dev/disk$d"
+expect never_mounted_noentry_retried test "$(grep -c "^diskutil eject /dev/disk$d\$" "$S/calls.all")" -ge 2
 fl_iter ext4 1 1 "$W/census/nouuid-swept-stuck.img" > /dev/null 2>&1; d=$(cat "$S/disks")
 expect swept_nouuid_not_forced not forced_on "/dev/disk$d"
 expect swept_nouuid_retried test "$(grep -c "^diskutil eject /dev/disk$d\$" "$S/calls.all")" -ge 2
 rm -f "$S/nodes/disk$d" "$S/nodes/disk$d.m"   # the leftover goes without a stub call, so no forced detach is logged
-drop_stuck nevermount-stuck; drop_stuck nouuid-stuck
+drop_stuck nevermount-stuck; drop_stuck nouuid-stuck; drop_stuck noentry-stuck; rm -f "${W:?}/census/noentry-stuck.img"
 # (fix round 2) census_detach_checked's Apple side (nothing mounted) is detached by force only when no lklfuse names
 #   the disk: with one on it, or ps unable to say, it is ejected only
 for c in held plain; do echo "$c" > "$W/census/sweep-stuck-hfs-$c.img"; done
