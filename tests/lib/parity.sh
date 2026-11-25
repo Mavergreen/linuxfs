@@ -149,6 +149,7 @@ PARITY_LIB=${PARITY_LIB:-$(cd "$(dirname "$0")" && pwd)/lib}
 PARITY_PYTHON=${PARITY_PYTHON:-/usr/bin/python}
 PARITY_FSTAB=${PARITY_FSTAB:-/etc/fstab}
 PARITY_DALOG=${PARITY_DALOG:-/var/log/diskarbitrationd.log}
+PARITY_POLLS=${PARITY_POLLS:-60}   # census_wait_*: once a second; the tests poll fewer times
 
 # census_pause SECONDS: a sleep, bounded like every other wait
 census_pause() { bounded $(($1 * 10 + 20)) sleep "$1"; }
@@ -162,10 +163,11 @@ census_sysctl() {
 # census_info NODE KEY: one field of diskutil info
 census_info() { bounded 300 diskutil info "$1" 2>/dev/null </dev/null | sed -n "s/^ *$2: *//p" | head -n 1; }
 
-# census_wait_mounted NODE...: waits up to 60 s for one of the nodes to be mounted; prints its node, then its mount point
+# census_wait_mounted NODE...: waits up to PARITY_POLLS (60) s for one of the nodes to be mounted; prints its node,
+#   then its mount point
 census_wait_mounted() {
   _cw_k=0
-  while test "$_cw_k" -lt 60; do
+  while test "$_cw_k" -lt "$PARITY_POLLS"; do
     for _cw_d; do
       if test "$(census_info "$_cw_d" Mounted)" = Yes; then
         _cw_m=$(census_info "$_cw_d" "Mount Point")
@@ -456,11 +458,11 @@ fl_iter() {
   return "$it_ok"
 }
 
-# census_wait_uuid NODE...: waits up to 60 s for a node with a Volume UUID; prints the last such node (an EFI partition,
-#   if diskutil made one, comes before the volume's), then its UUID
+# census_wait_uuid NODE...: waits up to PARITY_POLLS (60) s for a node with a Volume UUID; prints the last such node
+#   (an EFI partition, if diskutil made one, comes before the volume's), then its UUID
 census_wait_uuid() {
   _cv_k=0
-  while test "$_cv_k" -lt 60; do
+  while test "$_cv_k" -lt "$PARITY_POLLS"; do
     _cv_n= _cv_v=
     for _cv_d; do
       _cv_u=$(census_info "$_cv_d" "Volume UUID")

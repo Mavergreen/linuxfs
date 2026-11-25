@@ -252,7 +252,7 @@ else echo "ok - unicode_image # SKIP needs Linux, mkfs.ext4 and debugfs"; fi
 #   with directories for volumes. The stub bounded marks what runs under it, and a stub sleep outside it is a failure.
 unset -f mkfile hdiutil diskutil
 S=$T/stub; mkdir -p "$S/nodes" "$T/vols" "$T/in"
-PARITY_FSTAB=$S/fstab PARITY_DALOG=$S/dalog PARITY_DAPL=$S/da.plist STUB=$S
+PARITY_FSTAB=$S/fstab PARITY_DALOG=$S/dalog PARITY_DAPL=$S/da.plist STUB=$S PARITY_POLLS=3
 export PARITY_FSTAB PARITY_DALOG STUB
 : > "$PARITY_FSTAB"; : > "$PARITY_DALOG"; : > "$PARITY_DAPL"; : > "$S/calls"
 for py in python3 /usr/bin/python; do command -v "$py" > /dev/null 2>&1 && PARITY_PYTHON=$py; done
@@ -449,8 +449,8 @@ fl_iter ext4 1 1 "$W/census/nouuid-stuck.img" > /dev/null 2>&1; d=$(cat "$S/disk
 expect never_mounted_nouuid_forced forced_on "/dev/disk$d"
 fl_iter ext4 1 1 "$W/census/nouuid-swept-stuck.img" > /dev/null 2>&1; d=$(cat "$S/disks")
 expect swept_nouuid_not_forced not forced_on "/dev/disk$d"
-expect swept_nouuid_retried grep -q "^diskutil eject /dev/disk$d\$" "$S/calls.all"
-hdiutil detach -force "disk$d" > /dev/null 2>&1
+expect swept_nouuid_retried test "$(grep -c "^diskutil eject /dev/disk$d\$" "$S/calls.all")" -ge 2
+rm -f "$S/nodes/disk$d" "$S/nodes/disk$d.m"   # the leftover goes without a stub call, so no forced detach is logged
 expect census_waits_bounded test ! -s "$unbounded"
 test ! -s "$unbounded" || sed 's/^/# /' "$unbounded"
 
