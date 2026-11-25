@@ -396,8 +396,12 @@ hdiutil)
     d=disk$k
     case $b in *hfs*|*fat32*|*exfat*) nd=${d}s1; echo "/dev/$d          	GUID_partition_scheme" ;; *) nd=$d; echo "$d" >> "$STUB/fsdisks" ;; esac
     mp=$STUB/../vols/$b; mkdir -p "$mp"
-    # a linuxfs volume draws a refusal from root's fseventsd (pid 1 stands in), naming its mount point
-    test "$nd" != "$d" || echo "Nov 25 10:00:00 stubhost fseventsd[1]: could not open $mp/.fseventsd (Operation not permitted)" >> "$PARITY_SYSLOG"
+    # fseventsd makes .fseventsd on every volume, a linuxfs one too now that SHARE_OPT lets root's fseventsd in (Task 14);
+    #   with $STUB/fsevents-refused, as in pushes A and C, a linuxfs volume has none and draws a refusal from root's
+    #   fseventsd (pid 1 stands in), naming its mount point
+    if test "$nd" = "$d" && test -f "$STUB/fsevents-refused"; then
+      rm -rf "$mp/.fseventsd"; echo "Nov 25 10:00:00 stubhost fseventsd[1]: could not open $mp/.fseventsd (Operation not permitted)" >> "$PARITY_SYSLOG"
+    else mkdir -p "$mp/.fseventsd"; fi
     printf 'img=%s\nvol=%s\nmp=%s\nuuid=UUID-%s\ndisk=%s\n' "$img" "$b" "$mp" "$b" "$d" > "$N/$nd"
     log "created disk, id = /dev/$d."
     log "probed disk, id = /dev/$nd, with stub, success."
@@ -475,7 +479,8 @@ mkfile) : > "$2" ;;
 sysctl) echo "$1.version.number: stub" ;;
 mdutil)
   eval "echo \"\${$#}:\""
-  if test "$1" = -s; then echo "	Indexing enabled."
+  if test "$1" = -s && test -f "$STUB/mdutil-unknown"; then echo "	Error: unknown indexing state."
+  elif test "$1" = -s; then echo "	Indexing enabled."
   elif test "$1:$2" = -i:on && test -f "$STUB/mdutil-400"; then echo "Error: unable to perform operation.  (-400)"; echo "	Error: unknown indexing state."
   else echo "	Indexing disabled."; fi ;;
 mdfind) test ! -e "$2/$4" || echo "$2/$4" ;;
@@ -791,6 +796,11 @@ expect census_busy_eject_lsof grep -q '^#   COMMAND PID USER (stub lsof lsof .*/
 expect census_busy_bar_notok has "$r" "^not ok - parity busy.ext4.cycles (hfs 0 of 20, ext4 1 of 20)$"
 expect census_busy_bar_why has "$r" "^parity: ext4 was busy more often than HFS+$"
 expect census_busy_quiet test "$(printf '%s\n' "$r" | grep -c 'not ok')" -eq 1
+# item 4's (a) with fsevents on (Task 15): each side's cycles say whether fseventsd had made .fseventsd, checked under
+#   PARITY_MODE_SPOTLIGHT
+expect census_busy_fsevents_said grep -q '^ext4: fsevents: .fseventsd yes$' "$P/busy.ext4.cycles.txt"
+expect census_busy_fsevents_said_hfs grep -q '^hfs: fsevents: .fseventsd yes$' "$P/busy.ext4.cycles.txt"
+expect census_busy_fsevents_ok has "$r" "^ok - parity spotlight.ext4.busy-fsevents (item 4 (a) with fsevents on: .fseventsd on hfs yes, ext4 yes)$"
 # (a)'s eject cycles, each side PARITY_BUSY_EJECTS (3) times with another HFS+ copy coming and going: recorded
 expect census_busy_ejects_recorded has "$r" "^# recorded busy.ext4.ejects: hfs 0 of 3, ext4 0 of 3$"
 # the other volume is the HFSX control (another UUID and name), not a second copy of the HFS+ one
@@ -803,6 +813,16 @@ for s in shell-unmount textedit-unmount textedit-eject finder-eject; do expect "
 expect census_busy_sysctl test -s "$P/busy-ext4.sysctl.txt"
 # every mount is said, census_busy_cycles' remounts too (20 of them, and the attach)
 expect census_names_busy_remounts test "$(grep -c '/vols/busy-ext4: exact' "$P/names-mode.txt")" -ge 21
+# census_busy_fsevents WHAT FS LOG, on its own: not ok when a side said no, or said nothing; recorded under record
+printf '%s\n' 'hfs: fsevents: .fseventsd yes' 'xfs: fsevents: .fseventsd no' > "$T/bf.log"
+r=$(census_busy_fsevents spotlight.xfs.busy-fsevents xfs "$T/bf.log" 2>&1)
+expect census_busy_fsevents_notok has "$r" "^not ok - parity spotlight.xfs.busy-fsevents (item 4 (a) with fsevents on: .fseventsd on hfs yes, xfs no)$"
+expect census_busy_fsevents_why has "$r" "^parity: spotlight.xfs.busy-fsevents: fseventsd did not make .fseventsd on both volumes, so (a) did not run with fsevents on$"
+r=$(: > "$T/bf.log"; census_busy_fsevents spotlight.xfs.busy-fsevents xfs "$T/bf.log" 2>&1)
+expect census_busy_fsevents_unknown has "$r" "^not ok - parity spotlight.xfs.busy-fsevents (item 4 (a) with fsevents on: .fseventsd on hfs unknown, xfs unknown)$"
+r=$(PARITY_MODE_SPOTLIGHT=record; census_busy_fsevents spotlight.xfs.busy-fsevents xfs "$T/bf.log" 2>&1)
+expect census_busy_fsevents_record test "$r" = "# recorded spotlight.xfs.busy-fsevents: item 4 (a) with fsevents on: .fseventsd on hfs unknown, xfs unknown"
+rm -f "$T/bf.log"
 # item 2 (Task 13b): census_finder_ask dismisses what its step left up (busy-eject's dialog) before the next side's shot
 expect census_busy_dialogs grep -q '^busy-eject: OK: ' "$P/dialogs.txt"
 # item 3 (Task 13b, fix round 1): a busy-eject shot is not awaited: on 10.9 Finder's eject alerts are invisible to System
@@ -907,10 +927,45 @@ expect census_busy_bar_badmode has "$r" "^not ok - parity busy.x.cycles$"
 drop_stuck calm; drop_stuck busy-hfs
 rm -f "$W/img/calm.img"
 
-# census_spotlight: read-write, then read-only (HFS+ attach -readonly against ext4 with ReadOnly on)
-: > "$S/calls"; : > "$S/mdutil-400"
+# census_spotlight: read-write, then read-only (HFS+ attach -readonly against ext4 with ReadOnly on). Item 5 is checked
+#   (Task 15: PARITY_MODE_SPOTLIGHT defaults to check). The world push D hopes for first: indexing on for the HFS+
+#   control (the stub's mdutil -s says enabled) and fseventsd let into the linuxfs volume, so every step but the file's
+#   making and the refusals (each pass's own record; census_refusals_bar is their check) is checked, and ok
+r=$(unset PARITY_MODE_SPOTLIGHT; . "$here/lib/parity.sh"; echo "$PARITY_MODE_SPOTLIGHT")
+expect census_spotlight_mode test "$r" = check
+: > "$S/calls"
 r=$(census_spotlight ext4 2>&1)
-rm -f "$S/mdutil-400"
+for p in rw ro; do
+  for s in mdutil mdfind store fseventsd privacy-off privacy-remount; do
+    expect "census_spotlight_on_${p}_$s" has "$r" "^ok - parity spotlight.ext4.$p.$s\$"
+  done
+  expect "census_spotlight_on_${p}_said" has "$r" "^# spotlight.ext4.$p: the indexing steps are checked: indexing is on for the HFS+ control\$"
+  expect "census_spotlight_on_${p}_mode_file" grep -q '^check: indexing is on for the HFS+ control$' "$P/spotlight.ext4.$p.index-mode.txt"
+  expect "census_spotlight_on_${p}_refusals_recorded" has "$r" "^# recorded spotlight.ext4.$p.refusals\$"
+done
+expect census_spotlight_on_refresh has "$r" "^ok - parity spotlight.ext4.rw.refresh$"
+expect census_spotlight_on_create has "$r" "^# recorded spotlight.ext4.rw.create$"
+expect census_spotlight_on_fseventsd grep -q '^.fseventsd: yes$' "$P/spotlight.ext4.rw.fseventsd.ext4.txt"
+expect census_spotlight_on_store grep -q '^.Spotlight-V100: no$' "$P/spotlight.ext4.rw.store.ext4.txt"
+expect census_spotlight_on_quiet hasnt "$r" "not ok"
+expect census_spotlight_on_detached test -z "$(attached)"
+# push C's world: mdutil -i on fails -400 on the HFS+ control, mdutil -s says unknown, and root's fseventsd is refused on
+#   the linuxfs volume: the indexing steps are recorded, said why, and .fseventsd's parity is not ok in each pass
+#   (the first run's shots removed: census_shot takes HFS+'s once a run)
+rm -f "$OUT"/*-refresh.png "$OUT"/*-privacy.png "$OUT"/*-privacy-ro.png
+: > "$S/calls"; : > "$S/mdutil-400"; : > "$S/mdutil-unknown"; : > "$S/fsevents-refused"
+r=$(census_spotlight ext4 2>&1)
+rm -f "$S/mdutil-400" "$S/mdutil-unknown" "$S/fsevents-refused"
+for p in rw ro; do
+  for s in mdutil mdfind store privacy-off privacy-remount; do
+    expect "census_spotlight_off_${p}_$s" has "$r" "^# recorded spotlight.ext4.$p.$s\$"
+  done
+  expect "census_spotlight_off_${p}_said" has "$r" "^# spotlight.ext4.$p: the indexing steps are recorded: indexing could not be turned on for the HFS+ control (mdutil -s: <MP>: Error: unknown indexing state.)\$"
+  expect "census_spotlight_off_${p}_mode_file" grep -q '^record: indexing could not be turned on' "$P/spotlight.ext4.$p.index-mode.txt"
+  expect "census_spotlight_off_${p}_fseventsd" has "$r" "^not ok - parity spotlight.ext4.$p.fseventsd\$"
+done
+expect census_spotlight_off_refresh has "$r" "^# recorded spotlight.ext4.rw.refresh$"
+expect census_spotlight_off_only_fseventsd test "$(printf '%s\n' "$r" | grep -c 'not ok')" -eq 2
 # item 5 (Task 13b): mdutil -i on failing -400 on the HFS+ control (push C) is followed, there alone, by mdutil -E and -i on
 #   once more, all in index-on's record; and each pass keeps Spotlight's own state (the boot volume's, mds's job, its
 #   stores and the volumes' mount flags) in spotlight.ext4.PASS.diagnosis.txt
@@ -922,7 +977,7 @@ for p in rw ro; do
 done
 expect census_spotlight_erase_hfs_only not grep -q '^sudo -n mdutil -E .*/vols/spotlight-ext4-' "$S/calls"
 for p in rw ro; do
-  for s in mdutil mdfind dirs refusals privacy-off privacy-remount; do
+  for s in mdutil mdfind store fseventsd refusals privacy-off privacy-remount; do
     expect "census_spotlight_${p}_$s" test -s "$P/spotlight.ext4.$p.$s.hfs.txt" -a -s "$P/spotlight.ext4.$p.$s.ext4.txt"
   done
   for f in refusals-all processes lsof mdfind-seconds; do expect "census_spotlight_${p}_$f" test -e "$P/spotlight.ext4.$p.$f.txt"; done
@@ -934,7 +989,7 @@ t0=$(date +%s); rnf=$(PARITY_SPOT_SECS=1; bounded 100 census_mdfind "$T/nofind" 
 expect census_mdfind_not_found test "$rnf" = "not found within 1 s" -a "$(cat "$T/nofind.secs")" = "$T/nofind: not found within 1 s"
 expect census_mdfind_by_clock test $((t1 - t0)) -ge 1
 expect census_spotlight_refresh test -s "$P/spotlight.ext4.rw.refresh.hfs.txt" -a -s "$P/spotlight.ext4.rw.refresh.ext4.txt" -a ! -e "$P/spotlight.ext4.ro.refresh.ext4.txt"
-expect census_spotlight_dirs grep -q '^.fseventsd: no$' "$P/spotlight.ext4.rw.dirs.ext4.txt"
+expect census_spotlight_dirs grep -q '^.fseventsd: no$' "$P/spotlight.ext4.rw.fseventsd.ext4.txt"
 # pid 1's owner is the host's own: root on a Mac, the build user in the Linux container
 pid1=$(ps -o uid=,user= -p 1 2> /dev/null | sed 's/^ *//; s/  */ /g')
 expect census_spotlight_refusal_uid grep -qxF "#   pid 1: uid ${pid1:-unknown (it has exited)}" "$P/spotlight.ext4.rw.refusals-all.txt"
@@ -958,10 +1013,22 @@ for s in refresh privacy privacy-ro; do expect "census_spotlight_shot_$s" test "
 expect census_spotlight_pane grep -q 'com.apple.preference.spotlight' "$S/calls"
 expect census_spotlight_sysctl test -s "$P/spotlight-ext4.sysctl.txt"
 expect census_spotlight_recorded has "$r" "^# recorded spotlight.ext4.ro.mdfind"
-expect census_spotlight_quiet hasnt "$r" "not ok"
 expect census_spotlight_detached test -z "$(attached)"
 : > "$S/calls"; r=$(census_index_on "$T/a" 2>&1)
 expect census_index_on_plain not grep -q 'mdutil -E' "$S/calls"
+# census_index_mode MP: check only when PARITY_MODE_SPOTLIGHT is check and mdutil -s MP says indexing is enabled
+r=$(PARITY_MODE_SPOTLIGHT=record; census_index_mode "$T/a"; echo "$CS_INDEX_MODE: $CS_INDEX_WHY")
+expect census_index_mode_record test "$r" = "record: PARITY_MODE_SPOTLIGHT is record"
+r=$(PARITY_MODE_SPOTLIGHT=check; census_index_mode "$T/a"; echo "$CS_INDEX_MODE: $CS_INDEX_WHY")
+expect census_index_mode_check test "$r" = "check: indexing is on for the HFS+ control"
+# census_spot_parity index|record|check WHAT CMD...: a step's own mode leaves PARITY_MODE_SPOTLIGHT as it was
+r=$(reset; pair; touch "$T/b/extra"; PARITY_MODE_SPOTLIGHT=check CS_INDEX_MODE=record; census_spot_parity index spotlight.x.i ls @MP@ 2>&1; census_spot_parity record spotlight.x.r ls @MP@ 2>&1; census_spot_parity check spotlight.x.c ls @MP@ 2>&1; echo "after: $PARITY_MODE_SPOTLIGHT")
+expect census_spot_parity_index has "$r" "^# recorded spotlight.x.i$"
+expect census_spot_parity_record has "$r" "^# recorded spotlight.x.r$"
+expect census_spot_parity_check has "$r" "^not ok - parity spotlight.x.c$"
+expect census_spot_parity_restored has "$r" "^after: check$"
+r=$(reset; pair; PARITY_MODE_SPOTLIGHT=record CS_INDEX_MODE=check; census_spot_parity index spotlight.x.i ls @MP@ 2>&1)
+expect census_spot_parity_index_check test "$r" = "ok - parity spotlight.x.i"
 
 # census_finder: the screenshot pairs, Finder's properties against df -k, diskutil info's fields, a custom volume icon
 : > "$S/calls"
@@ -1195,6 +1262,35 @@ expect census_before_login_mdutil grep -q '^<MP>:$' "$P/spotlight.before-login.t
 expect census_before_login_fseventsd grep -q '^.fseventsd: yes$' "$P/spotlight.before-login.txt"
 expect census_before_login_recorded has "$r" "^# recorded spotlight.before-login"
 
+# census_refusals_bar LINE (Task 15): fseventsd's, mds's or mdworker's "Operation not permitted" naming a linuxfs census
+#   mount point (names-mode.txt's), in system.log after LINE: ok when there is none, not ok with the lines; another
+#   process's, or another volume's (one whose name only begins alike), not counted; no mount point proves nothing
+rb() { ( PARITY_SYSLOG=$T/rb.log; census_refusals_bar "$@" ) 2>&1; }
+printf '%s\n' 'disk5 /Volumes/my data: exact (stub)' 'disk6 /Volumes/my data: exact (stub)' 'disk7 /Volumes/flash: exact (stub)' > "$P/names-mode.txt"
+printf '%s\n' 'Nov 25 old fseventsd[42]: failed to make the directory /Volumes/flash/.fseventsd (1/Operation not permitted)' \
+  'Nov 25 fseventsd[42]: failed to make the directory /Volumes/my data 3/.fseventsd (1/Operation not permitted)' \
+  'Nov 25 Finder[9]: /Volumes/flash/x (Operation not permitted)' \
+  'Nov 25 fseventsd[42]: opened /Volumes/flash' > "$T/rb.log"
+r=$(rb 1)
+expect census_refusals_bar_ok test "$r" = "ok - spotlight: no refusals for linuxfs volumes (0 lines, 2 linuxfs mount points searched, system.log since the census began)"
+echo 'Nov 25 mdworker[77]: open /Volumes/my data/x: Operation not permitted' >> "$T/rb.log"
+echo 'Nov 25 fseventsd[42]: failed to make the directory /Volumes/flash/.fseventsd (1/Operation not permitted)' >> "$T/rb.log"
+r=$(rb 1)
+expect census_refusals_bar_notok has "$r" "^not ok - spotlight: no refusals for linuxfs volumes (2 lines, 2 linuxfs mount points searched, system.log since the census began)$"
+expect census_refusals_bar_lines has "$r" "^# Nov 25 mdworker\[77\]: open /Volumes/my data/x: Operation not permitted$"
+expect census_refusals_bar_file test "$(grep -c . "$P/refusals-linuxfs.txt")" -eq 2
+r=$(PARITY_MODE_SPOTLIGHT=record; rb 1)
+expect census_refusals_bar_record test "$r" = "# recorded spotlight: no refusals for linuxfs volumes (2 lines, 2 linuxfs mount points searched, system.log since the census began)"
+# system.log turned over since LINE (now shorter than it): read whole
+printf '%s\n' 'disk7 /Volumes/flash: exact (stub)' > "$P/names-mode.txt"
+r=$(rb 999)
+expect census_refusals_bar_turned_over has "$r" "^not ok - spotlight: no refusals for linuxfs volumes (2 lines, 1 linuxfs mount points searched"
+: > "$P/names-mode.txt"; r=$(rb 1)
+expect census_refusals_bar_none test "$r" = "not ok - spotlight: no refusals for linuxfs volumes: no linuxfs census mount to search for, so this proves nothing"
+r=$(PARITY_MODE_SPOTLIGHT=chek; rb 1)
+expect census_refusals_bar_badmode has "$r" "^not ok - spotlight: no refusals for linuxfs volumes$"
+rm -f "$T/rb.log"
+
 # parity_census_all: the controls, then each census in order (NTFS with NTFSTakeover on), PARITY_STALL_N 50, a census
 #   disk left attached recorded; past PARITY_CENSUS_MIN, the rest is skipped and said
 rm -rf "$W/ctl"; echo left > "$W/census/left-stuck.img"; echo old > "$W/census/old.img"
@@ -1218,6 +1314,8 @@ want=$(printf '%s\n' "stall 0 50" "unicode ext4 off" "unicode btrfs off" "unicod
   "trash_tags_case ext4 off" "trash_tags_case btrfs off" "trash_tags_case xfs off" "trash_tags_case ntfs on" "trash_tags_case apfs off" "later 0")
 expect census_all_order test "$(cat "$ran")" = "$want"
 expect census_all_names_bar has "$r" "^# recorded census names: "
+# no linuxfs census mount ran (the steps are stand-ins), so the refusals bar proves nothing
+expect census_all_refusals_bar has "$r" "^not ok - spotlight: no refusals for linuxfs volumes: no linuxfs census mount to search for"
 expect census_all_missing has "$r" "^# census: no .*/img/f2fs.img, so no census_finder f2fs"
 expect census_all_controls test -f "$W/ctl/hfs.img" -a -f "$W/ctl/hfsx.img" -a -f "$W/ctl/fat32.img" -a -f "$W/ctl/exfat.img"
 expect census_all_takeover_off test ! -f "$S/takeover"
@@ -1227,7 +1325,10 @@ expect census_all_cleans test ! -e "$W/census/old.img" -a -e "$W/census/left-stu
 # a step begins only when, at its worst (the console hung: every AppleScript at its bound), it ends by
 #   PARITY_CENSUS_MIN + 11; a step whose worst is 11 or less keeps the plain cutoff
 expect census_worst_default test "$(census_worst_min zzz)" -eq 11
-expect census_worst_table test "$(for c in census_unicode census_busy census_spotlight census_finder census_trash_tags_case census_later census_stall stall; do census_worst_min "$c"; done | tr '\n' ' ')" = '17 31 31 30 21 9 63 63 '
+expect census_worst_table test "$(for c in census_unicode census_busy census_spotlight census_finder census_trash_tags_case census_later census_stall stall; do census_worst_min "$c"; done | tr '\n' ' ')" = '17 31 32 30 21 9 63 63 '
+# Task 15: the census begins nothing past 132 min (it was 135), for the refusals bar and the non-admin mount after it
+r=$(unset PARITY_CENSUS_MIN; . "$here/lib/parity.sh"; echo "$PARITY_CENSUS_MIN")
+expect census_min_default test "$r" -eq 132
 r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=20; census_due census_finder ext4 2>&1); rc=$?
 expect census_due_worst_skips test "$rc" -ne 0
 expect census_due_worst_said has "$r" "^# census: census_finder may take 30 min, past the census's end (31 min), skipped: census_finder ext4$"
@@ -1329,9 +1430,68 @@ expect workflow_parity_upload grep -q '^ *images-after/parity/\*\*$' "$wf"
 expect workflow_guest_timeout awk '/^  guest:/ { g = 1 } /^  fsck:/ { g = 0 } g && /^    timeout-minutes: 180$/ { f = 1 } END { exit !f }' "$wf"
 # push C's census runs item 3's loop, 50 iterations, before the census
 expect smoke_stall_on ascending "$(first_line '^ *PARITY_STALL_N=50$')" "$(first_line '^ *parity_census_all$')"
-# item 2 in the smoke: the six names exactly, never the macfuse_ prefix as a family, and no bundle under its old linuxfs name left
+# item 5 (Task 15): a user outside macFUSE's admin_group, lfs_nonadmin, made with dscl after the census and removed
+#   before the before-login section (and by finish), mounts an ext4 image without the CLI's SHARE_OPT, which the smoke
+#   reads from the installed CLI and never writes itself
+na_l=$(first_line '^ *if check "non-admin: .* made with dscl')
+expect smoke_nonadmin_after_census ascending "$(first_line '^ *parity_census_all$')" "$na_l" "$bl"
+expect smoke_nonadmin_removed ascending "$na_l" "$(first_line '^ *check "non-admin: .* removed" nonadmin_remove$')" "$bl"
 # smoke_fn NAME: the smoke's definition of the function NAME (one line, or up to its closing brace)
 smoke_fn() { awk -v n="$1() " 'index($0, n) == 1 { p = 1; print; if ($0 !~ /[{] *(#.*)?$/) exit; next } p { print } p && /^}/ { exit }' "$sm"; }
+expect smoke_finish_removes_nonadmin has "$(smoke_fn finish)" 'nonadmin_remove'
+expect smoke_share_opt_not_written not grep -q 'allow_root' "$sm"
+r=$(eval "$(smoke_fn share_opt_of)"; share_opt_of "$here/../cli/linuxfs")
+expect smoke_share_opt_of test -n "$r" -a "$r" = "$(sed -n 's/^SHARE_OPT=//p' "$here/../cli/linuxfs")"
+# no_share_opt UID MP SHARE: the lklfuse UID runs serving MP has an -o, and SHARE is not among its options
+nso() { (eval "$(smoke_fn lklfuse_opts_of)"; eval "$(smoke_fn no_share_opt)"; ps() { cat "$T/nso.ps"; }; no_share_opt "$@") > /dev/null 2>&1; }
+printf '%s\n' '  601 /p/lklfuse -f -o type=ext4,lock=/l,local,uid=601,gid=20,owner=root /h/ext4.img /h/mnt' '  501 /p/lklfuse -f -o type=ext4,allow_root /x.img /h/mnt' > "$T/nso.ps"
+expect smoke_no_share_opt nso 601 /h/mnt allow_root
+expect smoke_no_share_opt_empty not nso 601 /h/mnt ''
+printf '%s\n' '  601 /p/lklfuse -f -o type=ext4,allow_root,local /h/ext4.img /h/mnt' > "$T/nso.ps"
+expect smoke_share_opt_seen not nso 601 /h/mnt allow_root
+printf '%s\n' '  601 /p/lklfuse -f -o type=ext4,local /h/ext4.img /h/mnt2' > "$T/nso.ps"
+expect smoke_no_share_opt_none not nso 601 /h/mnt allow_root
+rm -f "$T/nso.ps"
+# nonadmin_unshared: macFUSE's allow_other is off, and lfs_nonadmin is outside its admin_group
+nau() { (eval "$(smoke_fn nonadmin_unshared)"; NA=lfs_nonadmin; sysctl() { case $2 in *admin_group) echo 80 ;; *allow_other) echo "$nau_ao" ;; esac; }; id() { echo "$nau_g"; }; nonadmin_unshared) > /dev/null 2>&1; }
+nau_ao=0 nau_g="20 12 61"; expect smoke_nonadmin_unshared nau
+nau_ao=0 nau_g="20 80"; expect smoke_nonadmin_admin not nau
+nau_ao=1 nau_g="20"; expect smoke_nonadmin_allow_other not nau
+nau_ao=0 nau_g=""; expect smoke_nonadmin_no_groups not nau
+# nonadmin_make IMAGE and nonadmin_remove, with dscl, sudo and mount stubbed (calls in $T/na.calls)
+nam() {
+  ( eval "$(smoke_fn nonadmin_make)"; eval "$(smoke_fn nonadmin_remove)"
+    NA=lfs_nonadmin NAH=$T/nah na_made=${nam_made:-}
+    dscl() { echo "dscl $*" >> "$T/na.calls"; case "$*" in *-read*) test -f "$T/na.exists" ;; *-list*) printf '%s\n' 'root 0' 'me 501' 'u 601' 'v 602' ;; esac; }
+    sudo() { echo "sudo $*" >> "$T/na.calls"; }
+    mount() { cat "$T/na.mount" 2> /dev/null; }
+    "$@"; echo "rc $? made ${na_made:-} uid ${na_uid:-}" )
+}
+: > "$T/na.calls"; r=$(nam nonadmin_make /img 2>&1)
+expect smoke_nonadmin_make has "$r" "^rc 0 made 1 uid 603$"
+expect smoke_nonadmin_make_staff grep -q 'PrimaryGroupID 20' "$T/na.calls"
+expect smoke_nonadmin_make_hidden grep -q 'IsHidden 1' "$T/na.calls"
+expect smoke_nonadmin_make_args grep -qF "_ lfs_nonadmin 603 $T/nah /img" "$T/na.calls"
+expect smoke_nonadmin_make_no_admin not grep -qw 'admin\|GroupMembership' "$T/na.calls"
+: > "$T/na.calls"; : > "$T/na.exists"; r=$(nam nonadmin_make /img 2>&1)
+expect smoke_nonadmin_exists has "$r" "^rc 1 made  uid"
+expect smoke_nonadmin_exists_untouched not grep -q '^sudo' "$T/na.calls"
+: > "$T/na.calls"; r=$(nam nonadmin_remove 2>&1)
+expect smoke_nonadmin_remove_unmade test "$(cat "$T/na.calls")" = ""
+rm -f "$T/na.exists"
+: > "$T/na.calls"; r=$(nam_made=1; nam nonadmin_remove 2>&1)
+expect smoke_nonadmin_remove has "$r" "^rc 0 made  uid"
+expect smoke_nonadmin_remove_dscl grep -q 'dscl . -delete' "$T/na.calls"
+expect smoke_nonadmin_remove_home grep -q 'rm -rf' "$T/na.calls"
+echo "/dev/x on $T/nah/mnt (macfuse_ext4, local, mounted by lfs_nonadmin)" > "$T/na.mount"
+: > "$T/na.calls"; r=$(nam_made=1; nam nonadmin_remove 2>&1)
+expect smoke_nonadmin_remove_mounted_keeps_home not grep -q 'rm -rf' "$T/na.calls"
+expect smoke_nonadmin_remove_mounted_dscl grep -q 'sudo -n dscl . -delete /Users/lfs_nonadmin' "$T/na.calls"
+expect smoke_nonadmin_remove_mounted_said has "$r" "still mounted"
+expect smoke_nonadmin_remove_no_unmount not grep -q 'unmount\|umount' "$T/na.calls"
+rm -f "$T/na.mount" "$T/na.calls"
+
+# item 2 in the smoke: the six names exactly, never the macfuse_ prefix as a family, and no bundle under its old linuxfs name left
 expect smoke_no_old_names test -z "$(grep -n 'linuxfs[_]' "$sm" "$here/lib/parity.sh" "$here/parity-test.sh")"
 expect smoke_fstab_by_hand grep -qF "'LABEL=my\\040data none macfuse_ext4 rw,noauto # linuxfs'" "$sm"
 expect smoke_apfs_mount_program test "$(grep -c 'pgrep -f mount_macfuse_apfs' "$sm")" -eq 3

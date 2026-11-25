@@ -13,7 +13,10 @@
 #       with no mount, mounts through --password-stdin and the keeper's --offer, then from the login keychain with no dialog;
 #       then the HFS+ parity census (tests/lib/parity.sh parity_census_all; PARITY_STALL_N=50: item 3's loop, 50 attaches per loop and volume), which records, and gates only the items it
 #       checks (item 1, Unicode names: on HFS+ and each linuxfs volume, created, listed and opened by both forms alike,
-#       and every linuxfs census mount's lklfuse finding names exactly; item 4's held unmounts and ejects);
+#       and every linuxfs census mount's lklfuse finding names exactly; item 4's held unmounts and ejects; item 5: .fseventsd
+#       on a linuxfs volume as on HFS+, no fseventsd, mds or mdworker refused on one, Spotlight's indexing steps when the
+#       guest will index the HFS+ control); then a user outside macFUSE's admin_group (lfs_nonadmin, made with dscl and
+#       removed) mounts an ext4 image without the CLI's SHARE_OPT;
 #       last, before login (the user's console session ended), an attached ext4 disk is mounted by root (as macfuse_ext4) with allow_other and
 #       served by lklfuse as _linuxfs (with a macFUSE that cannot serve /dev/fd/N the mount program refuses, and that is what is
 #       checked: nothing mounted, the reason in system.log); with that lklfuse killed, diskutil unmount still works. No lklfuse ever runs as root. exFAT keeps no symlinks, hard links, modes or xattrs, and ntfs3 keeps no
@@ -95,6 +98,7 @@ syslog_since() {  # LINES FIRST [LOG]
   cat "$sl"
 }
 finish() {
+  test -z "${na_made:-}" || nonadmin_remove > /dev/null 2>&1
   for m in "$W"/mnt/*; do mount | grep -qF " on $m (" && { umount -f "$m" || diskutil unmount force "$m"; } > /dev/null 2>&1; done
   [ -z "$disk" ] || hdiutil detach -force "$disk" > /dev/null 2>&1
   defaults delete dev.mavergreen.linuxfs > /dev/null 2>&1
@@ -174,6 +178,51 @@ type_of() { case $1 in exfat) echo macfuse ;; *) echo "macfuse_$1" ;; esac; }
 mount_type_is() {  # MOUNTPOINT TYPE: mount shows MOUNTPOINT as (TYPE, ...); prints mount's line for it
   l=$(mount | grep -F " on $1 ("); echo "$l"
   printf '%s\n' "$l" | grep -qF " on $1 ($2, "
+}
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-15-brief.md Step 1 -- item 5: cli/linuxfs passes its SHARE_OPT (root's
+#       fseventsd and mds let in) only to a user macFUSE lets share a mount (in its admin_group, or allow_other on); one
+#       outside both must still mount, without it. lfs_nonadmin is that user: made with dscl (hidden, staff alone, its
+#       home NAH under W), used after the census, and removed before the before-login section, or by finish.
+NA=lfs_nonadmin NAH=$W/nonadmin na_made= na_uid=
+share_opt_of() { sed -n 's/^SHARE_OPT=//p' "$1" | head -n 1; }   # CLI: the SHARE_OPT the installed CLI passes
+lklfuse_opts_of() {  # UID MOUNTPOINT: the -o of the lklfuse UID runs serving MOUNTPOINT (its command's last argument)
+  ps -axww -o uid=,command= 2> /dev/null | awk -v u="$1" -v m=" $2" '$1 == u && /lklfuse/ && !/awk/ && length($0) > length(m) && substr($0, length($0) - length(m) + 1) == m { for (i = 2; i < NF; i++) if ($i == "-o") { print $(i + 1); exit } }'
+}
+no_share_opt() {  # UID MOUNTPOINT SHARE: that lklfuse runs with an -o, and SHARE is not one of its options
+  o=$(lklfuse_opts_of "$1" "$2"); echo "lklfuse -o: ${o:-none found}; SHARE_OPT: ${3:-none}"
+  test -n "$o" && test -n "$3" || return 1
+  case ,$o, in *,"$3",*) return 1 ;; esac
+}
+nonadmin_unshared() {  # macFUSE's allow_other is off, and NA is outside its admin_group
+  ao=$(sysctl -n vfs.generic.macfuse.tunables.allow_other 2> /dev/null) ag=$(sysctl -n vfs.generic.macfuse.tunables.admin_group 2> /dev/null) gs=$(id -G "$NA" 2> /dev/null)
+  echo "allow_other ${ao:-unknown}, admin_group ${ag:-unknown}; $NA's groups: ${gs:-unknown}"
+  test "$ao" = 0 && test -n "$ag" && test -n "$gs" || return 1
+  for g in $gs; do test "$g" != "$ag" || return 1; done
+}
+nonadmin_make() {  # IMAGE: NA made (na_made set before dscl is asked, so finish removes even a half-made one), hidden and
+  #                  in staff alone, its home NAH holding a copy of IMAGE and mnt/; none made when NA exists already
+  if dscl . -read "/Users/$NA" > /dev/null 2>&1; then echo "$NA exists already: neither made nor removed here"; return 1; fi
+  na_uid=$(dscl . -list /Users UniqueID 2> /dev/null | awk '{ u[$2] = 1 } END { for (i = 601; i < 700; i++) if (!(i in u)) { print i; exit } }')
+  test -n "$na_uid" || { echo "no free UniqueID in 601-699"; return 1; }
+  na_made=1
+  bounded 600 sudo -n sh -c 'u=/Users/$1
+    dscl . -create "$u" && dscl . -create "$u" UniqueID "$2" && dscl . -create "$u" PrimaryGroupID 20 &&
+    dscl . -create "$u" UserShell /bin/sh && dscl . -create "$u" RealName "linuxfs smoke user" &&
+    dscl . -create "$u" NFSHomeDirectory "$3" && dscl . -create "$u" IsHidden 1 &&
+    mkdir -p "$3/mnt" && cp "$4" "$3/ext4.img" && chown -R "$1:staff" "$3"' _ "$NA" "$na_uid" "$NAH" "$1"
+}
+nonadmin_unmount() {  # as NA, linuxfs unmount of NAH/mnt (once: no retry, never forced), its lklfuse gone within 30 s
+  bounded 600 sudo -n -H -u "$NA" "$L" unmount "$NAH/mnt" || return 1
+  bounded 300 sh -c 'while ps -axww -o uid=,command= | awk -v u="$1" -v m=" $2" '"'"'$1 == u && /lklfuse/ && !/awk/ && substr($0, length($0) - length(m) + 1) == m { f = 1 } END { exit !f }'"'"'; do sleep 0.1; done' _ "$na_uid" "$NAH/mnt" || { echo "an lklfuse still serves $NAH/mnt"; return 1; }
+  ! mount | grep -qF " on $NAH/mnt ("
+}
+nonadmin_remove() {  # NA and NAH removed, if this smoke made NA; NAH kept while its volume is mounted (never unmounted here)
+  test -n "${na_made:-}" || return 0
+  if mount | grep -qF " on $NAH/mnt ("; then
+    echo "# non-admin: $NAH/mnt is still mounted, so $NAH is kept"; bounded 300 sudo -n dscl . -delete "/Users/$NA"
+  else bounded 300 sudo -n sh -c 'dscl . -delete "/Users/$1"; rm -rf "$2"' _ "$NA" "$NAH"; fi
+  na_made=
+  ! dscl . -read "/Users/$NA" > /dev/null 2>&1
 }
 for fs in $imgfs; do
   img=$W/img/$fs.img m=$W/mnt/$fs
@@ -573,6 +622,24 @@ if [ -f "$tests_dir/lib/parity.sh" ]; then
   parity_census_all
   check "no lklfuse runs as root, after the census" no_root_lklfuse
 else notok "no $tests_dir/lib/parity.sh: the census cannot run"; fi
+
+# spec: tests/smoke-mavericks.sh nonadmin_make -- item 5: a user outside macFUSE's admin_group mounts without SHARE_OPT. Its
+#       bounds: made 60 s, the mount 60, ps 10, the unmount 60 and its lklfuse 30, removed 30: 250 s, 5 min at most
+#       (tests/lib/parity.sh PARITY_CENSUS_MIN counts it)
+if sudo -n true 2> /dev/null; then
+  share=$(share_opt_of "$L")
+  check "non-admin: the installed CLI names its SHARE_OPT (${share:-none})" test -n "$share"
+  nalog=$(wc -l < /var/log/system.log 2> /dev/null | tr -d ' ')
+  if check "non-admin: $NA made with dscl, hidden, in staff alone" nonadmin_make "$W/img/ext4.img"; then
+    check "non-admin: macFUSE's allow_other is off and $NA is outside its admin_group" nonadmin_unshared
+    if check "non-admin: as $NA, linuxfs mount of an ext4 image mounts" bounded 600 sudo -n -H -u "$NA" "$L" mount "$NAH/ext4.img" "$NAH/mnt"; then
+      check "non-admin: its lklfuse runs as $NA, its -o without ${share:-SHARE_OPT}" no_share_opt "$na_uid" "$NAH/mnt" "$share"
+      echo "# non-admin: system.log's Operation not permitted lines naming $NAH/mnt since: $(tail -n +"$((${nalog:-0} + 1))" /var/log/system.log 2> /dev/null | grep 'Operation not permitted' | grep -cF "$NAH/mnt")"
+      check "non-admin: as $NA, linuxfs unmount, and its lklfuse exits" nonadmin_unmount
+    fi
+  fi
+  check "non-admin: $NA removed" nonadmin_remove
+else notok "non-admin: no sudo, so $NA cannot be made"; fi
 
 # spec: tests/smoke-mavericks.sh header -- ---- before login: nobody at the console, ssh the only way in. Last, because the console session does not come back by itself ----
 # platform: mavericks-vm README -- on 10.9 loginwindow logs in by itself only at boot, so the user does not return in this job;

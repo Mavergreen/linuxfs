@@ -38,12 +38,13 @@
 #                                         (diskutil unmount force on both, checked; Force Eject on HFS+ alone
 #                                         unless PARITY_BUSY_FORCE=1, recorded either way); a linuxfs disk that will not eject is recorded
 #                                         (eject-failed.txt) and left, the steps going on with a fresh copy
-#   census_spotlight FS                   item 5: read-write HFS+ against FS, then attach -readonly HFS+ against FS
-#                                         with ReadOnly on: mdutil -i on (HFS+ alone), mdutil -s, an mdfind find
-#                                         (120 s), .Spotlight-V100 and
-#                                         .fseventsd, system.log's refusals (each one's uid), who runs mds, mdworker
-#                                         and fseventsd, Finder's refresh (read-write only), mdutil -i off kept across
-#                                         a remount
+#   census_spotlight FS                   item 5 (checked: .fseventsd; the indexing steps only when indexing is on
+#                                         for the HFS+ control, census_index_mode): read-write HFS+ against FS, then
+#                                         attach -readonly HFS+ against FS with ReadOnly on: mdutil -i on (HFS+ alone),
+#                                         mdutil -s, an mdfind find (120 s), .Spotlight-V100 and .fseventsd,
+#                                         system.log's refusals (each one's uid), who runs mds, mdworker and
+#                                         fseventsd, Finder's refresh (read-write only), mdutil -i off kept across a
+#                                         remount
 #   census_finder FS                      item 6: screenshots (sidebar, getinfo, desktop-on, desktop-off, icon),
 #                                         and item 2's FS-only getinfo-format (Finder restarted just before),
 #                                         Finder's disk properties against df -k, diskutil info's fields (by mount
@@ -57,12 +58,13 @@
 #   parity_census_all                     the controls, then all of it (PARITY_STALL_N 50), within PARITY_CENSUS_MIN;
 #                                         after each step, the disks it left are freed (census_sweep, census-sweep.txt)
 #                                         and Finder's dialogs dismissed (census_finder_dialogs, dialogs.txt); every
-#                                         linuxfs mount's names mode (names-mode.txt) barred by census_names_bar
+#                                         linuxfs mount's names mode (names-mode.txt) barred by census_names_bar; and
+#                                         census_refusals_bar: no fseventsd, mds or mdworker refused on any of those
 #   Each records sysctl vfs.generic.macfuse once, as $OUT/parity/<census>.sysctl.txt. Every console step goes through
 #   $AQUA (guest-macosx-aqua by its path), and every screenshot follows census_dismiss (a dialog's or an offer's, from
 #   before the dialog or the attach). WHAT
 #   prefixes (the items whose PARITY_MODE_ a later task sets): unicode, busy, spotlight, finder, trash, tags, case,
-#   later. unicode is checked; unicode-ctl (Apple's own FAT32 against HFS+) and unicode-pair (both forms of one name,
+#   later. unicode, busy and spotlight are checked; unicode-ctl (Apple's own FAT32 against HFS+) and unicode-pair (both forms of one name,
 #   which HFS+ cannot hold) stay records. What cannot be equal on two volumes (pids, times, sizes, volume names) is a plain record,
 #   $OUT/parity/<what>.txt, never a parity step.
 
@@ -77,6 +79,13 @@ PARITY_MODE_UNICODE=${PARITY_MODE_UNICODE:-check}
 #   Those are (a)'s eject cycles, and (b)'s unmounts, TextEdit's eject (after the HFS+ side's unheld eject) and Finder's.
 PARITY_MODE_BUSY=${PARITY_MODE_BUSY:-check}
 PARITY_MODE_BUSY_DA=${PARITY_MODE_BUSY_DA:-record}
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-15-brief.md Step 1, and the Task 15 ruling (progress.md) -- item 5 is
+#   checked where the CI guest can show it: .fseventsd made on a linuxfs volume as on HFS+ (each census_spotlight pass),
+#   no fseventsd, mds or mdworker refused on any linuxfs census mount (census_refusals_bar), and item 4's (a) run with
+#   fsevents on (census_busy_fsevents). The indexing steps (mdutil -s, the mdfind find, .Spotlight-V100, mdutil -i off
+#   across a remount, the read-only pass, Finder's item count) are checked only in a pass where indexing is on for the
+#   HFS+ control (census_index_mode); else recorded, said why: mdutil -i on gave -400 there in pushes A and C.
+PARITY_MODE_SPOTLIGHT=${PARITY_MODE_SPOTLIGHT:-check}
 
 # The console session's helper: not on the ssh PATH, so always by its path (the smoke sets AQUA to the same)
 AQUA=${AQUA:-/usr/local/bin/guest-macosx-aqua}
@@ -860,6 +869,9 @@ census_busy_cycles() {
     if ! bc_m=$(bounded 900 census_wait_mounted "$bc_dev"); then echo "cycle $bc_k: not mounted again; stopping" >>"$3"; break; fi
     bc_mp=$(printf '%s\n' "$bc_m" | sed -n 2p); census_names_mode "$bc_dev" "$bc_mp"
   done
+  # Task 15: whether fseventsd had made .fseventsd, so whether the cycles ran with fsevents on (census_busy_fsevents)
+  if bounded 100 test -e "$bc_mp/.fseventsd"; then bc_fe=yes; else bc_fe=no; fi
+  echo "$bc_name: fsevents: .fseventsd $bc_fe" >>"$3"
   census_detach "$bc_disk" "$bc_side" "$bc_mp" >>"$3"
   echo "$bc_name: busy $bc_busy of 20" >>"$3"
   echo "$bc_busy $bc_k"
@@ -929,6 +941,24 @@ census_busy_bar() {
       else echo "parity: $3 was busy more often than HFS+"; fi
     fi ;;
   *) notok "parity $1"; echo "parity: its mode is '$2', not record or check" ;;
+  esac
+}
+
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-15-brief.md Step 1 -- item 4's (a) re-measured with fsevents on.
+# census_busy_fsevents WHAT FS LOG: from census_busy_cycles' "NAME: fsevents: .fseventsd yes|no" lines in LOG, whether
+#   both sides' cycles ran with fsevents on. PARITY_MODE_SPOTLIGHT check: ok when both said yes, else not ok and why;
+#   record: recorded; anything else not ok
+census_busy_fsevents() {
+  _cbf_h=$(sed -n 's/^hfs: fsevents: .fseventsd //p' "$3" 2>/dev/null | tail -n 1)
+  _cbf_f=$(sed -n "s/^$2: fsevents: .fseventsd //p" "$3" 2>/dev/null | tail -n 1)
+  _cbf_s="item 4 (a) with fsevents on: .fseventsd on hfs ${_cbf_h:-unknown}, $2 ${_cbf_f:-unknown}"
+  case ${PARITY_MODE_SPOTLIGHT:-record} in
+  record) echo "# recorded $1: $_cbf_s" ;;
+  check)
+    if test "$_cbf_h" = yes && test "$_cbf_f" = yes; then ok "parity $1 ($_cbf_s)"; return 0; fi
+    notok "parity $1 ($_cbf_s)"
+    echo "parity: $1: fseventsd did not make .fseventsd on both volumes, so (a) did not run with fsevents on"; return 1 ;;
+  *) notok "parity $1"; echo "parity: PARITY_MODE_SPOTLIGHT is '$PARITY_MODE_SPOTLIGHT', not record or check"; return 1 ;;
   esac
 }
 
@@ -1075,6 +1105,7 @@ census_busy() {
   cb_bh=$(census_busy_cycles hfs "$cb_h" "$cb_log" | tail -n 1)
   cb_bf=$(census_busy_cycles "$cb_fs" "$cb_i" "$cb_log" | tail -n 1)
   census_busy_bar "busy.$cb_fs.cycles" "$PARITY_MODE_BUSY" "$cb_fs" "$cb_bh" "$cb_bf" 20
+  census_busy_fsevents "spotlight.$cb_fs.busy-fsevents" "$cb_fs" "$cb_log"
   cb_eh=$(census_busy_ejects hfs "$cb_h" "$cb_o" "$cb_log" | tail -n 1)
   cb_ef=$(census_busy_ejects "$cb_fs" "$cb_i" "$cb_o" "$cb_log" | tail -n 1)
   census_busy_bar "busy.$cb_fs.ejects" "$PARITY_MODE_BUSY_DA" "$cb_fs" "$cb_eh" "$cb_ef" "${PARITY_BUSY_EJECTS:-3}"
@@ -1115,11 +1146,13 @@ PARITY_SYSLOG=${PARITY_SYSLOG:-/var/log/system.log}
 PARITY_SPOT_SECS=${PARITY_SPOT_SECS:-120}   # census_mdfind: once a second; the tests wait less
 PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/AlertStopIcon.icns}
 # The guest job has 180 min. Before the smoke: the VM's boot and the installs, about 5. The census begins nothing after
-#   PARITY_CENSUS_MIN = 135 min from the smoke's start (PARITY_T0, which the smoke sets first), and begins a step only if
-#   at its worst (census_worst_min: the console hung; since Task 13b spotlight and busy 31, census_finder 30, the sweep
-#   and dismissal after each counted in) it ends by 135 + 11 = 146: spotlight and busy begin by 115, census_finder by
-#   116, trash/tags/case by 125, unicode by 129, a stall iteration by 83. Then before login
-#   (about 5) and the copyback and uploads (about 5) remain: 5 + 146 + 5 + 5 = 161, leaving 19 to spare. Typical
+#   PARITY_CENSUS_MIN = 132 min from the smoke's start (PARITY_T0, which the smoke sets first), and begins a step only if
+#   at its worst (census_worst_min: the console hung; since Task 15 spotlight 32, busy 31, census_finder 30, the sweep
+#   and dismissal after each counted in) it ends by 132 + 11 = 143: spotlight begins by 111, busy by 112, census_finder
+#   by 113, trash/tags/case by 122, unicode by 126, a stall iteration by 80. Task 15 adds after the census
+#   census_refusals_bar (its system.log read bounded at 60 s: 1 min) and the smoke's non-admin mount (250 s at its
+#   bounds: 5 min), so PARITY_CENSUS_MIN went from 135 to 132. Then before login (about 5) and the copyback and uploads
+#   (about 5) remain: 5 + 143 + 1 + 5 + 5 + 5 = 164 of 180, under the 165 allowed. Typical
 #   steps are shorter: spotlight about 11 (its 120 s mdfind waits, remounts, Finder's refresh, the Privacy shots); a
 #   busy census about 7, or about 11 with a stuck disk at each of its six re-attaches; one trash/tags/case census about
 #   3; one stall iteration under 1. Push A's census, its Finder steps not
@@ -1127,10 +1160,10 @@ PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Content
 #   well inside 135. Push C's smoke sets PARITY_STALL_N=50 (push B's set 0): the stall's 30 min come first,
 #   about 90 in all, plus item 2's Finder restart and getinfo-format shot in each census_finder (about 15 s typical, 2.5 of
 #   census_finder's 24 at worst). A stall iteration's worst is 60 min (census_worst_min), and census_stall asks census_due
-#   "stall ..." before each of its 200 iterations, so none begins after minute 83 (63 since Task 13b, the sweep after
-#   it counted) and every one ends by 146 like every other step: 5 + 146 + 5 + 5 = 161 of 180, under the 165 allowed. A
-#   step's larger worst case (Task 13b's 31) moves only when it may begin, never that end.
-PARITY_CENSUS_MIN=${PARITY_CENSUS_MIN:-135}
+#   "stall ..." before each of its 200 iterations, so none begins after minute 80 (63 since Task 13b, the sweep after
+#   it counted) and every one ends by 143 like every other step (164 of 180 in all, as above). A step's larger worst
+#   case (Task 13b's 31, Task 15's 32) moves only when it may begin, never that end.
+PARITY_CENSUS_MIN=${PARITY_CENSUS_MIN:-132}
 
 # census_pair_up CTL-IMAGE FS-IMAGE FS [readonly]: attaches both (the control -readonly when readonly) and makes them
 #   the pair (PARITY_CTL_DEV and PARITY_FS_DEV the mounted nodes); 1 when either fails, with what did attach ejected
@@ -1169,7 +1202,11 @@ census_osa() {
 }
 census_finder_restart() { bounded 300 "$AQUA" killall Finder >/dev/null 2>&1 </dev/null; census_pause 6; }
 census_log_lines() { wc -l <"$PARITY_SYSLOG" 2>/dev/null | tr -d ' '; }
-census_log_since() { tail -n +"$((${1:-0} + 1))" "$PARITY_SYSLOG" 2>/dev/null; }
+# census_log_since LINE: system.log after line LINE; all of it when it is shorter than LINE now (turned over since)
+census_log_since() {
+  if test "$(census_log_lines)" -lt "${1:-0}" 2>/dev/null; then cat "$PARITY_SYSLOG" 2>/dev/null
+  else tail -n +"$((${1:-0} + 1))" "$PARITY_SYSLOG" 2>/dev/null; fi
+}
 census_refusal_re='Operation not permitted|Permission denied|EPERM|EACCES'
 
 # ---- item 5: Spotlight and fsevents ----
@@ -1205,6 +1242,51 @@ census_refusal_uids() {
 census_md_users() {
   ps -axww -o user=,uid=,pid=,command= 2>/dev/null |
     awk '{ c = $4; sub(/.*\//, "", c) } c == "mds" || c == "mds_stores" || c == "mdworker" || c == "mdflagwriter" || c == "fseventsd"'
+}
+# census_eperm_lines LINE: system.log's lines after LINE in which fseventsd, mds, mds_stores, mdworker or mdflagwriter
+#   says Operation not permitted
+census_eperm_lines() {
+  census_log_since "$1" | grep -E '(fseventsd|mds|mds_stores|mdworker|mdflagwriter)\[[0-9]+\]' | grep 'Operation not permitted'
+  return 0
+}
+# census_naming MP: filter: the lines naming MP or a path in it (MP followed by /, ), :, a quote, a comma or the line's
+#   end; so /Volumes/my data never matches /Volumes/my data 3)
+census_naming() {
+  awk -v m="$1" '{ s = $0; while ((i = index(s, m)) > 0) { c = substr(s, i + length(m), 1)
+      if (c == "" || c == "/" || c == ")" || c == ":" || c == "\047" || c == "\"" || c == ",") { print; next }
+      s = substr(s, i + 1) } }'
+}
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-15-brief.md Step 1 -- push C saw root's fseventsd refused 15 times, one a
+#   linuxfs mount, before cli/linuxfs passed SHARE_OPT (Task 14).
+# census_refusals_bar LINE: every linuxfs census mount point (names-mode.txt's) searched in system.log after LINE (the
+#   census's start) for census_eperm_lines naming it; those found go to refusals-linuxfs.txt. PARITY_MODE_SPOTLIGHT check:
+#   ok when there are none, not ok with them (and when no mount point was recorded: that proves nothing); record:
+#   recorded; anything else not ok
+census_refusals_bar() {
+  _crb_w="spotlight: no refusals for linuxfs volumes"
+  mkdir -p "$OUT/parity"; : >"$OUT/parity/refusals-linuxfs.txt"
+  _crb_e=$OUT/parity/.eperm.$$
+  bounded 600 census_eperm_lines "$1" >"$_crb_e" 2>/dev/null
+  _crb_n=0
+  while IFS= read -r _crb_mp; do
+    test -n "$_crb_mp" || continue
+    _crb_n=$((_crb_n + 1))
+    census_naming "$_crb_mp" <"$_crb_e" >>"$OUT/parity/refusals-linuxfs.txt"
+  done <<EOF
+$(sed 's/^[^ ]* //; s/: .*//' "$OUT/parity/names-mode.txt" 2>/dev/null | sort -u)
+EOF
+  rm -f "$_crb_e"
+  sort -u "$OUT/parity/refusals-linuxfs.txt" >"$OUT/parity/.refusals.$$" && mv "$OUT/parity/.refusals.$$" "$OUT/parity/refusals-linuxfs.txt"
+  _crb_k=$(grep -c . "$OUT/parity/refusals-linuxfs.txt")
+  _crb_s="$_crb_k lines, $_crb_n linuxfs mount points searched, system.log since the census began"
+  case ${PARITY_MODE_SPOTLIGHT:-record} in
+  record) echo "# recorded $_crb_w ($_crb_s)" ;;
+  check)
+    if test "$_crb_n" -eq 0; then notok "$_crb_w: no linuxfs census mount to search for, so this proves nothing"; return 1; fi
+    if test "$_crb_k" -eq 0; then ok "$_crb_w ($_crb_s)"; return 0; fi
+    notok "$_crb_w ($_crb_s)"; head -n 20 "$OUT/parity/refusals-linuxfs.txt" | sed 's/^/# /'; return 1 ;;
+  *) notok "$_crb_w"; echo "parity: PARITY_MODE_SPOTLIGHT is '$PARITY_MODE_SPOTLIGHT', not record or check"; return 1 ;;
+  esac
 }
 # census_refresh MP: a Finder window on MP/refresh (made empty), awaited (census_await), a file made there from the
 #   shell, 3 s, then Finder's count of its items and a screenshot (refresh)
@@ -1254,18 +1336,44 @@ census_spotlight_diag() {
   return 0
 }
 
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/progress.md "Ruling (Task 15)" -- census_index_mode MP: after census_index_on,
+#   whether the indexing steps are checked: CS_INDEX_MODE check when PARITY_MODE_SPOTLIGHT is check and mdutil -s MP (the
+#   HFS+ control) says indexing is enabled, else record; CS_INDEX_WHY says why
+census_index_mode() {
+  _cim=$(bounded 300 mdutil -s "$1" 2>&1 </dev/null | parity_norm "$1" "" | tr '\n\t' '  ' | sed 's/  */ /g; s/^ //; s/ $//')
+  if test "${PARITY_MODE_SPOTLIGHT:-record}" != check; then CS_INDEX_MODE=record CS_INDEX_WHY="PARITY_MODE_SPOTLIGHT is ${PARITY_MODE_SPOTLIGHT:-record}"
+  elif printf '%s\n' "$_cim" | grep -q 'Indexing enabled'; then CS_INDEX_MODE=check CS_INDEX_WHY="indexing is on for the HFS+ control"
+  else CS_INDEX_MODE=record CS_INDEX_WHY="indexing could not be turned on for the HFS+ control (mdutil -s: $_cim)"; fi
+}
+CS_INDEX_MODE=record
+# census_spot_parity index|record|check WHAT CMD...: parity WHAT with PARITY_MODE_SPOTLIGHT as CS_INDEX_MODE (index: an
+#   indexing step), as record, or as it is (check), then as it was
+census_spot_parity() {
+  csp_m=$PARITY_MODE_SPOTLIGHT
+  case $1 in index) PARITY_MODE_SPOTLIGHT=$CS_INDEX_MODE ;; record) PARITY_MODE_SPOTLIGHT=record ;; esac
+  shift; parity "$@"; csp_rc=$?
+  PARITY_MODE_SPOTLIGHT=$csp_m
+  return "$csp_rc"
+}
+
 # census_spotlight_steps FS PASS NAME LINE: item 5's steps on the current pair, after sudo mdutil -i on for the HFS+
-#   control alone (index-on, census_index_on); NAME is the file mdfind looks for, LINE system.log's length at the attach;
-#   Spotlight's own state in spotlight.FS.PASS.diagnosis.txt
+#   control alone (index-on, census_index_on), and census_index_mode (said, and in spotlight.FS.PASS.index-mode.txt);
+#   NAME is the file mdfind looks for, LINE system.log's length at the attach; Spotlight's own state in
+#   spotlight.FS.PASS.diagnosis.txt. .fseventsd is checked; the refusals recorded (census_refusals_bar checks them)
 census_spotlight_steps() {
   _ss_t=spotlight.$1.$2
   # the guest leaves external volumes unindexed ("unknown indexing state"), so HFS+'s control is asked to be indexed
   census_hfs_only "$_ss_t.index-on" census_index_on @MP@
+  census_index_mode "$PARITY_CTL_MP"
+  echo "$CS_INDEX_MODE: $CS_INDEX_WHY" >"$OUT/parity/$_ss_t.index-mode.txt"
+  if test "$CS_INDEX_MODE" = check; then _ss_m=checked; else _ss_m=recorded; fi
+  echo "# $_ss_t: the indexing steps are $_ss_m: $CS_INDEX_WHY"
   census_spotlight_diag "$4" >"$OUT/parity/$_ss_t.diagnosis.txt" 2>&1
-  parity "$_ss_t.mdutil" mdutil -s @MP@
-  census_bound $((PARITY_SPOT_SECS * 10 + 400)) parity "$_ss_t.mdfind" census_mdfind @MP@ "$3" "$OUT/parity/$_ss_t.mdfind-seconds.txt"
-  parity "$_ss_t.dirs" census_dirs @MP@ .Spotlight-V100 .fseventsd
-  parity "$_ss_t.refusals" census_refusals "$4" @MP@
+  census_spot_parity index "$_ss_t.mdutil" mdutil -s @MP@
+  census_bound $((PARITY_SPOT_SECS * 10 + 400)) census_spot_parity index "$_ss_t.mdfind" census_mdfind @MP@ "$3" "$OUT/parity/$_ss_t.mdfind-seconds.txt"
+  census_spot_parity index "$_ss_t.store" census_dirs @MP@ .Spotlight-V100
+  census_spot_parity check "$_ss_t.fseventsd" census_dirs @MP@ .fseventsd
+  census_spot_parity record "$_ss_t.refusals" census_refusals "$4" @MP@
   census_log_since "$4" | grep -E "$census_refusal_re" | census_refusal_uids >"$OUT/parity/$_ss_t.refusals-all.txt"
   census_md_users >"$OUT/parity/$_ss_t.processes.txt"
   for _ss_m in "$PARITY_CTL_MP" "$PARITY_FS_MP"; do echo "== sudo lsof $_ss_m"; bounded 900 sudo -n lsof "$_ss_m" 2>&1 </dev/null; done >"$OUT/parity/$_ss_t.lsof.txt"
@@ -1273,7 +1381,8 @@ census_spotlight_steps() {
 
 # census_spotlight FS: item 5, twice on fresh copies: read-write HFS+ against FS; then attach -readonly HFS+ against FS
 #   with ReadOnly on (the file mdfind looks for is made first, read-write). Each pass records census_spotlight_steps,
-#   Finder's refresh (read-write only), then sudo mdutil -i off, a remount, mdutil -s and the Privacy pane.
+#   Finder's refresh (read-write only), then sudo mdutil -i off, a remount, mdutil -s and the Privacy pane; the indexing
+#   steps checked or recorded as census_index_mode found in the pass.
 census_spotlight() {
   sp_fs=$1
   census_sysctl "spotlight-$sp_fs"
@@ -1290,13 +1399,13 @@ census_spotlight() {
     fi
     sp_log=$(census_log_lines)
     if census_pair_up "$sp_h" "$sp_i" "$sp_fs" $sp_ro; then
-      test "$sp_pass" = ro || parity "spotlight.$sp_fs.rw.create" sh -c 'echo spot > "$1/$2"' _ @MP@ "$sp_name"
+      test "$sp_pass" = ro || census_spot_parity record "spotlight.$sp_fs.rw.create" sh -c 'echo spot > "$1/$2"' _ @MP@ "$sp_name"
       census_spotlight_steps "$sp_fs" "$sp_pass" "$sp_name" "${sp_log:-0}"
       # census_refresh's worst: four 30 s bounds (open, count, shot, close), the window's wait 17 and a 3 s pause
-      test "$sp_pass" = ro || census_bound 1500 parity "spotlight.$sp_fs.rw.refresh" census_refresh @MP@
-      parity "spotlight.$sp_fs.$sp_pass.privacy-off" sudo -n mdutil -i off @MP@
+      test "$sp_pass" = ro || census_bound 1500 census_spot_parity index "spotlight.$sp_fs.rw.refresh" census_refresh @MP@
+      census_spot_parity index "spotlight.$sp_fs.$sp_pass.privacy-off" sudo -n mdutil -i off @MP@
       if census_remount_pair "$sp_h" "$sp_i" $sp_ro; then
-        parity "spotlight.$sp_fs.$sp_pass.privacy-remount" mdutil -s @MP@
+        census_spot_parity index "spotlight.$sp_fs.$sp_pass.privacy-remount" mdutil -s @MP@
         if test "$sp_pass" = rw; then census_privacy_shot privacy; else census_privacy_shot privacy-ro; fi
         census_pair_down
       fi
@@ -1611,8 +1720,11 @@ census_later() {
 #   note, nothing. So:
 #   census_unicode 13 + (2 names waits 30 + 205) / 60 = 16.9, 17;
 #   census_busy 23 + (2 Finder ejects 2 x (68 + 31) = 198 + 205 + about 45 names-mode reads, 5) / 60 = 29.8, 31 (fix round 3:
-#   one minute over, since 29.8 leaves too thin a margin under 30);
-#   census_spotlight 24 + (2 refresh waits 28 + 2 panes 30 + 2 x 60 + 2 x 10 + 205) / 60 = 30.7, 31;
+#   one minute over, since 29.8 leaves too thin a margin under 30); Task 15's .fseventsd test after each side's cycles,
+#   bounded at 10 s: 29.8 + 20 / 60 = 30.1, still 31;
+#   census_spotlight 24 + (2 refresh waits 28 + 2 panes 30 + 2 x 60 + 2 x 10 + 205) / 60 = 30.7, 31; Task 15 adds
+#   census_index_mode's mdutil -s, 30 a pass (bounded 300), and nothing that waits on the console (.fseventsd's own step,
+#   a test -e): 30.7 + 60 / 60 = 31.7, 32;
 #   census_finder 24 + (7 views 105 + 205) / 60 = 29.2, 30;
 #   census_trash_tags_case 13 + (3 census_finder_ask 3 x (68 + 13) = 243 + 205) / 60 = 20.5, 21;
 #   census_later 5 + 205 / 60 = 8.4, 9;
@@ -1620,7 +1732,7 @@ census_later() {
 #   anything else 11
 census_worst_min() {
   case $1 in
-  census_spotlight) echo 31 ;;
+  census_spotlight) echo 32 ;;
   census_busy) echo 31 ;;
   census_finder) echo 30 ;;
   census_trash_tags_case) echo 21 ;;
@@ -1793,13 +1905,13 @@ census_left_attached() {
 
 # parity_census_all: the census, record-only: the four controls made, then item 3 (PARITY_STALL_N, 50 unless set; first,
 #   as the longest), items 1 and 7 on ext4, btrfs, xfs, f2fs and NTFS, item 4 on ext4 and xfs, item 5 on ext4, item 6 on
-#   those and APFS, item 7's case step on APFS too, then Later. Nothing is begun past PARITY_CENSUS_MIN (135) minutes
+#   those and APFS, item 7's case step on APFS too, then Later. Nothing is begun past PARITY_CENSUS_MIN (132) minutes
 #   from the smoke's start (PARITY_T0; the census's own start without it). Nothing runs when $W lacks room for the
 #   controls and PARITY_START_FLOOR_KB; a step without room for its own copies is skipped, and the next tried
 #   (census-room.txt says which).
 parity_census_all() {
   : "${PARITY_STALL_N:=50}"
-  CA_T0=${PARITY_T0:-$(date +%s)}
+  CA_T0=${PARITY_T0:-$(date +%s)} CA_LOG0=$(census_log_lines)
   # room for the four 128 MiB controls (each step checks its own copies: census_step_room)
   if ! census_room $((4 * 131072)) "$OUT/parity/census-room.txt" "$PARITY_START_FLOOR_KB"; then
     echo "# census: $CR_SAID: no census" | tee -a "$OUT/parity/census-room.txt"
@@ -1820,5 +1932,6 @@ parity_census_all() {
     ca_b=$(census_attached); census_later; census_after census_later "$ca_b"; census_clean
   fi
   census_names_bar
+  census_refusals_bar "${CA_LOG0:-0}"
   census_left_attached
 }
