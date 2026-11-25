@@ -613,6 +613,9 @@ rm -f "$W/img/nomnt.img"
 # census_on's skips (time, room, no image) of census_unicode are not ok; of a recording census, only said
 r=$(CA_T0=$(($(date +%s) - 120)); PARITY_CENSUS_MIN=1; census_on btrfs census_unicode btrfs 2>&1)
 expect census_on_unicode_time_notok has "$r" "^not ok - parity unicode.btrfs: not run (out of time (1 min))$"
+# skipped for its worst case (10 min gone, 13 at worst, the end at 11 + 11): that reason, not "out of time"
+r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=11; census_on btrfs census_unicode btrfs 2>&1)
+expect census_on_unicode_worst_notok has "$r" "^not ok - parity unicode.btrfs: not run (census_unicode may take 13 min, past the census's end (22 min))$"
 r=$(PARITY_START_FLOOR_KB=999999999999; census_on btrfs census_unicode btrfs 2>&1)
 expect census_on_unicode_room_notok has "$r" "^not ok - parity unicode.btrfs: not run (no room on "
 r=$(census_on nosuchfs census_unicode nosuchfs 2>&1)

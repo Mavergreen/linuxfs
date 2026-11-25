@@ -1255,15 +1255,18 @@ census_worst_min() {
 }
 # census_due WHAT...: true while within PARITY_CENSUS_MIN minutes of CA_T0 (the smoke's start; with no CA_T0, always),
 #   and while WHAT's first word, at its worst (census_worst_min), would end by PARITY_CENSUS_MIN + 11; else it says it
-#   skips WHAT. A census step is never cut short: the guest job's timeout would lose every record, the smoke's too.
+#   skips WHAT, and why, which it also leaves in CD_WHY. A census step is never cut short: the guest job's timeout would
+#   lose every record, the smoke's too.
 census_due() {
+  CD_WHY=
   test -n "${CA_T0:-}" || return 0
   _cdu_e=$(($(date +%s) - CA_T0)) _cdu_w=$(census_worst_min "$1") _cdu_end=$((PARITY_CENSUS_MIN + 11))
   if test "$_cdu_e" -ge $((PARITY_CENSUS_MIN * 60)); then
-    echo "# census: out of time ($PARITY_CENSUS_MIN min), skipped: $*"; return 1
-  fi
-  test $((_cdu_e + _cdu_w * 60)) -le $((_cdu_end * 60)) && return 0
-  echo "# census: $1 may take $_cdu_w min, past the census's end ($_cdu_end min), skipped: $*"; return 1
+    CD_WHY="out of time ($PARITY_CENSUS_MIN min)"
+  elif test $((_cdu_e + _cdu_w * 60)) -gt $((_cdu_end * 60)); then
+    CD_WHY="$1 may take $_cdu_w min, past the census's end ($_cdu_end min)"
+  else return 0; fi
+  echo "# census: $CD_WHY, skipped: $*"; return 1
 }
 # census_on FS CMD...: CMD, when there is time and FS's image ($W/img/FS.img); NTFS with NTFSTakeover on, so linuxfs
 #   mounts it rather than Apple's ntfs, and put back as it was after
@@ -1276,7 +1279,7 @@ census_step_room() {
   echo "# census: $CR_SAID, skipped: $*" | tee -a "$OUT/parity/census-room.txt"; return 1
 }
 census_on() {
-  census_due "$2" "$1" || { census_not_run "$2" "$1" "out of time ($PARITY_CENSUS_MIN min)"; return 1; }
+  census_due "$2" "$1" || { census_not_run "$2" "$1" "$CD_WHY"; return 1; }
   test -f "$W/img/$1.img" || { echo "# census: no $W/img/$1.img, so no $2 $1"; census_not_run "$2" "$1" "no $1.img"; return 1; }
   census_step_room "$W/img/$1.img" "$2" "$1" || { census_not_run "$2" "$1" "no room on $W"; return 1; }
   _con_fs=$1; shift
