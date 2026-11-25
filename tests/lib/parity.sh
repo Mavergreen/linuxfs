@@ -26,7 +26,23 @@
 #                                         each (unset or 0 runs nothing); counts, probe times and Fisher's p
 #   census_busy FS                        item 4: write-then-unmount cycles, and a held file's unmount and ejects
 #                                         (forced ones on HFS+ alone unless PARITY_BUSY_FORCE=1)
-#   Each records sysctl vfs.generic.macfuse once, as $OUT/parity/<census>.sysctl.txt.
+#   census_spotlight FS                   item 5: read-write HFS+ against FS, then attach -readonly HFS+ against FS
+#                                         with ReadOnly on: mdutil -s, an mdfind find (120 s), .Spotlight-V100 and
+#                                         .fseventsd, system.log's refusals (each one's uid), who runs mds, mdworker
+#                                         and fseventsd, Finder's refresh (read-write only), mdutil -i off kept across
+#                                         a remount
+#   census_finder FS                      item 6: screenshots (sidebar, getinfo, desktop-on, desktop-off, icon),
+#                                         Finder's disk properties against df -k, diskutil info's fields, a custom
+#                                         .VolumeIcon.icns
+#   census_trash_tags_case FS             item 7: Finder's delete, .Trashes/<uid> and empty trash; a tag and a label
+#                                         read back, after a remount too; a 128 KiB xattr; pathconf(_PC_CASE_SENSITIVE)
+#                                         against HFS+ and against HFSX (FS apfs, read-only: the pathconf alone)
+#   census_later                          Later: Time Machine and the exFAT control, against ext4
+#   census_before_login MP                item 5 before login: mdutil -s and .fseventsd only
+#   parity_census_all                     the controls, then all of it (PARITY_STALL_N 50), within PARITY_CENSUS_MIN
+#   Each records sysctl vfs.generic.macfuse once, as $OUT/parity/<census>.sysctl.txt. WHAT prefixes (the items whose
+#   PARITY_MODE_ a later task sets): unicode, busy, spotlight, finder, trash, tags, case, later. What cannot be equal on
+#   two volumes (pids, times, sizes, volume names) is a plain record, $OUT/parity/<what>.txt, never a parity step.
 
 parity_control() {
   _pc_kind=$1
@@ -179,11 +195,12 @@ census_wait_mounted() {
   return 1
 }
 
-# census_attach IMAGE [nomount]: attaches; sets CA_DISK (the whole disk) and CA_NODES (every node), and unless nomount
-#   waits for the mount: CA_DEV, CA_MP, CA_VOL. On failure says why and detaches what it attached.
+# census_attach IMAGE [nomount|readonly]: attaches (readonly: hdiutil attach -readonly); sets CA_DISK (the whole disk)
+#   and CA_NODES (every node), and unless nomount waits for the mount: CA_DEV, CA_MP, CA_VOL. On failure says why and
+#   detaches what it attached.
 census_attach() {
   CA_DISK= CA_NODES= CA_DEV= CA_MP= CA_VOL=
-  if test "${2:-}" = nomount; then _ca_o=-nomount; else _ca_o=; fi
+  case ${2:-} in nomount) _ca_o=-nomount ;; readonly) _ca_o=-readonly ;; *) _ca_o= ;; esac
   _ca_out=$(bounded 3000 hdiutil attach $_ca_o -imagekey diskimage-class=CRawDiskImage "$1" 2>&1 </dev/null); _ca_rc=$?
   CA_NODES=$(printf '%s\n' "$_ca_out" | awk '/^\/dev\/disk/ { print $1 }' | tr '\n' ' ')
   CA_DISK=${CA_NODES%% *}
@@ -236,8 +253,12 @@ census_copy() {
   echo "$W/census/$2.img"
 }
 
-# census_shot STEP SIDE: parity_shot for one side, bounded
-census_shot() { parity_side "$2"; bounded 300 parity_shot "$1" >/dev/null 2>&1; }
+# census_shot STEP SIDE: parity_shot for one side, bounded. HFS+'s side of a step is taken once: the control is the same
+#   for every filesystem, and a later census would overwrite it.
+census_shot() {
+  test "$2" != hfs || test ! -f "$OUT/hfs-$1.png" || return 0
+  parity_side "$2"; bounded 300 parity_shot "$1" >/dev/null 2>&1
+}
 
 # census_hfs_only WHAT CMD...: one step on the HFS+ side alone, recorded as parity would (WHAT.hfs.txt)
 census_hfs_only() {
@@ -577,19 +598,25 @@ census_busy_release() {
   bounded 300 guest-macosx-aqua osascript -e 'tell application "TextEdit" to if it is running then quit saving no' >/dev/null 2>&1 </dev/null
 }
 
-# census_finder_eject MP VOL: Finder's eject by AppleScript, its dialog photographed 4 s in; osascript is given 20 s more
-census_finder_eject() {
-  fe_o=$W/census/finder-eject.out
-  guest-macosx-aqua osascript -e "tell application \"Finder\" to eject disk \"$2\"" >"$fe_o" 2>&1 </dev/null &
+# census_finder_ask STEP MP SCRIPT: SCRIPT by osascript in the console session, in the background; MP's side is
+#   photographed 4 s in (STEP), and osascript is given 20 s more: one still waiting is held by a dialog, and is said
+#   and stopped. Run it under bounded (parity does).
+census_finder_ask() {
+  fe_o=$W/census/finder-ask.out
+  mkdir -p "$W/census"
+  guest-macosx-aqua osascript -e "$3" >"$fe_o" 2>&1 </dev/null &
   fe_p=$!
   sleep 4
-  if test "$1" = "$PARITY_CTL_MP"; then census_shot busy-eject hfs; else census_shot busy-eject fs; fi
+  if test "$2" = "$PARITY_CTL_MP"; then census_shot "$1" hfs; else census_shot "$1" fs; fi
   fe_k=0; while kill -0 "$fe_p" 2>/dev/null && test "$fe_k" -lt 20; do fe_k=$((fe_k + 1)); sleep 1; done
-  if kill -0 "$fe_p" 2>/dev/null; then kill "$fe_p" 2>/dev/null; echo "osascript still waiting 24 s after Finder's eject (its dialog)"; fi
+  if kill -0 "$fe_p" 2>/dev/null; then kill "$fe_p" 2>/dev/null; echo "osascript still waiting 24 s after Finder's $1 (its dialog)"; fi
   wait "$fe_p"; fe_rc=$?
   cat "$fe_o"; rm -f "$fe_o"
   return "$fe_rc"
 }
+
+# census_finder_eject MP VOL: Finder's eject by AppleScript, its dialog photographed (busy-eject)
+census_finder_eject() { census_finder_ask busy-eject "$1" "tell application \"Finder\" to eject disk \"$2\""; }
 
 # census_busy FS: item 4 on the HFS+ control against FS. (a) census_busy_cycles on each, into busy.FS.cycles.txt.
 #   (b) with a file held open (a shell, then TextEdit): diskutil unmount and eject, and Finder's eject (parity_shot
@@ -629,4 +656,410 @@ census_busy() {
   census_detach "$(census_image_disk "$cb_h")" apple
   census_detach "$(census_image_disk "$cb_i")" fs "$PARITY_FS_MP"
   da_debug_off "busy-$cb_fs"
+}
+
+# ---- the census's shared steps for items 5 to 7 and Later ----
+PARITY_SYSLOG=${PARITY_SYSLOG:-/var/log/system.log}
+PARITY_SPOT_SECS=${PARITY_SPOT_SECS:-120}   # census_mdfind: once a second; the tests wait less
+PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/AlertStopIcon.icns}
+PARITY_CENSUS_MIN=${PARITY_CENSUS_MIN:-130}
+
+# census_pair_up CTL-IMAGE FS-IMAGE FS [readonly]: attaches both (the control -readonly when readonly) and makes them
+#   the pair; 1 when either fails, with what did attach ejected
+census_pair_up() {
+  census_attach "$1" ${4:-} || return 1
+  _cp_hd=$CA_DISK _cp_hm=$CA_MP _cp_hv=$CA_VOL
+  census_attach "$2" || { census_detach "$_cp_hd" apple; return 1; }
+  parity_pair "$_cp_hd" "$_cp_hm" "$_cp_hv" "$3" "$CA_DISK" "$CA_MP" "$CA_VOL"
+}
+# census_pair_down: the pair ejected (the control as Apple's, the other as linuxfs's); 1 when the latter is left attached
+census_pair_down() {
+  census_detach "$PARITY_FS_DISK" fs "$PARITY_FS_MP"; _cpd_rc=$?
+  census_detach "$PARITY_CTL_DISK" apple
+  return "$_cpd_rc"
+}
+# census_remount_pair CTL-IMAGE FS-IMAGE [readonly]: the pair ejected and attached again
+census_remount_pair() {
+  census_pair_down || { echo "# census: $PARITY_FS_DISK is still attached, so no remount"; return 1; }
+  census_pair_up "$1" "$2" "$PARITY_FS" ${3:-}
+}
+# census_both CMD...: CMD once with each volume of the pair's mount point as its last argument, each output headed
+census_both() { for _cb_m in "$PARITY_CTL_MP" "$PARITY_FS_MP"; do echo "== $_cb_m"; "$@" "$_cb_m" 2>&1; done; }
+# census_bound TENTHS CMD...: CMD with PARITY_BOUND set to TENTHS, PARITY_BOUND then as it was
+census_bound() {
+  _cbd_old=${PARITY_BOUND-unset}; PARITY_BOUND=$1; shift
+  "$@"; _cbd_rc=$?
+  if test "$_cbd_old" = unset; then unset PARITY_BOUND; else PARITY_BOUND=$_cbd_old; fi
+  return "$_cbd_rc"
+}
+# census_osa LINE...: an AppleScript in the console session, bounded, its output dropped
+census_osa() {
+  _co_n=$#
+  while test "$_co_n" -gt 0; do set -- "$@" -e "$1"; shift; _co_n=$((_co_n - 1)); done
+  bounded 300 guest-macosx-aqua osascript "$@" >/dev/null 2>&1 </dev/null
+}
+census_finder_restart() { bounded 300 guest-macosx-aqua killall Finder >/dev/null 2>&1 </dev/null; census_pause 6; }
+census_log_lines() { wc -l <"$PARITY_SYSLOG" 2>/dev/null | tr -d ' '; }
+census_log_since() { tail -n +"$((${1:-0} + 1))" "$PARITY_SYSLOG" 2>/dev/null; }
+census_refusal_re='Operation not permitted|Permission denied|EPERM|EACCES'
+
+# ---- item 5: Spotlight and fsevents ----
+# census_mdfind MP NAME SECONDS-FILE: up to PARITY_SPOT_SECS s for mdfind -onlyin MP to find NAME; the seconds it took go
+#   to SECONDS-FILE (they differ between volumes)
+census_mdfind() {
+  _cm_k=0
+  while test "$_cm_k" -lt "$PARITY_SPOT_SECS"; do
+    _cm_f=$(mdfind -onlyin "$1" -name "$2" 2>&1 </dev/null)
+    if test -n "$_cm_f"; then echo "found: $_cm_f"; echo "$1: found after $_cm_k s" >>"$3"; return 0; fi
+    _cm_k=$((_cm_k + 1)); sleep 1
+  done
+  echo "not found within $PARITY_SPOT_SECS s"; echo "$1: not found within $PARITY_SPOT_SECS s" >>"$3"; return 1
+}
+# census_dirs MP NAME...: whether each MP/NAME exists
+census_dirs() { _cd_m=$1; shift; for _cd_n; do if test -e "$_cd_m/$_cd_n"; then echo "$_cd_n: yes"; else echo "$_cd_n: no"; fi; done; }
+# census_refusals LINE MP: system.log's refusals after line LINE that name MP
+census_refusals() { census_log_since "$1" | grep -E "$census_refusal_re" | grep -F -- "$2"; return 0; }
+# census_refusal_uids: filter: each line, then the uid and user of the process it names (name[pid]:), while it runs
+census_refusal_uids() {
+  while IFS= read -r _cr_l; do
+    printf '%s\n' "$_cr_l"
+    _cr_p=$(printf '%s\n' "$_cr_l" | sed -n 's/^[^[]*[A-Za-z0-9_.]\[\([0-9][0-9]*\)\]:.*/\1/p')
+    test -n "$_cr_p" || continue
+    _cr_u=$(ps -o uid=,user= -p "$_cr_p" 2>/dev/null | sed 's/^ *//; s/  */ /g')
+    echo "#   pid $_cr_p: uid ${_cr_u:-unknown (it has exited)}"
+  done
+}
+# census_md_users: the user, uid, pid and command of every mds, mds_stores, mdworker, mdflagwriter and fseventsd
+census_md_users() {
+  ps -axww -o user=,uid=,pid=,command= 2>/dev/null |
+    awk '{ c = $4; sub(/.*\//, "", c) } c == "mds" || c == "mds_stores" || c == "mdworker" || c == "mdflagwriter" || c == "fseventsd"'
+}
+# census_refresh MP: a Finder window on MP/refresh (made empty), a file made there from the shell, 3 s, then Finder's
+#   count of its items and a screenshot (refresh)
+census_refresh() {
+  rm -rf "$1/refresh"; mkdir "$1/refresh" || return 1
+  census_osa "tell application \"Finder\" to open (POSIX file \"$1/refresh\" as alias)"
+  sleep 3
+  echo new >"$1/refresh/new.txt" || return 1
+  sleep 3
+  guest-macosx-aqua osascript -e 'tell application "Finder" to count items of (target of front Finder window)' 2>&1 </dev/null; _crf_rc=$?
+  if test "$1" = "$PARITY_CTL_MP"; then census_shot refresh hfs; else census_shot refresh fs; fi
+  census_osa 'tell application "Finder" to close every window'
+  return "$_crf_rc"
+}
+# census_privacy_shot STEP: the Spotlight pane's Privacy tab, photographed for both sides (it lists every volume)
+census_privacy_shot() {
+  census_osa 'tell application "System Preferences"' 'activate' 'reveal anchor "privacy" of pane id "com.apple.preference.spotlight"' 'end tell'
+  census_pause 3
+  census_shot "$1" hfs; census_shot "$1" fs
+  census_osa 'tell application "System Preferences" to quit'
+}
+
+# census_spotlight_steps FS PASS NAME LINE: item 5's steps on the current pair; NAME is the file mdfind looks for, LINE
+#   system.log's length at the attach
+census_spotlight_steps() {
+  _ss_t=spotlight.$1.$2
+  parity "$_ss_t.mdutil" mdutil -s @MP@
+  census_bound $((PARITY_SPOT_SECS * 10 + 300)) parity "$_ss_t.mdfind" census_mdfind @MP@ "$3" "$OUT/parity/$_ss_t.mdfind-seconds.txt"
+  parity "$_ss_t.dirs" census_dirs @MP@ .Spotlight-V100 .fseventsd
+  parity "$_ss_t.refusals" census_refusals "$4" @MP@
+  census_log_since "$4" | grep -E "$census_refusal_re" | census_refusal_uids >"$OUT/parity/$_ss_t.refusals-all.txt"
+  census_md_users >"$OUT/parity/$_ss_t.processes.txt"
+  for _ss_m in "$PARITY_CTL_MP" "$PARITY_FS_MP"; do echo "== sudo lsof $_ss_m"; bounded 900 sudo -n lsof "$_ss_m" 2>&1 </dev/null; done >"$OUT/parity/$_ss_t.lsof.txt"
+}
+
+# census_spotlight FS: item 5, twice on fresh copies: read-write HFS+ against FS; then attach -readonly HFS+ against FS
+#   with ReadOnly on (the file mdfind looks for is made first, read-write). Each pass records census_spotlight_steps,
+#   Finder's refresh (read-write only), then sudo mdutil -i off, a remount, mdutil -s and the Privacy pane.
+census_spotlight() {
+  sp_fs=$1
+  census_sysctl "spotlight-$sp_fs"
+  sp_c=$(parity_control hfs) || { echo "# census_spotlight $sp_fs: no HFS+ control"; return 1; }
+  for sp_pass in rw ro; do
+    sp_h=$(census_copy "$sp_c" "spotlight-hfs-$sp_fs-$sp_pass") && sp_i=$(census_copy "$W/img/$sp_fs.img" "spotlight-$sp_fs-$sp_pass") ||
+      { echo "# census_spotlight $sp_fs: no images"; return 1; }
+    sp_name=parity-spot-$$-$sp_pass sp_ro=
+    if test "$sp_pass" = ro; then
+      census_pair_up "$sp_h" "$sp_i" "$sp_fs" || { echo "# census_spotlight $sp_fs ro: cannot attach both to make the file"; continue; }
+      echo spot >"$PARITY_CTL_MP/$sp_name"; echo spot >"$PARITY_FS_MP/$sp_name"
+      census_pair_down || { echo "# census_spotlight $sp_fs ro: $PARITY_FS_DISK is still attached"; continue; }
+      bounded 600 "$L" prefs ReadOnly on </dev/null; sp_ro=readonly
+    fi
+    sp_log=$(census_log_lines)
+    if census_pair_up "$sp_h" "$sp_i" "$sp_fs" $sp_ro; then
+      test "$sp_pass" = ro || parity "spotlight.$sp_fs.rw.create" sh -c 'echo spot > "$1/$2"' _ @MP@ "$sp_name"
+      census_spotlight_steps "$sp_fs" "$sp_pass" "$sp_name" "${sp_log:-0}"
+      test "$sp_pass" = ro || parity "spotlight.$sp_fs.rw.refresh" census_refresh @MP@
+      parity "spotlight.$sp_fs.$sp_pass.privacy-off" sudo -n mdutil -i off @MP@
+      if census_remount_pair "$sp_h" "$sp_i" $sp_ro; then
+        parity "spotlight.$sp_fs.$sp_pass.privacy-remount" mdutil -s @MP@
+        if test "$sp_pass" = rw; then census_privacy_shot privacy; else census_privacy_shot privacy-ro; fi
+        census_pair_down
+      fi
+    else echo "# census_spotlight $sp_fs $sp_pass: cannot attach both volumes"; fi
+    test "$sp_pass" = rw || bounded 600 "$L" prefs ReadOnly off </dev/null
+  done
+}
+
+# census_before_login MP: before login, mdutil -s and .fseventsd for the mount at MP (record-only), into
+#   $OUT/parity/spotlight.before-login.txt
+census_before_login() {
+  mkdir -p "$OUT/parity" || return 1
+  {
+    echo "== mdutil -s"; bounded 300 mdutil -s "$1" 2>&1 </dev/null; echo "== status $?"
+    if bounded 100 test -e "$1/.fseventsd"; then echo ".fseventsd: yes"; else echo ".fseventsd: no"; fi
+  } | parity_norm "$1" "" >"$OUT/parity/spotlight.before-login.txt"
+  echo "# recorded spotlight.before-login: $(tr '\n' ' ' <"$OUT/parity/spotlight.before-login.txt")"
+}
+
+# ---- item 6: Finder presentation ----
+# census_finder_props MP RAW-FILE: Finder's ejectable, local volume and ignore privileges, and whether its capacity and
+#   free space match df -k's; the raw values (and format) are appended to RAW-FILE
+census_finder_props() {
+  _fp_o=$(guest-macosx-aqua osascript -e 'tell application "Finder"' -e "set d to disk of (POSIX file \"$1\" as alias)" \
+    -e 'set o to {ejectable of d, local volume of d, ignore privileges of d, capacity of d, free space of d, format of d}' \
+    -e 'end tell' -e "set AppleScript's text item delimiters to \"|\"" -e 'return o as text' 2>&1 </dev/null); _fp_rc=$?
+  _fp_df=$(df -P -k "$1" 2>&1 | awk 'NR == 2 { print $2, $4 }')
+  { echo "== $1"; echo "Finder (ejectable|local volume|ignore privileges|capacity|free space|format): $_fp_o"; echo "df -k (size, available): $_fp_df"; } >>"$2"
+  if test "$_fp_rc" -ne 0; then echo "Finder: $_fp_o"; return "$_fp_rc"; fi
+  printf '%s\n' "$_fp_o" | awk -F'|' -v df="$_fp_df" '{
+    n = split(df, k, " "); c = $4 + 0; f = $5 + 0
+    print "ejectable: " $1; print "local volume: " $2; print "ignore privileges: " $3
+    d = c - k[1] * 1024; if (d < 0) d = -d; print "capacity equals df -k size (within 1 KiB): " (n == 2 && d < 1024 ? "yes" : "no")
+    d = f - k[2] * 1024; if (d < 0) d = -d; print "free space equals df -k available (within 1 MiB): " (n == 2 && d < 1048576 ? "yes" : "no")
+  }'
+}
+# census_du_fields MP: diskutil info's Ejectable, Removable Media, Internal and Device Location
+census_du_fields() { diskutil info "$1" 2>&1 </dev/null | grep -E '^ *(Ejectable|Removable Media|Internal|Device Location):' | sed 's/^ *//; s/:  */: /'; }
+# FinderInfo with kHasCustomIcon (0x0400) in fdFlags, bytes 8 and 9 of the 32
+census_finderinfo_icon=0000000000000000040000000000000000000000000000000000000000000000
+# census_volume_icon MP: PARITY_ICNS as MP/.VolumeIcon.icns, and the root's FinderInfo custom-icon flag set, read back
+census_volume_icon() {
+  cp "$PARITY_ICNS" "$1/.VolumeIcon.icns" && xattr -wx com.apple.FinderInfo "$census_finderinfo_icon" "$1"; _vi_rc=$?
+  echo "cp .VolumeIcon.icns and xattr -wx com.apple.FinderInfo: exit $_vi_rc"
+  echo "FinderInfo: $(xattr -px com.apple.FinderInfo "$1" 2>&1 | tr -s ' \n' '  ')"
+  return "$_vi_rc"
+}
+# census_finder_view SIDE STEP open|info: a Finder window (open) or Get Info window (info) on SIDE's volume, 3 s, the
+#   screenshot STEP, and every window closed
+census_finder_view() {
+  if test "$1" = hfs; then _fv_m=$PARITY_CTL_MP; else _fv_m=$PARITY_FS_MP; fi
+  if test "$3" = info; then _fv_v="open information window of (disk of (POSIX file \"$_fv_m\" as alias))"
+  else _fv_v="open (POSIX file \"$_fv_m\" as alias)"; fi
+  census_osa 'tell application "Finder"' 'activate' "$_fv_v" 'end tell'
+  census_pause 3
+  census_shot "$2" "$1"
+  census_osa 'tell application "Finder" to close every window'
+}
+# census_desktop true|false STEP: ShowExternalHardDrivesOnDesktop set, Finder restarted, the Desktop photographed
+census_desktop() {
+  bounded 300 guest-macosx-aqua defaults write com.apple.finder ShowExternalHardDrivesOnDesktop -bool "$1" >/dev/null 2>&1 </dev/null
+  census_finder_restart
+  census_shot "$2" hfs; census_shot "$2" fs
+}
+
+# census_finder FS: item 6 on the HFS+ control against FS: the sidebar and Get Info, photographed for each; Finder's
+#   properties against df -k (raw values in finder.FS.raw.txt); diskutil info's fields; a custom .VolumeIcon.icns
+#   (Get Info photographed as icon); the Desktop with external disks shown and hidden. ShowExternalHardDrivesOnDesktop
+#   is put back as it was.
+census_finder() {
+  cf_fs=$1
+  census_sysctl "finder-$cf_fs"
+  cf_c=$(parity_control hfs) && cf_h=$(census_copy "$cf_c" "finder-hfs-$cf_fs") && cf_i=$(census_copy "$W/img/$cf_fs.img" "finder-$cf_fs") ||
+    { echo "# census_finder $cf_fs: no images"; return 1; }
+  census_pair_up "$cf_h" "$cf_i" "$cf_fs" || { echo "# census_finder $cf_fs: cannot attach both volumes"; return 1; }
+  cf_old=$(bounded 300 guest-macosx-aqua defaults read com.apple.finder ShowExternalHardDrivesOnDesktop 2>/dev/null </dev/null)
+  for cf_s in hfs fs; do census_finder_view "$cf_s" sidebar open; done
+  : >"$OUT/parity/finder.$cf_fs.raw.txt"
+  parity "finder.$cf_fs.properties" census_finder_props @MP@ "$OUT/parity/finder.$cf_fs.raw.txt"
+  parity "finder.$cf_fs.diskutil-info" census_du_fields @MP@
+  for cf_s in hfs fs; do census_finder_view "$cf_s" getinfo info; done
+  parity "finder.$cf_fs.volumeicon" census_volume_icon @MP@
+  census_desktop true desktop-on
+  for cf_s in hfs fs; do census_finder_view "$cf_s" icon info; done
+  census_desktop false desktop-off
+  case $cf_old in
+  1) set -- write com.apple.finder ShowExternalHardDrivesOnDesktop -bool true ;;
+  0) set -- write com.apple.finder ShowExternalHardDrivesOnDesktop -bool false ;;
+  *) set -- delete com.apple.finder ShowExternalHardDrivesOnDesktop ;;
+  esac
+  bounded 300 guest-macosx-aqua defaults "$@" >/dev/null 2>&1 </dev/null
+  census_finder_restart
+  census_pair_down
+}
+
+# ---- item 7: Trash, tags and labels, case-sensitivity ----
+# census_trash_delete MP: MP/trash-me made, then deleted by Finder (census_finder_ask: a "delete immediately?" dialog
+#   leaves osascript waiting, photographed as trash-delete)
+census_trash_delete() {
+  echo trash >"$1/trash-me" || return 1
+  census_finder_ask trash-delete "$1" "tell application \"Finder\" to delete (POSIX file \"$1/trash-me\" as alias)"
+}
+# census_trashes MP UID: .Trashes and .Trashes/UID: mode, owner and group, then what the latter holds
+census_trashes() {
+  for _ct_p in "$1/.Trashes" "$1/.Trashes/$2"; do
+    if test -e "$_ct_p"; then stat -f '%N %Sp %u:%g' "$_ct_p" 2>&1; else echo "$_ct_p: absent"; fi
+  done
+  echo "-- in .Trashes/$2:"; ls -A "$1/.Trashes/$2" 2>&1
+  return 0
+}
+# a binary plist of the one-tag array ("Parity"), as com.apple.metadata:_kMDItemUserTags holds it (plutil -convert binary1)
+census_tag_plist=62706c6973743030a10156506172697479080a0000000000000101000000000000000200000000000000000000000000000011
+# census_tag_set MP: MP/tagged made, given the tag by xattr -wx and the label red (label index 2) by Finder
+census_tag_set() {
+  echo tagged >"$1/tagged" || return 1
+  xattr -wx com.apple.metadata:_kMDItemUserTags "$census_tag_plist" "$1/tagged" 2>&1; echo "tag (xattr -wx): exit $?"
+  guest-macosx-aqua osascript -e "tell application \"Finder\" to set label index of (POSIX file \"$1/tagged\" as alias) to 2" 2>&1 </dev/null
+  echo "label (Finder): exit $?"
+}
+# census_xattr_big MP: xattr writes of 128 KiB, and of 128 KiB and a byte, to MP/big-xattr: each one's error and status
+census_xattr_big() {
+  echo big >"$1/big-xattr" || return 1
+  for _xb_n in 131072 131073; do
+    xattr -w user.parity-big "$("$PARITY_PYTHON" -c "import sys; sys.stdout.write('x' * $_xb_n)")" "$1/big-xattr" 2>&1
+    echo "$_xb_n bytes: exit $?"
+  done
+}
+census_py_pathconf='import os, sys
+try:
+    print("pathconf(_PC_CASE_SENSITIVE) = %d" % os.pathconf(sys.argv[1], 11))
+except (IOError, OSError) as e:
+    print("errno " + str(e.errno))'
+
+# census_trash_tags_case FS: item 7 on the HFS+ control against FS. Trash: Finder's delete (trash-delete photographed),
+#   .Trashes/<uid>, then empty trash (once: it empties every volume; trash.FS.empty-trash.txt) and what is left. Tags: a
+#   tag and a label, xattr -l, again after a remount, and the oversized xattr. Case: pathconf against HFS+ (case.FS.pathconf)
+#   and against HFSX (case.FS.pathconf-hfsx, whose .hfs.txt is HFSX's). APFS is read-only: the case step alone.
+census_trash_tags_case() {
+  tt_fs=$1 tt_uid=$(id -u)
+  census_sysctl "trash-$tt_fs"
+  tt_c=$(parity_control hfs) && tt_cx=$(parity_control hfsx) && tt_h=$(census_copy "$tt_c" "trash-hfs-$tt_fs") &&
+    tt_x=$(census_copy "$tt_cx" "trash-hfsx-$tt_fs") && tt_i=$(census_copy "$W/img/$tt_fs.img" "trash-$tt_fs") ||
+    { echo "# census_trash_tags_case $tt_fs: no images"; return 1; }
+  census_pair_up "$tt_h" "$tt_i" "$tt_fs" || { echo "# census_trash_tags_case $tt_fs: cannot attach both volumes"; return 1; }
+  if test "$tt_fs" = apfs; then
+    echo "# census_trash_tags_case apfs: read-only, so the case step alone"
+  else
+    parity "trash.$tt_fs.finder-delete" census_trash_delete @MP@
+    if grep -q '^osascript still waiting' "$OUT/parity/trash.$tt_fs.finder-delete.hfs.txt" "$OUT/parity/trash.$tt_fs.finder-delete.$tt_fs.txt"; then
+      census_finder_restart   # a dialog was left up
+    fi
+    parity "trash.$tt_fs.trashes" census_trashes @MP@ "$tt_uid"
+    bounded 450 census_finder_ask trash-empty "$PARITY_CTL_MP" \
+      'tell application "Finder"
+set warns before emptying of trash to false
+empty trash
+end tell' >"$OUT/parity/trash.$tt_fs.empty-trash.txt" 2>&1
+    echo "== status $?" >>"$OUT/parity/trash.$tt_fs.empty-trash.txt"
+    grep -q '^osascript still waiting' "$OUT/parity/trash.$tt_fs.empty-trash.txt" && census_finder_restart
+    parity "trash.$tt_fs.after-empty" census_trashes @MP@ "$tt_uid"
+    parity "tags.$tt_fs.set" census_tag_set @MP@
+    parity "tags.$tt_fs.read" xattr -l @MP@/tagged
+    parity "tags.$tt_fs.oversized" census_xattr_big @MP@
+    census_remount_pair "$tt_h" "$tt_i" || { echo "# census_trash_tags_case $tt_fs: no remount"; return 1; }
+    parity "tags.$tt_fs.after-remount" xattr -l @MP@/tagged
+  fi
+  parity "case.$tt_fs.pathconf" "$PARITY_PYTHON" -c "$census_py_pathconf" @MP@
+  tt_hd=$PARITY_CTL_DISK tt_hm=$PARITY_CTL_MP tt_hv=$PARITY_CTL_VOL
+  if census_attach "$tt_x"; then
+    parity_pair "$CA_DISK" "$CA_MP" "$CA_VOL" "$tt_fs" "$PARITY_FS_DISK" "$PARITY_FS_MP" "$PARITY_FS_VOL"
+    parity "case.$tt_fs.pathconf-hfsx" "$PARITY_PYTHON" -c "$census_py_pathconf" @MP@
+    census_detach "$CA_DISK" apple
+    parity_pair "$tt_hd" "$tt_hm" "$tt_hv" "$tt_fs" "$PARITY_FS_DISK" "$PARITY_FS_MP" "$PARITY_FS_VOL"
+  else echo "# census_trash_tags_case $tt_fs: no HFSX control attached"; fi
+  census_pair_down
+}
+
+# ---- Later: Time Machine (record-only, never checked) ----
+# census_tm_destination MP: sudo tmutil setdestination MP; whether destinationinfo then lists MP; if it does, that
+#   destination is removed again
+census_tm_destination() {
+  sudo -n tmutil setdestination "$1" 2>&1 </dev/null; echo "setdestination: exit $?"
+  _tm_id=$(tmutil destinationinfo 2>/dev/null </dev/null | awk -v m="$1" '
+    /^=+$/ { if (hit && id != "") { print id; done = 1; exit } hit = 0; id = ""; next }
+    /^Mount Point/ { v = $0; sub(/^Mount Point *: */, "", v); hit = (v == m) }
+    /^ID/ { v = $0; sub(/^ID *: */, "", v); id = v }
+    END { if (!done && hit && id != "") print id }')
+  if test -z "$_tm_id"; then echo "a Time Machine destination: no"; return 0; fi
+  echo "a Time Machine destination: yes"
+  sudo -n tmutil removedestination "$_tm_id" 2>&1 </dev/null; echo "removedestination: exit $?"
+}
+
+# census_later: Later's Time Machine record: the HFS+ control beside the exFAT control (later.exfat.*), then beside
+#   ext4 (later.ext4.*): tmutil isexcluded, census_tm_destination, and Time Machine's offer photographed 5 s after
+#   each attach (tm-offer)
+census_later() {
+  census_sysctl later
+  cl_c=$(parity_control hfs) && cl_cx=$(parity_control exfat) && cl_h=$(census_copy "$cl_c" later-hfs) &&
+    cl_x=$(census_copy "$cl_cx" later-exfat) && cl_i=$(census_copy "$W/img/ext4.img" later-ext4) ||
+    { echo "# census_later: no images"; return 1; }
+  census_attach "$cl_h" || { echo "# census_later: no HFS+ control attached"; return 1; }
+  cl_hd=$CA_DISK cl_hm=$CA_MP cl_hv=$CA_VOL
+  census_pause 5; census_shot tm-offer hfs
+  for cl_k in exfat ext4; do
+    if test "$cl_k" = exfat; then cl_img=$cl_x cl_side=apple; else cl_img=$cl_i cl_side=fs; fi
+    census_attach "$cl_img" || { echo "# census_later: no $cl_k attached"; continue; }
+    parity_pair "$cl_hd" "$cl_hm" "$cl_hv" "$cl_k" "$CA_DISK" "$CA_MP" "$CA_VOL"
+    census_pause 5; census_shot tm-offer fs
+    parity "later.$cl_k.tm-excluded" tmutil isexcluded @MP@
+    parity "later.$cl_k.tm-destination" census_tm_destination @MP@
+    census_detach "$PARITY_FS_DISK" "$cl_side" "$PARITY_FS_MP"
+  done
+  census_detach "$cl_hd" apple
+}
+
+# ---- all of it ----
+# census_due WHAT...: true while the census is within PARITY_CENSUS_MIN minutes of its start (CA_T0); else it says it
+#   skips WHAT. A census step is never cut short: the guest job's timeout would lose every record, the smoke's too.
+census_due() {
+  test $(($(date +%s) - CA_T0)) -lt $((PARITY_CENSUS_MIN * 60)) && return 0
+  echo "# census: out of time ($PARITY_CENSUS_MIN min), skipped: $*"; return 1
+}
+# census_on FS CMD...: CMD, when there is time and FS's image ($W/img/FS.img); NTFS with NTFSTakeover on, so linuxfs
+#   mounts it rather than Apple's ntfs
+census_on() {
+  census_due "$2" "$1" || return 1
+  test -f "$W/img/$1.img" || { echo "# census: no $W/img/$1.img, so no $2 $1"; return 1; }
+  _con_fs=$1; shift
+  test "$_con_fs" != ntfs || bounded 300 defaults write dev.mavergreen.linuxfs NTFSTakeover -bool true >/dev/null 2>&1 </dev/null
+  "$@"; _con_rc=$?
+  test "$_con_fs" != ntfs || bounded 300 defaults delete dev.mavergreen.linuxfs NTFSTakeover >/dev/null 2>&1 </dev/null
+  census_clean
+  return "$_con_rc"
+}
+# census_clean: the census's copies no longer attached removed (each is up to 320 MB, on the guest's own disk)
+census_clean() {
+  _ccl_att=$(bounded 600 hdiutil info 2>/dev/null </dev/null | awk '/^image-path/ { sub(/^image-path[ \t]*:[ \t]*/, ""); print }')
+  for _ccl_f in "$W"/census/*.img; do
+    test -f "$_ccl_f" || continue
+    printf '%s\n' "$_ccl_att" | grep -qxF -- "$_ccl_f" || rm -f "$_ccl_f"
+  done
+}
+# census_left_attached: every census or control image still attached (a linuxfs disk whose eject failed is never
+#   detached by force), into $OUT/parity/census-left-attached.txt ("none" when none is) and said
+census_left_attached() {
+  mkdir -p "$OUT/parity" || return 1
+  _cla=$(bounded 600 hdiutil info 2>/dev/null </dev/null | awk -v c="$W/census/" -v k="$W/ctl/" '
+    /^image-path/ { p = $0; sub(/^image-path[ \t]*:[ \t]*/, "", p); cur = (index(p, c) == 1 || index(p, k) == 1); next }
+    cur && /^\/dev\/disk[0-9]+[ \t]/ { print $1 " " p; cur = 0 }')
+  if test -z "$_cla"; then echo none >"$OUT/parity/census-left-attached.txt"; echo "# census: no census disk is left attached"; return 0; fi
+  printf '%s\n' "$_cla" >"$OUT/parity/census-left-attached.txt"
+  echo "# census: left attached (not detached by force): $(printf '%s\n' "$_cla" | tr '\n' ' ')"
+}
+
+# parity_census_all: the census, record-only: the four controls made, then item 3 (PARITY_STALL_N, 50 unless set; first,
+#   as the longest), items 1 and 7 on ext4, btrfs, xfs, f2fs and NTFS, items 4 and 5 on ext4, item 6 on those and APFS,
+#   item 7's case step on APFS too, then Later. A census not begun within PARITY_CENSUS_MIN (130) minutes is skipped.
+parity_census_all() {
+  : "${PARITY_STALL_N:=50}"
+  CA_T0=$(date +%s)
+  for ca_k in hfs hfsx fat32 exfat; do parity_control "$ca_k" >/dev/null || echo "# census: cannot make the $ca_k control"; done
+  census_due census_stall && { census_stall; census_clean; }
+  for ca_fs in ext4 btrfs xfs f2fs ntfs; do census_on "$ca_fs" census_unicode "$ca_fs"; done
+  census_on ext4 census_busy ext4
+  census_on ext4 census_spotlight ext4
+  for ca_fs in ext4 btrfs xfs f2fs ntfs apfs; do census_on "$ca_fs" census_finder "$ca_fs"; done
+  for ca_fs in ext4 btrfs xfs f2fs ntfs apfs; do census_on "$ca_fs" census_trash_tags_case "$ca_fs"; done
+  census_due census_later && { census_later; census_clean; }
+  census_left_attached
 }

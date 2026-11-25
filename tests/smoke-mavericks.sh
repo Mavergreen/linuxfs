@@ -9,6 +9,7 @@
 #       ReadOnly in the user's plist (read by the root mount program) mounts read-only; a label with a slash or a control
 #       character gets a safe /Volumes name; the encrypted APFS fixture shows the password dialog (screenshot), times out
 #       with no mount, mounts through --password-stdin and the keeper's --offer, then from the login keychain with no dialog;
+#       then the HFS+ parity census (tests/lib/parity.sh parity_census_all), which records and never gates;
 #       last, before login (the user's console session ended), an attached ext4 disk is mounted by root with allow_other and
 #       served by lklfuse as _linuxfs (with a macFUSE that cannot serve /dev/fd/N the mount program refuses, and that is what is
 #       checked: nothing mounted, the reason in system.log); with that lklfuse killed, diskutil unmount still works. No lklfuse ever runs as root. exFAT keeps no symlinks, hard links, modes or xattrs, and ntfs3 keeps no
@@ -468,6 +469,16 @@ rm -f "$W/gpt-enc.img"
 check "the keychain keeper is still running" pgrep -f "$P/libexec/linuxfs-agent"
 check "no lklfuse runs as root, after everything" no_root_lklfuse
 
+# spec: tests/lib/parity.sh parity_census_all -- the HFS+ parity census: each behaviour on an HFS+ control and on linuxfs
+#       volumes, recorded into OUT/parity (record-only until an item's task sets its PARITY_MODE_ to check), with its
+#       screenshots in OUT; before the before-login section, which must stay last
+tests_dir=$(cd "$(dirname "$0")" && pwd)
+if [ -f "$tests_dir/lib/parity.sh" ]; then
+  . "$tests_dir/lib/parity.sh"
+  parity_census_all
+  check "no lklfuse runs as root, after the census" no_root_lklfuse
+else notok "no $tests_dir/lib/parity.sh: the census cannot run"; fi
+
 # spec: tests/smoke-mavericks.sh header -- ---- before login: nobody at the console, ssh the only way in. Last, because the console session does not come back by itself ----
 # platform: mavericks-vm README -- on 10.9 loginwindow logs in by itself only at boot, so the user does not return in this job;
 #           that is a logged SKIP, never a failure, and nothing is rebooted.
@@ -525,6 +536,8 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
         # spec: tools/open.c fuse_chan -- the opener holds the lock from before "ready" on fd 7, which lklfuse's lock= names
         check "before login: lklfuse's lock is the descriptor the opener holds (lock=/dev/fd/7)" sh -c 'ps -axww -o command= | grep "lklfuse.*lock=/dev/fd/7" | grep -qv grep'
         check "before login: the user can write and read the volume over ssh" rw_works "$mp"
+        # spec: tests/lib/parity.sh census_before_login -- item 5's census before login: mdutil -s and .fseventsd, recorded only
+        census_before_login "$mp"
         # spec: macfuse DETAILS.md "A mount made for you" -- a daemon that dies leaves the mount with nobody serving it: macFUSE
         #       answers it with an error (ENXIO, the dead file system) instead of a hang, and its owner still unmounts it
         lp=$(lklfuse_fd | awk '{ print $2 }' | head -n 1)

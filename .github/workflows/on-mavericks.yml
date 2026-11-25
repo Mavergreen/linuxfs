@@ -75,7 +75,9 @@ jobs:
     name: Mount, write, read back and automount on Mac OS X 10.9 (mavericks-vm)
     needs: [images]
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # spec: tests/lib/parity.sh parity_census_all -- the census adds up to about two hours (it starts nothing after
+    #       PARITY_CENSUS_MIN, 130 minutes) to the smoke's half hour
+    timeout-minutes: 180
     permissions:
       contents: read
       packages: write
@@ -128,7 +130,7 @@ jobs:
             status=0; sh tests/smoke-mavericks.sh "$LINUXFS_VERSION" images images-after || status=$?
             [ "$status" -eq 0 ] || { echo "tests/smoke-mavericks.sh exited $status (77 is a skip, a failure here)"; exit 1; }
       # spec: Mavergreen/mavericks-vm README -- copyback: true copies the workspace back after run, failure included, so the guest's
-      #       screenshots and system.log arrive in images-after
+      #       screenshots and system.log arrive in images-after, and the census's records in images-after/parity
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -137,6 +139,7 @@ jobs:
           path: |
             images-after/*.png
             images-after/*.log
+            images-after/parity/**
       - uses: actions/upload-artifact@v7
         if: always()
         with:

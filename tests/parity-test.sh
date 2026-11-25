@@ -31,6 +31,10 @@ expect() { # NAME CONDITION-COMMAND...
 has() { printf '%s\n' "$1" | grep -q -- "$2"; }
 hasnt() { ! has "$1" "$2"; }
 not() { ! "$@"; }
+ascending() { # N...: every N given, each less than the next
+  _ap=
+  for _an; do test -n "$_an" || return 1; test -z "$_ap" || test "$_ap" -lt "$_an" || return 1; _ap=$_an; done
+}
 
 reset() { # makes two fresh volume directories a and b
   rm -rf "$T/a" "$T/b" "$OUT/parity"
@@ -253,8 +257,9 @@ else echo "ok - unicode_image # SKIP needs Linux, mkfs.ext4 and debugfs"; fi
 unset -f mkfile hdiutil diskutil
 S=$T/stub; mkdir -p "$S/nodes" "$T/vols" "$T/in"
 PARITY_FSTAB=$S/fstab PARITY_DALOG=$S/dalog PARITY_DAPL=$S/da.plist STUB=$S PARITY_POLLS=3
-export PARITY_FSTAB PARITY_DALOG STUB
-: > "$PARITY_FSTAB"; : > "$PARITY_DALOG"; : > "$PARITY_DAPL"; : > "$S/calls"
+PARITY_SYSLOG=$S/syslog PARITY_ICNS=$S/icon.icns PARITY_SPOT_SECS=3
+export PARITY_FSTAB PARITY_DALOG PARITY_SYSLOG STUB
+: > "$PARITY_FSTAB"; : > "$PARITY_DALOG"; : > "$PARITY_DAPL"; : > "$S/calls"; : > "$PARITY_SYSLOG"; echo icns > "$PARITY_ICNS"
 for py in python3 /usr/bin/python; do command -v "$py" > /dev/null 2>&1 && PARITY_PYTHON=$py; done
 cat > "$T/bin/stub" <<'EOF'
 #!/bin/sh
@@ -288,8 +293,10 @@ hdiutil)
     esac
     k=$(($(cat "$STUB/disks" 2> /dev/null || echo 1) + 1)); echo $k > "$STUB/disks"
     d=disk$k
-    case $b in *hfs*|*fat32*) nd=${d}s1; echo "/dev/$d          	GUID_partition_scheme" ;; *) nd=$d; echo "$d" >> "$STUB/fsdisks" ;; esac
+    case $b in *hfs*|*fat32*|*exfat*) nd=${d}s1; echo "/dev/$d          	GUID_partition_scheme" ;; *) nd=$d; echo "$d" >> "$STUB/fsdisks" ;; esac
     mp=$STUB/../vols/$b; mkdir -p "$mp"
+    # a linuxfs volume draws a refusal from root's fseventsd (pid 1 stands in), naming its mount point
+    test "$nd" != "$d" || echo "Nov 25 10:00:00 stubhost fseventsd[1]: could not open $mp/.fseventsd (Operation not permitted)" >> "$PARITY_SYSLOG"
     printf 'img=%s\nvol=%s\nmp=%s\nuuid=UUID-%s\ndisk=%s\n' "$img" "$b" "$mp" "$b" "$d" > "$N/$nd"
     log "created disk, id = /dev/$d."
     log "probed disk, id = /dev/$nd, with stub, success."
@@ -338,17 +345,39 @@ linuxfs)
   esac ;;
 sudo)
   test "$1" != -n || shift
-  case $1 in sh|tail|cat|wc) exec "$@" ;; lsof) echo "COMMAND PID USER (stub lsof $*)" ;; esac ;;
+  case $1 in sh|tail|cat|wc|mdutil|tmutil) exec "$@" ;; lsof) echo "COMMAND PID USER (stub lsof $*)" ;; esac ;;
 mkfile) : > "$2" ;;
 sysctl) echo "$1.version.number: stub" ;;
+mdutil) eval "echo \"\${$#}:\""; if test "$1" = -s; then echo "	Indexing enabled."; else echo "	Indexing disabled."; fi ;;
+mdfind) test ! -e "$2/$4" || echo "$2/$4" ;;
+tmutil)
+  case $1 in
+  isexcluded) echo "[Excluded]    $2" ;;
+  setdestination) echo "$2" > "$STUB/tmdest" ;;
+  destinationinfo)
+    if test -s "$STUB/tmdest"; then printf '%s\n' ==================================================== "Name          : Stub" "Kind          : Local" "Mount Point   : $(cat "$STUB/tmdest")" "ID            : STUB-ID"
+    else echo "tmutil: No destinations configured."; fi ;;
+  removedestination) : > "$STUB/tmdest" ;;
+  esac ;;
+defaults)
+  case $1:$3 in write:NTFSTakeover) : > "$STUB/takeover" ;; delete:NTFSTakeover) rm -f "$STUB/takeover" ;; esac ;;
+xattr)
+  case $1 in -w) echo "${#3}" >> "$STUB/xattr-sizes" ;; -l) echo "com.apple.FinderInfo: stub" ;; -px) echo "00 00 04 00" ;; esac ;;
+guest-macosx-aqua)
+  case $1 in
+  screencapture) : > "$3" ;;
+  defaults) test "$2" != read || exit 1 ;;
+  osascript)
+    case "$*" in *ejectable*) echo "true|true|false|1.34217728E+8|1.0E+8|Mac OS Extended format" ;; *"count items"*) echo 1 ;; esac ;;
+  esac ;;
 esac
 exit 0
 EOF
 chmod +x "$T/bin/stub"
-for c in hdiutil diskutil osascript guest-macosx-aqua sudo sysctl mkfile linuxfs; do ln -sf stub "$T/bin/$c"; done
+for c in hdiutil diskutil osascript guest-macosx-aqua sudo sysctl mkfile linuxfs mdutil mdfind tmutil defaults xattr; do ln -sf stub "$T/bin/$c"; done
 L=$T/bin/linuxfs; IN=$T/in
 rm -rf "$W/ctl" "$OUT/parity"; mkdir -p "$W/img"
-for f in ext4 btrfs; do echo "$f image" > "$W/img/$f.img"; done
+for f in ext4 btrfs ntfs apfs; do echo "$f image" > "$W/img/$f.img"; done
 echo names | gzip -c > "$IN/ext4-names.img.gz"
 unbounded=$T/unbounded; : > "$unbounded"
 bounded() { ( PARITY_TEST_BOUNDED=1; shift; "$@" ); }
@@ -430,6 +459,144 @@ expect census_busy_recorded has "$r" "^# recorded busy.ext4.cycles: hfs 0 of 20,
 expect census_busy_quiet hasnt "$r" "not ok"
 expect census_busy_sysctl test -s "$P/busy-ext4.sysctl.txt"
 expect census_busy_detached test -z "$(attached)"
+
+# census_spotlight: read-write, then read-only (HFS+ attach -readonly against ext4 with ReadOnly on)
+: > "$S/calls"
+r=$(census_spotlight ext4 2>&1)
+for p in rw ro; do
+  for s in mdutil mdfind dirs refusals privacy-off privacy-remount; do
+    expect "census_spotlight_${p}_$s" test -s "$P/spotlight.ext4.$p.$s.hfs.txt" -a -s "$P/spotlight.ext4.$p.$s.ext4.txt"
+  done
+  for f in refusals-all processes lsof mdfind-seconds; do expect "census_spotlight_${p}_$f" test -e "$P/spotlight.ext4.$p.$f.txt"; done
+  expect "census_spotlight_${p}_found" grep -q '^found: <MP>/parity-spot-' "$P/spotlight.ext4.$p.mdfind.ext4.txt"
+done
+expect census_spotlight_refresh test -s "$P/spotlight.ext4.rw.refresh.hfs.txt" -a -s "$P/spotlight.ext4.rw.refresh.ext4.txt" -a ! -e "$P/spotlight.ext4.ro.refresh.ext4.txt"
+expect census_spotlight_dirs grep -q '^.fseventsd: no$' "$P/spotlight.ext4.rw.dirs.ext4.txt"
+expect census_spotlight_refusal_uid grep -q '^#   pid 1: uid 0 root$' "$P/spotlight.ext4.rw.refusals-all.txt"
+expect census_spotlight_refusal_mp grep -q '<MP>/.fseventsd (Operation not permitted)' "$P/spotlight.ext4.rw.refusals.ext4.txt"
+expect census_spotlight_refusal_not_hfs not grep -q 'Operation not permitted' "$P/spotlight.ext4.rw.refusals.hfs.txt"
+expect census_spotlight_readonly grep -q '^hdiutil attach -readonly -imagekey diskimage-class=CRawDiskImage .*/spotlight-hfs-ext4-ro.img$' "$S/calls"
+expect census_spotlight_rw_not_readonly not grep -q '^hdiutil attach -readonly .*-rw.img$' "$S/calls"
+ro_on=$(grep -n '^linuxfs prefs ReadOnly on$' "$S/calls" | cut -d: -f1) ro_off=$(grep -n '^linuxfs prefs ReadOnly off$' "$S/calls" | cut -d: -f1)
+ro_att=$(grep -n '^hdiutil attach -imagekey diskimage-class=CRawDiskImage .*/spotlight-ext4-ro.img$' "$S/calls" | tail -n 1 | cut -d: -f1)
+expect census_spotlight_readonly_pref ascending "$ro_on" "$ro_att" "$ro_off"
+expect census_spotlight_privacy grep -q '^sudo -n mdutil -i off .*/vols/spotlight-ext4-rw$' "$S/calls"
+for s in refresh privacy privacy-ro; do expect "census_spotlight_shot_$s" test "$(grep -Ec "screencapture -x .*/(hfs|ext4)-$s.png$" "$S/calls")" -eq 2; done
+expect census_spotlight_pane grep -q 'com.apple.preference.spotlight' "$S/calls"
+expect census_spotlight_sysctl test -s "$P/spotlight-ext4.sysctl.txt"
+expect census_spotlight_recorded has "$r" "^# recorded spotlight.ext4.ro.mdfind"
+expect census_spotlight_quiet hasnt "$r" "not ok"
+expect census_spotlight_detached test -z "$(attached)"
+
+# census_finder: the screenshot pairs, Finder's properties against df -k, diskutil info's fields, a custom volume icon
+: > "$S/calls"
+r=$(census_finder ext4 2>&1)
+for s in properties diskutil-info volumeicon; do expect "census_finder_$s" test -s "$P/finder.ext4.$s.hfs.txt" -a -s "$P/finder.ext4.$s.ext4.txt"; done
+for s in sidebar getinfo desktop-on desktop-off icon; do expect "census_finder_shot_$s" test "$(grep -Ec "screencapture -x .*/(hfs|ext4)-$s.png$" "$S/calls")" -eq 2; done
+expect census_finder_props grep -q '^capacity equals df -k' "$P/finder.ext4.properties.ext4.txt"
+expect census_finder_props_ejectable grep -q '^ejectable: true$' "$P/finder.ext4.properties.hfs.txt"
+expect census_finder_raw grep -q 'Mac OS Extended format' "$P/finder.ext4.raw.txt"
+expect census_finder_icon_flag grep -q '^xattr -wx com.apple.FinderInfo 0000000000000000040000000000000000000000000000000000000000000000 .*/vols/finder-ext4$' "$S/calls"
+expect census_finder_icns test -s "$T/vols/finder-ext4/.VolumeIcon.icns"
+expect census_finder_desktop_on grep -q '^guest-macosx-aqua defaults write com.apple.finder ShowExternalHardDrivesOnDesktop -bool true$' "$S/calls"
+expect census_finder_desktop_off grep -q '^guest-macosx-aqua defaults write com.apple.finder ShowExternalHardDrivesOnDesktop -bool false$' "$S/calls"
+expect census_finder_desktop_restored test "$(grep 'ShowExternalHardDrivesOnDesktop' "$S/calls" | tail -n 1)" = "guest-macosx-aqua defaults delete com.apple.finder ShowExternalHardDrivesOnDesktop"
+expect census_finder_restarts test "$(grep -c '^guest-macosx-aqua killall Finder$' "$S/calls")" -ge 3
+expect census_finder_quiet hasnt "$r" "not ok"
+expect census_finder_detached test -z "$(attached)"
+: > "$S/calls"
+census_finder btrfs > /dev/null 2>&1
+expect census_finder_hfs_shots_once test "$(grep -c 'screencapture -x .*/hfs-sidebar.png$' "$S/calls")" -eq 0 -a "$(grep -c 'screencapture -x .*/btrfs-sidebar.png$' "$S/calls")" -eq 1
+
+# census_trash_tags_case: Finder's delete, .Trashes and empty trash; a tag and a label, after a remount too; the
+#   oversized xattr; pathconf against HFS+ and against HFSX. APFS, read-only, gets the case step alone.
+: > "$S/calls"; : > "$S/xattr-sizes"
+r=$(census_trash_tags_case ext4 2>&1)
+for s in trash.ext4.finder-delete trash.ext4.trashes trash.ext4.after-empty tags.ext4.set tags.ext4.read tags.ext4.after-remount tags.ext4.oversized case.ext4.pathconf case.ext4.pathconf-hfsx; do
+  expect "census_ttc_$s" test -s "$P/$s.hfs.txt" -a -s "$P/$s.ext4.txt"
+done
+expect census_ttc_empty_record test -s "$P/trash.ext4.empty-trash.txt"
+expect census_ttc_delete grep -q 'to delete (POSIX file ".*/vols/trash-ext4/trash-me" as alias)' "$S/calls"
+expect census_ttc_empty grep -q 'empty trash' "$S/calls"
+expect census_ttc_shot test "$(grep -Ec 'screencapture -x .*/(hfs|ext4)-trash-delete.png$' "$S/calls")" -eq 2
+expect census_ttc_tag grep -q '^xattr -wx com.apple.metadata:_kMDItemUserTags 62706c6973743030a10156506172697479080a0000000000000101000000000000000200000000000000000000000000000011 .*/vols/trash-ext4/tagged$' "$S/calls"
+expect census_ttc_label grep -q 'set label index of (POSIX file ".*/vols/trash-ext4/tagged" as alias) to 2' "$S/calls"
+expect census_ttc_remount test "$(grep -c '^hdiutil attach -imagekey diskimage-class=CRawDiskImage .*/trash-ext4.img$' "$S/calls")" -eq 2
+expect census_ttc_oversized test "$(sort -u "$S/xattr-sizes" | tr '\n' ' ')" = "131072 131073 "
+expect census_ttc_hfsx grep -q '^hdiutil attach -imagekey diskimage-class=CRawDiskImage .*/trash-hfsx-ext4.img$' "$S/calls"
+expect census_ttc_pathconf grep -Eq '^(pathconf\(_PC_CASE_SENSITIVE\) = -?[0-9]+|errno [0-9]+)$' "$P/case.ext4.pathconf.ext4.txt"
+expect census_ttc_quiet hasnt "$r" "not ok"
+expect census_ttc_detached test -z "$(attached)"
+r=$(census_trash_tags_case apfs 2>&1)
+expect census_ttc_apfs_case test -s "$P/case.apfs.pathconf.apfs.txt" -a -s "$P/case.apfs.pathconf-hfsx.apfs.txt"
+expect census_ttc_apfs_case_only test -z "$(ls "$P" | grep -E '^(trash|tags)\.apfs\.')"
+expect census_ttc_apfs_detached test -z "$(attached)"
+
+# census_later: Time Machine, the exFAT control against ext4 (each beside HFS+)
+: > "$S/calls"
+r=$(census_later 2>&1)
+for k in exfat ext4; do
+  for s in tm-excluded tm-destination; do expect "census_later_${k}_$s" test -s "$P/later.$k.$s.hfs.txt" -a -s "$P/later.$k.$s.$k.txt"; done
+done
+expect census_later_destination grep -q '^a Time Machine destination: yes$' "$P/later.ext4.tm-destination.ext4.txt"
+expect census_later_removed grep -q '^sudo -n tmutil removedestination STUB-ID$' "$S/calls"
+expect census_later_shots test "$(grep -Ec 'screencapture -x .*/(hfs|exfat|ext4)-tm-offer.png$' "$S/calls")" -eq 3
+expect census_later_quiet hasnt "$r" "not ok"
+expect census_later_detached test -z "$(attached)"
+
+# census_before_login: mdutil -s and .fseventsd only
+mkdir -p "$T/bl/.fseventsd"
+r=$(census_before_login "$T/bl" 2>&1)
+expect census_before_login_mdutil grep -q '^<MP>:$' "$P/spotlight.before-login.txt"
+expect census_before_login_fseventsd grep -q '^.fseventsd: yes$' "$P/spotlight.before-login.txt"
+expect census_before_login_recorded has "$r" "^# recorded spotlight.before-login"
+
+# parity_census_all: the controls, then each census in order (NTFS with NTFSTakeover on), PARITY_STALL_N 50, a census
+#   disk left attached recorded; past PARITY_CENSUS_MIN, the rest is skipped and said
+rm -rf "$W/ctl"; echo left > "$W/census/left-stuck.img"; echo old > "$W/census/old.img"
+census_attach "$W/census/left-stuck.img" > /dev/null 2>&1; left=disk$(cat "$S/disks")
+ran=$T/ran; : > "$ran"
+r=$(
+  unset PARITY_STALL_N
+  tk() { if test -f "$S/takeover"; then echo on; else echo off; fi; }
+  census_stall() { echo "stall $# $PARITY_STALL_N" >> "$ran"; }
+  census_unicode() { echo "unicode $1 $(tk)" >> "$ran"; }
+  census_busy() { echo "busy $1 $(tk)" >> "$ran"; }
+  census_spotlight() { echo "spotlight $1 $(tk)" >> "$ran"; }
+  census_finder() { echo "finder $1 $(tk)" >> "$ran"; }
+  census_trash_tags_case() { echo "trash_tags_case $1 $(tk)" >> "$ran"; }
+  census_later() { echo "later $#" >> "$ran"; }
+  parity_census_all 2>&1
+)
+# the stub images are ext4, btrfs, ntfs and apfs: xfs and f2fs are said to be missing, and skipped
+want=$(printf '%s\n' "stall 0 50" "unicode ext4 off" "unicode btrfs off" "unicode ntfs on" "busy ext4 off" "spotlight ext4 off" \
+  "finder ext4 off" "finder btrfs off" "finder ntfs on" "finder apfs off" \
+  "trash_tags_case ext4 off" "trash_tags_case btrfs off" "trash_tags_case ntfs on" "trash_tags_case apfs off" "later 0")
+expect census_all_order test "$(cat "$ran")" = "$want"
+expect census_all_missing has "$r" "^# census: no .*/img/xfs.img, so no census_finder xfs"
+expect census_all_controls test -f "$W/ctl/hfs.img" -a -f "$W/ctl/hfsx.img" -a -f "$W/ctl/fat32.img" -a -f "$W/ctl/exfat.img"
+expect census_all_takeover_off test ! -f "$S/takeover"
+expect census_all_left grep -q "^/dev/$left .*/census/left-stuck.img\$" "$P/census-left-attached.txt"
+expect census_all_left_said has "$r" "^# census: left attached .*left-stuck.img"
+expect census_all_cleans test ! -e "$W/census/old.img" -a -e "$W/census/left-stuck.img"
+: > "$ran"
+r=$(PARITY_CENSUS_MIN=0; census_stall() { echo stall >> "$ran"; }; census_later() { echo later >> "$ran"; }; parity_census_all 2>&1)
+expect census_all_out_of_time test ! -s "$ran"
+expect census_all_out_of_time_said has "$r" "^# census: out of time (0 min), skipped: census_stall"
+rm -f "$S/nodes/$left" "$S/nodes/$left.m"
+census_left_attached > /dev/null 2>&1
+expect census_all_none_left grep -q '^none$' "$P/census-left-attached.txt"
+
+# the smoke sources parity.sh and runs the census before the before-login section, and records the before-login mount in it;
+#   the workflow uploads OUT/parity and gives the guest job 180 minutes
+sm=$here/smoke-mavericks.sh wf=$here/../.github/workflows/on-mavericks.yml
+first_line() { grep -n -- "$1" "$sm" | head -n 1 | cut -d: -f1; }
+bl=$(first_line '---- before login')
+expect smoke_sources_parity ascending "$(first_line '^ *\. ".*/lib/parity\.sh"')" "$bl"
+expect smoke_runs_census ascending "$(first_line '^ *parity_census_all$')" "$bl"
+expect smoke_before_login_census ascending "$bl" "$(first_line 'census_before_login "\$mp"')"
+expect workflow_parity_upload grep -q '^ *images-after/parity/\*\*$' "$wf"
+expect workflow_guest_timeout awk '/^  guest:/ { g = 1 } /^  fsck:/ { g = 0 } g && /^    timeout-minutes: 180$/ { f = 1 } END { exit !f }' "$wf"
 
 # no forced unmount, eject or detach ever targets a linuxfs disk (QEMU first)
 forced=
