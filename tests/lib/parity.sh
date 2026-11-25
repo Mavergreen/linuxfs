@@ -32,10 +32,12 @@
 #                                         not ok; the .names lists are written only once their image was read
 #   census_stall                          item 3: spike round 4's attach loops on HFS+ and ext4, PARITY_STALL_N times
 #                                         each (unset or 0 runs nothing); counts, probe times and Fisher's p
-#   census_busy FS                        item 4: write-then-unmount cycles, and a held file's unmount and ejects
-#                                         (forced ones on HFS+ alone unless PARITY_BUSY_FORCE=1); a linuxfs disk
-#                                         that will not eject is recorded (eject-failed.txt) and left, the steps going
-#                                         on with a fresh copy
+#   census_busy FS                        item 4 (checked, but for the steps DiskArbitration's tie decides): (a)
+#                                         write-then-unmount cycles and eject-after-another-volume cycles, each
+#                                         side's busy count against HFS+'s; (b) a held file's unmount and ejects
+#                                         (forced ones on HFS+ alone unless PARITY_BUSY_FORCE=1, and recorded
+#                                         either way); a linuxfs disk that will not eject is recorded
+#                                         (eject-failed.txt) and left, the steps going on with a fresh copy
 #   census_spotlight FS                   item 5: read-write HFS+ against FS, then attach -readonly HFS+ against FS
 #                                         with ReadOnly on: mdutil -i on (HFS+ alone), mdutil -s, an mdfind find
 #                                         (120 s), .Spotlight-V100 and
@@ -63,6 +65,14 @@
 
 # spec: .superpowers/sdd/2026-11-25-hfs-parity/task-7-brief.md -- item 1 is proven: its parity steps say ok or not ok
 PARITY_MODE_UNICODE=${PARITY_MODE_UNICODE:-check}
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-12-brief.md Step 3 -- item 4 is checked: (a)'s unmount cycles and (b)'s
+#   held-file eject. The steps whose linuxfs outcome DiskArbitration's tie to the disk decides take PARITY_MODE_BUSY_DA,
+#   record until item 6's fsname=/dev/diskN (QEMU first: the hfs-fsname kit) lands: a linuxfs mount named
+#   linuxfs@rdiskN is untied from its disk by the next mount or unmount of any volume (push A, item-4-findings.md),
+#   after which its eject unmounts nothing and fails busy, and diskutil unmount words it by mount point, not by disk.
+#   Those are (a)'s eject cycles, and (b)'s unmounts, TextEdit's eject (after the HFS+ side's unheld eject) and Finder's.
+PARITY_MODE_BUSY=${PARITY_MODE_BUSY:-check}
+PARITY_MODE_BUSY_DA=${PARITY_MODE_BUSY_DA:-record}
 
 # The console session's helper: not on the ssh PATH, so always by its path (the smoke sets AQUA to the same)
 AQUA=${AQUA:-/usr/local/bin/guest-macosx-aqua}
@@ -247,14 +257,18 @@ census_attach() {
 }
 
 # census_holders DISK [MP]: what may hold DISK, as "# " lines: sudo lsof on MP (when given; empty once it is unmounted),
-#   and on DISK's whole and raw device; every lklfuse process; and mount's lines for DISK
+#   and on DISK's whole and raw device; every lklfuse process; DiskArbitration's view of DISK and its first slice (Mounted);
+#   and mount's lines for DISK (as /dev/diskN or lklfuse's linuxfs@rdiskN) or on MP. A linuxfs volume still in mount's
+#   lines where DiskArbitration says not mounted is its mount untied from the disk (item 4, census_busy_ejects)
 census_holders() {
   _cho_d=/dev/${1#/dev/} _cho_r=/dev/r${1#/dev/}
   if test -n "${2:-}"; then echo "# census: sudo lsof $2:"; bounded 300 sudo -n lsof "$2" 2>&1 </dev/null | head -n 40 | sed 's/^/#   /'; fi
   echo "# census: sudo lsof $_cho_d $_cho_r:"; bounded 300 sudo -n lsof "$_cho_d" "$_cho_r" 2>&1 </dev/null | head -n 40 | sed 's/^/#   /'
   echo "# census: lklfuse processes (user, pid, ppid, started, command):"
   bounded 100 ps -axww -o user=,pid=,ppid=,lstart=,command= 2>&1 </dev/null | awk '/lklfuse/ && !/awk/' | head -n 40 | sed 's/^/#   /'
-  echo "# census: mount, for ${1#/dev/}:"; bounded 100 mount 2>&1 </dev/null | grep -E "(^|[^0-9a-z])${1#/dev/}([^0-9]|\$)" | sed 's/^/#   /'
+  for _cho_n in "${1#/dev/}" "${1#/dev/}s1"; do echo "# census: DiskArbitration: $_cho_n Mounted: $(census_info "$_cho_n" Mounted)"; done
+  echo "# census: mount, for ${1#/dev/}${2:+ or on $2}:"
+  bounded 100 mount 2>&1 </dev/null | awk -v d="${1#/dev/}" -v m="${2:+ on $2 (}" '$0 ~ ("(^|[^0-9a-z])r?" d "([^0-9]|$)") || (m != "" && index($0, m)) { print "#   " $0 }'
   return 0
 }
 
@@ -279,7 +293,7 @@ census_detach() {
   _cd_o=$(bounded 600 diskutil eject "$1" 2>&1 </dev/null) && { echo "# census: $1 ejected on the retry" >>"$OUT/parity/eject-failed.txt"; return 0; }
   {
     echo "# census: $(date -u +%H:%M:%S) diskutil eject $1 failed again; left attached: $(printf '%s' "$_cd_o" | tr '\n' ' ')"
-    census_holders "$1"
+    census_holders "$1" "${3:-}"
   } | tee -a "$OUT/parity/eject-failed.txt"
   return 1
 }
@@ -643,11 +657,11 @@ census_stall() {
 # ---- item 4: busy volumes ----
 # census_busy_cycles NAME IMAGE LOG: 20 times, a write and at once diskutil unmount; a busy unmount records who holds
 #   the volume (sudo lsof on the mount point, ps, DiskArbitration's dissent), is tried once more, and the volume is
-#   mounted again. Prints the busy count.
+#   mounted again. Prints the busy count and the cycles run ("0 0" when IMAGE did not attach).
 census_busy_cycles() {
   bc_name=$1 bc_busy=0 bc_k=0
   if test "$1" = hfs; then bc_side=apple; else bc_side=fs; fi
-  census_attach "$2" || { echo "$bc_name: not attached" >>"$3"; echo 0; return 1; }
+  census_attach "$2" || { echo "$bc_name: not attached" >>"$3"; echo 0 0; return 1; }
   bc_disk=$CA_DISK bc_dev=$CA_DEV bc_mp=$CA_MP
   while test "$bc_k" -lt 20; do
     bc_k=$((bc_k + 1))
@@ -673,7 +687,58 @@ census_busy_cycles() {
   done
   census_detach "$bc_disk" "$bc_side" "$bc_mp" >>"$3"
   echo "$bc_name: busy $bc_busy of 20" >>"$3"
-  echo "$bc_busy"
+  echo "$bc_busy $bc_k"
+}
+
+# census_busy_ejects NAME IMAGE OTHER LOG: push A's spurious busy eject, PARITY_BUSY_EJECTS (3) times: IMAGE attached and
+#   mounted, then another volume (OTHER, an HFS+ copy) attached and ejected, then IMAGE's disk ejected with nothing open
+#   on it. A linuxfs mount is named linuxfs@rdiskN (f_mntfromname), so DiskArbitration ties it to its disk only until
+#   the next mount or unmount of any volume: then the disk's eject unmounts nothing, and the media eject fails busy
+#   (status 0x10) under the lklfuse still serving the volume. A busy eject records census_holders (mount still showing
+#   the volume, DiskArbitration saying not mounted), then frees the volume as a user would (diskutil unmount of its mount
+#   point) and ejects it (census_detach). Not run when IMAGE is still attached (an earlier eject failed). Prints the
+#   busy count and the cycles run; stops at a disk left attached.
+census_busy_ejects() {
+  be_name=$1 be_busy=0 be_k=0 be_n=${PARITY_BUSY_EJECTS:-3}
+  if test "$1" = hfs; then be_side=apple; else be_side=fs; fi
+  if test -n "$(census_image_disk "$2")"; then echo "$be_name: eject cycles not run: ${2##*/} is still attached" >>"$4"; echo 0 0; return 1; fi
+  while test "$be_k" -lt "$be_n"; do
+    census_attach "$2" || { echo "$be_name eject $((be_k + 1)): not attached; stopping" >>"$4"; break; }
+    be_k=$((be_k + 1)) be_disk=$CA_DISK be_mp=$CA_MP
+    if census_attach "$3"; then census_detach "$CA_DISK" apple >>"$4"; else echo "$be_name eject $be_k: the other volume did not attach" >>"$4"; fi
+    if be_out=$(bounded 600 diskutil eject "$be_disk" 2>&1 </dev/null); then
+      echo "$be_name eject $be_k: ejected: $be_out" >>"$4"
+    else
+      be_busy=$((be_busy + 1))
+      {
+        echo "$be_name eject $be_k: BUSY: $be_out"
+        census_holders "$be_disk" "$be_mp"
+        echo "-- freed as a user would: $(bounded 600 diskutil unmount "$be_mp" 2>&1 </dev/null)"
+      } >>"$4" 2>&1
+      census_detach "$be_disk" "$be_side" "$be_mp" >>"$4" || { echo "$be_name eject $be_k: left attached; stopping" >>"$4"; break; }
+    fi
+  done
+  echo "$be_name: eject busy $be_busy of $be_k" >>"$4"
+  echo "$be_busy $be_k"
+}
+
+# census_busy_bar WHAT MODE FS HFS-COUNTS FS-COUNTS N: item 4(a)'s bar, from two "BUSY RUN" counts: FS busy no more often
+#   than HFS+, each side run N times. MODE check: ok, or not ok with why (a side not run N times proves nothing); record:
+#   recorded; anything else is not ok, as parity says
+census_busy_bar() {
+  set -- "$1" "$2" "$3" ${4:-0 0} ${5:-0 0} "$6"
+  for _cbb_v in "$4" "$5" "$6" "$7"; do case $_cbb_v in '' | *[!0-9]*) set -- "$1" "$2" "$3" 0 0 0 0 "$8"; break ;; esac; done
+  _cbb_s="hfs $4 of $5, $3 $6 of $7"
+  case $2 in
+  record) echo "# recorded $1: $_cbb_s" ;;
+  check)
+    if test "$5" -eq "$8" && test "$7" -eq "$8" && test "$6" -le "$4"; then ok "parity $1 ($_cbb_s)"; else
+      notok "parity $1 ($_cbb_s)"
+      if test "$5" -ne "$8" || test "$7" -ne "$8"; then echo "parity: $1 did not run $8 times on each side, so it proves nothing"
+      else echo "parity: $3 was busy more often than HFS+"; fi
+    fi ;;
+  *) notok "parity $1"; echo "parity: its mode is '$2', not record or check" ;;
+  esac
 }
 
 # census_kib FILE: FILE's size in KiB, rounded up (0 when it is missing)
@@ -764,30 +829,47 @@ census_finder_ask() {
 # census_finder_eject MP VOL: Finder's eject by AppleScript, its dialog photographed (busy-eject)
 census_finder_eject() { census_finder_ask busy-eject "$1" "tell application \"Finder\" to eject disk \"$2\""; }
 
-# census_busy FS: item 4 on the HFS+ control against FS. (a) census_busy_cycles on each, into busy.FS.cycles.txt.
-#   (b) with a file held open (a shell, then TextEdit): diskutil unmount and eject, and Finder's eject (parity_shot
-#   busy-eject). diskutil unmount force and Force Eject (unmountDisk force, then eject) run on HFS+ alone unless
-#   PARITY_BUSY_FORCE=1: a forced unmount of a busy macFUSE volume runs on the QEMU kit first.
+# census_busy_parity record|check|da WHAT CMD...: parity WHAT under PARITY_MODE_BUSY as it is, or for this step alone as
+#   record, or as PARITY_MODE_BUSY_DA (da: a step DiskArbitration's tie decides)
+census_busy_parity() {
+  cbp_m=$PARITY_MODE_BUSY
+  case $1 in record) PARITY_MODE_BUSY=record ;; da) PARITY_MODE_BUSY=$PARITY_MODE_BUSY_DA ;; esac
+  shift; parity "$@"; cbp_rc=$?
+  PARITY_MODE_BUSY=$cbp_m
+  return "$cbp_rc"
+}
+
+# census_busy FS: item 4 on the HFS+ control against FS, into busy.FS.cycles.txt. (a) census_busy_cycles on each,
+#   checked by census_busy_bar (PARITY_MODE_BUSY); then census_busy_ejects on each (another HFS+ copy coming and
+#   going), barred by PARITY_MODE_BUSY_DA. (b) with a file held open (a shell, then TextEdit): diskutil unmount and
+#   eject, and Finder's eject (parity_shot busy-eject); the shell's eject is checked, the others take PARITY_MODE_BUSY_DA.
+#   diskutil unmount force and Force Eject (unmountDisk force, then eject) run on HFS+ alone unless
+#   PARITY_BUSY_FORCE=1: a forced unmount of a busy macFUSE volume runs on the QEMU kit first; either way they are
+#   recorded, never checked, until a kit result clears them (preflight F14).
 census_busy() {
   cb_fs=$1 CB_HOLDERS= cb_n=1
   census_sysctl "busy-$cb_fs"
-  cb_c=$(parity_control hfs) && cb_h=$(census_copy "$cb_c" "busy-hfs-$cb_fs") && cb_i=$(census_copy "$W/img/$cb_fs.img" "busy-$cb_fs") ||
-    { echo "# census_busy $cb_fs: no images"; return 1; }
+  cb_c=$(parity_control hfs) && cb_h=$(census_copy "$cb_c" "busy-hfs-$cb_fs") && cb_o=$(census_copy "$cb_c" "busy-hfs-other-$cb_fs") &&
+    cb_i=$(census_copy "$W/img/$cb_fs.img" "busy-$cb_fs") || { echo "# census_busy $cb_fs: no images"; return 1; }
   da_debug_on
   cb_log=$OUT/parity/busy.$cb_fs.cycles.txt; : >"$cb_log"
   cb_bh=$(census_busy_cycles hfs "$cb_h" "$cb_log" | tail -n 1)
   cb_bf=$(census_busy_cycles "$cb_fs" "$cb_i" "$cb_log" | tail -n 1)
-  echo "# recorded busy.$cb_fs.cycles: hfs $cb_bh of 20, $cb_fs $cb_bf of 20"
+  census_busy_bar "busy.$cb_fs.cycles" "$PARITY_MODE_BUSY" "$cb_fs" "$cb_bh" "$cb_bf" 20
+  cb_eh=$(census_busy_ejects hfs "$cb_h" "$cb_o" "$cb_log" | tail -n 1)
+  cb_ef=$(census_busy_ejects "$cb_fs" "$cb_i" "$cb_o" "$cb_log" | tail -n 1)
+  census_busy_bar "busy.$cb_fs.ejects" "$PARITY_MODE_BUSY_DA" "$cb_fs" "$cb_eh" "$cb_ef" "${PARITY_BUSY_EJECTS:-3}"
   PARITY_CTL_DEV= PARITY_FS_DEV= PARITY_FS_MP=
   for cb_case in shell:unmount shell:eject textedit:unmount textedit:eject shell:finder-eject; do
     census_busy_up || { echo "# census_busy $cb_fs: cannot attach both volumes again"; break; }
     cb_how=${cb_case%%:*} cb_step=${cb_case#*:}
     census_busy_hold "$cb_how" "$PARITY_CTL_MP" "$PARITY_FS_MP"
+    case $cb_case in shell:eject) cb_m=check ;; *) cb_m=da ;; esac
     case $cb_step in
-    unmount) parity "busy.$cb_fs.$cb_how-unmount" diskutil unmount @MP@ ;;
-    eject) parity "busy.$cb_fs.$cb_how-eject" diskutil eject @DISK@ ;;
+    unmount) census_busy_parity "$cb_m" "busy.$cb_fs.$cb_how-unmount" diskutil unmount @MP@ ;;
+    eject) census_busy_parity "$cb_m" "busy.$cb_fs.$cb_how-eject" diskutil eject @DISK@ ;;
     finder-eject)
-      parity "busy.$cb_fs.finder-eject" census_finder_eject @MP@ @VOL@
+      census_busy_parity "$cb_m" "busy.$cb_fs.finder-eject" census_finder_eject @MP@ @VOL@
       bounded 300 "$AQUA" killall Finder >/dev/null 2>&1 </dev/null; census_pause 6 ;;
     esac
     census_busy_release
@@ -796,7 +878,7 @@ census_busy() {
     census_busy_up || break
     if test "${PARITY_BUSY_FORCE:-0}" = 1; then census_busy_hold shell "$PARITY_CTL_MP" "$PARITY_FS_MP"; else census_busy_hold shell "$PARITY_CTL_MP"; fi
     if test "$cb_step" = force-unmount; then set -- diskutil unmount force @MP@; else set -- sh -c 'diskutil unmountDisk force "$1" && diskutil eject "$1"' _ @DISK@; fi
-    if test "${PARITY_BUSY_FORCE:-0}" = 1; then parity "busy.$cb_fs.$cb_step" "$@"; else census_hfs_only "busy.$cb_fs.$cb_step" "$@"; fi
+    if test "${PARITY_BUSY_FORCE:-0}" = 1; then census_busy_parity record "busy.$cb_fs.$cb_step" "$@"; else census_hfs_only "busy.$cb_fs.$cb_step" "$@"; fi
     census_busy_release
   done
   census_detach "$(census_image_disk "$cb_h")" apple
@@ -811,10 +893,10 @@ PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Content
 # The guest job has 180 min. Before the smoke: the VM's boot and the installs, about 5. The census begins nothing after
 #   PARITY_CENSUS_MIN = 135 min from the smoke's start (PARITY_T0, which the smoke sets first), and begins a step only if
 #   at its worst (census_worst_min: the console hung, spotlight and census_finder 24 min) it ends by 135 + 11 = 146:
-#   census_finder and spotlight begin by 122, busy by 129, unicode and trash/tags/case by 133. Then before login
+#   census_finder and spotlight begin by 122, busy by 126, unicode and trash/tags/case by 133. Then before login
 #   (about 5) and the copyback and uploads (about 5) remain: 5 + 146 + 5 + 5 = 161, leaving 19 to spare. Typical
 #   steps are shorter: spotlight about 11 (its 120 s mdfind waits, remounts, Finder's refresh, the Privacy shots); a
-#   busy census about 5, or about 9 with a stuck disk at each of its six re-attaches; one trash/tags/case census about
+#   busy census about 7, or about 11 with a stuck disk at each of its six re-attaches; one trash/tags/case census about
 #   3; one stall iteration under 1. Push A's census, its Finder steps not
 #   run, took 50 min (the stall 30 of them); with them, and stuck disks in both busy censuses, about 90 are expected,
 #   well inside 135. Push C's smoke sets PARITY_STALL_N=50 (push B's set 0): the stall's 30 min come first,
@@ -1242,7 +1324,8 @@ census_later() {
 # census_worst_min CMD: the minutes census step CMD may take at its worst, with the console hung (every AppleScript, aqua
 #   call and screenshot at its bound; disks attaching and ejecting as usual). Counted from each function's bounds:
 #   census_unicode, ext4's (two Finder steps of 60 s a side on ext4 and on FAT32, the pair window and its shots), 13;
-#   census_busy (a stuck disk at each re-attach, about 9, and TextEdit, Finder's eject and seven quits), 17;
+#   census_busy (a stuck disk at each re-attach, about 9, TextEdit, Finder's eject and seven quits, and the six
+#   eject-after-another-volume cycles of census_busy_ejects, about 15 s each and 10 s more when busy, 3), 20;
 #   census_spotlight (two passes' mdfind at 160 s a side, the refresh at 150 s a side, two Privacy panes), 24;
 #   census_finder (seven Get Info and window views of about 113 s, two Desktop passes, three restarts), 24;
 #   census_trash_tags_case (Finder's delete and empty trash, two restarts, the label, the xattr climb), 13;
@@ -1254,7 +1337,7 @@ census_later() {
 census_worst_min() {
   case $1 in
   census_spotlight | census_finder) echo 24 ;;
-  census_busy) echo 17 ;;
+  census_busy) echo 20 ;;
   census_unicode | census_trash_tags_case) echo 13 ;;
   census_later) echo 5 ;;
   stall | census_stall) echo 60 ;;

@@ -236,13 +236,36 @@ kill_lklfuse() {
   bounded 300 sh -c 'while ps -p "$1" > /dev/null; do sleep 0.1; done' _ "$1"
 }
 mounted_by_root() { l=$(mount | grep -F " on $1 ("); echo "$l"; [ -n "$l" ] && ! echo "$l" | grep -q "mounted by"; }
-# spec: tests/smoke-mavericks.sh header -- a volume can be briefly busy right after writes (run 45436964610: xfs GPT
-#       "Unmount failed" once): say who holds it, then try once more after 2 s; the retry is printed, so a flake stays visible
-da_unmount() {  # MOUNTPOINT
-  bounded 600 diskutil unmount "$1" && return 0
-  echo "# diskutil unmount $1 failed; open files there:"; lsof +D "$1" 2> /dev/null | sed 's/^/#   /' | head -n 20
-  sleep 2; echo "# retrying diskutil unmount $1"; bounded 600 diskutil unmount "$1"
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-12-brief.md Step 2 -- who holds a volume: sudo -n lsof on its mount point,
+#       every user's open files on that filesystem, root's too (the directory walk it replaces, run as the user, saw only
+#       the user's own). With DISK, also DiskArbitration's view of the disk, the mount table's line for MOUNTPOINT and
+#       who has the disk's devices open: a linuxfs volume still mounted where DiskArbitration says it is not is item 4's
+#       spurious busy eject (push A, task-12-report.md): its mount is named linuxfs@rdiskN (f_mntfromname, item 6), so
+#       DiskArbitration unties it from its disk at the next mount or unmount of any volume, and the disk's eject then
+#       unmounts nothing and fails busy under the lklfuse still serving it
+holders() {  # MOUNTPOINT [DISK]
+  echo "#   sudo -n lsof $1:"; bounded 300 sudo -n lsof "$1" 2>&1 < /dev/null | sed 's/^/#     /' | head -n 20
+  test -n "${2:-}" || return 0
+  hd=${2#/dev/} hdv=
+  for hn in "$hd" "${hd}s1"; do
+    test -e "/dev/$hn" && hdv="$hdv /dev/$hn /dev/r$hn"
+    hm=$(bounded 300 info "$hn" Mounted); test -z "$hm" || echo "#   DiskArbitration: $hn Mounted: $hm"
+  done
+  hl=$(bounded 100 mount < /dev/null | grep -F " on $1 ("); echo "#   mount: ${hl:-nothing on $1}"
+  # shellcheck disable=SC2086  # the device nodes are words
+  echo "#   sudo -n lsof$hdv:"; test -z "$hdv" || bounded 300 sudo -n lsof $hdv 2>&1 < /dev/null | sed 's/^/#     /' | head -n 20
 }
+# spec: tests/smoke-mavericks.sh header -- a volume can be briefly busy right after writes (run 45436964610: xfs GPT
+#       "Unmount failed" once; run 45449093147: ext4 GPT eject once): CMD; when it fails, who holds MOUNTPOINT (holders),
+#       then CMD once more after 2 s; the retry is printed, so a flake stays visible. The retries stay until push D's
+#       Spotlight-on measurement (preflight F13)
+retry_busy() {  # MOUNTPOINT DISK|"" CMD...
+  rb_mp=$1 rb_d=$2; shift 2
+  bounded 600 "$@" && return 0
+  echo "# $* failed; who holds $rb_mp:"; holders "$rb_mp" $rb_d
+  sleep 2; echo "# retrying $*"; bounded 600 "$@"
+}
+da_unmount() { retry_busy "$1" "" diskutil unmount "$1"; }  # MOUNTPOINT
 login_unmount() { bounded 600 sudo -n diskutil unmount "$1" && ! mount | grep -qF " on $1 ("; }
 login_eject() {  # whole disk: ejected, and no _linuxfs lklfuse within 10 s
   bounded 600 sudo -n diskutil eject "$1" || return 1
@@ -250,12 +273,7 @@ login_eject() {  # whole disk: ejected, and no _linuxfs lklfuse within 10 s
 }
 da_eject() {  # whole disk, mount point: leaves no lklfuse on it
   pids=$(lklfuse_on "$2" | awk '{ print $2 }')
-  # spec: tests/smoke-mavericks.sh da_unmount -- a volume can be briefly busy right after writes (run 45449093147: ext4 GPT
-  #       eject once); say who holds it and try once more, printed
-  if ! bounded 600 diskutil eject "$1"; then
-    echo "# diskutil eject $1 failed; open files on $2:"; lsof +D "$2" 2> /dev/null | sed 's/^/#   /' | head -n 20
-    sleep 2; echo "# retrying diskutil eject $1"; bounded 600 diskutil eject "$1" || return 1
-  fi
+  retry_busy "$2" "$1" diskutil eject "$1" || return 1
   for p in $pids; do bounded 300 sh -c 'while ps -p "$1" > /dev/null; do sleep 0.1; done' _ "$p" || { echo "lklfuse $p still runs"; return 1; }; done
   j=0; while [ -n "$(lklfuse_on "$2")" ]; do
     j=$((j + 1)); [ $j -le 10 ] || { echo "lklfuse still on $2 ten seconds after the eject:"; lklfuses; ps -axww -o user=,pid=,command= | grep -i 'fuse' | grep -v grep; return 1; }
