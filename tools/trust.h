@@ -6,7 +6,13 @@
 #define LINUXFS_TRUST_H
 
 #include <stddef.h>
+#include <sys/stat.h>
 #include <sys/types.h>
+
+/* Whether a file or directory is owner's (root's) and writable by it alone: a group may write only when it is gid 0, others
+ * never; a directory of owner's with the sticky bit counts whoever can write it (nobody else can rename or remove owner's
+ * entries). The rule trust_path applies to each step of its walk. */
+int trust_root_only(const struct stat *st, uid_t owner);
 
 /* Whether root may trust the file at path. The path is walked the way the kernel and dyld walk it, one component at a time,
  * following every symlink by hand: each directory the walk stands in (so the directories holding each symlink hop, as well as

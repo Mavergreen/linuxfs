@@ -12,7 +12,7 @@
 /* Whether a file or directory is owner's (root's) and writable by it alone (a group counts only when it is gid 0: /usr/local is
  * root:wheel 0775). A root-owned directory with the sticky bit counts whoever can write it: nobody else can rename or remove root's
  * entries, and the walk requires each entry below it to be root's too (stock 10.9 may ship / as 1775 root:admin). */
-static int root_only(const struct stat *st, uid_t owner)
+int trust_root_only(const struct stat *st, uid_t owner)
 {
 	if (st->st_uid != owner)
 		return 0;
@@ -36,7 +36,7 @@ int trust_path(const char *path, uid_t owner, const char *trust_root, char *out,
 	snprintf(rest, sizeof rest, "%s", path);
 	cur[0] = '/';
 	cur[1] = '\0';
-	if (!skip && (lstat("/", &st) != 0 || !root_only(&st, owner)))
+	if (!skip && (lstat("/", &st) != 0 || !trust_root_only(&st, owner)))
 		return -1;
 	for (;;) {
 		char *r = rest, *slash;
@@ -92,7 +92,7 @@ int trust_path(const char *path, uid_t owner, const char *trust_root, char *out,
 			continue;
 		}
 		if (S_ISDIR(st.st_mode)) {
-			if (strlen(next) > skip && !root_only(&st, owner))
+			if (strlen(next) > skip && !trust_root_only(&st, owner))
 				return -1;
 			memcpy(cur, next, strlen(next) + 1);
 			continue;
@@ -108,7 +108,7 @@ int trust_path(const char *path, uid_t owner, const char *trust_root, char *out,
 			if (*e)
 				return -2;
 		}
-		if (!root_only(&st, owner))
+		if (!trust_root_only(&st, owner))
 			return -1;
 		if (strlen(next) >= outlen)
 			return -1;

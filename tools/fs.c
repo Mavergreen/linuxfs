@@ -578,7 +578,7 @@ static int run_cli(const char *cli, const struct mountreq *req, const char *pw, 
 #define STATUS_WAIT_S 60	/* for its mount status: mount(2) ends when lklfuse answers the kernel's INIT */
 #define REFUSED_WAIT_S 5	/* for that status after the CLI failed (its descriptors closed, the mount fails) */
 #define STOP_WAIT_S 2		/* for a process told to stop, before SIGKILL */
-#define LOCK_DIR "/var/run/linuxfs"	/* the disks' locks: LOCK_DIR/dev.mavergreen.linuxfs.mount.<whole disk>.lock */
+#define LOCK_DIR "/var/db/dev.mavergreen.linuxfs.locks"	/* the disks' locks: LOCK_DIR/dev.mavergreen.linuxfs.mount.<whole disk>.lock */
 #define LOCK_FD_MIN 10		/* the lock's descriptor, at or above this: clear of the disk (3), the device (4), 5 and the channel (6) */
 #define STR_(x) #x
 #define STR(x) STR_(x)
@@ -935,18 +935,33 @@ static int mounted_already(const char *mnt, const char *whole)
 	return 0;
 }
 
-/* The locks' directory, LOCK_DIR (/var/run/linuxfs), opened: made on demand (/var/run is emptied at boot), root's (uid and gid 0)
- * and 0700, because /var/run itself is root:daemon 0775, where the daemon group could rename a held lock file aside or plant one.
- * It is checked at each use, by lstat and by fstat of the descriptor opened without following a symlink (the same directory both
- * times): a directory of root's and root's group, mode exactly 0700. Anything else is refused and never repaired. A directory
- * mkdir made now is ours to give root's group and 0700, but only when it is root's already (a directory someone else put there
- * between the mkdir and the open is not). The descriptor, or -1 having refused. */
+/* The locks' directory, LOCK_DIR (/var/db/dev.mavergreen.linuxfs.locks), opened. Its parent must be root's alone by trust.c's
+ * rule (trust_root_only: /var/db is root:wheel 0755), checked first at each use: in a parent anyone else can write (/var/run is
+ * root:daemon 0775), the directory itself could be renamed aside while a lock in it is held, and the next request would make a
+ * fresh one. The directory is made on demand, root's (uid and gid 0) and 0700, and checked at each use, by lstat and by fstat of
+ * the descriptor opened without following a symlink (the same directory both times): a directory of root's and root's group, mode
+ * exactly 0700. Anything else, the parent included, is refused and never repaired. A directory mkdir made now is ours to give
+ * root's group and 0700, but only when it is root's already. Its lock files stay (flocks end with their holders, and at reboot):
+ * harmless, and the uninstaller removes them. The descriptor, or -1 having refused. */
 static int lock_dir_open(const char *fs)
 {
-	const char *dir = lock_dir();
+	const char *dir = lock_dir(), *slash = strrchr(dir, '/');
+	char parent[PATH_MAX];
 	struct stat lst, st;
 	int dfd;
 
+	if (!slash || (size_t)(slash - dir) >= sizeof parent) {
+		refuse(fs, "the disks' lock directory has no parent");
+		return -1;
+	}
+	memcpy(parent, dir, (size_t)(slash - dir));
+	parent[slash == dir ? 1 : slash - dir] = '\0';
+	if (slash == dir)
+		parent[0] = '/';
+	if (lstat(parent, &st) != 0 || !S_ISDIR(st.st_mode) || !trust_root_only(&st, ROOT_ONLY_UID)) {
+		refuse(fs, "the disks' lock directory's parent is writable by others than root");
+		return -1;
+	}
 	if (mkdir(dir, 0700) == 0) {
 		dfd = open(dir, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
 		if (dfd < 0 || fstat(dfd, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != ROOT_ONLY_UID ||

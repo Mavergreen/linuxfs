@@ -364,8 +364,10 @@ mkdir -p "$D/short"
 V=$D/vols; rm -rf "$V"; mkdir -p "$V/NAME" "$V/other"; : > "$V/file"; ln -s "$V/NAME" "$V/link"
 H=/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d
 UID_D=$(id -u daemon)
-# the disks' locks, in a directory the program makes on demand (root's are /var/run/linuxfs/dev.mavergreen.linuxfs.mount.<disk>.lock)
-LK=$D/locks; rm -rf "$LK"; LKF=$LK/dev.mavergreen.linuxfs.mount.$E.lock
+# the disks' locks, in a directory the program makes on demand under a parent only root can write in (root's are
+# /var/db/dev.mavergreen.linuxfs.locks/dev.mavergreen.linuxfs.mount.<disk>.lock; /var/db is root:wheel 0755)
+LKP=$D/lockparent; rm -rf "$LKP"; mkdir -p "$LKP"; chmod 755 "$LKP"
+LK=$LKP/locks; LKF=$LK/dev.mavergreen.linuxfs.mount.$E.lock
 plan() { # ARGS...: the drop build's plan for user daemon, volumes under $V
   env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_FS_TEST_LOCKDIR="$LK" LINUXFS_PREFS_USER="$D/none.plist" \
     LINUXFS_PREFS_MACHINE="${MACHP:-$D/none2.plist}" "$DM" "$@"; }
@@ -455,6 +457,24 @@ fi
 rm -rf "$LK.file"; mv "$LK" "$LK.real"; : > "$LK"; chmod 700 "$LK"
 lockdir_refused "a file where the locks' directory goes"
 rm -f "$LK"; mv "$LK.real" "$LK"
+# spec: Task 16f fix round 2 (I1') -- the locks' directory's parent must pass trust.c's root_only rule (root's; writable by a group
+#       only when it is gid 0, by others never; or sticky), or anyone who can write there could rename the directory aside and
+#       a second request would make a fresh one; refused, and the parent is left as it was
+parent_refused() { # WHAT
+  fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc=$?
+  test $rc = 1 && grep -qx "linuxfs-mount: refused: the disks' lock directory's parent is writable by others than root" "$M/plan.err" && ! grep -q '^fd3' "$M/plan"
+  ok $? "root plan: $1 → refused (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"; }
+chmod 775 "$LKP"; parent_refused "the locks' directory's parent group-writable (gid $(stat -f %g "$LKP")), not sticky"
+test "$(stat -f %Lp "$LKP")" = 775; ok $? "and the parent is left as it was ($(stat -f %Lp "$LKP"))"
+chmod 757 "$LKP"; parent_refused "the locks' directory's parent writable by others, not sticky"
+chmod 1777 "$LKP"
+fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
+test $rc = 0; ok $? "root plan: a sticky parent (1777) is root's alone in the rule's sense: accepted (rc $rc: $(tail -n 1 "$M/plan"))"
+chmod 755 "$LKP"
+rm -rf "$LK"; chmod 775 "$LKP"
+parent_refused "no locks' directory yet, and a group-writable parent"
+test ! -e "$LK"; ok $? "and no locks' directory is made there"
+chmod 755 "$LKP"
 fplan "$F2" "/dev/$E" "$V/NAME" > /dev/null 2>&1
 chmod 644 "$LKF"
 fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc=$?
