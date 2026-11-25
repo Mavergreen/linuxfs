@@ -574,7 +574,7 @@ r=$("$PARITY_PYTHON" -c "$census_py_create" "$T/uc" 66696c652f78 79 2>&1)
 expect census_py_create_goes_on test "$(printf '%s\n' "$r" | sed 's/errno [0-9]*$/errno N/')" = "$(printf '%s\n' '66696c652f78 errno N' '79 created')"
 rm -rf "$T/uc"
 bounded() { ( PARITY_TEST_BOUNDED=1; shift; "$@" ); }
-sleep() { test -n "${PARITY_TEST_BOUNDED:-}" || { echo "sleep $* outside bounded" >> "$unbounded"; return 1; }; }
+sleep() { test -n "${PARITY_TEST_BOUNDED:-}" || { echo "sleep $* outside bounded" >> "$unbounded"; return 1; }; echo "sleep $*" >> "$T/sleeps"; }
 attached() { ls "$S/nodes" | grep -v '\.[mu]$' | tr '\n' ' '; }
 
 # platform: the stub volumes are plain directories, and only a Mac's (HFS+) finds a name by its other form, which the
@@ -790,7 +790,10 @@ expect census_busy_dialogs grep -q '^busy-eject: OK: ' "$P/dialogs.txt"
 # item 3 (Task 13b, fix round 1): a busy-eject shot is not awaited: on 10.9 Finder's eject alerts are invisible to System
 #   Events, so a wait for one would always run out; it is taken after a fixed 3 s, and that said
 expect census_busy_eject_not_awaited not grep -q '^busy-eject ext4: seen' "$P/shots.txt"
-expect census_busy_eject_not_awaited_said grep -q '^busy-eject ext4: not awaited: Finder.s eject alerts are invisible to System Events on 10.9; photographed after 3 s$' "$P/shots.txt"
+expect census_busy_eject_not_awaited_said grep -q '^busy-eject ext4: not awaited: Finder.s eject alerts are invisible to System Events on 10.9; photographed after 3 s (busy-eject-3s) and 15 s (busy-eject)$' "$P/shots.txt"
+# (fix round 2) push C's HFS+ alert was not up 4 s in: each side is photographed twice, at 3 s and at 15 s, both kept
+expect census_busy_eject_two_shots test "$(grep -c 'screencapture -x .*-busy-eject-3s.png' "$S/calls")" -eq 2
+expect census_busy_eject_bound test -n "$(sed -n '/^census_busy()/,/^}/p' "$here/lib/parity.sh" | grep 'census_bound 1800 census_busy_parity "$cb_m" "busy.$cb_fs.finder-eject"')"
 expect census_busy_eject_restarted grep -q '^busy-eject: restarted Finder after an eject (alerts invisible to System Events on 10.9)$' "$P/dialogs.txt"
 expect census_busy_detached test -z "$(attached)"
 # census_finder_ask dismisses the console's alerts before osascript starts, never between it and its shot (osascript
@@ -1086,16 +1089,19 @@ expect census_dialogs_force_restart grep -q '^guest-macosx-aqua killall Finder$'
 #   subshell, as bounded runs it) the next dismissal restarts Finder whatever System Events says, says so, and only once;
 #   a Finder step that ejects nothing leaves no restart; the eject's shot is not awaited (no System Events wait), but
 #   taken after 3 s; nothing presses a key (Force Eject can never be pressed)
-rm -f "$P/dialogs.txt" "$P/shots.txt"; : > "$S/calls"
-bounded 1600 census_finder_eject "$T/b" FSQ > /dev/null 2>&1
+rm -f "$P/dialogs.txt" "$P/shots.txt"; : > "$S/calls"; : > "$T/sleeps"
+bounded 1800 census_finder_eject "$T/b" FSQ > /dev/null 2>&1
 expect census_eject_shot_not_awaited not grep -q 'return exists (first window' "$S/calls"
-expect census_eject_shot_said grep -q '^busy-eject fsq: not awaited: Finder.s eject alerts are invisible to System Events on 10.9; photographed after 3 s$' "$P/shots.txt"
+expect census_eject_shot_said grep -q '^busy-eject fsq: not awaited: Finder.s eject alerts are invisible to System Events on 10.9; photographed after 3 s (busy-eject-3s) and 15 s (busy-eject)$' "$P/shots.txt"
+expect census_eject_shots_order ascending "$(grep -n 'screencapture -x .*/fsq-busy-eject-3s.png$' "$S/calls" | cut -d: -f1)" "$(grep -n 'screencapture -x .*/fsq-busy-eject.png$' "$S/calls" | cut -d: -f1)"
+expect census_eject_shots_kept test -f "$OUT/fsq-busy-eject-3s.png" -a -f "$OUT/fsq-busy-eject.png"
+expect census_eject_late_pause grep -q '^sleep 1[0-5]$' "$T/sleeps"
 : > "$S/calls"; census_finder_dialogs step-e > /dev/null 2>&1
 expect census_eject_restarts grep -q '^guest-macosx-aqua killall Finder$' "$S/calls"
 expect census_eject_restart_said grep -q '^step-e: restarted Finder after an eject (alerts invisible to System Events on 10.9)$' "$P/dialogs.txt"
 : > "$S/calls"; census_finder_dialogs step-f > /dev/null 2>&1
 expect census_eject_restart_once not grep -q 'killall Finder' "$S/calls"
-bounded 1600 census_finder_eject "$T/b" FSQ > /dev/null 2>&1; bounded 1600 census_finder_eject "$T/a" CTL > /dev/null 2>&1
+bounded 1800 census_finder_eject "$T/b" FSQ > /dev/null 2>&1; bounded 1800 census_finder_eject "$T/a" CTL > /dev/null 2>&1
 expect census_eject_restart_between_sides test "$(grep -c 'killall Finder' "$S/calls")" -eq 1
 census_finder_dialogs step-h > /dev/null 2>&1
 bounded 1600 census_finder_ask trash-delete "$T/b" 'tell application "Finder" to delete (POSIX file "/x" as alias)' > /dev/null 2>&1
@@ -1424,20 +1430,35 @@ for d in $(sort -u "$S/fsdisks"); do
   grep -Eq "^(hdiutil detach -force|diskutil unmountDisk force|diskutil unmount force) (/dev/)?$d(s1)?\$" "$S/calls.all" && forced="$forced $d"
 done
 expect census_no_force_on_fs test -z "$forced" -a -s "$S/fsdisks"
-# a disk that never mounted may be detached by force when its eject fails; a mounted linuxfs disk never is:
-#   census_attach's "not mounted within 60 s", a stalled plain attach in fl_iter, and fl_iter's no-UUID path (swept or not)
+# (fix round 2) a linuxfs disk is never detached by force, mounted or not: census_attach's "not mounted within 60 s"
+#   (a slow DiskArbitration mount: its lklfuse may be starting), a stalled plain attach in fl_iter, and fl_iter's no-UUID
+#   path (swept or not) are ejected, and the eject retried, as census_detach fs does
 forced_on() { grep -q "^hdiutil detach -force $1\$" "$S/calls.all"; }
 for c in nevermount-stuck-a nevermount-stuck-b nouuid-stuck nouuid-swept-stuck; do echo "$c" > "$W/census/$c.img"; done
 census_attach "$W/census/nevermount-stuck-a.img" > /dev/null 2>&1; d=$(cat "$S/disks")
-expect never_mounted_attach_forced forced_on "/dev/disk$d"
+expect never_mounted_attach_not_forced not forced_on "/dev/disk$d"
+expect never_mounted_attach_retried test "$(grep -c "^diskutil eject /dev/disk$d\$" "$S/calls.all")" -ge 2
 fl_iter ext4 2 1 "$W/census/nevermount-stuck-b.img" > /dev/null 2>&1; d=$(cat "$S/disks")
-expect never_mounted_stall_forced forced_on "/dev/disk$d"
+expect never_mounted_stall_not_forced not forced_on "/dev/disk$d"
 fl_iter ext4 1 1 "$W/census/nouuid-stuck.img" > /dev/null 2>&1; d=$(cat "$S/disks")
-expect never_mounted_nouuid_forced forced_on "/dev/disk$d"
+expect never_mounted_nouuid_not_forced not forced_on "/dev/disk$d"
 fl_iter ext4 1 1 "$W/census/nouuid-swept-stuck.img" > /dev/null 2>&1; d=$(cat "$S/disks")
 expect swept_nouuid_not_forced not forced_on "/dev/disk$d"
 expect swept_nouuid_retried test "$(grep -c "^diskutil eject /dev/disk$d\$" "$S/calls.all")" -ge 2
 rm -f "$S/nodes/disk$d" "$S/nodes/disk$d.m"   # the leftover goes without a stub call, so no forced detach is logged
+drop_stuck nevermount-stuck; drop_stuck nouuid-stuck
+# (fix round 2) census_detach_checked's Apple side (nothing mounted) is detached by force only when no lklfuse names
+#   the disk: with one on it, or ps unable to say, it is ejected only
+for c in held plain; do echo "$c" > "$W/census/sweep-stuck-hfs-$c.img"; done
+hdiutil attach -nomount "$W/census/sweep-stuck-hfs-held.img" > /dev/null 2>&1; d=disk$(cat "$S/disks")
+echo "$d" > "$S/lklfuse-holds"; census_detach_checked "/dev/$d" apple > /dev/null 2>&1; rm -f "$S/lklfuse-holds"
+expect census_detach_checked_held_not_forced not forced_on "/dev/$d"
+: > "$S/ps-fail"; census_detach_checked "/dev/$d" apple > /dev/null 2>&1; rm -f "$S/ps-fail"
+expect census_detach_checked_psless_not_forced not forced_on "/dev/$d"
+hdiutil attach -nomount "$W/census/sweep-stuck-hfs-plain.img" > /dev/null 2>&1; d=disk$(cat "$S/disks")
+census_detach_checked "/dev/$d" apple > /dev/null 2>&1
+expect census_detach_checked_apple_forced forced_on "/dev/$d"
+drop_stuck sweep-stuck-hfs; rm -f "${W:?}"/census/sweep-stuck-hfs-*.img
 # item 7's recovery: the remount's linuxfs attach never mounts and cannot be detached: the case step is skipped, said,
 #   and the stale disk is not ejected again
 echo flaky5 > "$W/img/flaky5.img"; first=disk$(($(cat "$S/disks") + 2))

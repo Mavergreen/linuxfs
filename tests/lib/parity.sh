@@ -340,11 +340,17 @@ census_detach() {
 }
 
 # census_detach_checked DISK SIDE: census_detach of DISK as SIDE, with its mount point, when any node of it (the whole
-#   disk, s1 to s4) is mounted; as nomount when none is
+#   disk, s1 to s4) is mounted. When none is: a linuxfs SIDE (fs), or a disk an lklfuse names (census_lklfuse_on), or
+#   one ps cannot say of, as fs, ejected only, never by force (fix round 2: census_attach's "not mounted within 60 s"
+#   may be a slow DiskArbitration mount, its lklfuse starting; a stall's leftover likewise); otherwise (Apple's, no
+#   lklfuse on it) as nomount
 census_detach_checked() {
   for _cdc_n in "$1" "${1}s1" "${1}s2" "${1}s3" "${1}s4"; do
     if test "$(census_info "$_cdc_n" Mounted)" = Yes; then census_detach "$1" "$2" "$(census_info "$_cdc_n" "Mount Point")"; return; fi
   done
+  test "$2" != fs || { census_detach "$1" fs; return; }
+  census_lklfuse_on "$1"
+  test $? -eq 1 || { census_detach "$1" fs; return; }
   census_detach "$1" nomount
 }
 
@@ -975,8 +981,12 @@ census_busy_release() {
 #   up is dismissed first (census_finder_dialogs: push C's HFS+ dialog showed in ext4's shot). Run it under bounded
 #   (parity does), at 160 s: the dismissal 68, census_dismiss 20, the wait 17, the shot 30, osascript's 20, and the rest.
 #   Fix round 1: when SCRIPT ejects or unmounts, its alert is invisible to System Events on 10.9 (census_finder_dialogs),
-#   so a wait for it would always run out: the shot is taken after a fixed 3 s (census_pause, bounded at 5), and that
-#   said in shots.txt; the eject is marked ($W/census/finder-eject-asked) for the next dismissal's Finder restart. Push C's
+#   so a wait for it would always run out. Fix round 2: push C's HFS+ alert was not up yet 4 s in, so the side is
+#   photographed twice, kept both: STEP-3s after a fixed 3 s (census_pause, bounded at 5), and STEP at 15 s from
+#   osascript's start (census_pause of what is left of the 15, bounded at 2 s over it; none when the first shot took
+#   it all); shots.txt says so. Bound: the dismissal 68, census_dismiss 20, the pause and first shot 35 at their worst
+#   (a shot of 30 leaves no second pause; a quick one leaves at most 14), the second shot 30, osascript's 20: 173, under
+#   the 180 s census_busy gives it; the eject is marked ($W/census/finder-eject-asked) for the next dismissal's Finder restart. Push C's
 #   wrong-side dialog (HFS+'s busy-eject alert in ext4's shot) is closed by that restart, before the other side's ask.
 census_finder_ask() {
   fe_o=$W/census/finder-ask.out
@@ -988,8 +998,11 @@ census_finder_ask() {
   fe_p=$!
   if test "$2" = "$PARITY_CTL_MP"; then fe_s=hfs fe_n=hfs; else fe_s=fs fe_n=$PARITY_FS; fi
   if test -n "$fe_e"; then
-    census_pause 3; mkdir -p "$OUT/parity"
-    echo "$1 $fe_n: not awaited: Finder's eject alerts are invisible to System Events on 10.9; photographed after 3 s" >>"$OUT/parity/shots.txt"
+    fe_t0=$(date +%s); census_pause 3; mkdir -p "$OUT/parity"
+    echo "$1 $fe_n: not awaited: Finder's eject alerts are invisible to System Events on 10.9; photographed after 3 s ($1-3s) and 15 s ($1)" >>"$OUT/parity/shots.txt"
+    census_shot "$1-3s" "$fe_s" nodismiss
+    fe_r=$((15 - ($(date +%s) - fe_t0)))
+    test "$fe_r" -le 0 || census_pause "$fe_r"
   else census_awaited "$1" "$fe_n" "$census_await_dialog"; fi
   census_shot "$1" "$fe_s" nodismiss
   fe_k=0; while kill -0 "$fe_p" 2>/dev/null && test "$fe_k" -lt 20; do fe_k=$((fe_k + 1)); sleep 1; done
@@ -1051,7 +1064,7 @@ census_busy() {
     unmount) census_busy_parity "$cb_m" "busy.$cb_fs.$cb_how-unmount" diskutil unmount @MP@ ;;
     eject) census_busy_parity "$cb_m" "busy.$cb_fs.$cb_how-eject" diskutil eject @DISK@ ;;
     finder-eject)
-      census_bound 1600 census_busy_parity "$cb_m" "busy.$cb_fs.finder-eject" census_finder_eject @MP@ @VOL@
+      census_bound 1800 census_busy_parity "$cb_m" "busy.$cb_fs.finder-eject" census_finder_eject @MP@ @VOL@   # census_finder_ask's eject worst, 173 s (see it)
       bounded 300 "$AQUA" killall Finder >/dev/null 2>&1 </dev/null; census_pause 6 ;;
     esac
     census_busy_release
@@ -1568,11 +1581,12 @@ census_later() {
 #   the restart after an eject asked of Finder is that one); census_after after the stall, its sweep alone, 137; a
 #   census_awaited window, pane or dialog wait, 17, in place of a pause 2 s longer than the 1 kept (census_finder_view,
 #   names, privacy: 15 net) or of census_refresh's 3 (14 net) or census_finder_ask's 4 s (13 net); an eject's
-#   census_finder_ask takes no wait but a census_pause 3 (bounded at 5) for the 4 s, 1 net; census_finder_ask's own
+#   census_finder_ask takes no wait but two shots, at 3 s and 15 s (fix round 2): at worst the pause and first shot
+#   35, the second shot 30, for the 4 s and one shot of 30 before, 31 net; census_finder_ask's own
 #   dismissal, 68; census_index_on's -E and second -i on, 60 a pass, and census_spotlight_diag, 10 a pass; tm-offer's
 #   note, nothing. So:
 #   census_unicode 13 + (2 names waits 30 + 205) / 60 = 16.9, 17;
-#   census_busy 23 + (2 Finder ejects 2 x (68 + 1) = 138 + 205 + about 45 names-mode reads, 5) / 60 = 28.8, kept at 30;
+#   census_busy 23 + (2 Finder ejects 2 x (68 + 31) = 198 + 205 + about 45 names-mode reads, 5) / 60 = 29.8, 30;
 #   census_spotlight 24 + (2 refresh waits 28 + 2 panes 30 + 2 x 60 + 2 x 10 + 205) / 60 = 30.7, 31;
 #   census_finder 24 + (7 views 105 + 205) / 60 = 29.2, 30;
 #   census_trash_tags_case 13 + (3 census_finder_ask 3 x (68 + 13) = 243 + 205) / 60 = 20.5, 21;
