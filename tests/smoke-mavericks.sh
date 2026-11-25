@@ -16,9 +16,10 @@
 #       fails it. Linux checks the images afterwards (on-mavericks.yml's fsck job).
 #   usage: smoke-mavericks.sh VERSION IN OUT
 #          VERSION is the run's version (the pkg installed). IN holds ext4, btrfs, xfs, ntfs, exfat, f2fs and apfs .img.gz
-#          from tests/lib/probe-images.sh, gpt-<fs>.img.gz (each in its own partition type), gpt-ext4-basic.img.gz and gpt-enc.img.gz (tests/lib/gpt-wrap.py), and ext4-slash and
-#          ext4-ctl .img.gz (tests/lib/label-images.sh). OUT receives every image as it is after the run, gzipped (da-*.img.gz
-#          are the disks DiskArbitration mounted), and the screenshots. Run as the guest's user over ssh, not root and not in
+#          from tests/lib/probe-images.sh, gpt-<fs>.img.gz (each in its own partition type), gpt-ext4-basic.img.gz and gpt-enc.img.gz (tests/lib/gpt-wrap.py), ext4-slash and
+#          ext4-ctl .img.gz (tests/lib/label-images.sh), and ext4-names.img.gz (tests/lib/unicode-images.sh). OUT receives every image as it is after the run, gzipped (da-*.img.gz
+#          are the disks DiskArbitration mounted; ctl-fat32.img.gz is the census's FAT32 control), the screenshots, and the
+#          census's records in OUT/parity (tests/lib/parity.sh). Run as the guest's user over ssh, not root and not in
 #          the console session: the steps that need it go through /usr/local/bin/guest-macosx-aqua.
 #          Exits 77 where it cannot run (not 10.9, product not installed, wrong arguments); the job treats 77 as failure.
 set -u

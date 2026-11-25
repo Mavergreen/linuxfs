@@ -35,15 +35,17 @@ jobs:
       - uses: actions/checkout@v7
         with: { persist-credentials: false }
       - uses: Mavergreen/shipyard/.github/actions/install@v1
-      - name: ext4, btrfs, xfs, f2fs, NTFS, exFAT and APFS images, labelled, in the build container
+      - name: ext4, btrfs, xfs, f2fs, NTFS, exFAT and APFS images, labelled, and the Linux-made Unicode names, in the build container
         run: |
           set -eu
           d="$RUNNER_TEMP/images"
           mkdir -p "$d"
           LINUX_HOST_SHARE="$HOME" sh build/linux-host.sh sh tests/lib/probe-images.sh "$d"
           LINUX_HOST_SHARE="$HOME" sh build/linux-host.sh sh tests/lib/label-images.sh "$d"
+          LINUX_HOST_SHARE="$HOME" sh build/linux-host.sh sh tests/lib/unicode-images.sh "$d"
           mkdir -p "$RUNNER_TEMP/up"
           for fs in ext4 btrfs xfs f2fs ntfs exfat apfs; do gzip -c "$d/$fs.img" > "$RUNNER_TEMP/up/$fs.img.gz"; done
+          gzip -c "$d/ext4-names.img" > "$RUNNER_TEMP/up/ext4-names.img.gz"
           for l in slash ctl; do [ ! -f "$d/ext4-$l.img" ] || gzip -c "$d/ext4-$l.img" > "$RUNNER_TEMP/up/ext4-$l.img.gz"; done
       # spec: tests/lib/gpt-wrap.py -- the same images in a GPT wrapper with each filesystem's own partition type (Linux data, basic data for NTFS, APFS), plus ext4 in the basic-data type,
       #       as an external disk formatted by macOS is laid out,
@@ -153,6 +155,15 @@ jobs:
       - uses: Mavergreen/shipyard/.github/actions/install@v1
       - uses: actions/download-artifact@v8
         with: { name: linuxfs-images-after, path: "${{ runner.temp }}/after" }
+      # spec: tests/lib/parity.sh census_unicode -- the census records, never gates: the names Apple's msdosfs wrote to the
+      #       FAT32 control (ctl-fat32.img), as Linux reads them, one hex line per root-directory name
+      - name: The FAT32 control's names as Linux reads them (census, recorded only)
+        run: |
+          d="$RUNNER_TEMP/after"
+          if [ -f "$d/ctl-fat32.img.gz" ]; then
+            gzip -dc "$d/ctl-fat32.img.gz" > "$RUNNER_TEMP/ctl-fat32.img"
+            python3 -I tests/lib/check-names.py fat "$RUNNER_TEMP/ctl-fat32.img" | sed 's/^/# ctl-fat32 name: /' || echo "# check-names.py fat failed on ctl-fat32.img"
+          else echo "# the guest returned no ctl-fat32.img.gz (the census did not run)"; fi
       - name: e2fsck -fn, btrfs check, xfs_repair -n, ntfsfix -n, fsck.exfat -n and fsck.f2fs --dry-run, in the build container
         run: |
           set -eu
