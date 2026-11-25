@@ -217,13 +217,13 @@ done
 cat > "$T/dalog" <<'EOF'
 23:59:58   created disk, id = /dev/disk3.
 23:59:58   created disk, id = /dev/disk3s1.
-23:59:59   probed disk, id = /dev/disk3s1, with linuxfs_apfs, ongoing.
-23:59:59   probed disk, id = /dev/disk3s1, with linuxfs_apfs, failure.
+23:59:59   probed disk, id = /dev/disk3s1, with macfuse_apfs, ongoing.
+23:59:59   probed disk, id = /dev/disk3s1, with macfuse_apfs, failure.
 00:00:01   probed disk, id = /dev/disk3s1, with hfs, success.
 00:00:02   probed disk, id = /dev/disk3s1, with hfs, success.
 00:00:02   created disk, id = /Volumes/Control?owner=501.
 00:00:05   created disk, id = /dev/disk4.
-00:00:05   probed disk, id = /dev/disk4, with linuxfs_ext4, failure.
+00:00:05   probed disk, id = /dev/disk4, with macfuse_ext4, failure.
 00:00:09   created disk, id = /dev/disk5.
 EOF
 r=$(census_probe_times < "$T/dalog")
@@ -420,7 +420,7 @@ diskutil)
   esac ;;
 linuxfs)
   case $1 in
-  ignore) d=${2#/dev/}; echo "UUID=$(field "$d" uuid) none linuxfs_ext4 rw,noauto # linuxfs" >> "$PARITY_FSTAB" ;;
+  ignore) d=${2#/dev/}; echo "UUID=$(field "$d" uuid) none macfuse_ext4 rw,noauto # linuxfs" >> "$PARITY_FSTAB" ;;
   unignore) d=${2#/dev/}; grep -v "^UUID=$(field "$d" uuid) " "$PARITY_FSTAB" > "$PARITY_FSTAB.t"; cat "$PARITY_FSTAB.t" > "$PARITY_FSTAB"; rm -f "$PARITY_FSTAB.t" ;;
   esac ;;
 sudo)
@@ -791,12 +791,19 @@ expect census_finder_icns test -s "$T/vols/finder-ext4/.VolumeIcon.icns"
 expect census_finder_desktop_on grep -q '^guest-macosx-aqua defaults write com.apple.finder ShowExternalHardDrivesOnDesktop -bool true$' "$S/calls"
 expect census_finder_desktop_off grep -q '^guest-macosx-aqua defaults write com.apple.finder ShowExternalHardDrivesOnDesktop -bool false$' "$S/calls"
 expect census_finder_desktop_restored test "$(grep 'ShowExternalHardDrivesOnDesktop' "$S/calls" | tail -n 1)" = "guest-macosx-aqua defaults delete com.apple.finder ShowExternalHardDrivesOnDesktop"
-expect census_finder_restarts test "$(grep -c '^guest-macosx-aqua killall Finder$' "$S/calls")" -ge 3
+expect census_finder_restarts test "$(grep -c '^guest-macosx-aqua killall Finder$' "$S/calls")" -ge 4
+# item 2: Finder restarted before the first Get Info (it reads the bundles' FSNames when it starts), then the
+#   filesystem's own Get Info photographed as getinfo-format (its Format line, HFS+ has none)
+restart_before_info() { awk '/^guest-macosx-aqua killall Finder$/ { k = 1 } /open information window/ { exit !k } END { exit !k }' "$S/calls"; }
+expect census_finder_restart_before_info restart_before_info
+expect census_finder_getinfo_format test "$(grep -c 'screencapture -x .*/ext4-getinfo-format.png$' "$S/calls")" -eq 1 -a "$(grep -c 'getinfo-format' "$S/calls")" -eq 1
 expect census_finder_quiet hasnt "$r" "not ok"
 expect census_finder_detached test -z "$(attached)"
 : > "$S/calls"
 census_finder btrfs > /dev/null 2>&1
 expect census_finder_hfs_shots_once test "$(grep -c 'screencapture -x .*/hfs-sidebar.png$' "$S/calls")" -eq 0 -a "$(grep -c 'screencapture -x .*/btrfs-sidebar.png$' "$S/calls")" -eq 1
+expect census_finder_restart_before_info_each restart_before_info
+expect census_finder_getinfo_format_each test "$(grep -c 'screencapture -x .*/btrfs-getinfo-format.png$' "$S/calls")" -eq 1
 
 # census_trash_tags_case: Finder's delete, .Trashes and empty trash; a tag and a label, after a remount too; the
 #   oversized xattr; pathconf against HFS+ and against HFSX. APFS, read-only, gets the case step alone.
@@ -958,6 +965,56 @@ expect smoke_runs_census ascending "$(first_line '^ *parity_census_all$')" "$bl"
 expect smoke_before_login_census ascending "$bl" "$(first_line 'census_before_login "\$mp"')"
 expect workflow_parity_upload grep -q '^ *images-after/parity/\*\*$' "$wf"
 expect workflow_guest_timeout awk '/^  guest:/ { g = 1 } /^  fsck:/ { g = 0 } g && /^    timeout-minutes: 180$/ { f = 1 } END { exit !f }' "$wf"
+# push B's census runs without item 3's loop (it waits for push C)
+expect smoke_stall_off ascending "$(first_line '^ *PARITY_STALL_N=0$')" "$(first_line '^ *parity_census_all$')"
+
+# item 2 in the smoke: the six names exactly, never the macfuse_ prefix as a family, and no bundle under its old linuxfs name left
+# smoke_fn NAME: the smoke's definition of the function NAME (one line, or up to its closing brace)
+smoke_fn() { awk -v n="$1() " 'index($0, n) == 1 { p = 1; print; if ($0 !~ /[{] *(#.*)?$/) exit; next } p { print } p && /^}/ { exit }' "$sm"; }
+expect smoke_no_old_names test -z "$(grep -n 'linuxfs[_]' "$sm" "$here/lib/parity.sh" "$here/parity-test.sh")"
+expect smoke_fstab_by_hand grep -qF "'LABEL=my\\040data none macfuse_ext4 rw,noauto # linuxfs'" "$sm"
+expect smoke_apfs_mount_program test "$(grep -c 'pgrep -f mount_macfuse_apfs' "$sm")" -eq 3
+# the FSNames are tools/fsrules.c's
+fsn_bad=
+for fs in ext4 ntfs btrfs xfs f2fs apfs; do
+  want=$(awk -v f="\"$fs\"," -F'"' 'index($0, "{ " f) == 2 { print $12; exit }' "$here/../tools/fsrules.c")
+  got=$(eval "$(smoke_fn fsname_of)"; fsname_of "$fs")
+  test -n "$want" -a "$got" = "$want" || fsn_bad="$fsn_bad $fs:'$got'/'$want'"
+done
+expect smoke_fsnames test -z "$fsn_bad"
+test -z "$fsn_bad" || echo "# fsname_of against fsrules.c:$fsn_bad"
+# persona_is: personality, Type (Bundle) macfuse_FS, Name (User Visible) the FSName, and Mounted
+du_says() { printf '   %s\n' "File System Personality:  $1" "Type (Bundle):            $2" "Name (User Visible):      $3" "Mounted:                  $4" > "$T/du"; }
+persona() { (eval "$(smoke_fn info)"; eval "$(smoke_fn fsname_of)"; eval "$(smoke_fn persona_is)"; diskutil() { cat "$T/du"; }; persona_is /dev/disk9s1 "$@") > /dev/null 2>&1; }
+du_says XFS macfuse_xfs 'Linux XFS (linuxfs)' Yes; expect smoke_persona_ok persona XFS xfs
+du_says XFS macfuse_ext4 'Linux XFS (linuxfs)' Yes; expect smoke_persona_bundle not persona XFS xfs
+du_says XFS macfuse_xfs 'Unknown (macfuse_xfs)' Yes; expect smoke_persona_fsname not persona XFS xfs
+du_says XFS macfuse_xfs 'Linux XFS (linuxfs)' No; expect smoke_persona_mounted not persona XFS xfs
+du_says xfs macfuse_xfs 'Linux XFS (linuxfs)' Yes; expect smoke_persona_personality not persona XFS xfs
+# mount_type_is: mount shows the mount point as (TYPE, exactly
+printf '%s\n' 'linuxfs@disk4s1 on /Volumes/my data (macfuse_ext4, local, nodev, nosuid, synchronous, mounted by u)' \
+  'linuxfs@disk5 on /Volumes/x (macfuse, local, nodev)' 'linuxfs@disk6 on /Volumes/y (macfuse_ext4x, local)' > "$T/mounts"
+mtype() { (eval "$(smoke_fn mount_type_is)"; mount() { cat "$T/mounts"; }; mount_type_is "$@") > /dev/null 2>&1; }
+expect smoke_mount_type_ok mtype '/Volumes/my data' macfuse_ext4
+expect smoke_mount_type_plain mtype /Volumes/x macfuse
+expect smoke_mount_type_exact not mtype /Volumes/x macfuse_ext4
+expect smoke_mount_type_no_prefix not mtype /Volumes/y macfuse_ext4
+expect smoke_mount_type_no_family not mtype '/Volumes/my data' macfuse
+expect smoke_mount_type_exfat test "$(eval "$(smoke_fn type_of)"; type_of exfat) $(eval "$(smoke_fn type_of)"; type_of apfs)" = 'macfuse macfuse_apfs'
+# F7: macFUSE's own mount_macfuse as root is found, the bundles' mount_macfuse_<fs> never
+rootps() { printf '%s\n' "$@" > "$T/ps"; (eval "$(smoke_fn no_root_mount_macfuse)"; ps() { cat "$T/ps"; }; no_root_mount_macfuse); }
+expect smoke_root_helper_found not rootps 'root 12 /Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse -o allow_other /dev/fd/3'
+expect smoke_root_helper_bare_found not rootps 'root 12 mount_macfuse'
+expect smoke_root_bundle_ignored rootps 'root 13 /System/Library/Filesystems/macfuse_ext4.fs/Contents/Resources/mount_macfuse_ext4 -o nodev /dev/disk4s1 /Volumes/x' 'root 14 mount_macfuse_ntfs /dev/disk5 /Volumes/y'
+expect smoke_root_helper_user_ignored rootps 'u 12 /Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse /dev/fd/3'
+# the checks are where item 2 asks: each DiskArbitration cycle, each CLI image mount, ignore's entry, before login
+expect smoke_type_in_da_cycle test -n "$(smoke_fn da_cycle | grep 'mount_type_is "$mp" "macfuse_$nm"')"
+expect smoke_persona_in_da_cycle test -n "$(smoke_fn da_cycle | grep 'persona_is "$dev" "$want" "$nm"')"
+expect smoke_type_in_noauto test "$(smoke_fn noauto_cycle | grep -c 'mount_type_is "$mp" "macfuse_$fs"')" -eq 1
+expect smoke_ignore_entry_named test -n "$(smoke_fn noauto_cycle | grep 'macfuse_$fs')"
+expect smoke_type_cli test "$(grep -c 'mount_type_is "$m" "$(type_of "$fs")"' "$sm")" -eq 2
+expect smoke_type_cli_apfs test "$(grep -c 'mount_type_is "$m" macfuse_apfs' "$sm")" -eq 1
+expect smoke_type_before_login ascending "$bl" "$(first_line 'mount_type_is "$mp" macfuse_ext4')"
 
 # no forced unmount, eject or detach ever targets a linuxfs disk (QEMU first)
 forced=

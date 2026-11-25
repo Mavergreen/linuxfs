@@ -43,6 +43,7 @@
 #                                         and fseventsd, Finder's refresh (read-write only), mdutil -i off kept across
 #                                         a remount
 #   census_finder FS                      item 6: screenshots (sidebar, getinfo, desktop-on, desktop-off, icon),
+#                                         and item 2's FS-only getinfo-format (Finder restarted just before),
 #                                         Finder's disk properties against df -k, diskutil info's fields (by mount
 #                                         point and by device), a custom .VolumeIcon.icns
 #   census_trash_tags_case FS             item 7: Finder's delete, .Trashes/<uid> and empty trash; a tag and a label
@@ -815,7 +816,8 @@ PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Content
 #   xattr probe bounded at 2 of it; one stall iteration, under 1), before login (about 5) and the copyback and
 #   uploads (about 5) remain: 5 + 135 + 11 + 5 + 5 = 161, leaving 19 to spare. Push A's census, its Finder steps not
 #   run, took 50 min (the stall 30 of them); with them, and stuck disks in both busy censuses, about 90 are expected,
-#   well inside 135.
+#   well inside 135. Push B's smoke sets PARITY_STALL_N=0 (item 3's loop waits for push C): about 60, plus item 2's
+#   Finder restart and getinfo-format shot in each census_finder (about 15 s typical, 2.5 min with every bound hit).
 PARITY_CENSUS_MIN=${PARITY_CENSUS_MIN:-135}
 
 # census_pair_up CTL-IMAGE FS-IMAGE FS [readonly]: attaches both (the control -readonly when readonly) and makes them
@@ -1032,7 +1034,8 @@ census_desktop() {
   census_shot "$2" hfs; census_shot "$2" fs
 }
 
-# census_finder FS: item 6 on the HFS+ control against FS: the sidebar and Get Info, photographed for each; Finder's
+# census_finder FS: item 6 on the HFS+ control against FS: the sidebar and Get Info, photographed for each (and item 2's
+#   Get Info of FS alone, getinfo-format, after a Finder restart); Finder's
 #   properties against df -k (raw values in finder.FS.raw.txt); diskutil info's fields by mount point and by device (the
 #   whole of it in finder.FS.diskutil-info-raw.txt); a custom .VolumeIcon.icns
 #   (Get Info photographed as icon); the Desktop with external disks shown and hidden. ShowExternalHardDrivesOnDesktop
@@ -1050,6 +1053,10 @@ census_finder() {
   parity "finder.$cf_fs.diskutil-info" census_du_fields @MP@
   parity "finder.$cf_fs.diskutil-info-dev" census_du_fields_dev @MP@
   census_du_raw "$OUT/parity/finder.$cf_fs.diskutil-info-raw.txt"
+  # spec: docs/superpowers/specs/2026-11-25-hfs-parity-design.md item 2 -- Finder, restarted first (it reads the bundles'
+  #       FSNames when it starts), shows FS's Get Info: its Format line must be the FSName, which proves the fssubtype
+  census_finder_restart
+  census_finder_view fs getinfo-format info
   for cf_s in hfs fs; do census_finder_view "$cf_s" getinfo info; done
   parity "finder.$cf_fs.volumeicon" census_volume_icon @MP@
   census_desktop true desktop-on

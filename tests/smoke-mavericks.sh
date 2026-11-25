@@ -2,17 +2,18 @@
 # platform: macOS-only -- mounts Linux filesystems through Mavergreen macFUSE on a real Mac OS X 10.9 box (the acceptance job's guest)
 # spec: .github/workflows/on-mavericks.yml -- the installed product on 10.9: the manifest is the run's version; the root
 #       helper and the keychain keeper (linuxfs-agent) are running; `linuxfs mount` mounts ext4, btrfs, xfs, NTFS (ntfs3),
-#       exFAT and f2fs images (lklfuse finding names exactly, with macFUSE's name pass-through, on the pinned 5.5.0-mavericks.5),
+#       exFAT and f2fs images (lklfuse finding names exactly, with macFUSE's name pass-through, on the pinned 5.5.0-mavericks.5;
+#       mount shows each as macfuse_<fs>, exFAT as plain macfuse),
 #       writes through each, unmounts, mounts again and reads it all back. Then DiskArbitration's six
-#       bundles: ext4, btrfs, xfs, f2fs, NTFS (NTFSTakeover on) and APFS, raw and GPT-wrapped, are mounted by an attach within 30 s (personality, reads, writes, unmount and mount, eject
+#       bundles: ext4, btrfs, xfs, f2fs, NTFS (NTFSTakeover on) and APFS, raw and GPT-wrapped, are mounted by an attach within 30 s (personality, Type (Bundle) macfuse_<fs>, Name (User Visible) the FSName, mount type macfuse_<fs>, reads, writes, unmount and mount, eject
 #       leaves no lklfuse); NTFS with NTFSTakeover off is Apple's; `linuxfs ignore` (an /etc/fstab noauto entry: ext4 by device, NTFS by
-#       label; ext4 by a label with a space, written as LABEL=my\040data) mounts nothing on a plain attach and never runs the mount program, `diskutil mount` mounts it, and after `linuxfs unignore` a plain attach does;
+#       label; ext4 by a label with a space, written as LABEL=my\040data; each entry's type macfuse_<fs>) mounts nothing on a plain attach and never runs the mount program, `diskutil mount` mounts it, and after `linuxfs unignore` a plain attach does;
 #       ReadOnly in the user's plist (read by the root mount program) mounts read-only; a label with a slash or a control
 #       character gets a safe /Volumes name; the encrypted APFS fixture shows the password dialog (screenshot), times out
 #       with no mount, mounts through --password-stdin and the keeper's --offer, then from the login keychain with no dialog;
-#       then the HFS+ parity census (tests/lib/parity.sh parity_census_all), which records, and gates only the items it
+#       then the HFS+ parity census (tests/lib/parity.sh parity_census_all; PARITY_STALL_N=0, item 3's loop off until push C), which records, and gates only the items it
 #       checks (item 1, Unicode names: on HFS+ and each linuxfs volume, created, listed and opened by both forms alike);
-#       last, before login (the user's console session ended), an attached ext4 disk is mounted by root with allow_other and
+#       last, before login (the user's console session ended), an attached ext4 disk is mounted by root (as macfuse_ext4) with allow_other and
 #       served by lklfuse as _linuxfs (with a macFUSE that cannot serve /dev/fd/N the mount program refuses, and that is what is
 #       checked: nothing mounted, the reason in system.log); with that lklfuse killed, diskutil unmount still works. No lklfuse ever runs as root. exFAT keeps no symlinks, hard links, modes or xattrs, and ntfs3 keeps no
 #       POSIX mode without its acl option, so those are not asked of them. Any hang, new panic or new lklfuse crash report
@@ -133,16 +134,26 @@ macfuse_at_least() {
 #       components/macfuse/version, 5.5.0-mavericks.5, so exact is what the census's item 1 steps run on
 names_mode() { sed -n 's/^lklfuse: names: //p' "$HOME/Library/Logs/linuxfs/$1.log" 2> /dev/null | tail -n 1; }
 names_are() { names_mode "$1" | grep -q "^$2 "; }   # IMAGE exact|scanning
+# spec: tools/fsrules.c names -- item 2's six names, exactly (never the macfuse_ prefix as a family): the FSName Finder
+#       shows as Format, and the mount type (macfuse_<fs>; exFAT, which has no bundle, plain macfuse)
+fsname_of() { case $1 in ext4) echo 'Linux ext4 (linuxfs)' ;; ntfs) echo 'Windows NTFS (linuxfs)' ;; btrfs) echo 'Linux btrfs (linuxfs)' ;; xfs) echo 'Linux XFS (linuxfs)' ;; f2fs) echo 'Linux F2FS (linuxfs)' ;; apfs) echo 'APFS (linuxfs)' ;; *) return 1 ;; esac; }
+type_of() { case $1 in exfat) echo macfuse ;; *) echo "macfuse_$1" ;; esac; }
+mount_type_is() {  # MOUNTPOINT TYPE: mount shows MOUNTPOINT as (TYPE, ...); prints mount's line for it
+  l=$(mount | grep -F " on $1 ("); echo "$l"
+  printf '%s\n' "$l" | grep -qF " on $1 ($2, "
+}
 for fs in $imgfs; do
   img=$W/img/$fs.img m=$W/mnt/$fs
   mkdir -p "$m"
   check "$fs: linuxfs mount" bounded 600 "$L" mount "$img" "$m"
+  check "$fs: mount shows it as $(type_of "$fs")" mount_type_is "$m" "$(type_of "$fs")"
   echo "# $fs: lklfuse's names: $(names_mode "$fs.img")"
   if macfuse_at_least 5 5 0 5; then check "$fs: with macFUSE 5.5.0-mavericks.5 or later, lklfuse finds names exactly (-o nonorm_insensitive)" names_are "$fs.img" exact
   else check "$fs: with a macFUSE before 5.5.0-mavericks.5, lklfuse scans for names (no -o nonorm_insensitive, which it would refuse)" names_are "$fs.img" scanning; fi
   check "$fs: write, rename, symlink, hard link, chmod and xattr through the mount" write_through "$fs" "$m"
   check "$fs: linuxfs unmount, and lklfuse exits" unmount_and_wait "$img" "$m"
   check "$fs: mount again" bounded 600 "$L" mount "$img" "$m"
+  check "$fs: mount shows it as $(type_of "$fs") again" mount_type_is "$m" "$(type_of "$fs")"
   check "$fs: everything reads back" read_back "$fs" "$m"
   check "$fs: unmount again" unmount_and_wait "$img" "$m"
 done
@@ -153,6 +164,7 @@ cp "$W/img/apfs.img" "$W/apfs.before"
 img=$W/img/apfs.img m=$W/mnt/apfs; mkdir -p "$m"
 check "apfs: linuxfs-probe names it, by its volume" sh -c '[ "$("$1" "$2")" = "$(printf "apfs\tTime Machine")" ]' _ "$P/libexec/linuxfs-probe" "$img"
 check "apfs: linuxfs mount" bounded 600 "$L" mount "$img" "$m"
+check "apfs: mount shows it as macfuse_apfs" mount_type_is "$m" macfuse_apfs
 check "apfs: the volume lists" ls -la "$m"
 check "apfs: mounted read-only; a write is refused" sh -c '! ( echo x > "$1/c" ) 2>/dev/null' _ "$m"
 check "apfs: status says ro" sh -c '"$1" status | grep -F "$2" | grep -q "ro\$"' _ "$L" "$m"
@@ -193,8 +205,9 @@ no_root_lklfuse() { lklfuses | awk '$1 == "root" { f = 1 } END { exit f }'; }
 # spec: tools/fs.c mount_by_root -- before login: the lklfuse lines run by _linuxfs whose mountpoint is /dev/fd/N (root's mount)
 lklfuse_fd() { lklfuses | awk '$1 == "_linuxfs" && $NF ~ /^\/dev\/fd\/[0-9]+$/'; }
 lklfuse_fd_runs() { [ -n "$(lklfuse_fd)" ]; }
-# spec: tools/fs.c mount_by_root -- no mount_macfuse root started outlives the mount program (it stops one that lingers)
-no_root_mount_macfuse() { ! ps -axww -o user=,pid=,command= | awk '$1 == "root" && /mount_macfuse/ && !/awk/' | grep -q .; }
+# spec: tools/fs.c mount_by_root -- no mount_macfuse root started outlives the mount program (it stops one that lingers);
+#       macFUSE's own helper alone (MOUNT_MACFUSE), never the bundles' mount_macfuse_<fs>
+no_root_mount_macfuse() { ! ps -axww -o user=,pid=,command= | awk '$1 == "root" && /mount_macfuse( |$)/ && !/awk/' | grep -q .; }
 # spec: tools/fs.c mount_by_root -- waits up to $1 s (default 90, past mount(2)'s own give-up on INIT after about 50 s) for no root
 #       mount_macfuse; prints ps when one is left
 root_mount_macfuse_gone() {
@@ -248,10 +261,13 @@ da_eject() {  # whole disk, mount point: leaves no lklfuse on it
 rw_works() { echo da > "$1/da-file" && [ "$(cat "$1/da-file")" = da ] && mkdir "$1/da-dir" && echo two > "$1/da-dir/f" && [ "$(cat "$1/da-dir/f")" = two ]; }
 rw_reads() { [ "$(cat "$1/da-file")" = da ] && [ "$(cat "$1/da-dir/f")" = two ]; }
 
-persona_is() {  # DEV PERSONALITY: on failure, what diskutil info said
+# spec: tools/fsrules.c names -- item 2: the personality, Type (Bundle) macfuse_FS and Name (User Visible) FS's FSName
+persona_is() {  # DEV PERSONALITY FS: on failure, what diskutil info said
   got=$(info "$1" 'File System Personality'); mnt=$(info "$1" Mounted)
-  [ "$got" = "$2" ] && [ "$mnt" = Yes ] && return 0
-  echo "personality '$got' (want '$2'), Mounted '$mnt'; diskutil info $1:"; diskutil info "$1" 2>&1; return 1
+  bun=$(info "$1" 'Type (Bundle)'); nam=$(info "$1" 'Name (User Visible)'); fsn=$(fsname_of "$3")
+  test "$got" = "$2" && test "$bun" = "macfuse_$3" && test -n "$fsn" && test "$nam" = "$fsn" && test "$mnt" = Yes && return 0
+  echo "personality '$got' (want '$2'), Type (Bundle) '$bun' (want 'macfuse_$3'), Name (User Visible) '$nam' (want '$fsn'), Mounted '$mnt'; diskutil info $1:"
+  diskutil info "$1" 2>&1; return 1
 }
 # spec: tests/smoke-mavericks.sh header -- the disk hdiutil attached IMAGE as, if it is still attached
 image_disk() { hdiutil info 2> /dev/null | awk -v p="$1" '/^image-path/ { sub(/^image-path[ \t]*:[ \t]*/, ""); cur = ($0 == p) } cur && /^\/dev\/disk[0-9]+[ \t]/ { print $1; exit }'; }
@@ -269,7 +285,8 @@ da_cycle() {
     notok "$tag: mounted by DiskArbitration within 30 s"; diskutil list | sed 's/^/# /'; cleanup_disk; return 1
   fi
   ok "$tag: $dev mounted at $mp within 30 s"
-  check "$tag: diskutil info shows the personality $want and Mounted: Yes" persona_is "$dev" "$want"
+  check "$tag: diskutil info shows the personality $want, Type (Bundle) macfuse_$nm, Name (User Visible) '$(fsname_of "$nm")' and Mounted: Yes" persona_is "$dev" "$want" "$nm"
+  check "$tag: mount shows it as macfuse_$nm" mount_type_is "$mp" "macfuse_$nm"
   check "$tag: no lklfuse runs as root" no_root_lklfuse
   if [ "$kind" = rw ]; then
     check "$tag: reads and writes work" rw_works "$mp"
@@ -324,19 +341,21 @@ cleanup_disk
 #       (ext4 by its device, so by UUID; NTFS, which has no UUID, by its label): a plain attach mounts nothing (hdiutil fails
 #       with no mountable file systems), DiskArbitration never runs the mount program for it, and no "not readable" dialog
 #       shows (screenshot); diskutil mount over ssh mounts it; after linuxfs unignore a plain attach mounts it again
-noauto_cycle() {  # TAG IMAGE device|label LABEL
-  tag=$1 img=$2 how=$3 lab=$4
+noauto_cycle() {  # TAG IMAGE device|label|spaced LABEL FS
+  tag=$1 img=$2 how=$3 lab=$4 fs=$5
   if ! da_attach_nomount "$img"; then notok "$tag: hdiutil attach -nomount"; disk=$(image_disk "$img"); cleanup_disk; return 1; fi
   if [ "$how" = spaced ]; then
     # spec: tools/fstab.c -- the entry the helper writes for a label with a space (\040, as fstab spells it), written here by hand
     #       because linuxfs ignore names an ext4 volume by its UUID: DiskArbitration must read \040 as the space and skip the volume
-    check "$tag: an /etc/fstab noauto entry for LABEL=my\\040data" sudo -n sh -c 'printf "%s\n" "$1" >> /etc/fstab' _ 'LABEL=my\040data none linuxfs_ext4 rw,noauto # linuxfs'
+    check "$tag: an /etc/fstab noauto entry for LABEL=my\\040data" sudo -n sh -c 'printf "%s\n" "$1" >> /etc/fstab' _ 'LABEL=my\040data none macfuse_ext4 rw,noauto # linuxfs'
   else
     if [ "$how" = device ]; then arg=$disk; else arg=$lab; fi
     check "$tag: linuxfs ignore $arg" bounded 600 "$L" ignore "$arg"
   fi
   echo "# $tag: linuxfs ignore lists: $(bounded 600 "$L" ignore | tr '\n' '|')"
   check "$tag: /etc/fstab has linuxfs's noauto entry" sh -c 'grep -q " rw,noauto # linuxfs\$" /etc/fstab'
+  # spec: tools/fstab.c -- item 2: the entry names the bundle, macfuse_$fs, as its type
+  check "$tag: the entry's type is macfuse_$fs" awk -v t="macfuse_$fs" '$3 == t && / rw,noauto # linuxfs$/ { f = 1 } END { exit !f }' /etc/fstab
   cleanup_disk
   log0=$(wc -l < /var/log/system.log 2> /dev/null | tr -d ' ')
   out=$(bounded 600 hdiutil attach -imagekey diskimage-class=CRawDiskImage "$img" 2>&1); rc=$?
@@ -361,6 +380,7 @@ noauto_cycle() {  # TAG IMAGE device|label LABEL
   if da_attach_nomount "$img"; then
     check "$tag: diskutil mount over ssh mounts it" bounded 600 diskutil mount "$disk"
     if da_wait 100; then ok "$tag: mounted at $mp by diskutil mount, the noauto entry notwithstanding"
+      check "$tag: mount shows it as macfuse_$fs" mount_type_is "$mp" "macfuse_$fs"
     else notok "$tag: mounted within 10 s of diskutil mount"; tail -n 30 /var/log/system.log 2> /dev/null | grep 'linuxfs\|diskarbitrationd' | sed 's/^/# /'; fi
     [ "$how" != device ] || check "$tag: linuxfs unignore $disk" bounded 600 "$L" unignore "$disk"
   else notok "$tag: hdiutil attach -nomount, again"; disk=$(image_disk "$img"); fi
@@ -383,16 +403,16 @@ noauto_leftover() {  # IMAGE
   if grep -q "# linuxfs\$" /etc/fstab 2> /dev/null; then sudo -n sed -i '' '/# linuxfs$/d' /etc/fstab 2> /dev/null; fi
 }
 if cp "$W/img/ext4.img" "$W/img/da-ext4-noauto.img"; then
-  noauto_cycle "ignore ext4 by device" "$W/img/da-ext4-noauto.img" device "my data"
+  noauto_cycle "ignore ext4 by device" "$W/img/da-ext4-noauto.img" device "my data" ext4
   noauto_leftover "$W/img/da-ext4-noauto.img"
 else notok "ignore ext4 by device: cannot copy ext4.img"; fi
 if cp "$W/img/ext4.img" "$W/img/da-ext4-space.img"; then
-  noauto_cycle "ignore ext4 by a label with a space" "$W/img/da-ext4-space.img" spaced "my data"
+  noauto_cycle "ignore ext4 by a label with a space" "$W/img/da-ext4-space.img" spaced "my data" ext4
   noauto_leftover "$W/img/da-ext4-space.img"
 else notok "ignore ext4 by a label with a space: cannot copy ext4.img"; fi
 defaults write dev.mavergreen.linuxfs NTFSTakeover -bool true
 if cp "$W/img/ntfs.img" "$W/img/da-ntfs-noauto.img"; then
-  noauto_cycle "ignore ntfs by label" "$W/img/da-ntfs-noauto.img" label Windows
+  noauto_cycle "ignore ntfs by label" "$W/img/da-ntfs-noauto.img" label Windows ntfs
   bounded 600 "$L" unignore Windows > /dev/null 2>&1
 else notok "ignore ntfs by label: cannot copy ntfs.img"; fi
 defaults delete dev.mavergreen.linuxfs NTFSTakeover
@@ -428,14 +448,14 @@ if gunzip -c "$IN/gpt-enc.img.gz" > "$W/gpt-enc.img"; then
   sleep 5
   bounded 600 "$AQUA" screencapture -x "$OUT/apfs-dialog.png" > /dev/null 2>&1 && ok "encrypted apfs: screenshot apfs-dialog.png 5 s after the attach (the mount program's password dialog)" || notok "encrypted apfs: screencapture"
   echo "# the dialog's process, if any: $(ps -axww -o user=,pid=,command= | grep -i 'UserNotificationCenter\|CFUserNotification' | grep -v grep | tr '\n' '|')"
-  check "encrypted apfs: the mount program is waiting on its dialog" pgrep -f mount_linuxfs_apfs
+  check "encrypted apfs: the mount program is waiting on its dialog" pgrep -f mount_macfuse_apfs
   disk=$(image_disk "$W/gpt-enc.img")
   disks="$disk $(diskutil list "$disk" 2> /dev/null | awk '{ print $NF }' | grep -E '^disk[0-9]+s[0-9]+$' | sed 's|^|/dev/|' | tr '\n' ' ')"
   # spec: tools/fs.c DIALOG_SECONDS -- the dialog times out after 120 s: exit 4, no mount
   i=5; while kill -0 "$ap" 2> /dev/null && [ $i -lt 170 ]; do i=$((i + 1)); sleep 1; done
   if kill -0 "$ap" 2> /dev/null; then notok "encrypted apfs: the attach was still waiting after 170 s"; kill "$ap" 2> /dev/null
   else ok "encrypted apfs: the attach finished after about ${i} s ($(tr '\n' ' ' < "$W/enc-attach.out"))"; fi
-  check "encrypted apfs: the dialog's timeout ended the mount program" sh -c '! pgrep -f mount_linuxfs_apfs > /dev/null'
+  check "encrypted apfs: the dialog's timeout ended the mount program" sh -c '! pgrep -f mount_macfuse_apfs > /dev/null'
   check "encrypted apfs: and left nothing mounted (exit 4, no mount)" sh -c 'for d in $1; do [ "$(diskutil info "$d" 2>/dev/null | sed -n "s/^ *Mounted: *//p")" != Yes ] || exit 1; done' _ "$disks"
   echo "# system.log, linuxfs lines:"; grep -i 'linuxfs' /var/log/system.log 2> /dev/null | tail -n 8 | sed 's/^/# /'
   cleanup_disk
@@ -474,7 +494,7 @@ if gunzip -c "$IN/gpt-enc.img.gz" > "$W/gpt-enc.img"; then
       if da_wait 300; then
         ok "encrypted apfs: a plain attach mounts it at $mp with the keychain's password"
         bounded 600 "$AQUA" screencapture -x "$OUT/apfs-keychain.png" > /dev/null 2>&1
-        check "encrypted apfs: no mount program is left waiting on a dialog" sh -c '! pgrep -f mount_linuxfs_apfs > /dev/null'
+        check "encrypted apfs: no mount program is left waiting on a dialog" sh -c '! pgrep -f mount_macfuse_apfs > /dev/null'
       else notok "encrypted apfs: mounted within 30 s from the keychain, with no dialog"; fi
     else notok "encrypted apfs: attach again"; disk=$(image_disk "$W/gpt-enc.img"); fi
     cleanup_disk
@@ -491,6 +511,9 @@ check "no lklfuse runs as root, after everything" no_root_lklfuse
 tests_dir=$(cd "$(dirname "$0")" && pwd)
 if [ -f "$tests_dir/lib/parity.sh" ]; then
   . "$tests_dir/lib/parity.sh"
+  # spec: tests/lib/parity.sh census_stall -- push B: the whole census in its current modes, without item 3's loop,
+  #       which waits for push C
+  PARITY_STALL_N=0
   parity_census_all
   check "no lklfuse runs as root, after the census" no_root_lklfuse
 else notok "no $tests_dir/lib/parity.sh: the census cannot run"; fi
@@ -547,6 +570,7 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
         lklfuses | sed 's/^/# /'
         mount | grep -F " on $mp (" | sed 's/^/# /'
         check "before login: the mount at $mp is root's (no 'mounted by')" mounted_by_root "$mp"
+        check "before login: mount shows it as macfuse_ext4" mount_type_is "$mp" macfuse_ext4
         check "before login: the lklfuse serving it runs as _linuxfs, on a /dev/fd/N mountpoint" lklfuse_fd_runs
         check "before login: no lklfuse runs as root" no_root_lklfuse
         # spec: tools/open.c fuse_chan -- the opener holds the lock from before "ready" on fd 7, which lklfuse's lock= names
