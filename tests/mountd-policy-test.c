@@ -321,6 +321,7 @@ int main(void)
 		is(mountd_adopted(&opened, &entry, 1, 501, &why), -1, "adopted: still the peer's");
 		opened = entry = dir(7, 100, 0, S_IFDIR | 0755);
 		is(mountd_adopted(&opened, &entry, 0, 501, &why), -1, "adopted: filled before fchown (m3)");
+		starts(why, "the mount point is not empty", "adopted: and says it is not empty");
 	}
 
 	/* ---- the status and the reply ---- */

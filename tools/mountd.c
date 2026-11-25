@@ -163,8 +163,12 @@ int mountd_adopted(const struct stat *after, const struct stat *entry_after, int
 {
 	(void)peer;	/* on -1 the caller gives the directory back to the peer */
 	if (!S_ISDIR(after->st_mode) || after->st_uid != 0 || (after->st_mode & 07777) != 0755 ||
-	    after->st_dev != entry_after->st_dev || after->st_ino != entry_after->st_ino || !empty_after) {
+	    after->st_dev != entry_after->st_dev || after->st_ino != entry_after->st_ino) {
 		*why = "the mount point changed";
+		return -1;
+	}
+	if (!empty_after) {
+		*why = "the mount point is not empty";
 		return -1;
 	}
 	*why = "";
