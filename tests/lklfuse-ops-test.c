@@ -813,6 +813,160 @@ static void unicode_tests(void)
 }
 
 /*
+ * The volume icon (patch 0017, spec: item 6 amendment, -o volicon=PATH): with no /.VolumeIcon.icns of the volume's own,
+ * lookup and getattr answer a read-only file whose bytes are PATH's, the root's com.apple.FinderInfo says it has a custom
+ * icon, readdir does not list it, nothing can change it, and nothing reaches the disk. A real one wins, at once.
+ */
+static int volicon_listed;
+
+static int volicon_fill(void *buf, const char *name, const struct stat *st, off_t off, enum fuse_fill_dir_flags flags)
+{
+	if (strcmp(name, ".VolumeIcon.icns") == 0)
+		volicon_listed++;
+	return 0;
+}
+
+static int volicon_in_readdir(void)
+{
+	struct fuse_file_info f = { 0 };
+
+	volicon_listed = 0;
+	if (lklfuse_opendir("/", &f))
+		return -1;
+	lklfuse_readdir("/", NULL, volicon_fill, 0, &f, 0);
+	lklfuse_releasedir("/", &f);
+	return volicon_listed;
+}
+
+/* listxattr of PATH has NAME */
+static int lists(const char *path, const char *name)
+{
+	char b[1024];
+	int n = lklfuse_listxattr(path, b, sizeof(b)), off;
+
+	for (off = 0; n > 0 && off < n; off += strlen(b + off) + 1)
+		if (strcmp(b + off, name) == 0)
+			return 1;
+	return 0;
+}
+
+static void volicon_tests(void)
+{
+	const char *V = "/.VolumeIcon.icns", *FI = "com.apple.FinderInfo";
+	char path[PATH_MAX], b[64], icon[3000], got[3000];
+	const char *tmp = getenv("TMPDIR");
+	struct fuse_file_info fi = { .flags = O_RDONLY };
+	struct stat st, root;
+	struct statvfs vfs;
+	size_t i;
+	int f, n;
+
+	is(lklfuse_getattr(V, &st, NULL), -ENOENT, "volicon: without the option, there is no /.VolumeIcon.icns");
+	is(lklfuse_getxattr("/", FI, b, sizeof(b)), -ENOTSUP, "volicon: without it, the root's FinderInfo is as before (ENOTSUP)");
+	for (i = 0; i < sizeof(icon); i++)
+		icon[i] = (char)(i * 7 + 3);
+	snprintf(path, sizeof(path), "%s/lklfuse-ops-icon.XXXXXX", tmp && *tmp ? tmp : "/tmp");
+	f = mkstemp(path);
+	is(f >= 0 && write(f, icon, sizeof(icon)) == (ssize_t)sizeof(icon), 1, "volicon: an icon file of 3000 bytes");
+	if (f >= 0)
+		close(f);
+	lklfuse.volicon = "/nonexistent/linuxfs.icns";
+	is(lklfuse_volicon_open(), -1, "volicon: a missing icon file is refused, and said");
+	is(lklfuse_getattr(V, &st, NULL), -ENOENT, "volicon: so there is no icon");
+	lklfuse.volicon = path;
+	is(lklfuse_volicon_open(), 0, "volicon=PATH: the icon file is opened");
+	lkl_sys_chown("/", 1234, 5678);
+	is(lklfuse_getattr("/", &root, NULL), 0, "volicon: the root's attributes");
+	is(lklfuse_getattr(V, &st, NULL), 0, "volicon: getattr (lookup) of /.VolumeIcon.icns answers");
+	is(S_ISREG(st.st_mode), 1, "volicon: a regular file");
+	is((int)(st.st_mode & 07777), 0444, "volicon: read-only, 0444");
+	is((int)st.st_size, (int)sizeof(icon), "volicon: its size is the icon file's");
+	is((int)st.st_nlink, 1, "volicon: one link");
+	is((int)st.st_uid, (int)root.st_uid, "volicon: its owner is the root's (mapped as every other file)");
+	is((int)st.st_gid, (int)root.st_gid, "volicon: its group is the root's");
+	is(st.st_ino != root.st_ino && st.st_ino != 0, 1, "volicon: its inode number is its own");
+	is(lklfuse_open(V, &fi), 0, "volicon: open for reading");
+	memset(got, 0, sizeof(got));
+	is(lklfuse_read(NULL, got, sizeof(got), 0, &fi), (int)sizeof(icon), "volicon: read gives all its bytes (no path: nullpath_ok)");
+	is(memcmp(got, icon, sizeof(icon)), 0, "volicon: and they are the icon file's");
+	is(lklfuse_read(NULL, got, 10, 2990, &fi), 10, "volicon: a read at an offset");
+	is(memcmp(got, icon + 2990, 10), 0, "volicon: gives the bytes there");
+	is(lklfuse_read(NULL, got, 10, 3000, &fi), 0, "volicon: a read at the end gives nothing");
+	memset(&st, 0, sizeof(st));
+	is(lklfuse_getattr(NULL, &st, &fi) == 0 && (int)st.st_size == (int)sizeof(icon), 1, "volicon: getattr of the open file");
+	is(lklfuse_write(NULL, "x", 1, 0, &fi) < 0, 1, "volicon: a write to it fails");
+	is(lklfuse_truncate(NULL, 0, &fi), -EACCES, "volicon: ftruncate of it: EACCES");
+	is(lklfuse_chmod(NULL, 0644, &fi), -EACCES, "volicon: fchmod of it: EACCES");
+	is(lklfuse_release(NULL, &fi), 0, "volicon: release");
+	is_str(content_of(V, b, 8), "\x03\x0a\x11\x18\x1f\x26\x2d", "volicon: content_of reads it too");
+	fi.flags = O_WRONLY;
+	is(lklfuse_open(V, &fi), -EACCES, "volicon: open for writing: EACCES");
+	fi.flags = O_RDWR;
+	is(lklfuse_open(V, &fi), -EACCES, "volicon: open read-write: EACCES");
+	fi.flags = O_RDONLY | O_TRUNC;
+	is(lklfuse_open(V, &fi), -EACCES, "volicon: open with O_TRUNC: EACCES");
+	fi.flags = O_WRONLY;
+	is(lklfuse_create(V, 0644, &fi), -EACCES, "volicon: create over it: EACCES");
+	is(lklfuse_unlink(V), -EACCES, "volicon: unlink: EACCES");
+	is(lklfuse_rename(V, "/vi-moved", 0), -EACCES, "volicon: rename away: EACCES");
+	plant("/vi-src", "x");
+	is(lklfuse_rename("/vi-src", V, 0), -EACCES, "volicon: rename onto it: EACCES");
+	is(lklfuse_link(V, "/vi-link"), -EACCES, "volicon: a hard link to it: EACCES");
+	is(lklfuse_link("/vi-src", V), -EEXIST, "volicon: a hard link under its name: EEXIST");
+	is(lklfuse_mkdir(V, 0755), -EEXIST, "volicon: mkdir under its name: EEXIST");
+	is(lklfuse_mknod(V, S_IFIFO | 0644, 0), -EEXIST, "volicon: mknod under its name: EEXIST");
+	is(lklfuse_symlink("x", V), -EEXIST, "volicon: symlink under its name: EEXIST");
+	is(lklfuse_chmod(V, 0644, NULL), -EACCES, "volicon: chmod: EACCES");
+	is(lklfuse_chown(V, 1, 1, NULL), -EACCES, "volicon: chown: EACCES");
+	is(lklfuse_truncate(V, 0, NULL), -EACCES, "volicon: truncate: EACCES");
+	is(lklfuse_utimens(V, (struct timespec[2]){ { 0, 0 }, { 0, 0 } }, NULL), -EACCES, "volicon: utimens: EACCES");
+	is(lklfuse_setxattr(V, "user.k", "1", 1, 0), -EACCES, "volicon: setxattr on it: EACCES");
+	is(lklfuse_removexattr(V, "user.k"), -EACCES, "volicon: removexattr on it: EACCES");
+	is(lklfuse_getxattr(V, "user.k", b, sizeof(b)), -HOST_ENOATTR, "volicon: it has no xattrs");
+	is(lklfuse_listxattr(V, b, sizeof(b)), 0, "volicon: and lists none");
+	is(lklfuse_access(V, R_OK), 0, "volicon: access for reading");
+	is(lklfuse_access(V, W_OK), -EACCES, "volicon: access for writing: EACCES");
+	is(lklfuse_readlink(V, b, sizeof(b)), -EINVAL, "volicon: readlink: EINVAL, not a symlink");
+	is(lklfuse_opendir(V, &fi), -ENOTDIR, "volicon: opendir: ENOTDIR");
+	is(lklfuse_statfs(V, &vfs), 0, "volicon: statfs through it is the volume's");
+	is(names_in("/", ".VolumeIcon.icns"), 0, "volicon: after all that, nothing of that name is on the disk");
+	is(names_in("/", "vi-moved") + names_in("/", "vi-link"), 0, "volicon: and nothing was moved or linked");
+	is(volicon_in_readdir(), 0, "volicon: readdir of / does not list it");
+	/* the root's FinderInfo: a 32-byte FolderInfo whose frFlags (bytes 8-9, big-endian) have kHasCustomIcon, 0x0400 */
+	is(lklfuse_getxattr("/", FI, NULL, 0), 32, "volicon: the root's FinderInfo: 32 bytes");
+	memset(b, 0x55, sizeof(b));
+	is(lklfuse_getxattr("/", FI, b, sizeof(b)), 32, "volicon: read whole");
+	is((unsigned char)b[8] == 0x04 && b[9] == 0, 1, "volicon: frFlags has kHasCustomIcon (0x0400, big-endian)");
+	for (n = 0, i = 0; i < 32; i++)
+		n += i != 8 && b[i] != 0;
+	is(n, 0, "volicon: every other byte is 0");
+	is(lklfuse_getxattr("/", FI, b, 4), -ERANGE, "volicon: a buffer too small: ERANGE");
+	is(lists("/", FI), 1, "volicon: listxattr of / has com.apple.FinderInfo");
+	is(lists("/", "user.a"), 1, "volicon: and still the root's own xattrs");
+	n = lklfuse_listxattr("/", NULL, 0);
+	is(n, lklfuse_listxattr("/", b, sizeof(b)), "volicon: listxattr's size query is its length");
+	is(lklfuse_listxattr("/", b, (size_t)n - 1), -ERANGE, "volicon: and one byte short: ERANGE");
+	is(lklfuse_setxattr("/", FI, b, 32, 0), -ENOTSUP, "volicon: setting the root's FinderInfo is refused as before, not faked");
+	is(lklfuse_getxattr("/c", FI, b, sizeof(b)), -ENOTSUP, "volicon: another folder's FinderInfo is as before");
+	/* a real one wins, at once, and the synthetic one is back as soon as it is gone */
+	plant(V, "real");
+	is(lklfuse_getattr(V, &st, NULL) == 0 && st.st_size == 4 && (st.st_mode & 07777) == 0644, 1,
+	   "volicon: a real /.VolumeIcon.icns wins at once: its own size and mode");
+	is_str(content_of(V, b, sizeof(b)), "real", "volicon: and its own bytes");
+	is(volicon_in_readdir(), 1, "volicon: readdir lists the real one");
+	is(lklfuse_getxattr("/", FI, b, sizeof(b)), -ENOTSUP, "volicon: and the root's FinderInfo is the volume's own again");
+	is(lists("/", FI), 0, "volicon: not listed either");
+	is(lklfuse_unlink(V), 0, "volicon: the real one can be removed");
+	is(lklfuse_getattr(V, &st, NULL) == 0 && (int)st.st_size == (int)sizeof(icon), 1, "volicon: then the icon is back at once");
+	lkl_sys_unlink("/vi-src");
+	close(lklfuse_volicon_fd);
+	lklfuse_volicon_fd = -1;
+	lklfuse.volicon = NULL;
+	unlink(path);
+	is(lklfuse_getattr(V, &st, NULL), -ENOENT, "volicon: with no icon, the name is free again");
+}
+
+/*
  * FUSE_DESTROY (patch 0015). macFUSE's unmount sends it after vflush and waits for the answer, and libfuse answers only
  * once lklfuse's destroy returns: so the disk and the lock let go of there are free before unmount(2) returns and
  * DiskArbitration ejects (the hfs-fsname kit's residual 0x10).
@@ -1016,6 +1170,7 @@ int main(int argc, char **argv)
 #ifdef __APPLE__
 	caller_owner_tests();
 	unicode_tests();
+	volicon_tests();
 	destroy_tests(argv[1]);
 #endif
 	stop_lkl();

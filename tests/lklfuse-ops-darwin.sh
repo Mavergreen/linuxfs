@@ -5,7 +5,8 @@
 #          values, Darwin xattr and rename flags translated), and its Unicode names (patch 0012: stored NFC, shown as
 #          HFS+ shows them, found in any form, both scanning and with macFUSE's name pass-through, which it takes
 #          from the installed macFUSE's version; CoreFoundation's, so checked here only), and its FUSE destroy (patch
-#          0015: the disk and the lock let go of before macFUSE's unmount returns). Needs
+#          0015: the disk and the lock let go of before macFUSE's unmount returns), and the volume icon (patch 0017: volicon=,
+#          a read-only /.VolumeIcon.icns and the root's custom-icon flag while the volume has no icon of its own). Needs
 #          build/build-lkl-darwin.sh's output.
 set -u
 case "$(uname -s)" in Darwin) ;; *) echo "lklfuse-ops-darwin.sh: runs on a Mac" >&2; exit 77 ;; esac

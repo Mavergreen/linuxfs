@@ -79,6 +79,16 @@ and Finder reports ownership as not ignored even when it is. These are limits of
 choices: the Mac keeps that setting by a volume ID that only HFS+ stores, it changes a mounted volume in place
 (`mount -u`), which macFUSE refuses, and macFUSE has no mount option for the flag Finder reads.
 
+### Volume icon
+
+A linuxfs volume shows the Mac's external-disk icon with a small Tux in its lower-right corner, unless it has a
+`.VolumeIcon.icns` of its own. The installer draws that icon on your Mac, from your Mac's own external-disk icon, into
+each bundle (`Contents/Resources/linuxfs.icns`). Nothing is written to the volume: the icon is shown as a read-only
+`/.VolumeIcon.icns` that `ls -a` does not list. If the installer cannot draw the icon, it says so in
+`/var/log/install.log`, and the volumes show macFUSE's icon.
+
+Tux is by Larry Ewing (lewing@isc.tamu.edu), made with The GIMP (`art/README`).
+
 ### Preferences
 
 `linuxfs prefs` shows them; `linuxfs prefs KEY on|off` sets one for you. Keys: `ReadOnly`, `NTFSTakeover` and

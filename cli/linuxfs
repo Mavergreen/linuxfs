@@ -47,6 +47,8 @@ DOMAIN=${LINUXFS_DOMAIN:-dev.mavergreen.linuxfs}
 MACHINE=${LINUXFS_MACHINE_DOMAIN:-/Library/Preferences/dev.mavergreen.linuxfs}
 FUSION_WAIT=${LINUXFS_FUSION_WAIT:-300}   # tenths of a second, as wall-clock time
 FSTAB=${LINUXFS_FSTAB:-/etc/fstab}   # read only: the root helper writes it
+FILESYSTEMS=${LINUXFS_FILESYSTEMS:-/System/Library/Filesystems}   # the bundles, for their volume icons
+ICON_OWNER=${LINUXFS_ICON_OWNER:-0}   # tests only (root's path has a bare environment): whose a volume icon must be
 
 die() { echo "linuxfs: $*" >&2; exit 1; }
 usage() { sed -n 's/^#   usage: /usage: /p; s/^#          linuxfs /       linuxfs /p' "$0" >&2; exit 2; }
@@ -367,6 +369,7 @@ cmd_mount() {
   # with root's channel, linuxfs-open holds the lock (--lock $lockfile) and lklfuse takes it from its descriptor 7
   lockopt=$lockfile; [ -z "$fusechan" ] || lockopt=/dev/fd/7
   opts="type=$type,lock=$lockopt"
+  vi=$(volicon_opt "$type"); [ -z "$vi" ] || opts="$opts,$vi"
   # the mount's own options (the kernel's): root gave them to mount_macfuse when it made the mount lklfuse serves
   if [ -z "$fusefd" ]; then
     [ -n "$fsn" ] || fsn=linuxfs@$(safe_name "$(basename "$src")")
@@ -595,6 +598,17 @@ bundle_of() { case $1 in ext4|btrfs|xfs|f2fs|apfs) echo "macfuse_$1" ;; ntfs3) e
 # fstypename and fssubtype for what the probe calls TYPE; nothing for the filesystems the Mac mounts itself.
 fstype_opts() { case $1 in ext4) echo fstypename=ext4,fssubtype=7 ;; ntfs3) echo fstypename=ntfs,fssubtype=8 ;; btrfs) echo fstypename=btrfs,fssubtype=9 ;;
   xfs) echo fstypename=xfs,fssubtype=10 ;; f2fs) echo fstypename=f2fs,fssubtype=11 ;; apfs) echo fstypename=apfs,fssubtype=12 ;; esac; }
+# The volume icon lklfuse shows while a volume has none of its own (spec: item 6's amendment): volicon= the bundle's linuxfs.icns,
+# which the postinstall made, for what the probe calls TYPE (ext4's for exFAT and FAT, which no bundle mounts); nothing unless it is
+# a regular file, not a symlink, ICON_OWNER's (root's), and writable by no one else, so no one but root chooses what lklfuse serves.
+volicon_opt() { # TYPE
+  _b=$(bundle_of "$1") || _b=macfuse_ext4
+  _i=$FILESYSTEMS/$_b.fs/Contents/Resources/linuxfs.icns
+  case $_i in *,*|*\\*) return 0 ;; esac   # never another lklfuse option
+  [ -f "$_i" ] && [ ! -L "$_i" ] && [ "$(stat -f %u "$_i" 2>/dev/null)" = "$ICON_OWNER" ] || return 0
+  case $(stat -f %Lp "$_i" 2>/dev/null) in *[2367]?|*[2367]|'') return 0 ;; esac
+  echo "volicon=$_i"
+}
 # SHARE_OPT when macFUSE's tunables let this user share the mount with root (allow_other is 1, or the user is in admin_group);
 # nothing when neither holds or sysctl fails or says nothing.
 share_opt() {

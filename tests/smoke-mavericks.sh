@@ -155,6 +155,7 @@ names_are() { names_mode "$1" | grep -q "^$2 "; }   # IMAGE exact|scanning
 #       shows as Format, and the mount type (macfuse_<fs>; exFAT, which has no bundle, plain macfuse)
 fsname_of() { case $1 in ext4) echo 'Linux ext4 (linuxfs)' ;; ntfs) echo 'Windows NTFS (linuxfs)' ;; btrfs) echo 'Linux btrfs (linuxfs)' ;; xfs) echo 'Linux XFS (linuxfs)' ;; f2fs) echo 'Linux F2FS (linuxfs)' ;; apfs) echo 'APFS (linuxfs)' ;; *) return 1 ;; esac; }
 type_of() { case $1 in exfat) echo macfuse ;; *) echo "macfuse_$1" ;; esac; }
+volicon_of() { echo "/System/Library/Filesystems/macfuse_$1.fs/Contents/Resources/linuxfs.icns"; }   # the postinstall's volume icon
 mount_type_is() {  # MOUNTPOINT TYPE: mount shows MOUNTPOINT as (TYPE, ...); prints mount's line for it
   l=$(mount | grep -F " on $1 ("); echo "$l"
   printf '%s\n' "$l" | grep -qF " on $1 ($2, "
@@ -384,6 +385,15 @@ da_cycle() {
   else
     check "$tag: it lists, and a write is refused (read-only)" sh -c 'ls "$1" > /dev/null && ! ( echo x > "$1/c" ) 2> /dev/null' _ "$mp"
   fi
+  # spec: item 6's amendment (the volume icon) -- an ext4 volume with no icon of its own shows linuxfs's: lklfuse serves the bundle's
+  #       linuxfs.icns as /.VolumeIcon.icns, which ls -a does not list, and the root's FinderInfo has kHasCustomIcon (0x0400, bytes 8-9)
+  if [ "$nm.$via" = ext4.raw ] && [ -f "$(volicon_of ext4)" ]; then
+    check "$tag: its lklfuse has volicon= the bundle's linuxfs.icns" lklfuse_has "volicon=$(volicon_of ext4)" "$mp"
+    check "$tag: the root's FinderInfo has the custom-icon flag (xattr -px: $(xattr -px com.apple.FinderInfo "$mp" 2>&1 | tr -d ' \n' | cut -c 1-20))" \
+      sh -c 'xattr -px com.apple.FinderInfo "$1" | tr -d " \n" | grep -q "^000000000000000004"' _ "$mp"
+    check "$tag: ls -a does not list .VolumeIcon.icns" sh -c '! ls -a "$1" | grep -qx .VolumeIcon.icns' _ "$mp"
+    check "$tag: its /.VolumeIcon.icns is the bundle's linuxfs.icns" cmp -s "$mp/.VolumeIcon.icns" "$(volicon_of ext4)"
+  fi
   oldmp=$mp
   check "$tag: diskutil unmount" da_unmount "$mp"
   check "$tag: it is unmounted" sh -c '[ "$(diskutil info "$1" 2> /dev/null | sed -n "s/^ *Mounted: *//p")" = No ]' _ "$dev"
@@ -400,6 +410,15 @@ da_cycle() {
 #       format keys, so the six personalities are not listed there; that check returns with phase 2 (Erase)
 check "the keychain keeper (linuxfs-agent) is running" pgrep -f "$P/libexec/linuxfs-agent"
 check "no lklfuse runs as root before the disks" no_root_lklfuse
+# spec: item 6's amendment (the volume icon) -- the postinstall made each bundle's linuxfs.icns, root's and 0644; where it could not,
+#       its line in install.log is recorded, not failed (those volumes show macFUSE's icon)
+for b in ext4 ntfs btrfs xfs f2fs apfs; do
+  vi=$(volicon_of "$b")
+  if test -f "$vi"; then check "volume icon: macfuse_$b.fs has linuxfs.icns, root's and 0644" test "$(stat -f '%u %Lp' "$vi")" = "0 644"
+  elif grep -F "could not make the volume icon $vi" /var/log/install.log > /dev/null 2>&1; then
+    ok "volume icon: macfuse_$b.fs has no linuxfs.icns (recorded, not failed): $(grep -F "could not make the volume icon $vi" /var/log/install.log | tail -n 1)"
+  else notok "volume icon: macfuse_$b.fs has no linuxfs.icns, and install.log has no postinstall line for it"; fi
+done
 [ -x "$AQUA" ] && ok "the guest has $AQUA for the console user's session" || notok "no $AQUA: the dialog, screenshot and keychain checks cannot run"
 defaults delete dev.mavergreen.linuxfs 2> /dev/null
 disk=

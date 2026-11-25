@@ -18,6 +18,10 @@ Upstream's release notes: `build/upstream-release-notes-url.sh` links the pinned
 
 The Sparkle updater's icon: none, by explicit opt-in to the generic macOS application icon (`updater/ICON-CREDIT.txt`).
 
+The volume icon's Tux overlay: `art/tux.png`, Larry Ewing's Tux (made with The GIMP), vendored once with its provenance and
+SHA-256 in `art/README`; nothing tracks it. The postinstall draws it onto each Mac's own `External.icns`, so no Apple artwork
+ships.
+
 ## Declared state
 
 Not ingredients: `patches/lkl/` and the build scripts are this repo's own recipe, and a declared state names

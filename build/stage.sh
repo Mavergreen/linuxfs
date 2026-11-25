@@ -7,7 +7,9 @@
 #          LINUXFS_PREFIX (build/lib.sh), files 0644 and programs 0755. When DIR has linuxfs-fs it also lays out the six DiskArbitration
 #          bundles, version V, under System/Library/Filesystems (linuxfs-fs copied to each bundle's macfuse_<fs>.util, mount_macfuse_<fs>
 #          and fsck_macfuse_<fs>), and Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d with copies of lklfuse, the CLI, the prober
-#          and linuxfs-open for the before-login root path; --version V is then required (exit 2 without it). Ownership (0/0) is the packager's.
+#          and linuxfs-open for the before-login root path; --version V is then required (exit 2 without it). DIR's linuxfs-volicon goes
+#          in the .d directory too, with art/tux.png: the postinstall, as root, makes each bundle's volume icon with them. Ownership (0/0)
+#          is the packager's.
 set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="${REPO_ROOT:-$(cd "$HERE/.." && pwd)}"
@@ -61,5 +63,10 @@ mkdir -p "$pd"
 put "$built/lklfuse" "$pd/lklfuse" 755
 [ ! -f "$REPO_ROOT/cli/linuxfs" ] || put "$REPO_ROOT/cli/linuxfs" "$pd/linuxfs" 755
 for p in linuxfs-probe linuxfs-open; do [ ! -f "$built/$p" ] || put "$built/$p" "$pd/$p" 755; done
+# spec: item 6's amendment (the volume icon) -- root runs linuxfs-volicon at install, so it and the Tux it reads are where root's code is
+if [ -f "$built/linuxfs-volicon" ]; then
+  put "$built/linuxfs-volicon" "$pd/linuxfs-volicon" 755
+  put "$REPO_ROOT/art/tux.png" "$pd/tux.png" 644
+fi
 rmdir "$t/bin" 2>/dev/null || :
 find "$out" -type d -exec chmod 755 {} +

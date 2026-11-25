@@ -72,6 +72,18 @@ if [ "${3:-/}" = / ]; then
     launchctl bsexec "$lw" sudo -u "$user" launchctl load -S Aqua /Library/LaunchAgents/dev.mavergreen.linuxfs.agent.plist || :
   fi
 fi
+# linuxfs: each bundle's volume icon (spec: item 6's amendment): this Mac's own external-disk icon with Tux in its corner, made here
+# so no Apple artwork is shipped; linuxfs hands it to lklfuse as volicon=. One that cannot be made is said (install.log) and skipped:
+# its volumes show macFUSE's icon, as before. Only on the running system.
+if [ "${3:-/}" = / ]; then
+  for fs in ext4 ntfs btrfs xfs f2fs apfs; do
+    icon=/System/Library/Filesystems/macfuse_$fs.fs/Contents/Resources/linuxfs.icns
+    /Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d/linuxfs-volicon \
+      /System/Library/Extensions/IOStorageFamily.kext/Contents/Resources/External.icns \
+      /Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d/tux.png "$icon" ||
+      echo "linuxfs: could not make the volume icon $icon; macfuse_$fs volumes show macFUSE's icon" >&2
+  done
+fi
 # linuxfs: DiskArbitration reads the bundles when it starts, so restart it last, once the helper and agent are loaded; launchd brings it back.
 if [ "${3:-/}" = / ]; then
   killall diskarbitrationd 2>/dev/null || :

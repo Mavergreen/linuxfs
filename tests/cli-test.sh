@@ -126,13 +126,13 @@ exec /usr/bin/id "$@"
 EOF
 chmod 755 "$T/bin"/*
 # platform: cli/linuxfs is macOS-only and leans on two BSD behaviours GNU coreutils lacks: stat -f FORMAT, and cut -c
-#           counting characters, not bytes, in a UTF-8 locale. Off macOS these stand-ins supply both (stat's two formats
+#           counting characters, not bytes, in a UTF-8 locale. Off macOS these stand-ins supply both (stat's three formats
 #           as GNU's -c; cut -c 1-N through perl), so the suite also runs on the Linux CI host
 if [ "$(uname)" != Darwin ]; then
   cat > "$T/bin/stat" <<'EOF2'
 #!/bin/sh
 [ "$1" = -f ] || exec /usr/bin/stat "$@"
-case $2 in %d) f=%d ;; %Lp) f=%a ;; *) echo "stat stand-in: no GNU form for -f $2" >&2; exit 2 ;; esac
+case $2 in %d) f=%d ;; %Lp) f=%a ;; %u) f=%u ;; *) echo "stat stand-in: no GNU form for -f $2" >&2; exit 2 ;; esac
 shift 2; exec /usr/bin/stat -c "$f" "$@"
 EOF2
   cat > "$T/bin/cut" <<'EOF2'
@@ -144,6 +144,8 @@ EOF2
 fi
 export PATH="$T/bin:$PATH" LINUXFS_LKLFUSE="$T/bin/lklfuse" LINUXFS_PROBE="$T/bin/probe" LINUXFS_OPEN="$T/none"
 export LINUXFS_MACHINE_DOMAIN=test.machine LINUXFS_AGENT="$T/bin/agent"
+# the bundles' volume icons are looked for here, never in this machine's /System (empty until a case below makes one)
+mkdir -p "$T/Filesystems"; export LINUXFS_FILESYSTEMS="$T/Filesystems"
 export LINUXFS_DOMAIN=test.linuxfs LINUXFS_STATE="$T/state" LINUXFS_LOGS="$T/logs" LINUXFS_VOLUMES="$T/Volumes" LINUXFS_LOCKS="$T/locks" LINUXFS_WAIT=50
 L=$ROOT/cli/linuxfs
 n=0 bad=0
@@ -661,6 +663,46 @@ out=$(LINUXFS_FUSE_FD=4 LINUXFS_OPEN_INHERITED=1 sh "$L" mount "$T/img" 4</dev/n
 c=$(last)
 [ $rc -eq 0 ] && case $c in *" $T/img $out") true ;; *) false ;; esac; ok $? "linuxfs mount IMAGE ignores LINUXFS_FUSE_FD: only da-mount honours it (got $rc: '$c')"
 sh "$L" unmount "$T/img" > /dev/null 2>&1
+# spec: item 6's amendment (the volume icon) -- lklfuse gets volicon=<bundle>/Contents/Resources/linuxfs.icns when the postinstall made
+#       it: a regular file root owns (LINUXFS_ICON_OWNER stands in for root here) that no one else can write; otherwise no option, and the
+#       volume shows macFUSE's icon. The probed filesystem's bundle; ext4's for what has none (exFAT, FAT images). Every mount path.
+icon() { echo "$T/Filesystems/$1.fs/Contents/Resources/linuxfs.icns"; }
+mkicon() { mkdir -p "$(dirname "$(icon "$1")")"; rm -f "$(icon "$1")"; printf 'icns' > "$(icon "$1")"; chmod "$2" "$(icon "$1")"; }
+sh "$L" mount "$T/img" > /dev/null 2>&1
+case $(last) in *volicon=*) r=1 ;; *) r=0 ;; esac; ok $r "no linuxfs.icns in the bundle: no volicon= ($(last))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+mkicon macfuse_ext4 644; mkicon macfuse_ntfs 644
+LINUXFS_ICON_OWNER=$(id -u) sh "$L" mount "$T/img" > /dev/null 2>&1
+case $(last) in *",volicon=$(icon macfuse_ext4),"*) r=0 ;; *) r=1 ;; esac; ok $r "linuxfs mount IMAGE: volicon= the ext4 bundle's linuxfs.icns ($(last))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+sh "$L" mount "$T/img" > /dev/null 2>&1
+case $(last) in *volicon=*) r=1 ;; *) r=0 ;; esac; ok $r "one that is not root's: no volicon= ($(last))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+for m in 664 646 666; do
+  mkicon macfuse_ext4 $m
+  LINUXFS_ICON_OWNER=$(id -u) sh "$L" mount "$T/img" > /dev/null 2>&1
+  case $(last) in *volicon=*) r=1 ;; *) r=0 ;; esac; ok $r "one that is mode $m, writable by others: no volicon= ($(last))"
+  sh "$L" unmount "$T/img" > /dev/null 2>&1
+done
+mkicon macfuse_ext4 644; mv "$(icon macfuse_ext4)" "$T/real.icns"; ln -s "$T/real.icns" "$(icon macfuse_ext4)"
+LINUXFS_ICON_OWNER=$(id -u) sh "$L" mount "$T/img" > /dev/null 2>&1
+case $(last) in *volicon=*) r=1 ;; *) r=0 ;; esac; ok $r "a symlink in its place: no volicon= ($(last))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+rm -f "$(icon macfuse_ext4)" "$T/real.icns"; mkicon macfuse_ext4 644
+(LINUXFS_ICON_OWNER=$(id -u) FAKE_PROBE=ntfs3; export LINUXFS_ICON_OWNER FAKE_PROBE; sh "$L" mount "$T/img" > /dev/null 2>&1)
+case $(last) in *",volicon=$(icon macfuse_ntfs),"*) r=0 ;; *) r=1 ;; esac; ok $r "an NTFS image: the NTFS bundle's ($(last))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+(LINUXFS_ICON_OWNER=$(id -u) FAKE_PROBE=exfat; export LINUXFS_ICON_OWNER FAKE_PROBE; sh "$L" mount "$T/img" > /dev/null 2>&1)
+case $(last) in *",volicon=$(icon macfuse_ext4),"*) r=0 ;; *) r=1 ;; esac; ok $r "an exFAT image, which no bundle mounts: ext4's ($(last))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+(LINUXFS_ICON_OWNER=$(id -u); export LINUXFS_ICON_OWNER; DA /dev/disk3s1 "$T/dam" > /dev/null 2>&1)
+case $(last) in *",volicon=$(icon macfuse_ext4),"*) r=0 ;; *) r=1 ;; esac; ok $r "a DiskArbitration mount: volicon= too ($(last))"
+sh "$L" unmount disk3s1 > /dev/null 2>&1
+chanrun LINUXFS_ICON_OWNER=$(id -u) -- /dev/disk3s1 "$T/dam"
+c=$(grep '^open --fuse-chan' "$T/calls" | tail -n 1)
+case $c in *",volicon=$(icon macfuse_ext4),"*) r=0 ;; *) r=1 ;; esac; [ $rc -eq 0 ]; ok $(( $? | r )) "before login (root's device): volicon= too (got $rc: '$c')"
+sh "$L" unmount "$T/dam" > /dev/null 2>&1
+rm -rf "$T/Filesystems"/*
 # spec: cli/linuxfs cmd_ignore -- linuxfs ignore|unignore VOLUME: an /etc/fstab noauto entry, written by the root helper
 #       (linuxfs-open --noauto-add SPEC BUNDLE | --noauto-remove SPEC). A device: UUID= when the probe has one, else LABEL= the
 #       volume name DiskArbitration sees (the safe name); a label: LABEL= that safe name, with the bundle of the attached disk

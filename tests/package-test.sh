@@ -24,7 +24,7 @@ V="$UP-mavericks.1"
 P=".$LINUXFS_PREFIX"
 
 mkdir -p "$T/built"
-for f in lklfuse linuxfs-probe linuxfs-open linuxfs-fs linuxfs-helper linuxfs-agent; do printf '#!/bin/sh\n' > "$T/built/$f"; chmod 775 "$T/built/$f"; done
+for f in lklfuse linuxfs-probe linuxfs-open linuxfs-fs linuxfs-helper linuxfs-agent linuxfs-volicon; do printf '#!/bin/sh\n' > "$T/built/$f"; chmod 775 "$T/built/$f"; done
 sh "$REPO_ROOT/build/stage.sh" --built "$T/built" --out "$T/stage" --version "$V" > "$T/log" 2>&1 ||
   { cat "$T/log" >&2; echo "FAIL: stage.sh refused the fixtures" >&2; exit 1; }
 sh "$REPO_ROOT/build/package.sh" --stage "$T/stage" --version "$V" --out "$T/dist" > "$T/log" 2>&1 ||
@@ -112,11 +112,15 @@ if LINUXFS_TEST_EXTRA_FSTYPENAME=ext2 sh "$REPO_ROOT/build/package.sh" --stage "
 else
   grep -q LINUXFS_TEST_EXTRA_FSTYPENAME "$T/hook.out" || fail "package.sh's refusal does not name LINUXFS_TEST_EXTRA_FSTYPENAME: $(cat "$T/hook.out")"
 fi
-for prog in lklfuse linuxfs linuxfs-probe linuxfs-open; do
+for prog in lklfuse linuxfs linuxfs-probe linuxfs-open linuxfs-volicon; do
   grep -qxF "$D/$prog	100755	0/0" "$T/list" || fail "the payload lacks $D/$prog (0755)"
 done
+# spec: item 6's amendment (the volume icon) -- Tux, for the postinstall's linuxfs-volicon, root's like the program that reads it
+grep -qxF "$D/tux.png	100644	0/0" "$T/list" || fail "the payload lacks $D/tux.png (0644)"
 n="$(grep -c "^$D/" "$T/list" || :)"
-[ "$n" -eq 4 ] || fail "$D holds $n entries, not four programs"
+[ "$n" -eq 6 ] || fail "$D holds $n entries, not five programs and Tux"
+# spec: item 6's amendment -- no Apple artwork and no composite in the pkg: each Mac makes its own from its own External.icns
+! grep -q '\.icns	' "$T/list" || fail "the payload has an .icns: $(grep '\.icns	' "$T/list" | tr '\n' ' ')"
 mkdir -p "$T/bundles"; (cd "$T/bundles" && gzip -dc < "$comp/Payload" | cpio -id --quiet "$S/*")
 while IFS='	' read -r fs ptype bundle ftn pers fsname sub; do
   ip="$T/bundles/System/Library/Filesystems/$bundle.fs/Contents/Info.plist"
@@ -178,13 +182,16 @@ printf '[ "$*" != "-f %%Su /dev/console" ] || echo "${PH_USER:-}"\n' >> "$T/pbin
 printf '[ -z "${PH_LW:-}" ] || echo "$PH_LW"\n' >> "$T/pbin/pgrep"
 # spec: packaging/postinstall-hook -- the root helper's migration: a stub that prints what PH_MIGRATED holds, as DOMAIN<TAB>LABEL lines
 printf '#!/bin/sh\necho "helper $*" >> "$PH_DIR/calls"\n[ "$*" = --migrate-prefs ] && printf "%%b" "${PH_MIGRATED:-}"\n' > "$T/pbin/helper"
+# spec: packaging/postinstall-hook -- linuxfs-volicon is a stub that logs, and fails with PH_VOLICON_FAIL (the real one writes in /System)
+printf '#!/bin/sh\necho "volicon $*" >> "$PH_DIR/calls"\n[ -z "${PH_VOLICON_FAIL:-}" ] || { echo "linuxfs-volicon: no" >&2; exit 1; }\n' > "$T/pbin/volicon"
 chmod 755 "$T/pbin"/*
 run_post() {  # users groups-file-lines gid-or-empty user-exists(1/0)
   rm -f "$T/ds"/* "$T/calls"; : > "$T/calls"
   printf '%s\n' "$1" > "$T/ds/users"; printf '%s\n' "$2" > "$T/ds/groups"
   [ -z "$3" ] || echo "$3" > "$T/ds/gid"
   [ "$4" != 1 ] || : > "$T/ds/user"
-  sed "s|/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper|$T/pbin/helper|g" "$REPO_ROOT/packaging/postinstall-hook" > "$T/post.sh"
+  sed -e "s|/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper|$T/pbin/helper|g" \
+    -e "s|/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d/linuxfs-volicon|$T/pbin/volicon|g" "$REPO_ROOT/packaging/postinstall-hook" > "$T/post.sh"
   PH_DIR="$T" PATH="$T/pbin:$PATH" sh "$T/post.sh" > "$T/post.out" 2>&1
 }
 want() { grep -qxF "$1" "$T/calls" || fail "postinstall: $2 (no '$1')"; }
@@ -234,6 +241,21 @@ mig=$(grep -n 'helper --migrate-prefs' "$T/calls" | cut -d: -f1); agl=$(grep -n 
 [ "$(grep -n 'Ignore:my data' "$T/calls" | cut -d: -f1)" -lt "$agl" ] || fail "postinstall loads the agent before deleting the converted keys"
 PH_USER=root run_post "root 0" "wheel 0" 250 1 || fail "postinstall failed with root at the console"
 grep -q 'sudo -u' "$T/calls" && fail "postinstall ran defaults as root for the user's domain"
+# spec: item 6's amendment (the volume icon) -- each bundle's linuxfs.icns, made from this Mac's External.icns and the pkg's Tux,
+#       before DiskArbitration restarts; a failure is said and the install goes on (the volumes keep macFUSE's icon)
+EXT=/System/Library/Extensions/IOStorageFamily.kext/Contents/Resources/External.icns
+TUXP=/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d/tux.png
+run_post "root 0" "wheel 0" 250 1 || fail "postinstall failed making the volume icons"
+while IFS='	' read -r fs ptype bundle rest; do
+  want "volicon $EXT $TUXP /System/Library/Filesystems/$bundle.fs/Contents/Resources/linuxfs.icns" "the volume icon for $bundle"
+done < "$T/names"
+[ "$(grep -c '^volicon ' "$T/calls")" = 6 ] || fail "postinstall made $(grep -c '^volicon ' "$T/calls") volume icons, not six"
+[ "$(tail -n 1 "$T/calls")" = "killall diskarbitrationd" ] || fail "postinstall does not restart diskarbitrationd after the volume icons"
+PH_VOLICON_FAIL=1 run_post "root 0" "wheel 0" 250 1 || fail "postinstall fails when a volume icon cannot be made"
+[ "$(grep -c "^linuxfs: could not make the volume icon .*/Contents/Resources/linuxfs.icns" "$T/post.out")" = 6 ] ||
+  fail "postinstall does not say, once per bundle, that a volume icon could not be made: $(cat "$T/post.out")"
+grep -qF 'linuxfs-volicon: no' "$T/post.out" || fail "postinstall hides linuxfs-volicon's own reason"
+[ "$(tail -n 1 "$T/calls")" = "killall diskarbitrationd" ] || fail "postinstall stops short when a volume icon cannot be made"
 
 mkdir -p "$T/bin"
 # spec: packaging/pre-uninstall -- it deletes _linuxfs and its home: dscl and rm are stubs that only log, so this never touches the machine it runs on
@@ -268,12 +290,17 @@ grep -q 'dev.mavergreen.linuxfs.helper --noauto-remove-all' "$REPO_ROOT/packagin
 printf '#!/bin/sh\ncase "$*" in "-u _linuxfs") exit 0 ;; esac\necho 77\n' > "$T/bin/pgrep"; chmod 755 "$T/bin/pgrep"; : > "$T/launchctl.calls"; : > "$T/acct.calls"
 PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > "$T/u.out" 2>&1 || fail "pre-uninstall refuses with only _linuxfs processes"
 grep -q '_linuxfs' "$T/u.out" || fail "pre-uninstall says nothing when a _linuxfs process keeps the account"
-[ ! -s "$T/acct.calls" ] || fail "pre-uninstall deleted _linuxfs while a process runs as it: $(cat "$T/acct.calls")"
+! grep -v 'linuxfs\.icns$' "$T/acct.calls" | grep -q . || fail "pre-uninstall deleted _linuxfs while a process runs as it: $(cat "$T/acct.calls")"
 printf '#!/bin/sh\ncase "$*" in "-u _linuxfs") exit 1 ;; esac\necho 77\n' > "$T/bin/pgrep"; : > "$T/acct.calls"
 PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > /dev/null 2>&1 || fail "pre-uninstall refuses with nothing running as _linuxfs"
 for c in "dscl . -delete /Users/_linuxfs" "rm -rf /private/var/db/linuxfs"; do
   grep -qxF "$c" "$T/acct.calls" 2>/dev/null || fail "pre-uninstall did not run: $c"
 done
+# spec: item 6's amendment -- the volume icons the postinstall made are not in the pkg's receipt, so they go here, with the bundles
+while IFS='	' read -r fs ptype bundle rest; do
+  grep -qxF "rm -f /System/Library/Filesystems/$bundle.fs/Contents/Resources/linuxfs.icns" "$T/acct.calls" ||
+    fail "pre-uninstall does not remove $bundle.fs's linuxfs.icns"
+done < "$T/names"
 ! grep -q 'Groups/_linuxfs' "$T/acct.calls" || fail "pre-uninstall deleted a _linuxfs group the postinstall did not make"
 : > "$T/created-group"; : > "$T/acct.calls"
 PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > /dev/null 2>&1 || fail "pre-uninstall refuses with the group marker"

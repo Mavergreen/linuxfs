@@ -5,7 +5,8 @@
 #          removing lklfuse under a mounted volume leaves it unwritable until unmounted. Another volume's uninstall
 #          has nothing to check here. Otherwise it removes linuxfs's /etc/fstab noauto lines (the helper's
 #          --noauto-remove-all), unloads the root helper and the console user's automount agent before their files go,
-#          and removes the _linuxfs account and its home when nothing runs as it. An lklfuse under the .d directory counts as mounted too.
+#          removes the volume icons the postinstall made in the bundles (not in the receipt, so they would keep the bundles'
+#          directories), and removes the _linuxfs account and its home when nothing runs as it. An lklfuse under the .d directory counts as mounted too.
 [ "${MAVERGREEN_ROOT:-/}" = / ] || exit 0
 prefix=/usr/local/mavergreen/linuxfs
 priv=/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d
@@ -19,6 +20,7 @@ if [ -z "$running" ]; then
   launchctl unload /Library/LaunchDaemons/dev.mavergreen.linuxfs.helper.plist 2>/dev/null || :
   user=$(stat -f %Su /dev/console 2>/dev/null); lw=$(pgrep -x -u "$user" loginwindow 2>/dev/null | head -n 1)
   [ -z "$lw" ] || launchctl bsexec "$lw" sudo -u "$user" launchctl unload -S Aqua /Library/LaunchAgents/dev.mavergreen.linuxfs.agent.plist 2>/dev/null || :
+  for fs in ext4 ntfs btrfs xfs f2fs apfs; do rm -f "/System/Library/Filesystems/macfuse_$fs.fs/Contents/Resources/linuxfs.icns"; done
   # _linuxfs and its home go once nothing runs as it. DiskArbitration is not restarted: there is no post-uninstall hook, so its
   # list of bundles stays stale, and the missing probes fail, which reads as "not recognised", until the next reboot.
   if pgrep -u _linuxfs > /dev/null 2>&1; then

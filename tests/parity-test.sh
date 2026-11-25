@@ -1092,6 +1092,9 @@ dismissed_first() { awk '/killall UserNotificationCenter$/ { d = 1; next } /scre
 expect census_finder_alert_dismissed dismissed_first
 expect census_finder_alert_record grep -q 'UserNotificationCenter' "$P/alerts.txt"
 for s in sidebar getinfo desktop-on desktop-off icon; do expect "census_finder_shot_$s" test "$(grep -Ec "screencapture -x .*/(hfs|ext4)-$s.png$" "$S/calls")" -eq 2; done
+# spec: item 6's amendment -- the icon pair differs from HFS+ by design (the linuxfs volume icon): recorded so, once, for the fs side only
+expect census_finder_icon_by_design test "$(grep -c '^icon ext4: differs from hfs-icon.png by design: ' "$P/shots.txt")" -eq 1
+expect census_finder_icon_by_design_only_icon test "$(grep -c 'by design' "$P/shots.txt")" -eq 1
 expect census_finder_props grep -q '^capacity equals df -k' "$P/finder.ext4.properties.ext4.txt"
 expect census_finder_props_ejectable grep -q '^ejectable: true$' "$P/finder.ext4.properties.hfs.txt"
 expect census_finder_raw grep -q 'Mac OS Extended format' "$P/finder.ext4.raw.txt"
