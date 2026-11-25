@@ -26,7 +26,7 @@ Get Info's Format says what the volume is: "Linux ext4 (linuxfs)", "Windows NTFS
 
 Testers who installed an earlier build, which named the bundles `linuxfs_<fs>.fs`, clean up once, as root, after installing
 this one: `rm -rf /System/Library/Filesystems/linuxfs_{ext4,ntfs,btrfs,xfs,f2fs,apfs}.fs`, then delete the `/etc/fstab` lines
-ending `# linuxfs` (they name the old bundles), then `sudo killall diskarbitrationd`.
+that name an old bundle (`linuxfs_ext4`, `linuxfs_ntfs` and so on; leave any other line, even one ending `# linuxfs`), then `sudo killall diskarbitrationd`.
 Nothing migrates them.
 
 Mounting before login runs macFUSE as root, so it needs install paths only root can write: `mount_macfuse` (reached through

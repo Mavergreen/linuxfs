@@ -104,6 +104,12 @@ while IFS='	' read -r fs ptype bundle ftn pers fsname sub; do
     grep -qxF "$b/Resources/$prog	100755	0/0" "$T/list" || fail "the payload lacks $b/Resources/$prog (0755)"
   done
 done < "$T/names"
+[ "$(grep -o "^$S/[^/]*\.fs/" "$T/list" | sort -u | tr '\n' ' ')" = "$(printf '%s\n' "$names" | cut -f3 | sort | sed "s|^|$S/|; s|\$|.fs/|" | tr '\n' ' ')" ] ||
+  fail "the payload's bundles are not exactly the six macfuse_<fs>.fs"
+# spec: build/package.sh -- the fs-bundles test hook must not leak into a shipping build
+if LINUXFS_TEST_EXTRA_FSTYPENAME=ext2 sh "$REPO_ROOT/build/package.sh" --stage "$T/stage" --version "$V" --out "$T/dist-hook" > "$T/hook.out" 2>&1; then
+  fail "package.sh builds with LINUXFS_TEST_EXTRA_FSTYPENAME set"
+fi
 for prog in lklfuse linuxfs linuxfs-probe linuxfs-open; do
   grep -qxF "$D/$prog	100755	0/0" "$T/list" || fail "the payload lacks $D/$prog (0755)"
 done

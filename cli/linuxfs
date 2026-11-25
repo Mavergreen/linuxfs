@@ -292,7 +292,8 @@ cmd_mount() {
     [ "$type" = apfs ] || die "--password-stdin is for encrypted APFS volumes, and $target is $type"
     IFS= read -r password || [ -n "${password:-}" ] || die "no password on stdin"
   fi
-  case $extra in *type=*) type=$(printf '%s\n' "$extra" | tr ',' '\n' | sed -n 's/^type=//p' | tail -n 1) ;; esac
+  # (only an option named exactly type=, not fstype...=)
+  case $extra in *type=*) t=$(printf '%s\n' "$extra" | tr ',' '\n' | sed -n 's/^type=//p' | tail -n 1); [ -z "$t" ] || type=$t ;; esac
   # read-only or not by the root mount program's own rule (tools/fsrules.h fsrules_access, through linuxfs-probe --access):
   # asked, an encrypted volume, an APFS Fusion container, APFS unless the user opted in (APFSWrite: linux-apfs-rw's write
   # support is experimental, so read-write through its readwrite option, with a warning), a dirty NTFS volume
@@ -347,6 +348,10 @@ cmd_mount() {
   [ -z "$ro" ] || opts="$opts,ro"
   [ -z "$apfs_rw" ] || opts="$opts,opts=readwrite"
   [ -z "$tier2opt" ] || opts="$opts,$tier2opt"
+  # our fstypename/fssubtype (or root's, with its channel) win: a user's -o of either would only repeat them
+  if [ -n "$fusefd" ] || [ -n "$ft" ]; then
+    extra=$(printf '%s\n' "$extra" | tr ',' '\n' | grep -v '^fs\(typename\|subtype\)=' | paste -sd, -)
+  fi
   [ -z "$extra" ] || opts="$opts,$extra"
   [ -z "$fusechan" ] || [ -n "$open_dev" ] || die "LINUXFS_FUSE_CHAN needs the opener (the device inherited): root's device cannot reach lklfuse otherwise"
   mkdir -p "$STATE" "$LOGS" "$LOCKS" && chmod 700 "$LOCKS"

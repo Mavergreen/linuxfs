@@ -39,6 +39,7 @@ short=$LINUXFS_SHORT
 MACFUSE_MIN=5.5.0-mavericks.4
 id="$(sh "$SHIPYARD_SCRIPTS/product-name.sh" identifier "$short" 2>/dev/null)" ||
   die "the shipyard at $SHIPYARD_SCRIPTS does not register $short"
+[ -z "${LINUXFS_TEST_EXTRA_FSTYPENAME:-}" ] || die "LINUXFS_TEST_EXTRA_FSTYPENAME is set: that test hook would ship an extra bundle"
 up="$(upstream_version)"
 case "$V" in "$up"-mavericks.[1-9]*) ;; *) die "--version $V is not $up with a -mavericks.N (UPSTREAM_VERSION)" ;; esac
 [ -f "$stage$LINUXFS_PREFIX/libexec/lklfuse" ] || die "$stage is not a build/stage.sh stage"

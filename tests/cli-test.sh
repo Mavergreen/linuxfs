@@ -659,6 +659,11 @@ sh "$L" unmount "$T/img" > /dev/null 2>&1
 case $(last) in *type=ext4*) case $(last) in *fstypename*|*fssubtype*) r=1 ;; *) r=0 ;; esac ;; *) r=1 ;; esac
 ok $r "with root's channel there is no fstypename on lklfuse's -o (rc $rc: $(last))"
 sh "$L" unmount "$T/dam" > /dev/null 2>&1
+# spec: cli/linuxfs cmd_mount -- a user's -o fstypename=/fssubtype= would repeat ours: ours wins, the user's is dropped
+FAKE_PROBE=ext4 sh "$L" mount "$T/img" -o fstypename=zzz,fssubtype=99,sync > /dev/null 2>&1; rc=$?
+case $(last) in *fstypename=ext4,fssubtype=7*) case $(last) in *zzz*|*=99*) r=1 ;; *,sync[,\ ]*) r=0 ;; *) r=1 ;; esac ;; *) r=1 ;; esac
+ok $r "a user's -o fstypename/fssubtype is dropped, ours kept, other -o options kept (rc $rc: $(last))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
 # spec: cli/linuxfs bundle_of, fstype_opts -- agree with tools/fsrules.c's table (fsrules-test --names)
 names=$(sh "$ROOT/tests/fsrules-test.sh" --names 2>/dev/null); [ -n "$names" ]; ok $? "fsrules-test --names prints the table"
 eval "$(grep '^bundle_of()' "$L")"; eval "$(sed -n '/^fstype_opts()/,/; }$/p' "$L")"
