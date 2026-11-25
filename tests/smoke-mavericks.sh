@@ -66,37 +66,15 @@ bounded() {
   done
   wait "$bp"
 }
+# spec: tests/lib/parity.sh -- the census's library, and the system.log reader (syslog_since) finish shares with it:
+#       sourced before anything can call finish
+tests_dir=$(cd "$(dirname "$0")" && pwd) parity_lib=
+if test -f "$tests_dir/lib/parity.sh"; then
+  . "$tests_dir/lib/parity.sh"; parity_lib=1
+fi
 crashes() { ls "$HOME"/Library/Logs/DiagnosticReports/lklfuse_* /Library/Logs/DiagnosticReports/*.panic 2>/dev/null | wc -l | tr -d ' '; }
 mountpoint_of() { "$L" status | awk -F"$tab" -v s="$1" '$2 == s { print $3; exit }'; }
 pid_of() { "$L" status | awk -F"$tab" -v s="$1" '$2 == s { print $1; exit }'; }
-# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-13b-brief.md item 5 -- system.log since the smoke began (push C kept only
-#       its last 3000 lines, the census's last 9 minutes): the lines after LINES of the file whose first line was FIRST.
-#       Fix round 1: 10.9 rotates system.log by size at any time (/etc/asl.conf: rotate=seq compress file_max=5M, by
-#       aslmanager), gzipped, newest first: LOG.0.gz, LOG.1.gz, ... So when it turned over since (its first line
-#       differs), the rotated files are walked back, up to LOG.19 (bounded), to the one FIRST began: its rest, the newer
-#       rotated files, then LOG. A .bz2 (newsyslog's) is read where there is no .gz. When none began with FIRST, that is
-#       said, and LOG.0 and LOG follow whole.
-syslog_rotated() {  # LOG N: rotated file N of LOG, decompressed (nothing when there is none)
-  if test -f "$1.$2.gz"; then gzip -dc "$1.$2.gz"; elif test -f "$1.$2.bz2"; then bzcat "$1.$2.bz2"; fi
-}
-syslog_since() {  # LINES FIRST [LOG]
-  sl=${3:-/var/log/system.log}
-  if test "$(head -n 1 "$sl" 2> /dev/null)" = "$2"; then tail -n +"$((${1:-0} + 1))" "$sl"; return; fi
-  sn=0 sf=
-  while test "$sn" -lt 20; do
-    test -f "$sl.$sn.gz" || test -f "$sl.$sn.bz2" || break
-    if test "$(syslog_rotated "$sl" "$sn" 2> /dev/null | head -n 1)" = "$2"; then sf=$sn; break; fi
-    sn=$((sn + 1))
-  done
-  if test -n "$sf"; then
-    syslog_rotated "$sl" "$sf" 2> /dev/null | tail -n +"$((${1:-0} + 1))"
-    while test "$sf" -gt 0; do sf=$((sf - 1)); syslog_rotated "$sl" "$sf" 2> /dev/null; done
-  else
-    echo "# syslog_since: no rotated $sl.N (of $sn) began with the smoke's first line; $sl.0 and $sl whole"
-    syslog_rotated "$sl" 0 2> /dev/null
-  fi
-  cat "$sl"
-}
 finish() {
   test -z "${na_made:-}" || nonadmin_remove > /dev/null 2>&1
   for m in "$W"/mnt/*; do mount | grep -qF " on $m (" && { umount -f "$m" || diskutil unmount force "$m"; } > /dev/null 2>&1; done
@@ -106,7 +84,7 @@ finish() {
   for f in "$W"/img/*.img; do [ -f "$f" ] && gzip -c "$f" > "$OUT/$(basename "$f").gz"; done
   # spec: .github/workflows/on-mavericks.yml -- the run's evidence comes back in OUT (copyback), uploaded even when this fails
   # platform: sudo logs every COMMAND= line to system.log, and OUT is uploaded publicly: nothing that names the keychain unlock or kcpassword goes in
-  syslog_since "$LOG0" "$LOGHEAD" 2> /dev/null | grep -v 'unlock-keychain\|kcpassword\|security -i' | tail -n 200000 > "$OUT/system.log"
+  if test -n "$parity_lib"; then syslog_since "$LOG0" "$LOGHEAD" 2> /dev/null; else cat /var/log/system.log; fi | grep -v 'unlock-keychain\|kcpassword\|security -i' | tail -n 200000 > "$OUT/system.log"
   # spec: tests/lib/attach-retry.sh attach_retries -- a retried plain attach hides a stall, so the count is always said
   ar=$(attach_retries 2> /dev/null) || ar=0; echo "# attach retries: $ar"; ok "attach retries: $ar (each logged above as '# retrying hdiutil attach', listed in OUT/parity/attach-retries.txt)"
   echo "# OUT: $(ls -l "$OUT" | awk 'NR > 1 { printf "%s (%s) ", $NF, $5 }')"
@@ -185,8 +163,11 @@ mount_type_is() {  # MOUNTPOINT TYPE: mount shows MOUNTPOINT as (TYPE, ...); pri
 #       home NAH under W), used after the census, and removed before the before-login section, or by finish.
 NA=lfs_nonadmin NAH=$W/nonadmin na_made= na_uid=
 share_opt_of() { sed -n 's/^SHARE_OPT=//p' "$1" | head -n 1; }   # CLI: the SHARE_OPT the installed CLI passes
-lklfuse_opts_of() {  # UID MOUNTPOINT: the -o of the lklfuse UID runs serving MOUNTPOINT (its command's last argument)
-  ps -axww -o uid=,command= 2> /dev/null | awk -v u="$1" -v m=" $2" '$1 == u && /lklfuse/ && !/awk/ && length($0) > length(m) && substr($0, length($0) - length(m) + 1) == m { for (i = 2; i < NF; i++) if ($i == "-o") { print $(i + 1); exit } }'
+lklfuse_opts_of() {  # UID MOUNTPOINT: the -o of the lklfuse UID runs serving MOUNTPOINT (its command's last argument),
+  #                   whole: everything after " -o " but the image and MOUNTPOINT (volname may hold a space: "my data")
+  bounded 100 ps -axww -o uid=,command= 2> /dev/null < /dev/null | awk -v u="$1" -v m=" $2" '$1 == u && /lklfuse/ && !/awk/ && length($0) > length(m) && substr($0, length($0) - length(m) + 1) == m {
+    i = index($0, " -o "); if (!i) exit
+    r = substr($0, i + 4); r = substr(r, 1, length(r) - length(m)); sub(/ [^ ]*$/, "", r); print r; exit }'
 }
 no_share_opt() {  # UID MOUNTPOINT SHARE: that lklfuse runs with an -o, and SHARE is not one of its options
   o=$(lklfuse_opts_of "$1" "$2"); echo "lklfuse -o: ${o:-none found}; SHARE_OPT: ${3:-none}"
@@ -201,18 +182,22 @@ nonadmin_unshared() {  # macFUSE's allow_other is off, and NA is outside its adm
 }
 nonadmin_make() {  # IMAGE: NA made (na_made set before dscl is asked, so finish removes even a half-made one), hidden and
   #                  in staff alone, its home NAH holding a copy of IMAGE and mnt/; none made when NA exists already
-  if dscl . -read "/Users/$NA" > /dev/null 2>&1; then echo "$NA exists already: neither made nor removed here"; return 1; fi
-  na_uid=$(dscl . -list /Users UniqueID 2> /dev/null | awk '{ u[$2] = 1 } END { for (i = 601; i < 700; i++) if (!(i in u)) { print i; exit } }')
+  bounded 100 dscl . -read "/Users/$NA" > /dev/null 2>&1; nrc=$?
+  if test "$nrc" -eq 0; then echo "$NA exists already: neither made nor removed here"; return 1; fi
+  if test "$nrc" -eq 124; then echo "dscl did not answer within 10 s"; return 1; fi
+  na_uid=$(bounded 100 dscl . -list /Users UniqueID 2> /dev/null | awk '{ u[$2] = 1 } END { for (i = 601; i < 700; i++) if (!(i in u)) { print i; exit } }')
   test -n "$na_uid" || { echo "no free UniqueID in 601-699"; return 1; }
   na_made=1
   bounded 600 sudo -n sh -c 'u=/Users/$1
     dscl . -create "$u" && dscl . -create "$u" UniqueID "$2" && dscl . -create "$u" PrimaryGroupID 20 &&
     dscl . -create "$u" UserShell /bin/sh && dscl . -create "$u" RealName "linuxfs smoke user" &&
     dscl . -create "$u" NFSHomeDirectory "$3" && dscl . -create "$u" IsHidden 1 &&
-    mkdir -p "$3/mnt" && cp "$4" "$3/ext4.img" && chown -R "$1:staff" "$3"' _ "$NA" "$na_uid" "$NAH" "$1"
+    mkdir -p "$3/mnt" && cp "$4" "$3/ext4.img" && chown -R "$2:20" "$3"' _ "$NA" "$na_uid" "$NAH" "$1"
 }
-nonadmin_unmount() {  # as NA, linuxfs unmount of NAH/mnt (once: no retry, never forced), its lklfuse gone within 30 s
-  bounded 600 sudo -n -H -u "$NA" "$L" unmount "$NAH/mnt" || return 1
+nonadmin_unmount() {  # NAH/mnt unmounted once (no retry, never forced) by root's diskutil, which DiskArbitration lets do
+  #                    what it may refuse a user neither at the console nor an admin; said; its lklfuse gone within 30 s
+  echo "unmounted by: sudo -n diskutil unmount $NAH/mnt"
+  bounded 600 sudo -n diskutil unmount "$NAH/mnt" || return 1
   bounded 300 sh -c 'while ps -axww -o uid=,command= | awk -v u="$1" -v m=" $2" '"'"'$1 == u && /lklfuse/ && !/awk/ && substr($0, length($0) - length(m) + 1) == m { f = 1 } END { exit !f }'"'"'; do sleep 0.1; done' _ "$na_uid" "$NAH/mnt" || { echo "an lklfuse still serves $NAH/mnt"; return 1; }
   ! mount | grep -qF " on $NAH/mnt ("
 }
@@ -222,7 +207,8 @@ nonadmin_remove() {  # NA and NAH removed, if this smoke made NA; NAH kept while
     echo "# non-admin: $NAH/mnt is still mounted, so $NAH is kept"; bounded 300 sudo -n dscl . -delete "/Users/$NA"
   else bounded 300 sudo -n sh -c 'dscl . -delete "/Users/$1"; rm -rf "$2"' _ "$NA" "$NAH"; fi
   na_made=
-  ! dscl . -read "/Users/$NA" > /dev/null 2>&1
+  bounded 100 dscl . -read "/Users/$NA" > /dev/null 2>&1; nrc=$?
+  test "$nrc" -ne 0 && test "$nrc" -ne 124
 }
 for fs in $imgfs; do
   img=$W/img/$fs.img m=$W/mnt/$fs
@@ -612,9 +598,7 @@ check "no lklfuse runs as root, after everything" no_root_lklfuse
 # spec: tests/lib/parity.sh parity_census_all -- the HFS+ parity census: each behaviour on an HFS+ control and on linuxfs
 #       volumes, recorded into OUT/parity (record-only until an item's task sets its PARITY_MODE_ to check: item 1's is), with its
 #       screenshots in OUT; before the before-login section, which must stay last
-tests_dir=$(cd "$(dirname "$0")" && pwd)
-if [ -f "$tests_dir/lib/parity.sh" ]; then
-  . "$tests_dir/lib/parity.sh"
+if test -n "$parity_lib"; then
   # spec: tests/lib/parity.sh census_stall -- push C: item 3's loop, 50 iterations of each loop on each volume
   PARITY_STALL_N=50
   # spec: tests/lib/parity.sh census_names_bar -- item 1: every linuxfs census mount runs the names mode this macFUSE means
@@ -624,9 +608,9 @@ if [ -f "$tests_dir/lib/parity.sh" ]; then
 else notok "no $tests_dir/lib/parity.sh: the census cannot run"; fi
 
 # spec: tests/smoke-mavericks.sh nonadmin_make -- item 5: a user outside macFUSE's admin_group mounts without SHARE_OPT. Its
-#       bounds: made 60 s, the mount 60, ps 10, the unmount 60 and its lklfuse 30, removed 30: 250 s, 5 min at most
-#       (tests/lib/parity.sh PARITY_CENSUS_MIN counts it)
-if sudo -n true 2> /dev/null; then
+#       bounds: sudo -n true 10 s, dscl -read and -list 10 each, made 60, the mount 60, ps 10, the unmount 60 and its
+#       lklfuse 30, removed 30 and dscl -read 10: 290 s, 5 min at most (tests/lib/parity.sh PARITY_CENSUS_MIN counts it)
+if bounded 100 sudo -n true 2> /dev/null; then
   share=$(share_opt_of "$L")
   check "non-admin: the installed CLI names its SHARE_OPT (${share:-none})" test -n "$share"
   nalog=$(wc -l < /var/log/system.log 2> /dev/null | tr -d ' ')
@@ -635,7 +619,7 @@ if sudo -n true 2> /dev/null; then
     if check "non-admin: as $NA, linuxfs mount of an ext4 image mounts" bounded 600 sudo -n -H -u "$NA" "$L" mount "$NAH/ext4.img" "$NAH/mnt"; then
       check "non-admin: its lklfuse runs as $NA, its -o without ${share:-SHARE_OPT}" no_share_opt "$na_uid" "$NAH/mnt" "$share"
       echo "# non-admin: system.log's Operation not permitted lines naming $NAH/mnt since: $(tail -n +"$((${nalog:-0} + 1))" /var/log/system.log 2> /dev/null | grep 'Operation not permitted' | grep -cF "$NAH/mnt")"
-      check "non-admin: as $NA, linuxfs unmount, and its lklfuse exits" nonadmin_unmount
+      check "non-admin: its volume unmounted once by sudo -n diskutil unmount (DiskArbitration may refuse $NA itself), and its lklfuse exits" nonadmin_unmount
     fi
   fi
   check "non-admin: $NA removed" nonadmin_remove
