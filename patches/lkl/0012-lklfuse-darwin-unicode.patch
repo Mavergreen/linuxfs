@@ -20,7 +20,9 @@ On Darwin, for the filesystems that store names as given:
   -o nonorm_insensitive, which an older one refuses (fuse_new fails). Names then arrive as the kernel's bytes, not
   libfuse's ICU NFD, so the three lookups are all there is: never a directory scan. readdir and readlink then show a
   name in neither NFC nor NFD form as stored, so the bytes sent back for it find it. The mode is said on stderr, the
-  mount's log ("lklfuse: names: exact" or "lklfuse: names: scanning"). With an older macFUSE nothing changes;
+  mount's log ("lklfuse: names: exact" or "lklfuse: names: scanning"), once fuse_new has taken it: a libfuse that
+  refuses the option although its manifest says .5 (a dev build, a manifest out of step with the dylib) gets one
+  more fuse_new without it, scanning. With an older macFUSE nothing changes;
 - a new entry (create, mknod, mkdir, symlink, link, rename's target) is stored NFC on ext2/3/4, btrfs, xfs, f2fs,
   ntfs3, vfat and exfat (FAT and exFAT as Apple's msdosfs stores them, checked on a FAT32 control), and as given on
   apfs (as macOS does there); an existing entry in another form is used instead, so O_CREAT
@@ -65,7 +67,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  
  #define st_atim st_atimespec
  #define st_mtim st_mtimespec
-@@ -267,10 +272,449 @@
+@@ -267,10 +272,532 @@
  #endif
  	return f;
  }
@@ -470,22 +472,105 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +	return ok;
 +}
 +
-+/*
-+ * The names mode, from the macFUSE manifest at PATH (OWNER's), set in lklfuse_nf_exact and said on stderr (the
-+ * mount's log): the option to hand libfuse, or NULL
-+ */
++static char lklfuse_macfuse_ver[64];	/* the installed macFUSE's version, for the names line */
++
++/* The names mode, from the macFUSE manifest at PATH (OWNER's), set in lklfuse_nf_exact: the option to hand libfuse, or NULL */
 +static const char *lklfuse_names_option(const char *path, uid_t owner)
 +{
-+	char ver[64];
++	lklfuse_nf_exact = lklfuse_macfuse_exact(path, owner, lklfuse_macfuse_ver, sizeof(lklfuse_macfuse_ver));
++	return lklfuse_nf_exact ? "-ononorm_insensitive" : NULL;
++}
 +
-+	lklfuse_nf_exact = lklfuse_macfuse_exact(path, owner, ver, sizeof(ver));
++/* the names mode running, said on stderr (the mount's log) */
++static void lklfuse_names_say(void)
++{
++	const char *ver = lklfuse_macfuse_ver[0] ? lklfuse_macfuse_ver : "(no readable version)";
++
 +	if (lklfuse_nf_exact)
 +		fprintf(stderr, "lklfuse: names: exact (macFUSE %s passes them through, -o nonorm_insensitive): no directory scan\n",
 +			ver);
 +	else
-+		fprintf(stderr, "lklfuse: names: scanning (macFUSE %s is before %s, which passes them through): a directory scan on a miss\n",
-+			ver[0] ? ver : "(no readable version)", LKLFUSE_NAMES_EXACT_SINCE);
-+	return lklfuse_nf_exact ? "-ononorm_insensitive" : NULL;
++		fprintf(stderr, "lklfuse: names: scanning (macFUSE %s does not pass them through; %s does): a directory scan on a miss\n",
++			ver, LKLFUSE_NAMES_EXACT_SINCE);
++}
++
++/* fuse_opt_free_args, without libfuse: the argument strings and their array when ARGS owns them */
++static void lklfuse_args_free(struct fuse_args *args)
++{
++	int i;
++
++	if (args->allocated) {
++		for (i = 0; i < args->argc; i++)
++			free(args->argv[i]);
++		free(args->argv);
++	}
++	args->argc = 0;
++	args->argv = NULL;
++	args->allocated = 0;
++}
++
++/* a copy of ARGS with EXTRA after them, into OUT (it owns its strings): 0, or -1 */
++static int lklfuse_args_with(const struct fuse_args *args, const char *extra, struct fuse_args *out)
++{
++	int i;
++
++	out->argc = 0;
++	out->allocated = 1;
++	out->argv = calloc(args->argc + 2, sizeof(char *));
++	if (!out->argv)
++		return -1;
++	for (i = 0; i <= args->argc; i++) {
++		out->argv[i] = strdup(i < args->argc ? args->argv[i] : extra);
++		if (!out->argv[i]) {
++			lklfuse_args_free(out);
++			return -1;
++		}
++		out->argc++;
++	}
++	return 0;
++}
++
++typedef struct fuse *(*lklfuse_fuse_new_fn)(struct fuse_args *args, const struct fuse_operations *ops, size_t size,
++					    void *data);
++
++/*
++ * fuse_new (NEW) with the names mode from the macFUSE manifest at PATH (OWNER's). A libfuse that refuses
++ * -o nonorm_insensitive although the manifest says it has it (a dev build, a manifest out of step with the dylib) gets
++ * one more try without it, scanning. On success, ARGS are the ones it took, and the mode running is said; NULL when
++ * fuse_new failed without the option too.
++ */
++static struct fuse *lklfuse_fuse_new(struct fuse_args *args, const struct fuse_operations *ops, size_t size,
++				     const char *path, uid_t owner, lklfuse_fuse_new_fn new)
++{
++	const char *opt = lklfuse_names_option(path, owner);
++	struct fuse_args with;
++	struct fuse *f = NULL;
++
++	if (opt && lklfuse_args_with(args, opt, &with) == 0) {
++		f = new(&with, ops, size, NULL);
++		if (f) {
++			lklfuse_args_free(args);
++			*args = with;
++		} else {
++			lklfuse_args_free(&with);
++		}
++	}
++	if (!f && opt) {
++		fprintf(stderr, "lklfuse: libfuse refused %s although macFUSE %s should have it; scanning for names instead\n",
++			opt, lklfuse_macfuse_ver);
++		lklfuse_nf_exact = 0;
++	}
++	if (!f)
++		f = new(args, ops, size, NULL);
++	if (f)
++		lklfuse_names_say();
++	return f;
++}
++
++/* libfuse's own fuse_new (a macro, so not a function to point at) */
++static struct fuse *lklfuse_libfuse_new(struct fuse_args *args, const struct fuse_operations *ops, size_t size, void *data)
++{
++	return fuse_new(args, ops, size, data);
 +}
  #else
  #define lklfuse_err(ret) (ret)
@@ -515,7 +600,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  #endif
  
  static void lklfuse_xlat_stat(const struct lkl_stat *in, struct stat *st)
-@@ -303,8 +747,12 @@
+@@ -303,8 +830,12 @@
  	 * With nullpath_ok, path will be provided only if the struct
  	 * fuse_file_info argument is NULL.
  	 */
@@ -528,7 +613,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	else
  		ret = lkl_sys_lstat(path, &lkl_stat);
  	if (!ret)
-@@ -315,8 +763,11 @@
+@@ -315,8 +846,11 @@
  
  static int lklfuse_readlink(const char *path, char *buf, size_t len)
  {
@@ -540,7 +625,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	ret = lkl_sys_readlink(path, buf, len);
  	if (ret < 0)
  		return lklfuse_err(ret);
-@@ -326,6 +777,8 @@
+@@ -326,6 +860,8 @@
  
  	buf[ret] = 0;
  
@@ -549,7 +634,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	return 0;
  }
  
-@@ -369,33 +822,57 @@
+@@ -369,33 +905,57 @@
  
  static int lklfuse_mknod(const char *path, mode_t mode, dev_t dev)
  {
@@ -612,7 +697,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	/* libfuse: *flags* may be `RENAME_EXCHANGE` or `RENAME_NOREPLACE` */
  	return lklfuse_err(lkl_sys_renameat2(LKL_AT_FDCWD, oldname, LKL_AT_FDCWD, newname,
  				 lklfuse_rename_flags(flags)));
-@@ -403,16 +880,24 @@
+@@ -403,16 +963,24 @@
  
  static int lklfuse_link(const char *oldname, const char *newname)
  {
@@ -638,7 +723,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	else
  		ret = lkl_sys_fchmodat(LKL_AT_FDCWD, path, mode);
  
-@@ -422,10 +907,13 @@
+@@ -422,10 +990,13 @@
  static int lklfuse_chown(const char *path, uid_t uid, gid_t gid,
  			 struct fuse_file_info *fi)
  {
@@ -652,7 +737,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	else
  		ret = lkl_sys_fchownat(LKL_AT_FDCWD, path, uid, gid,
  				LKL_AT_SYMLINK_NOFOLLOW);
-@@ -435,10 +923,13 @@
+@@ -435,10 +1006,13 @@
  static int lklfuse_truncate(const char *path, off_t off,
  			    struct fuse_file_info *fi)
  {
@@ -666,7 +751,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	else
  		ret = lkl_sys_truncate(path, off);
  
-@@ -524,9 +1015,13 @@
+@@ -524,9 +1098,13 @@
  static int lklfuse_create(const char *path, mode_t mode,
  	                  struct fuse_file_info *fi)
  {
@@ -680,7 +765,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if (!lklfuse.set_owner)
  		return lklfuse_open3(path, true, mode, fi);
  	/*
-@@ -555,7 +1050,10 @@
+@@ -555,7 +1133,10 @@
  
  static int lklfuse_open(const char *path, struct fuse_file_info *fi)
  {
@@ -692,7 +777,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  }
  
  static int lklfuse_read(const char *path, char *buf, size_t size, off_t offset,
-@@ -600,7 +1098,10 @@
+@@ -600,7 +1181,10 @@
  {
  	long ret;
  	struct lkl_statfs lkl_statfs;
@@ -703,7 +788,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	ret = lkl_sys_statfs(path, &lkl_statfs);
  	if (ret < 0)
  		return lklfuse_err(ret);
-@@ -642,30 +1143,45 @@
+@@ -642,30 +1226,45 @@
  static int lklfuse_setxattr(const char *path, const char *name, const char *val,
  		   size_t size, int flags)
  {
@@ -753,7 +838,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	dir = lkl_opendir(path, &err);
  	if (!dir)
  		return lklfuse_err(err);
-@@ -705,11 +1221,13 @@
+@@ -705,11 +1304,13 @@
  
  	while ((de = lkl_readdir(dir))) {
  		struct stat st = { 0, };
@@ -768,7 +853,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  			break;
  	}
  
-@@ -740,12 +1258,16 @@
+@@ -740,12 +1341,16 @@
  
  static int lklfuse_access(const char *path, int mode)
  {
@@ -786,7 +871,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	int ret;
  	struct __lkl__kernel_timespec ts[2] = {
  		{ .tv_sec = tv[0].tv_sec, .tv_nsec = tv[0].tv_nsec },
-@@ -754,6 +1276,8 @@
+@@ -754,6 +1359,8 @@
  
  	if (fi)
  		ret = lkl_sys_utimensat(fi->fh, NULL, ts, 0);
@@ -795,7 +880,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	else
  		ret = lkl_sys_utimensat(-1, path, ts, LKL_AT_SYMLINK_NOFOLLOW);
  
-@@ -1102,6 +1626,10 @@
+@@ -1102,6 +1709,10 @@
  		goto out_umount;
  	}
  
@@ -806,21 +891,15 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	ret = lklfuse_set_owner();
  	if (ret)
  		goto out_umount;
-@@ -1246,6 +1774,17 @@
+@@ -1246,7 +1857,11 @@
  		lklfuse.tier2_id = ret;
  	}
  
 +#ifdef __APPLE__
-+	{
-+		const char *names = lklfuse_names_option(LKLFUSE_MACFUSE_MANIFEST, 0);
-+
-+		if (names && fuse_opt_add_arg(&args, names)) {
-+			ret = -1;
-+			goto out_close_disk;
-+		}
-+	}
-+#endif
-+
++	fuse = lklfuse_fuse_new(&args, &lklfuse_ops, sizeof(lklfuse_ops), LKLFUSE_MACFUSE_MANIFEST, 0, lklfuse_libfuse_new);
++#else
  	fuse = fuse_new(&args, &lklfuse_ops, sizeof(lklfuse_ops), NULL);
++#endif
  	if (!fuse) {
  		ret = -1;
+ 		goto out_close_disk;

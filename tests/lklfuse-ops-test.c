@@ -516,6 +516,51 @@ static void manifest(const char *path, const char *version, mode_t mode)
 	chmod(path, mode);
 }
 
+/* fuse_new, for lklfuse_fuse_new: REJECTS 0 takes anything, 1 refuses -o nonorm_insensitive (a libfuse without
+ * it), 2 refuses everything. FAKE_OPT: whether each call had the option. */
+static int fake_rejects, fake_calls, fake_opt[2];
+
+static struct fuse *fake_new(struct fuse_args *args, const struct fuse_operations *ops, size_t size, void *data)
+{
+	int i, has = 0;
+
+	for (i = 0; i < args->argc; i++)
+		has |= strcmp(args->argv[i], "-ononorm_insensitive") == 0;
+	if (fake_calls < 2)
+		fake_opt[fake_calls] = has;
+	fake_calls++;
+	if (fake_rejects == 2 || (fake_rejects == 1 && has))
+		return NULL;
+	return (struct fuse *)&fake_calls;
+}
+
+static char said[2048];	/* what lklfuse_fuse_new said on stderr */
+
+static struct fuse *new_saying(struct fuse_args *args, const char *path, int rejects)
+{
+	FILE *t = tmpfile();
+	struct fuse *f;
+	int save = dup(2);
+	size_t n = 0;
+
+	fake_rejects = rejects;
+	fake_calls = fake_opt[0] = fake_opt[1] = 0;
+	fflush(stderr);
+	if (t)
+		dup2(fileno(t), 2);
+	f = lklfuse_fuse_new(args, NULL, 0, path, getuid(), fake_new);
+	fflush(stderr);
+	dup2(save, 2);
+	close(save);
+	if (t) {
+		rewind(t);
+		n = fread(said, 1, sizeof(said) - 1, t);
+		fclose(t);
+	}
+	said[n] = '\0';
+	return f;
+}
+
 /* names_mode_*: the pass-through is taken from the installed macFUSE's version, as tools/fs.c's /dev/fd/N gate is */
 static void names_mode_tests(void)
 {
@@ -559,14 +604,61 @@ static void names_mode_tests(void)
 	is(lklfuse_macfuse_exact(path, getuid(), ver, sizeof(ver)), 0, "names_mode: no manifest: scanning");
 	is(ver[0], 0, "names_mode: and no version");
 
-	/* what lklfuse hands libfuse, and the mode it records */
-	manifest(path, "<string>5.5.0-mavericks.5</string>", 0644);
+	/* what lklfuse hands libfuse, the mode that runs, and what it says (review M1: only once fuse_new took it) */
+	{
+		static const struct {
+			const char *version;
+			int rejects, calls, first_opt, exact, made;
+			const char *said, *what;
+		} c[] = {
+			{ "5.5.0-mavericks.5", 0, 1, 1, 1, 1, "lklfuse: names: exact (macFUSE 5.5.0-mavericks.5",
+			  "fuse_new_names: .5, libfuse takes -o nonorm_insensitive" },
+			{ "5.5.0-mavericks.5", 1, 2, 1, 0, 1, "lklfuse: names: scanning",
+			  "fuse_new_names: .5, libfuse refuses the option: one retry without it" },
+			{ "5.5.0-mavericks.5", 2, 2, 1, 0, 0, NULL,
+			  "fuse_new_names: .5, fuse_new fails without the option too" },
+			{ "5.5.0-mavericks.4", 0, 1, 0, 0, 1, "lklfuse: names: scanning (macFUSE 5.5.0-mavericks.4",
+			  "fuse_new_names: .4, no option" },
+			{ "5.5.0-mavericks.4", 2, 1, 0, 0, 0, NULL,
+			  "fuse_new_names: .4, fuse_new fails: no retry" },
+		};
+		char what[160];
+
+		for (i = 0; i < ARRAY_SIZE(c); i++) {
+			char *argv0[] = { "lklfuse", "-f", NULL };
+			struct fuse_args args = FUSE_ARGS_INIT(2, argv0);
+			char ver[64];
+			struct fuse *made;
+			int a, has = 0;
+
+			snprintf(ver, sizeof(ver), "<string>%s</string>", c[i].version);
+			manifest(path, ver, 0644);
+			made = new_saying(&args, path, c[i].rejects);
+			snprintf(what, sizeof(what), "%s: made %s", c[i].what, c[i].made ? "it" : "nothing");
+			is(made != NULL, c[i].made, what);
+			snprintf(what, sizeof(what), "%s: fuse_new called %d time(s)", c[i].what, c[i].calls);
+			is(fake_calls, c[i].calls, what);
+			snprintf(what, sizeof(what), "%s: the first call %s the option", c[i].what, c[i].first_opt ? "has" : "lacks");
+			is(fake_opt[0], c[i].first_opt, what);
+			if (c[i].calls == 2) {
+				snprintf(what, sizeof(what), "%s: the retry lacks it", c[i].what);
+				is(fake_opt[1], 0, what);
+			}
+			snprintf(what, sizeof(what), "%s: names %s", c[i].what, c[i].exact ? "exact" : "scanned for");
+			is(lklfuse_nf_exact, c[i].exact, what);
+			for (a = 0; a < args.argc; a++)
+				has |= strcmp(args.argv[a], "-ononorm_insensitive") == 0;
+			snprintf(what, sizeof(what), "%s: the arguments kept %s the option", c[i].what, c[i].exact ? "have" : "lack");
+			is(has, c[i].exact, what);
+			snprintf(what, sizeof(what), "%s: says %s", c[i].what, c[i].said ? c[i].said : "no names mode");
+			is(c[i].said ? strstr(said, c[i].said) != NULL : strstr(said, "lklfuse: names:") == NULL, 1, what);
+			/* a failure with the option is said either way: the retry's own failure follows it */
+			snprintf(what, sizeof(what), "%s: %s the refusal", c[i].what, c[i].rejects && c[i].first_opt ? "says" : "never says");
+			is(strstr(said, "refused -ononorm_insensitive") != NULL, c[i].rejects && c[i].first_opt, what);
+			lklfuse_args_free(&args);
+		}
+	}
 	lklfuse_nf_exact = 0;
-	is_str(lklfuse_names_option(path, getuid()), "-ononorm_insensitive", "names_mode: with 5.5.0-mavericks.5, libfuse is given -o nonorm_insensitive");
-	is(lklfuse_nf_exact, 1, "names_mode: and names are exact");
-	manifest(path, "<string>5.5.0-mavericks.4</string>", 0644);
-	is(lklfuse_names_option(path, getuid()) == NULL, 1, "names_mode: with 5.5.0-mavericks.4, no option (libfuse would refuse it)");
-	is(lklfuse_nf_exact, 0, "names_mode: and names are scanned for");
 	unlink(path);
 	rmdir(dir);
 }
