@@ -977,7 +977,7 @@ end tell' >"$OUT/parity/trash.$tt_fs.empty-trash.txt" 2>&1
       echo "# census_trash_tags_case $tt_fs: no remount, so no tags read after one"
       tt_live=$(census_image_disk "$tt_i")
       if test -n "$tt_live" && { test "$tt_live" != "$PARITY_FS_DISK" || test "$(census_info "$PARITY_FS_MP" "Mount Point")" != "$PARITY_FS_MP"; }; then
-        # a new attach that never mounted, and could not be detached: no live linuxfs mount to ask
+        # no live linuxfs mount to ask: a new attach that never mounted and could not be detached, or the old disk unmounted but not ejected
         echo "# census_trash_tags_case $tt_fs: $tt_live is attached but not mounted as the pair's volume, so no case step"; return 1
       elif test -n "$tt_live"; then   # its eject failed: it is still mounted; the control comes back
         census_attach "$tt_h" || { echo "# census_trash_tags_case $tt_fs: no HFS+ control again, so no case step"; return 1; }
