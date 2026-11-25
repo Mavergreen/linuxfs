@@ -38,14 +38,15 @@
 #                                         Finder's disk properties against df -k, diskutil info's fields (by mount
 #                                         point and by device), a custom .VolumeIcon.icns
 #   census_trash_tags_case FS             item 7: Finder's delete, .Trashes/<uid> and empty trash; a tag and a label
-#                                         read back, after a remount too; xattrs of 128 KiB to 4 MiB;
+#                                         read back, after a remount too; xattrs of 128 KiB to 128 MiB, to a refusal;
 #                                         pathconf(_PC_CASE_SENSITIVE) against HFS+ and against HFSX (FS apfs,
 #                                         read-only: the pathconf alone)
 #   census_later                          Later: Time Machine's offer and the exFAT control, against ext4
 #   census_before_login MP                item 5 before login: mdutil -s and .fseventsd only
 #   parity_census_all                     the controls, then all of it (PARITY_STALL_N 50), within PARITY_CENSUS_MIN
 #   Each records sysctl vfs.generic.macfuse once, as $OUT/parity/<census>.sysctl.txt. Every console step goes through
-#   $AQUA (guest-macosx-aqua by its path), and every screenshot but Time Machine's offer follows census_dismiss. WHAT
+#   $AQUA (guest-macosx-aqua by its path), and every screenshot follows census_dismiss (a dialog's or an offer's, from
+#   before the dialog or the attach). WHAT
 #   prefixes (the items whose PARITY_MODE_ a later task sets): unicode, busy, spotlight, finder, trash, tags, case,
 #   later. What cannot be equal on two volumes (pids, times, sizes, volume names) is a plain record,
 #   $OUT/parity/<what>.txt, never a parity step.
@@ -291,12 +292,12 @@ census_dismiss() {
   echo "$1: UserNotificationCenter ${_cdi_p:+pids $_cdi_p}${_cdi_p:-not running}; killall exit $_cdi_rc" >>"$OUT/parity/alerts.txt"
 }
 
-# census_shot STEP SIDE: parity_shot for one side, bounded, after census_dismiss (not before tm-offer: Time Machine's
-#   offer may be such an alert). HFS+'s side of a step is taken once: the control is the same for every filesystem, and
-#   a later census would overwrite it.
+# census_shot STEP SIDE [nodismiss]: parity_shot for one side, bounded, after census_dismiss unless nodismiss (the
+#   caller dismissed before what the shot is to show: a Finder dialog, Time Machine's offer). HFS+'s side of a step is
+#   taken once: the control is the same for every filesystem, and a later census would overwrite it.
 census_shot() {
   test "$2" != hfs || test ! -f "$OUT/hfs-$1.png" || return 0
-  test "$1" = tm-offer || census_dismiss "$1"
+  test "${3:-}" = nodismiss || census_dismiss "$1"
   parity_side "$2"; bounded 300 parity_shot "$1" >/dev/null 2>&1
 }
 
@@ -614,12 +615,34 @@ census_busy_cycles() {
   echo "$bc_busy"
 }
 
+# census_room IMAGE: whether $W has room for one more copy of IMAGE and PARITY_FREE_FLOOR_KB besides; df -k's free
+#   KiB, the floor and the lklfuse count go to eject-failed.txt, and CR_SAID says it. The floor, 2 GiB: what the run
+#   still writes after census_busy is at most the next census's copies at once (trash: HFS+, HFSX and xfs, 576 MiB),
+#   the before-login mount and the finish's gzip of $W/img and copyback (under 1 GiB); 2 GiB keeps that with room over.
+PARITY_FREE_FLOOR_KB=${PARITY_FREE_FLOOR_KB:-2097152}
+census_room() {
+  _cro_i=$(($(wc -c <"$1" 2>/dev/null || echo 0) / 1024 + 1))
+  _cro_f=$(bounded 300 df -P -k "$W" 2>/dev/null </dev/null | awk 'NR == 2 { print $4 }')
+  _cro_l=$(bounded 100 ps -axww -o command= 2>/dev/null </dev/null | awk '/lklfuse/ && !/awk/' | grep -c .)
+  {
+    echo "# census: df -k $W: ${_cro_f:-unknown} KiB free, floor $PARITY_FREE_FLOOR_KB KiB and the image $_cro_i KiB"
+    echo "# census: lklfuse processes now: $_cro_l"
+  } >>"$OUT/parity/eject-failed.txt"
+  case $_cro_f in '' | *[!0-9]*) CR_SAID="free space on $W unknown (df -k)"; return 1 ;; esac
+  if test "$_cro_f" -lt $((PARITY_FREE_FLOOR_KB + _cro_i)); then
+    CR_SAID="$_cro_f KiB free on $W, under the floor $PARITY_FREE_FLOOR_KB KiB and the image $_cro_i KiB"; return 1
+  fi
+  CR_SAID="$_cro_f KiB free on $W"
+}
+
 # census_busy_up: both volumes of census_busy attached and mounted again, if a step unmounted or ejected one. A linuxfs
-#   disk whose eject fails is left attached (census_detach records it), and the steps go on with a fresh copy of FS.
+#   disk whose eject fails is left attached (census_detach records it), and the steps go on with a fresh copy of FS
+#   while census_room allows; else they stop for FS.
 census_busy_up() {
   if test "$(census_info "$PARITY_CTL_DEV" Mounted)" = Yes && test "$(census_info "$PARITY_FS_DEV" Mounted)" = Yes; then return 0; fi
   census_detach "$(census_image_disk "$cb_h")" apple
   if ! census_detach "$(census_image_disk "$cb_i")" fs "$PARITY_FS_MP"; then
+    census_room "$W/img/$cb_fs.img" || { echo "# census_busy $cb_fs: $CR_SAID: no fresh copy, so the busy steps stop" | tee -a "$OUT/parity/eject-failed.txt"; return 1; }
     cb_n=$((cb_n + 1))
     cb_i=$(census_copy "$W/img/$cb_fs.img" "busy-$cb_fs-$cb_n") || return 1
     echo "# census_busy $cb_fs: its disk is left attached; the steps go on with a fresh copy, ${cb_i##*/}"
@@ -657,10 +680,11 @@ census_busy_release() {
 census_finder_ask() {
   fe_o=$W/census/finder-ask.out
   mkdir -p "$W/census"
+  census_dismiss "$1"   # before the dialog, which the shot is to show
   "$AQUA" osascript -e "$3" >"$fe_o" 2>&1 </dev/null &
   fe_p=$!
   sleep 4
-  if test "$2" = "$PARITY_CTL_MP"; then census_shot "$1" hfs; else census_shot "$1" fs; fi
+  if test "$2" = "$PARITY_CTL_MP"; then census_shot "$1" hfs nodismiss; else census_shot "$1" fs nodismiss; fi
   fe_k=0; while kill -0 "$fe_p" 2>/dev/null && test "$fe_k" -lt 20; do fe_k=$((fe_k + 1)); sleep 1; done
   if kill -0 "$fe_p" 2>/dev/null; then kill "$fe_p" 2>/dev/null; echo "osascript still waiting 24 s after Finder's $1 (its dialog)"; fi
   wait "$fe_p"; fe_rc=$?
@@ -718,9 +742,12 @@ PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Content
 # The guest job has 180 min. Before the smoke: the VM's boot and the installs, about 5. The census begins nothing after
 #   PARITY_CENSUS_MIN = 135 min from the smoke's start (PARITY_T0, which the smoke sets first): then at most the census
 #   step already begun (about 11: spotlight's 120 s mdfind waits, remounts, Finder's refresh and the Privacy shots; a
-#   busy census with Finder's eject, about 5; one stall iteration, under 1), before login (about 5) and the copyback and
+#   busy census with Finder's eject, about 5, or about 9 with a stuck disk at each of its six re-attaches: two ejects,
+#   two census_holders, a copy of up to 320 MiB, an attach, about 30 s each; one trash/tags/case census, about 3 with
+#   the xattr probe's up to 128 MiB writes; one stall iteration, under 1), before login (about 5) and the copyback and
 #   uploads (about 5) remain: 5 + 135 + 11 + 5 + 5 = 161, leaving 19 to spare. Push A's census, its Finder steps not
-#   run, took 50 min (the stall 30 of them); with them, about 80 are expected, well inside 135.
+#   run, took 50 min (the stall 30 of them); with them, and stuck disks in both busy censuses, about 90 are expected,
+#   well inside 135.
 PARITY_CENSUS_MIN=${PARITY_CENSUS_MIN:-135}
 
 # census_pair_up CTL-IMAGE FS-IMAGE FS [readonly]: attaches both (the control -readonly when readonly) and makes them
@@ -994,30 +1021,45 @@ census_tag_set() {
   "$AQUA" osascript -e "tell application \"Finder\" to set label index of (POSIX file \"$1/tagged\" as alias) to 2" 2>&1 </dev/null
   echo "label (Finder): exit $?"
 }
-# census_py_xattr FILE N...: setxattr user.parity-big of N bytes on FILE, for each N: "N bytes: ok" or its errno. By
-#   Python's xattr (10.9's /usr/bin/python has it) or os.setxattr (Python 3 on Linux), as no exec argument carries
-#   1 MiB (10.9's ARG_MAX is 256 KiB)
+# census_py_xattr FILE N...: setxattr user.parity-big of N bytes on FILE, for each N in order: "N bytes: ok", or its errno
+#   and then "stopped at the first refusal" (no larger size is tried); the attribute is removed after. By Python's xattr
+#   (10.9's /usr/bin/python has it) or os.setxattr (Python 3 on Linux), as no exec argument carries 1 MiB (10.9's
+#   ARG_MAX is 256 KiB). One value is held at a time: memory peaks at the largest N tried.
 census_py_xattr='import os, sys
 p = sys.argv[1]
 try:
     import xattr
     put = lambda v: xattr.setxattr(p, "user.parity-big", v)
+    rm = lambda: xattr.removexattr(p, "user.parity-big")
 except ImportError:
     s = getattr(os, "setxattr", None)
     put = s and (lambda v: s(p, "user.parity-big", v))
+    rm = lambda: os.removexattr(p, "user.parity-big")
 for n in sys.argv[2:]:
     n = int(n)
     if not put:
         print("%d bytes: no setxattr in this Python" % n); continue
     try:
-        put(b"x" * n); print("%d bytes: ok" % n)
+        v = b"x" * n; put(v); v = None; print("%d bytes: ok" % n)
     except (IOError, OSError) as e:
-        print("%d bytes: errno %s (%s)" % (n, e.errno, e.strerror))'
-# census_xattr_big MP: xattr writes of 128 KiB, 128 KiB and a byte, 256 KiB, 1 MiB and 4 MiB to MP/big-xattr, to find
-#   HFS+'s limit: each one's result
+        print("%d bytes: errno %s (%s)" % (n, e.errno, e.strerror)); print("stopped at the first refusal"); break
+    except MemoryError:
+        print("%d bytes: no memory for the value in this Python" % n); print("stopped at the first refusal"); break
+if put:
+    try:
+        rm()
+    except (IOError, OSError):
+        pass'
+# The sizes, ascending. 10.9's VFS caps an xattr at INT32_MAX (XATTR_MAXSIZE in Kernel.framework's sys/xattr.h, checked
+#   on a 10.9 box), so HFS+ is bounded by its free space, not a size: 4 MiB was accepted on the dev box. 64 MiB and a
+#   byte pass the 64 MiB cap later xnu has; 128 MiB is the whole control image, so HFS+ must refuse it (ENOSPC, or
+#   whatever it says). Memory: one 128 MiB value at most; time: bounded by census_bound in census_trash_tags_case.
+PARITY_XATTR_SIZES=${PARITY_XATTR_SIZES:-131072 131073 262144 1048576 4194304 16777216 67108864 67108865 134217728}
+# census_xattr_big MP: census_py_xattr on MP/big-xattr with PARITY_XATTR_SIZES, to find HFS+'s limit and its error
 census_xattr_big() {
   echo big >"$1/big-xattr" || return 1
-  "$PARITY_PYTHON" -c "$census_py_xattr" "$1/big-xattr" 131072 131073 262144 1048576 4194304 2>&1
+  # shellcheck disable=SC2086  # the sizes are words
+  "$PARITY_PYTHON" -c "$census_py_xattr" "$1/big-xattr" $PARITY_XATTR_SIZES 2>&1
 }
 census_py_pathconf='import os, sys
 try:
@@ -1057,7 +1099,8 @@ end tell' >"$OUT/parity/trash.$tt_fs.empty-trash.txt" 2>&1
     parity "trash.$tt_fs.after-empty" census_trashes @MP@ "$tt_uid"
     parity "tags.$tt_fs.set" census_tag_set @MP@
     parity "tags.$tt_fs.read" xattr -l @MP@/tagged
-    parity "tags.$tt_fs.oversized" census_xattr_big @MP@
+    # up to 128 MiB written to a disk image: 3 min a side
+    census_bound 1800 parity "tags.$tt_fs.oversized" census_xattr_big @MP@
     if census_remount_pair "$tt_h" "$tt_i"; then
       parity "tags.$tt_fs.after-remount" xattr -l @MP@/tagged
     else
@@ -1096,14 +1139,16 @@ census_later() {
   cl_c=$(parity_control hfs) && cl_cx=$(parity_control exfat) && cl_h=$(census_copy "$cl_c" later-hfs) &&
     cl_x=$(census_copy "$cl_cx" later-exfat) && cl_i=$(census_copy "$W/img/ext4.img" later-ext4) ||
     { echo "# census_later: no images"; return 1; }
+  census_dismiss tm-offer-pre   # a kext alert left up would cover the offer, which comes after the attach
   census_attach "$cl_h" || { echo "# census_later: no HFS+ control attached"; return 1; }
   cl_hd=$CA_DISK cl_hm=$CA_MP cl_hv=$CA_VOL
-  census_pause 5; census_shot tm-offer hfs
+  census_pause 5; census_shot tm-offer hfs nodismiss
   for cl_k in exfat ext4; do
     if test "$cl_k" = exfat; then cl_img=$cl_x cl_side=apple; else cl_img=$cl_i cl_side=fs; fi
+    census_dismiss tm-offer-pre
     census_attach "$cl_img" || { echo "# census_later: no $cl_k attached"; continue; }
     parity_pair "$cl_hd" "$cl_hm" "$cl_hv" "$cl_k" "$CA_DISK" "$CA_MP" "$CA_VOL"
-    census_pause 5; census_shot tm-offer fs
+    census_pause 5; census_shot tm-offer fs nodismiss
     census_detach "$PARITY_FS_DISK" "$cl_side" "$PARITY_FS_MP"
   done
   census_detach "$cl_hd" apple

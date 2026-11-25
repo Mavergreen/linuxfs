@@ -28,7 +28,7 @@ expect() { # NAME CONDITION-COMMAND...
   n=$1; shift
   if "$@"; then echo "ok - $n"; else echo "not ok - $n"; fails=$((fails + 1)); fi
 }
-has() { printf '%s\n' "$1" | grep -q -- "$2"; }
+has() { printf '%s\n' "$1" | grep -- "$2" >/dev/null; }
 hasnt() { ! has "$1" "$2"; }
 not() { ! "$@"; }
 ascending() { # N...: every N given, each less than the next
@@ -407,6 +407,14 @@ rm -rf "$W/ctl" "$OUT/parity"; mkdir -p "$W/img"
 for f in ext4 btrfs xfs ntfs apfs; do echo "$f image" > "$W/img/$f.img"; done
 echo names | gzip -c > "$IN/ext4-names.img.gz"
 unbounded=$T/unbounded; : > "$unbounded"
+PARITY_XATTR_SIZES="131072 131073 262144"; PARITY_FREE_FLOOR_KB=1
+
+# census_xattr_sizes: by default the probe climbs past 10.9's XATTR_MAXSIZE-free HFS+ to a size no 128 MiB control holds
+r=$(unset PARITY_XATTR_SIZES; . "$here/lib/parity.sh"; echo "$PARITY_XATTR_SIZES")
+expect census_xattr_sizes_default test "$r" = "131072 131073 262144 1048576 4194304 16777216 67108864 67108865 134217728"
+# census_py_xattr: the sizes in order, stopping at the first refusal, which is said
+r=$("$PARITY_PYTHON" -c "$census_py_xattr" "$T/no-such-file" 131072 262144 2>&1)
+expect census_py_xattr_stops test "$(printf '%s\n' "$r" | sed 's/errno 2 .*/errno 2/')" = "$(printf '%s\n' '131072 bytes: errno 2' 'stopped at the first refusal')" -o "$r" = "$(printf '%s\n' '131072 bytes: no setxattr in this Python' '262144 bytes: no setxattr in this Python')"
 
 # census_py_create: a name that cannot be made says its errno, and the next name is still tried
 mkdir -p "$T/uc"; : > "$T/uc/file"
@@ -500,6 +508,9 @@ expect census_busy_recorded has "$r" "^# recorded busy.ext4.cycles: hfs 0 of 20,
 expect census_busy_quiet hasnt "$r" "not ok"
 expect census_busy_sysctl test -s "$P/busy-ext4.sysctl.txt"
 expect census_busy_detached test -z "$(attached)"
+# census_finder_ask dismisses the console's alerts before osascript starts, never between it and its shot
+ask_dismissed_first() { awk '/killall UserNotificationCenter$/ { if (a) bad = 1; d = 1; next } /osascript .*eject disk/ { if (!d) bad = 1; a = 1; d = 0 } /screencapture -x .*busy-eject.png$/ { a = 0 } END { exit bad }' "$S/calls"; }
+expect census_busy_finder_dismissed_first ask_dismissed_first
 expect census_busy_eject_failed_record grep -q '^#   COMMAND PID USER (stub lsof lsof .*/vols/busy-ext4)' "$P/eject-failed.txt"
 # a linuxfs disk whose eject fails is recorded (lsof on its device, the lklfuse processes) and left attached, not
 #   forced; the busy steps go on, each with a fresh copy
@@ -513,8 +524,26 @@ expect census_busy_stuck_lsof_dev grep -q '^#   COMMAND PID USER (stub lsof lsof
 expect census_busy_stuck_lklfuse grep -q '^# census: lklfuse processes' "$P/eject-failed.txt"
 expect census_busy_stuck_fresh has "$r" "^# census_busy stuck6: .* left attached; the steps go on with a fresh copy"
 expect census_busy_stuck_quiet hasnt "$r" "not ok"
-for f in "$S"/nodes/*; do case $f in *.m) ;; *) test -f "$f" || continue; case $(sed -n 's/^vol=//p' "$f") in *stuck6*) rm -f "$f" "$f.m" ;; esac ;; esac; done
+expect census_busy_stuck_df grep -q '^# census: df -k .*: [0-9]* KiB free, floor 1 KiB and the image' "$P/eject-failed.txt"
+expect census_busy_stuck_lklfuse_count grep -q '^# census: lklfuse processes now: [0-9]*$' "$P/eject-failed.txt"
+stuck_disks() { for f in "$S"/nodes/*; do case $f in *.m) ;; *) test -f "$f" || continue; case $(sed -n 's/^vol=//p' "$f") in *$1*) sed -n 's/^disk=//p' "$f" ;; esac ;; esac; done; }
+drop_stuck() { for f in "$S"/nodes/*; do case $f in *.m) ;; *) test -f "$f" || continue; case $(sed -n 's/^vol=//p' "$f") in *$1*) rm -f "$f" "$f.m" ;; esac ;; esac; done; }
+sd=$(stuck_disks stuck6); nf=
+for d in $sd; do grep -qx "$d" "$S/fsdisks" || nf="$nf $d"; done
+expect census_busy_stuck_count test "$(printf '%s\n' $sd | grep -c .)" -eq 7
+expect census_busy_stuck_in_fsdisks test -n "$sd" -a -z "$nf"
+drop_stuck stuck6
 rm -f "$W/img/stuck6.img"
+# below the free-space floor no fresh copy is made: said, recorded, and the busy steps stop for that filesystem
+echo stuck7 > "$W/img/stuck7.img"; : > "$P/eject-failed.txt"
+r=$(PARITY_FREE_FLOOR_KB=999999999999; census_busy stuck7 2>&1)
+expect census_busy_floor_said has "$r" "^# census_busy stuck7: .* KiB free on .*, under the floor .*: no fresh copy, so the busy steps stop"
+expect census_busy_floor_recorded grep -q 'under the floor' "$P/eject-failed.txt"
+expect census_busy_floor_stops test ! -e "$P/busy.stuck7.shell-eject.stuck7.txt"
+expect census_busy_floor_no_copy test ! -e "$W/census/busy-stuck7-2.img"
+expect census_busy_floor_quiet hasnt "$r" "not ok"
+drop_stuck stuck7
+rm -f "$W/img/stuck7.img"
 
 # census_spotlight: read-write, then read-only (HFS+ attach -readonly against ext4 with ReadOnly on)
 : > "$S/calls"
@@ -602,9 +631,15 @@ expect census_ttc_shot test "$(grep -Ec 'screencapture -x .*/(hfs|ext4)-trash-de
 expect census_ttc_tag grep -q '^xattr -wx com.apple.metadata:_kMDItemUserTags 62706c6973743030a10156506172697479080a0000000000000101000000000000000200000000000000000000000000000011 .*/vols/trash-ext4/tagged$' "$S/calls"
 expect census_ttc_label grep -q 'set label index of (POSIX file ".*/vols/trash-ext4/tagged" as alias) to 2' "$S/calls"
 expect census_ttc_remount test "$(grep -c '^hdiutil attach -imagekey diskimage-class=CRawDiskImage .*/trash-ext4.img$' "$S/calls")" -eq 2
-# the sizes, past 128 KiB, by setxattr from Python (no exec argument carries them): each one's result, in order
+# the sizes, past 128 KiB, by setxattr from Python (no exec argument carries them): each one's result, in order, all of
+#   them or up to the first refusal
 for f in hfs ext4; do
-  expect "census_ttc_oversized_sizes_$f" test "$(sed -n 's/^\([0-9]*\) bytes: .*/\1/p' "$P/tags.ext4.oversized.$f.txt" | tr '\n' ' ')" = "131072 131073 262144 1048576 4194304 "
+  got=$(sed -n 's/^\([0-9]*\) bytes: .*/\1/p' "$P/tags.ext4.oversized.$f.txt" | tr '\n' ' ')
+  case "$PARITY_XATTR_SIZES " in
+  "$got"*) if test "$got" = "$PARITY_XATTR_SIZES " || grep -q '^stopped at the first refusal$' "$P/tags.ext4.oversized.$f.txt"; then ok=1; else ok=; fi ;;
+  *) ok= ;;
+  esac
+  expect "census_ttc_oversized_sizes_$f" test -n "$got" -a -n "$ok"
 done
 expect census_ttc_hfsx grep -q '^hdiutil attach -imagekey diskimage-class=CRawDiskImage .*/trash-hfsx-ext4.img$' "$S/calls"
 expect census_ttc_pathconf grep -Eq '^(pathconf\(_PC_CASE_SENSITIVE\) = -?[0-9]+|errno [0-9]+)$' "$P/case.ext4.pathconf.ext4.txt"
@@ -629,7 +664,9 @@ r=$(census_later 2>&1)
 # tmutil isexcluded with no destination says [Excluded] for every volume: not asked, and said so
 expect census_later_no_isexcluded not grep -q '^tmutil isexcluded' "$S/calls"
 expect census_later_tm_note grep -q 'uninformative' "$P/later.tm-excluded.txt"
-expect census_later_no_dismiss not grep -q 'UserNotificationCenter' "$S/calls"
+# alerts are dismissed before each attach, and never between an attach and its tm-offer shot (the offer comes after)
+tm_dismissed() { awk '/killall UserNotificationCenter$/ { if (a) bad = 1; d = 1; next } /^hdiutil attach -imagekey / { if (!d) bad = 1; a = 1; d = 0 } /tm-offer.png$/ { a = 0 } END { exit bad }' "$S/calls"; }
+expect census_later_dismissed_before_attach tm_dismissed
 expect census_later_no_destination not grep -Eq 'tmutil (setdestination|removedestination)' "$S/calls"
 expect census_later_shots test "$(grep -Ec 'screencapture -x .*/(hfs|exfat|ext4)-tm-offer.png$' "$S/calls")" -eq 3
 expect census_later_quiet hasnt "$r" "not ok"
