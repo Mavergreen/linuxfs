@@ -711,20 +711,25 @@ static mode_t mode_of(const char *path)
 
 /*
  * owner=caller (spec: item 6, "Ignore ownership" off, the CLI's --owners): what a Mac user creates is that user's, by the
- * FUSE request's ids, as on HFS+ with ownership on; never LKL's root. Linux's chown drops a setuid or setgid bit a
- * create asked for (ATTR_KILL_SUID); one the owner sets afterwards stays, the owner's own.
+ * FUSE request's uid, and its group is the directory's it is made in, as on HFS+ (BSD's rule, which also keeps a Linux
+ * setgid directory's group); never LKL's root. Linux's chown drops a setuid or setgid bit a create asked for
+ * (ATTR_KILL_SUID); one the owner sets afterwards stays, the owner's own.
  */
 static void caller_owner_tests(void)
 {
 	struct fuse_file_info fi = { .flags = O_WRONLY };
+	uid_t ru;
+	gid_t rg;
 
 	lklfuse.owner = "caller";
 	is(lklfuse_set_owner(), 0, "owner=caller is taken");
 	test_ctx.uid = 501;
 	test_ctx.gid = 20;
 	test_ctx_set = 1;
+	owner_of("/", &ru, &rg);
 	is(lklfuse_mkdir("/c", 0755), 0, "owner=caller: mkdir by uid 501");
-	owned("/c", 501, 20, "owner=caller: a new directory is the caller's, 501:20");
+	owned("/c", 501, rg, "owner=caller: a new directory is the caller's, its group /'s, not the caller's 20");
+	lkl_sys_chown("/c", 501, 20);
 	is(lklfuse_create("/c/f", 0644, &fi), 0, "owner=caller: create by uid 501");
 	lklfuse_release("/c/f", &fi);
 	owned("/c/f", 501, 20, "owner=caller: a file created by uid 501 is 501:20");
@@ -746,6 +751,42 @@ static void caller_owner_tests(void)
 	is(lklfuse_create("/c/f", 0644, &fi), 0, "owner=caller: create of an existing file by another caller");
 	lklfuse_release("/c/f", &fi);
 	owned("/c/f", 501, 20, "does not change its owner");
+	/* the directory's group, not the caller's: a setgid one (Linux's inheritance) and a plain one (BSD's rule) */
+	test_ctx.uid = 501;
+	test_ctx.gid = 20;
+	lkl_sys_mkdir("/c/sg", 0777);
+	lkl_sys_chown("/c/sg", 0, 77);
+	lkl_sys_chmod("/c/sg", 02777);
+	lkl_sys_mkdir("/c/g", 0777);
+	lkl_sys_chown("/c/g", 0, 78);
+	lkl_sys_chmod("/c/g", 0777);
+	fi.flags = O_WRONLY;
+	is(lklfuse_create("/c/sg/f", 0644, &fi), 0, "owner=caller: create in a setgid directory of group 77");
+	lklfuse_release("/c/sg/f", &fi);
+	owned("/c/sg/f", 501, 77, "the file is the caller's, its group the directory's (77)");
+	is(lklfuse_mkdir("/c/sg/d", 0755), 0, "owner=caller: mkdir in it");
+	owned("/c/sg/d", 501, 77, "the directory is the caller's, group 77");
+	is(!!(mode_of("/c/sg/d") & S_ISGID), 1, "and it keeps the setgid bit Linux gave it, so its own files are 77's too");
+	is(lklfuse_symlink("f", "/c/sg/l"), 0, "owner=caller: symlink in it");
+	owned("/c/sg/l", 501, 77, "the symlink is the caller's, group 77");
+	fi.flags = O_WRONLY;
+	is(lklfuse_create("/c/g/f", 0644, &fi), 0, "owner=caller: create in a plain directory of group 78");
+	lklfuse_release("/c/g/f", &fi);
+	owned("/c/g/f", 501, 78, "the file's group is the directory's (78), as on HFS+");
+	is(lklfuse_mknod("/c/g/p", S_IFIFO | 0644, 0), 0, "owner=caller: mknod in it");
+	owned("/c/g/p", 501, 78, "the fifo's group is the directory's (78)");
+	/* a by-name chown takes only the node just made: one LKL made (its uid 0) and, unless a directory, the only link */
+	lkl_sys_mknod("/c/h1", S_IFREG | 0644, 0);
+	lkl_sys_link("/c/h1", "/c/h2");
+	is(lklfuse_chown_new("/c/h2", 501, 20), 0, "a name with a second hard link is not chowned");
+	owned("/c/h1", 0, 0, "and the file it names keeps its owner");
+	lkl_sys_mknod("/c/o", S_IFREG | 0644, 0);
+	lkl_sys_chown("/c/o", 42, 43);
+	is(lklfuse_chown_new("/c/o", 501, 20), 0, "a name someone already owns is not chowned");
+	owned("/c/o", 42, 43, "and keeps its owner");
+	lkl_sys_mknod("/c/n", S_IFREG | 0644, 0);
+	is(lklfuse_chown_new("/c/n", 501, 20), 1, "a new name LKL made, with one link, is chowned");
+	owned("/c/n", 501, 20, "to the ids given");
 	test_ctx_set = 0;
 	is(lklfuse_mkdir("/c/none", 0755), 0, "owner=caller with no FUSE caller: mkdir");
 	owned("/c/none", 0, 0, "keeps LKL's own ids");

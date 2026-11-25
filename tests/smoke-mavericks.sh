@@ -523,12 +523,11 @@ cleanup_disk
 # spec: README.md Ownership -- item 6, "Ignore ownership" off: an /etc/fstab rw,owners line makes DiskArbitration pass owners,
 #       so the volume shows Linux's own ids (ls -ln: Linux root's 0 0, not the user's ids as the mapping shows them, nor 99),
 #       the kernel refuses the user's write to Linux root's 0644 file (default_permissions), and what the user makes is the
-#       user's (lklfuse -o owner=caller), as on HFS+; the line is taken away after (and by finish, if a step failed)
+#       user's, in its folder's group (lklfuse -o owner=caller), as on HFS+; the line is taken away after (and by finish, if a step failed)
+# spec: tests/lib/owners-fstab.sh -- the line on its own line even when /etc/fstab ends without a newline; taken away alone
+. "$tests_dir/lib/owners-fstab.sh"
 OWNERS_TAG="# linuxfs-smoke-owners"
-owners_line_gone() {
-  if grep -qF "$OWNERS_TAG" /etc/fstab 2> /dev/null; then sudo -n sed -i '' "/$OWNERS_TAG\$/d" /etc/fstab 2> /dev/null; fi
-  ! grep -qF "$OWNERS_TAG" /etc/fstab 2> /dev/null
-}
+owners_line_gone() { owners_fstab_gone /etc/fstab "$OWNERS_TAG"; }
 owners_case() {
   oimg=$W/img/da-ext4-owners.img om=$W/mnt/owners-prep
   cp "$W/img/ext4.img" "$oimg" && mkdir -p "$om" || { notok "owners: cannot copy ext4.img"; return 1; }
@@ -540,13 +539,13 @@ owners_case() {
   ouuid=$(info "$disk" "Volume UUID") odisk=$disk
   cleanup_disk
   if test -z "$ouuid"; then notok "owners: diskutil info $odisk gives a Volume UUID"; return 1; fi
-  check "owners: an /etc/fstab line UUID=$ouuid none macfuse_ext4 rw,owners" sudo -n sh -c 'printf "%s\n" "$1" >> /etc/fstab' _ "UUID=$ouuid none macfuse_ext4 rw,owners $OWNERS_TAG"
+  check "owners: an /etc/fstab line UUID=$ouuid none macfuse_ext4 rw,owners" owners_fstab_add /etc/fstab "UUID=$ouuid none macfuse_ext4 rw,owners $OWNERS_TAG"
   if da_attach "$oimg" && da_wait 300; then
     ok "owners: a plain attach mounts it at $mp"
     echo "# owners: ls -ln: $(ls -ln "$mp" 2>&1 | tr '\n' '|')"
     check "owners: ls -ln shows Linux's ids: rootfile is 0 0 (not $(id -u) $(id -g), nor 99)" sh -c 'ls -ln "$1" | awk '"'"'$NF == "rootfile" { print $3, $4 }'"'"' | grep -qx "0 0"' _ "$mp"
     check "owners: the kernel refuses the user's write to Linux root's 0644 rootfile" sh -c '! ( echo x >> "$1/rootfile" ) 2> /dev/null && [ "$(cat "$1/rootfile")" = root ]' _ "$mp"
-    check "owners: a file the user makes in shared is the user's ($(id -u):$(id -g))" sh -c 'echo mine > "$1/shared/mine" && s=$(stat -f %u:%g "$1/shared/mine") && echo "$s" && [ "$s" = "$(id -u):$(id -g)" ]' _ "$mp"
+    check "owners: a file the user makes in shared is the user's ($(id -u)), in shared's group (0), as on HFS+" sh -c 'echo mine > "$1/shared/mine" && s=$(stat -f %u:%g "$1/shared/mine") && echo "$s" && [ "$s" = "$(id -u):$(stat -f %g "$1/shared")" ] && [ "$s" = "$(id -u):0" ]' _ "$mp"
   else notok "owners: a plain attach mounts it within 30 s"; disk=${disk:-$(image_disk "$oimg")}; fi
   cleanup_disk
   check "owners: /etc/fstab's owners line taken away" owners_line_gone

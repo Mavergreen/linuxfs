@@ -1798,4 +1798,29 @@ expect attach_retry_not_in_census test "$(grep -c 'da_attach_retry' "$here/lib/p
 expect attach_retry_count_said grep -q '^  ar=$(attach_retries' "$here/smoke-mavericks.sh"
 rm -f "$W/img"/retry-*.img "$W/img/plain-ar.img"
 
+# owners_fstab_add and owners_fstab_gone (tests/lib/owners-fstab.sh): the smoke's owners line goes on a line of its own
+#   even when /etc/fstab ends without a newline, and taking it away leaves every other entry as it was
+. "$here/lib/owners-fstab.sh"
+OF=$T/owners-fstab OT='# linuxfs-smoke-owners'
+r=$(sudo() { test "$1" != -n || shift; "$@"; }
+  printf 'UUID=A none hfs rw,noauto' > "$OF"
+  owners_fstab_add "$OF" "UUID=B none macfuse_ext4 rw,owners $OT"; echo "add $?"
+  awk '{ print NR ": " $0 }' "$OF"
+  owners_fstab_gone "$OF" "$OT"; echo "gone $?"
+  awk '{ print "after " NR ": " $0 }' "$OF")
+expect owners_fstab_add_ok has "$r" "^add 0$"
+expect owners_fstab_add_own_line has "$r" "^2: UUID=B none macfuse_ext4 rw,owners $OT$"
+expect owners_fstab_add_keeps_last has "$r" "^1: UUID=A none hfs rw,noauto$"
+expect owners_fstab_gone_ok has "$r" "^gone 0$"
+expect owners_fstab_gone_keeps test "$(printf '%s\n' "$r" | grep -c '^after ')" -eq 1 -a -n "$(printf '%s\n' "$r" | grep -x 'after 1: UUID=A none hfs rw,noauto')"
+r=$(sudo() { test "$1" != -n || shift; "$@"; }
+  printf 'UUID=A none hfs rw,noauto\n' > "$OF"; owners_fstab_add "$OF" "UUID=B none macfuse_ext4 rw,owners $OT"; wc -l < "$OF" | tr -d ' ')
+expect owners_fstab_add_no_blank test "$r" = 2
+r=$(sudo() { test "$1" != -n || shift; "$@"; }; rm -f "$OF"; owners_fstab_add "$OF" "x $OT"; cat "$OF")
+expect owners_fstab_add_new_file test "$r" = "x $OT"
+r=$(sudo() { return 1; }; printf 'x %s\n' "$OT" > "$OF"; owners_fstab_gone "$OF" "$OT"; echo "gone $?")
+expect owners_fstab_gone_says_left has "$r" "^gone 1$"
+expect owners_fstab_in_smoke grep -q '^\. "$tests_dir/lib/owners-fstab.sh"' "$here/smoke-mavericks.sh"
+rm -f "$OF"
+
 test "$fails" -eq 0
