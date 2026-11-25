@@ -593,13 +593,13 @@ sh "$L" unmount "$T/img" > /dev/null 2>&1
 U=0123ABCD-4567-89EF-0123-456789ABCDEF
 NA() { : > "$T/noauto"; LINUXFS_OPEN=$LO sh "$L" "$@"; }
 out=$(FAKE_UUID=$U NA ignore /dev/disk3s1 2>&1); rc=$?
-[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-add UUID=$U linuxfs_ext4" ]; ok $? "ignore DEVICE with a UUID asks the helper for UUID= and the probed bundle (got $rc: '$out' $(cat "$T/noauto"))"
+[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-add UUID=$U macfuse_ext4" ]; ok $? "ignore DEVICE with a UUID asks the helper for UUID= and the probed bundle (got $rc: '$out' $(cat "$T/noauto"))"
 out=$(FAKE_UUID=0123abcd-4567-89ef-0123-456789abcdef NA ignore disk3s1 2>&1)
-[ "$(cat "$T/noauto")" = "--noauto-add UUID=$U linuxfs_ext4" ]; ok $? "a bare diskNsM works too, and the UUID is uppercased ($(cat "$T/noauto"))"
+[ "$(cat "$T/noauto")" = "--noauto-add UUID=$U macfuse_ext4" ]; ok $? "a bare diskNsM works too, and the UUID is uppercased ($(cat "$T/noauto"))"
 out=$(FAKE_PROBE=ntfs3 NA ignore disk3s1 2>&1); rc=$?
-[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-add LABEL=helped linuxfs_ntfs" ]; ok $? "ignore DEVICE with no UUID (NTFS) asks for LABEL= (got $rc: $(cat "$T/noauto"))"
+[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-add LABEL=helped macfuse_ntfs" ]; ok $? "ignore DEVICE with no UUID (NTFS) asks for LABEL= (got $rc: $(cat "$T/noauto"))"
 out=$(FAKE_PROBE=btrfs FAKE_OPEN_LABEL="a/b:c" NA ignore disk3s1 2>&1)
-[ "$(cat "$T/noauto")" = "--noauto-add LABEL=a-b-c linuxfs_btrfs" ]; ok $? "the label is the safe name DiskArbitration sees, not the raw one ($(cat "$T/noauto"))"
+[ "$(cat "$T/noauto")" = "--noauto-add LABEL=a-b-c macfuse_btrfs" ]; ok $? "the label is the safe name DiskArbitration sees, not the raw one ($(cat "$T/noauto"))"
 out=$(FAKE_OPEN_LABEL="" NA ignore disk3s1 2>&1); rc=$?
 [ $rc -eq 1 ] && [ ! -s "$T/noauto" ] && echo "$out" | grep -q "no UUID or label"; ok $? "a device with neither a UUID nor a label is refused (got $rc: '$out')"
 for t in vfat exfat; do
@@ -609,9 +609,9 @@ done
 out=$(FAKE_PROBE=none NA ignore disk3s1 2>&1); rc=$?
 [ $rc -eq 1 ] && [ ! -s "$T/noauto" ]; ok $? "ignore of a disk with no filesystem linuxfs knows is refused (got $rc: '$out')"
 out=$(NA ignore helped 2>&1); rc=$?
-[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-add LABEL=helped linuxfs_ext4" ]; ok $? "ignore LABEL asks for LABEL= with the bundle of the attached disk of that name (got $rc: '$out' $(cat "$T/noauto"))"
+[ $rc -eq 0 ] && [ "$(cat "$T/noauto")" = "--noauto-add LABEL=helped macfuse_ext4" ]; ok $? "ignore LABEL asks for LABEL= with the bundle of the attached disk of that name (got $rc: '$out' $(cat "$T/noauto"))"
 out=$(FAKE_PROBE=f2fs FAKE_OPEN_LABEL="a/b" NA ignore "a/b" 2>&1)
-[ "$(cat "$T/noauto")" = "--noauto-add LABEL=a-b linuxfs_f2fs" ]; ok $? "a label given raw is matched and written as its safe name ($(cat "$T/noauto"))"
+[ "$(cat "$T/noauto")" = "--noauto-add LABEL=a-b macfuse_f2fs" ]; ok $? "a label given raw is matched and written as its safe name ($(cat "$T/noauto"))"
 out=$(NA ignore "no such" 2>&1); rc=$?
 [ $rc -eq 1 ] && [ ! -s "$T/noauto" ] && echo "$out" | grep -q "linuxfs ignore /dev/diskNsM"; ok $? "ignore LABEL with no attached disk of that name is refused, asking for the device (got $rc: '$out')"
 out=$(FAKE_UUID=$U FAKE_NOAUTO_NO="a label with # cannot be written to /etc/fstab" NA ignore disk3s1 2>&1); rc=$?
@@ -627,19 +627,47 @@ out=$(NA unignore "a/b" 2>&1)
 [ "$(cat "$T/noauto")" = "--noauto-remove LABEL=a-b" ]; ok $? "by its safe name ($(cat "$T/noauto"))"
 NA ignore a b > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "ignore takes one volume"
 NA unignore > /dev/null 2>&1; [ $? -eq 2 ]; ok $? "unignore takes one volume"
-printf '%s\n' "# the Mac's" "UUID=$U none hfs rw,noauto" "UUID=$U none linuxfs_ext4 rw,noauto # linuxfs" "LABEL=my\\040data none linuxfs_ntfs rw,noauto # linuxfs" > "$T/fstab"
+printf '%s\n' "# the Mac's" "UUID=$U none hfs rw,noauto" "UUID=$U none macfuse_ext4 rw,noauto # linuxfs" "LABEL=my\\040data none macfuse_ntfs rw,noauto # linuxfs" > "$T/fstab"
 out=$(LINUXFS_FSTAB=$T/fstab sh "$L" ignore); rc=$?
-[ $rc -eq 0 ] && [ "$out" = "UUID=$U	linuxfs_ext4
-LABEL=my data	linuxfs_ntfs" ]; ok $? "ignore alone lists linuxfs's entries, labels unescaped, and no other (got $rc: '$(echo "$out" | tr '\n' '|')')"
+[ $rc -eq 0 ] && [ "$out" = "UUID=$U	macfuse_ext4
+LABEL=my data	macfuse_ntfs" ]; ok $? "ignore alone lists linuxfs's entries, labels unescaped, and no other (got $rc: '$(echo "$out" | tr '\n' '|')')"
 # spec: cli/linuxfs cmd_ignore -- as the helper reads them: a linuxfs line ends in a space or tab, then "# linuxfs", then
 #       perhaps a \r (an fstab edited on Windows); "X# linuxfs" is somebody else's
-printf '%s\r\n' "LABEL=crlf none linuxfs_xfs rw,noauto # linuxfs" > "$T/fstab"
-printf '%s\n' "LABEL=glued none hfs rw,noauto,x# linuxfs" "LABEL=tabbed none linuxfs_f2fs rw,noauto	# linuxfs" >> "$T/fstab"
+printf '%s\r\n' "LABEL=crlf none macfuse_xfs rw,noauto # linuxfs" > "$T/fstab"
+printf '%s\n' "LABEL=glued none hfs rw,noauto,x# linuxfs" "LABEL=tabbed none macfuse_f2fs rw,noauto	# linuxfs" >> "$T/fstab"
 out=$(LINUXFS_FSTAB=$T/fstab sh "$L" ignore); rc=$?
-[ $rc -eq 0 ] && [ "$out" = "LABEL=crlf	linuxfs_xfs
-LABEL=tabbed	linuxfs_f2fs" ]; ok $? "a CRLF line is listed, a line with # linuxfs glued on is not (got $rc: '$(echo "$out" | od -c | tr -s ' ' | tr '\n' '|')')"
+[ $rc -eq 0 ] && [ "$out" = "LABEL=crlf	macfuse_xfs
+LABEL=tabbed	macfuse_f2fs" ]; ok $? "a CRLF line is listed, a line with # linuxfs glued on is not (got $rc: '$(echo "$out" | od -c | tr -s ' ' | tr '\n' '|')')"
 out=$(LINUXFS_FSTAB=$T/no-fstab sh "$L" ignore); rc=$?
 [ $rc -eq 0 ] && [ -z "$out" ]; ok $? "with no /etc/fstab it lists nothing (got $rc)"
+# spec: cli/linuxfs fstype_opts, cmd_mount -- a mount the CLI makes itself (no root fusefd) names its type to the kernel for the
+#       six filesystems with a table row: fstypename=<t>,fssubtype=<n> on lklfuse's -o; others (exFAT) get none; with root's channel
+#       (root already ran mount_macfuse with them) none either
+: > "$T/calls"
+FAKE_PROBE=ext4 sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
+case $(last) in *,fstypename=ext4,fssubtype=7[,\ ]*) r=0 ;; *) r=1 ;; esac; ok $r "an ext4 image mounts with fstypename=ext4,fssubtype=7 (rc $rc: $(last))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+FAKE_PROBE=ntfs3 sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
+case $(last) in *,fstypename=ntfs,fssubtype=8[,\ ]*) r=0 ;; *) r=1 ;; esac; ok $r "an NTFS image mounts with fstypename=ntfs,fssubtype=8 (rc $rc: $(last))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+FAKE_PROBE=exfat sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
+case $(last) in *fstypename*|*fssubtype*) r=1 ;; *type=exfat*) r=0 ;; *) r=1 ;; esac; ok $r "an exFAT image mounts with no fstypename (rc $rc: $(last))"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+: > "$T/calls"
+(LINUXFS_OPEN_INHERITED=1 LINUXFS_ALL_USERS=1 LINUXFS_FUSE_FD=4 LINUXFS_FUSE_CHAN=6 FAKE_FD_MNT=$T/dam; export LINUXFS_OPEN_INHERITED LINUXFS_ALL_USERS LINUXFS_FUSE_FD LINUXFS_FUSE_CHAN FAKE_FD_MNT
+ DA /dev/disk3s1 "$T/dam" 4</dev/null 6</dev/null > "$T/out" 2>&1); rc=$?
+case $(last) in *type=ext4*) case $(last) in *fstypename*|*fssubtype*) r=1 ;; *) r=0 ;; esac ;; *) r=1 ;; esac
+ok $r "with root's channel there is no fstypename on lklfuse's -o (rc $rc: $(last))"
+sh "$L" unmount "$T/dam" > /dev/null 2>&1
+# spec: cli/linuxfs bundle_of, fstype_opts -- agree with tools/fsrules.c's table (fsrules-test --names)
+names=$(sh "$ROOT/tests/fsrules-test.sh" --names 2>/dev/null); [ -n "$names" ]; ok $? "fsrules-test --names prints the table"
+eval "$(grep '^bundle_of()' "$L")"; eval "$(sed -n '/^fstype_opts()/,/; }$/p' "$L")"
+printf '%s\n' "$names" | while IFS='	' read -r fs ptype bundle ftn pers fsname sub; do
+  [ "$(bundle_of "$ptype")" = "$bundle" ] && [ "$(fstype_opts "$ptype")" = "fstypename=$ftn,fssubtype=$sub" ] || echo "$fs"
+done > "$T/mismatch"
+[ ! -s "$T/mismatch" ]; ok $? "bundle_of and fstype_opts agree with --names for all six (off: $(tr '\n' ' ' < "$T/mismatch"))"
+[ "$(printf '%s\n' "$names" | wc -l | tr -d ' ')" = 6 ]; ok $? "the table has six rows"
+[ -z "$(fstype_opts exfat)" ] && [ -z "$(fstype_opts vfat)" ] && [ -z "$(fstype_opts '')" ]; ok $? "fstype_opts says nothing for other types"
 sh "$L" help 2>&1 | grep -q "linuxfs ignore \[VOLUME\]"; ok $? "usage shows ignore [VOLUME]"
 ! sh "$L" help 2>&1 | grep -q "Automount"; ok $? "usage no longer offers Automount"
 ! sh "$L" help 2>&1 | grep -q da-mount; ok $? "usage does not list the internal da-mount"

@@ -20,6 +20,15 @@ before anyone logs in, once the Mac is told to mount disks without a login (10.9
 interface: `sudo defaults write /Library/Preferences/SystemConfiguration/autodiskmount AutomountDisksWithoutUserLogin
 -bool true`); such a disk is mounted by root and served by an unprivileged `_linuxfs` user, and is open to every user. `diskutil mount`, `diskutil unmount` and `diskutil eject` work as usual.
 
+Get Info's Format says what the volume is: "Linux ext4 (linuxfs)", "Windows NTFS (linuxfs)", "Linux btrfs (linuxfs)",
+"Linux XFS (linuxfs)", "Linux F2FS (linuxfs)" or "APFS (linuxfs)". The bundles are named `macfuse_ext4.fs`, `macfuse_ntfs.fs`,
+`macfuse_btrfs.fs`, `macfuse_xfs.fs`, `macfuse_f2fs.fs` and `macfuse_apfs.fs`.
+
+Testers who installed an earlier build, which named the bundles `linuxfs_<fs>.fs`, clean up once, as root, after installing
+this one: `rm -rf /System/Library/Filesystems/linuxfs_{ext4,ntfs,btrfs,xfs,f2fs,apfs}.fs`, then delete the `/etc/fstab` lines
+ending `# linuxfs` (they name the old bundles), then `sudo killall diskarbitrationd`.
+Nothing migrates them.
+
 Mounting before login runs macFUSE as root, so it needs install paths only root can write: `mount_macfuse` (reached through
 `/Library/Filesystems/macfuse.fs`), macFUSE's manifest and `/usr/local/lib/libfuse3.4.dylib`, and every directory and symlink on the way to
 them, must be root's and not writable by a user (a group-writable directory is fine only for group wheel; a sticky directory is fine). A Mac

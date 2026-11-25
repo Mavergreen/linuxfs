@@ -1167,7 +1167,7 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 		return refuse(fs, "no such filesystem");
 	if (snprintf(opts, sizeof opts, "allow_other,local,volname=%s,fsname=linuxfs@%s,noappledouble,fstypename=%s,fssubtype=%d%s", vol, bsd,
 		     nm->fstypename, nm->subtype, ro ? ",rdonly" : "") >= (int)sizeof opts)
-		return refuse(fs, "the mount options do not fit (a volume name too long)");
+		return refuse(fs, "the mount options do not fit");
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, cs) != 0)
 		return refuse(fs, "cannot make mount_macfuse's socket");
 	if (pipe(hout) != 0 || socketpair(AF_UNIX, SOCK_STREAM, 0, ch) != 0) {

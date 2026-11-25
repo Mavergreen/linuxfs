@@ -93,33 +93,39 @@ fi
 #       before-login root path execs; all root:wheel, nothing group- or world-writable (the awk check above)
 S=./System/Library/Filesystems
 D=./Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d
-for fs in ext4 ntfs btrfs xfs f2fs apfs; do
-  b=$S/linuxfs_$fs.fs/Contents
+names="$(sh "$REPO_ROOT/tests/fsrules-test.sh" --names)" || { echo "FAIL: fsrules-test --names failed" >&2; exit 1; }
+[ "$(printf '%s\n' "$names" | wc -l | tr -d ' ')" -eq 6 ] || fail "fsrules-test --names does not give six rows"
+! grep -q 'linuxfs_[a-z0-9]*\.fs' "$T/list" || fail "the payload still has a linuxfs_<fs>.fs bundle"
+printf '%s\n' "$names" > "$T/names"
+while IFS='	' read -r fs ptype bundle ftn pers fsname sub; do
+  b=$S/$bundle.fs/Contents
   grep -qxF "$b/Info.plist	100644	0/0" "$T/list" || fail "the payload lacks $b/Info.plist (0644)"
-  for prog in linuxfs_$fs.util mount_linuxfs_$fs fsck_linuxfs_$fs; do
+  for prog in $bundle.util mount_$bundle fsck_$bundle; do
     grep -qxF "$b/Resources/$prog	100755	0/0" "$T/list" || fail "the payload lacks $b/Resources/$prog (0755)"
   done
-done
+done < "$T/names"
 for prog in lklfuse linuxfs linuxfs-probe linuxfs-open; do
   grep -qxF "$D/$prog	100755	0/0" "$T/list" || fail "the payload lacks $D/$prog (0755)"
 done
 n="$(grep -c "^$D/" "$T/list" || :)"
 [ "$n" -eq 4 ] || fail "$D holds $n entries, not four programs"
 mkdir -p "$T/bundles"; (cd "$T/bundles" && gzip -dc < "$comp/Payload" | cpio -id --quiet "$S/*")
-for fs in ext4 ntfs btrfs xfs f2fs apfs; do
-  ip="$T/bundles/System/Library/Filesystems/linuxfs_$fs.fs/Contents/Info.plist"
-  case $fs in ntfs) pers=NTFS-linuxfs ;; xfs) pers=XFS ;; f2fs) pers=F2FS ;; apfs) pers=APFS ;; *) pers=$fs ;; esac
-  python3 -I - "$ip" "$fs" "$pers" "$V" <<'PY' || fail "linuxfs_$fs.fs/Contents/Info.plist is wrong"
+while IFS='	' read -r fs ptype bundle ftn pers fsname sub; do
+  ip="$T/bundles/System/Library/Filesystems/$bundle.fs/Contents/Info.plist"
+  python3 -I - "$ip" "$fs" "$bundle" "$pers" "$fsname" "$sub" "$V" <<'PY' || fail "$bundle.fs/Contents/Info.plist is wrong"
 import plistlib, sys
-ip, fs, pers, v = sys.argv[1:5]
+ip, fs, bundle, pers, fsname, sub, v = sys.argv[1:8]
 d = plistlib.load(open(ip, "rb"))
 def need(c, m):
     if not c: print(m, file=sys.stderr); sys.exit(1)
 need(d["CFBundleIdentifier"] == "dev.mavergreen.linuxfs." + fs, "CFBundleIdentifier")
+need(d["CFBundleName"] == bundle, "CFBundleName is %r, want %s" % (d["CFBundleName"], bundle))
 need(d["CFBundleShortVersionString"] == v and d["CFBundleVersion"] == v, "version")
 need(list(d["FSPersonalities"]) == [pers], "personality is %r, want %s" % (list(d["FSPersonalities"]), pers))
 p = d["FSPersonalities"][pers]
-need(p["FSMountExecutable"] == "mount_linuxfs_" + fs, "FSMountExecutable")
+need(p["FSMountExecutable"] == "mount_" + bundle, "FSMountExecutable")
+need(p["FSName"] == fsname, "FSName is %r, want %s" % (p["FSName"], fsname))
+need(p["FSSubType"] == int(sub), "FSSubType is %r, want %s" % (p["FSSubType"], sub))
 for k in p: need(not k.startswith(("FSFormat", "FSVerification", "FSRepair")), "unexpected key " + k)
 mt = d["FSMediaTypes"]
 want = {"ntfs": ["EBD0A0A2-B9E5-4433-87C0-68B6B72699C7", "Windows_NTFS", "Partitionless"],
@@ -127,10 +133,14 @@ want = {"ntfs": ["EBD0A0A2-B9E5-4433-87C0-68B6B72699C7", "Windows_NTFS", "Partit
         ["0FC63DAF-8483-4772-8E79-3D69D8477DE4", "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7", "Linux", "Partitionless"])
 need(sorted(mt) == sorted(want), "FSMediaTypes %r" % sorted(mt))
 for m in mt.values():
-    need(m["FSProbeExecutable"] == "linuxfs_%s.util" % fs and m["FSProbeOrder"] == 900 and m["FSProbeArguments"] == "-p", "probe keys")
+    need(m["FSProbeExecutable"] == bundle + ".util" and m["FSProbeOrder"] == 900 and m["FSProbeArguments"] == "-p", "probe keys")
 PY
-  if command -v plutil > /dev/null 2>&1; then plutil -lint "$ip" > /dev/null || fail "plutil -lint refuses linuxfs_$fs.fs's Info.plist"; fi
-done
+  if command -v plutil > /dev/null 2>&1; then plutil -lint "$ip" > /dev/null || fail "plutil -lint refuses $bundle.fs's Info.plist"; fi
+done < "$T/names"
+# spec: build/fs-bundles.sh -- a filesystem name over 6 characters (the kernel's fstypename limit) is refused, exit 2
+LINUXFS_TEST_EXTRA_FSTYPENAME=squashfs sh "$REPO_ROOT/build/fs-bundles.sh" --version "$V" --out "$T/over" > "$T/over.out" 2>&1 && rc=0 || rc=$?
+[ $rc -eq 2 ] && grep -q 'fs-bundles.sh: fstypename squashfs is over 6 characters' "$T/over.out" || fail "a 7-character fstypename is not refused with exit 2 (rc $rc: $(cat "$T/over.out"))"
+LINUXFS_TEST_EXTRA_FSTYPENAME=ext2 sh "$REPO_ROOT/build/fs-bundles.sh" --version "$V" --out "$T/six" > /dev/null 2>&1 || fail "a short extra fstypename is refused"
 grep -q 'killall diskarbitrationd' "$comp/Scripts/postinstall" || fail "the postinstall does not restart diskarbitrationd"
 grep -q 'dscl \. -create /Users/_linuxfs' "$comp/Scripts/postinstall" || fail "the postinstall does not create _linuxfs with dscl"
 

@@ -5,8 +5,8 @@
 #          linuxfs-open when DIR has them, DIR/linuxfs-helper as /Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper
 #          with its LaunchDaemon, DIR/linuxfs-agent with its LaunchAgent, and packaging/pre-uninstall as libexec/mavergreen/pre-uninstall, all under
 #          LINUXFS_PREFIX (build/lib.sh), files 0644 and programs 0755. When DIR has linuxfs-fs it also lays out the six DiskArbitration
-#          bundles, version V, under System/Library/Filesystems (linuxfs-fs copied to each bundle's linuxfs_<fs>.util, mount_linuxfs_<fs>
-#          and fsck_linuxfs_<fs>), and Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d with copies of lklfuse, the CLI, the prober
+#          bundles, version V, under System/Library/Filesystems (linuxfs-fs copied to each bundle's macfuse_<fs>.util, mount_macfuse_<fs>
+#          and fsck_macfuse_<fs>), and Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d with copies of lklfuse, the CLI, the prober
 #          and linuxfs-open for the before-login root path; --version V is then required (exit 2 without it). Ownership (0/0) is the packager's.
 set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -50,9 +50,9 @@ fi
 if [ -f "$built/linuxfs-fs" ]; then
   sh "$REPO_ROOT/build/fs-bundles.sh" --version "$ver" --out "$out/System/Library/Filesystems"
   for fs in ext4 ntfs btrfs xfs f2fs apfs; do
-    r="$out/System/Library/Filesystems/linuxfs_$fs.fs/Contents/Resources"
+    r="$out/System/Library/Filesystems/macfuse_$fs.fs/Contents/Resources"
     mkdir -p "$r"
-    for n in "linuxfs_$fs.util" "mount_linuxfs_$fs" "fsck_linuxfs_$fs"; do put "$built/linuxfs-fs" "$r/$n" 755; done
+    for n in "macfuse_$fs.util" "mount_macfuse_$fs" "fsck_macfuse_$fs"; do put "$built/linuxfs-fs" "$r/$n" 755; done
   done
 fi
 # spec: tools/fs.c mount_as_root -- the before-login root path execs these (names and directory as it spells them), as _linuxfs

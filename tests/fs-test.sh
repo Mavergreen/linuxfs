@@ -383,7 +383,7 @@ grep -qx "helper-argv allow_other,local,volname=a-b-c,fsname=linuxfs@$E,noappled
 # spec: tools/fs.c mount_by_root -- options that do not fit are refused, never cut (a cut one would lose a trailing rdonly)
 DM_EXT=$DM; DM=$D/short/mount_macfuse_ext4
 fplan "$F2" -o rdonly "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
-[ $rc = 1 ] && ! grep -q '^helper' "$M/plan" && grep -q 'do not fit' "$M/plan"; ok $? "root mount plan: options that do not fit are refused, not cut (rc $rc: $(tail -1 "$M/plan"))"
+[ $rc = 1 ] && ! grep -q '^helper' "$M/plan" && grep -q 'the mount options do not fit$' "$M/plan"; ok $? "root mount plan: options that do not fit are refused, not cut (rc $rc: $(tail -1 "$M/plan"))"
 DM=$DM_EXT
 # spec: tools/fs.c mount_by_root -- the mount's options end with the filesystem's fstypename and fssubtype (tools/fsrules.c's names table)
 cp "$DM" "$D/drop/mount_macfuse_ntfs"

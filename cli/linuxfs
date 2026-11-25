@@ -337,7 +337,10 @@ cmd_mount() {
   lockopt=$lockfile; [ -z "$fusechan" ] || lockopt=/dev/fd/7
   opts="type=$type,lock=$lockopt"
   # the mount's own options (the kernel's): root gave them to mount_macfuse when it made the mount lklfuse serves
-  [ -n "$fusefd" ] || opts="$opts,local,volname=$name,fsname=linuxfs@$(safe_name "$(basename "$src")"),noappledouble"
+  if [ -z "$fusefd" ]; then
+    opts="$opts,local,volname=$name,fsname=linuxfs@$(safe_name "$(basename "$src")"),noappledouble"
+    ft=$(fstype_opts "$type"); [ -z "$ft" ] || opts="$opts,$ft"
+  fi
   if [ -n "$ids" ]; then :
   elif [ "${LINUXFS_ALL_USERS:-}" = 1 ]; then [ -n "$fusefd" ] || opts="$opts,allow_other"; opts="$opts,uid=99,gid=99"
   else opts="$opts,uid=$(id -u),gid=$(id -g),owner=root"; fi
@@ -537,7 +540,12 @@ uuid_dev() {
   else "$OPENER" --uuid "$1" 2>/dev/null < /dev/null; fi | tr a-f A-F
 }
 # The bundle that mounts what the probe calls TYPE; fails for what the Mac mounts itself (FAT, exFAT).
-bundle_of() { case $1 in ext4|btrfs|xfs|f2fs|apfs) echo "linuxfs_$1" ;; ntfs3) echo linuxfs_ntfs ;; *) return 1 ;; esac; }
+# macfuse_<fs>, as tools/fsrules.c's table (tests/cli-test.sh checks them against fsrules-test --names).
+bundle_of() { case $1 in ext4|btrfs|xfs|f2fs|apfs) echo "macfuse_$1" ;; ntfs3) echo macfuse_ntfs ;; *) return 1 ;; esac; }
+# The kernel options that name the volume's type to macFUSE (Get Info's Format, mount's "(macfuse_ext4, ...)"): the table's
+# fstypename and fssubtype for what the probe calls TYPE; nothing for the filesystems the Mac mounts itself.
+fstype_opts() { case $1 in ext4) echo fstypename=ext4,fssubtype=7 ;; ntfs3) echo fstypename=ntfs,fssubtype=8 ;; btrfs) echo fstypename=btrfs,fssubtype=9 ;;
+  xfs) echo fstypename=xfs,fssubtype=10 ;; f2fs) echo fstypename=f2fs,fssubtype=11 ;; apfs) echo fstypename=apfs,fssubtype=12 ;; esac; }
 # A device's type, UUID and name (the volume name DiskArbitration sees: the bundle's util prints the label's safe name,
 # so a LABEL= entry must spell that, not the raw label). A label that leaves no safe name (empty, not UTF-8) gives no name:
 # DiskArbitration would call it Linux, as it calls every such volume. Sets type, uuid and name.
