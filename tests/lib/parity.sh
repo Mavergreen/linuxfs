@@ -69,7 +69,8 @@ PARITY_MODE_UNICODE=${PARITY_MODE_UNICODE:-check}
 #   held-file eject. The steps whose linuxfs outcome DiskArbitration's tie to the disk decides take PARITY_MODE_BUSY_DA,
 #   record until item 6's fsname=/dev/diskN (QEMU first: the hfs-fsname kit) lands: a linuxfs mount named
 #   linuxfs@rdiskN is untied from its disk by the next mount or unmount of any volume (push A, item-4-findings.md),
-#   after which its eject unmounts nothing and fails busy, and diskutil unmount words it by mount point, not by disk.
+#   after which its eject unmounts nothing and fails busy; and diskutil unmount always reaches it by mount point (the
+#   /Volumes/<name>?owner= entry DiskArbitration makes for a mount no disk matches), tied or not, so words it so.
 #   Those are (a)'s eject cycles, and (b)'s unmounts, TextEdit's eject (after the HFS+ side's unheld eject) and Finder's.
 PARITY_MODE_BUSY=${PARITY_MODE_BUSY:-check}
 PARITY_MODE_BUSY_DA=${PARITY_MODE_BUSY_DA:-record}
@@ -696,16 +697,24 @@ census_busy_cycles() {
 #   the next mount or unmount of any volume: then the disk's eject unmounts nothing, and the media eject fails busy
 #   (status 0x10) under the lklfuse still serving the volume. A busy eject records census_holders (mount still showing
 #   the volume, DiskArbitration saying not mounted), then frees the volume as a user would (diskutil unmount of its mount
-#   point) and ejects it (census_detach). Not run when IMAGE is still attached (an earlier eject failed). Prints the
-#   busy count and the cycles run; stops at a disk left attached.
+#   point), waits for its lklfuse to go (census_lklfuse_gone: an eject racing its exit would fail busy too) and ejects
+#   it (census_detach). A cycle whose other volume did not attach proves nothing: IMAGE is ejected and the cycle not
+#   counted. Not run when IMAGE is still attached (an earlier eject failed). Prints the busy count and the cycles
+#   counted; stops at a disk left attached.
 census_busy_ejects() {
   be_name=$1 be_busy=0 be_k=0 be_n=${PARITY_BUSY_EJECTS:-3}
   if test "$1" = hfs; then be_side=apple; else be_side=fs; fi
   if test -n "$(census_image_disk "$2")"; then echo "$be_name: eject cycles not run: ${2##*/} is still attached" >>"$4"; echo 0 0; return 1; fi
-  while test "$be_k" -lt "$be_n"; do
+  be_t=0
+  while test "$be_k" -lt "$be_n" && test "$be_t" -lt $((be_n * 2)); do
+    be_t=$((be_t + 1))
     census_attach "$2" || { echo "$be_name eject $((be_k + 1)): not attached; stopping" >>"$4"; break; }
     be_k=$((be_k + 1)) be_disk=$CA_DISK be_mp=$CA_MP
-    if census_attach "$3"; then census_detach "$CA_DISK" apple >>"$4"; else echo "$be_name eject $be_k: the other volume did not attach" >>"$4"; fi
+    if census_attach "$3"; then census_detach "$CA_DISK" apple >>"$4"; else
+      echo "$be_name eject $be_k: the other volume did not attach; not counted" >>"$4"; be_k=$((be_k - 1))
+      census_detach "$be_disk" "$be_side" "$be_mp" >>"$4" || { echo "$be_name: ${2##*/} left attached; stopping" >>"$4"; break; }
+      continue
+    fi
     if be_out=$(bounded 600 diskutil eject "$be_disk" 2>&1 </dev/null); then
       echo "$be_name eject $be_k: ejected: $be_out" >>"$4"
     else
@@ -714,12 +723,20 @@ census_busy_ejects() {
         echo "$be_name eject $be_k: BUSY: $be_out"
         census_holders "$be_disk" "$be_mp"
         echo "-- freed as a user would: $(bounded 600 diskutil unmount "$be_mp" 2>&1 </dev/null)"
+        bounded 300 census_lklfuse_gone "$be_mp" || echo "-- an lklfuse still serves $be_mp 30 s after its unmount"
       } >>"$4" 2>&1
       census_detach "$be_disk" "$be_side" "$be_mp" >>"$4" || { echo "$be_name eject $be_k: left attached; stopping" >>"$4"; break; }
     fi
   done
   echo "$be_name: eject busy $be_busy of $be_k" >>"$4"
   echo "$be_busy $be_k"
+}
+
+# census_lklfuse_gone MP: returns once no lklfuse serves MP (its command's last argument); run it under bounded
+census_lklfuse_gone() {
+  while ps -axww -o command= 2>/dev/null </dev/null | awk -v m=" $1" '/lklfuse/ && !/awk/ && length($0) > length(m) && substr($0, length($0) - length(m) + 1) == m { f = 1 } END { exit !f }'; do
+    sleep 0.2
+  done
 }
 
 # census_busy_bar WHAT MODE FS HFS-COUNTS FS-COUNTS N: item 4(a)'s bar, from two "BUSY RUN" counts: FS busy no more often
@@ -849,7 +866,7 @@ census_busy_parity() {
 census_busy() {
   cb_fs=$1 CB_HOLDERS= cb_n=1
   census_sysctl "busy-$cb_fs"
-  cb_c=$(parity_control hfs) && cb_h=$(census_copy "$cb_c" "busy-hfs-$cb_fs") && cb_o=$(census_copy "$cb_c" "busy-hfs-other-$cb_fs") &&
+  cb_c=$(parity_control hfs) && cb_h=$(census_copy "$cb_c" "busy-hfs-$cb_fs") && cb_o=$(census_copy "$(parity_control hfsx)" "busy-hfsx-other-$cb_fs") &&
     cb_i=$(census_copy "$W/img/$cb_fs.img" "busy-$cb_fs") || { echo "# census_busy $cb_fs: no images"; return 1; }
   da_debug_on
   cb_log=$OUT/parity/busy.$cb_fs.cycles.txt; : >"$cb_log"

@@ -736,7 +736,9 @@ expect census_busy_bar_why has "$r" "^parity: ext4 was busy more often than HFS+
 expect census_busy_quiet test "$(printf '%s\n' "$r" | grep -c 'not ok')" -eq 1
 # (a)'s eject cycles, each side PARITY_BUSY_EJECTS (3) times with another HFS+ copy coming and going: recorded
 expect census_busy_ejects_recorded has "$r" "^# recorded busy.ext4.ejects: hfs 0 of 3, ext4 0 of 3$"
-expect census_busy_ejects_other test "$(grep -c '^hdiutil attach .*busy-hfs-other-ext4.img$' "$S/calls")" -eq 6
+# the other volume is the HFSX control (another UUID and name), not a second copy of the HFS+ one
+expect census_busy_ejects_other test "$(grep -c '^hdiutil attach .*busy-hfsx-other-ext4.img$' "$S/calls")" -eq 6
+expect census_busy_ejects_not_hfs_copy not grep -q 'busy-hfs-other' "$S/calls"
 expect census_busy_ejects_said grep -q '^ext4: eject busy 0 of 3$' "$P/busy.ext4.cycles.txt"
 # (b): the shell's eject is checked; the unmounts, TextEdit's eject and Finder's are recorded
 expect census_busy_shell_eject_checked has "$r" "^ok - parity busy.ext4.shell-eject$"
@@ -796,6 +798,10 @@ expect census_busy_untied_da grep -q '^# census: DiskArbitration: disk[0-9]* Mou
 expect census_busy_untied_mount grep -q '^#   linuxfs@rdisk[0-9]* on .*/vols/busy-calm (macfuse_ext4' "$P/busy.calm.cycles.txt"
 expect census_busy_untied_freed grep -q '^-- freed as a user would: Volume busy-calm on disk[0-9]* unmounted$' "$P/busy.calm.cycles.txt"
 expect census_busy_untied_hfs grep -q '^hfs: eject busy 0 of 3$' "$P/busy.calm.cycles.txt"
+# a busy eject's volume is freed, and its lklfuse waited for (census_lklfuse_gone), before the eject: no failure block
+#   follows it in the cycles' record
+expect census_busy_untied_no_race not grep -q '^# census: .* diskutil eject /dev/disk[0-9]* failed' "$P/busy.calm.cycles.txt"
+expect census_busy_untied_waits test -n "$(sed -n '/^census_busy_ejects()/,/^}/p' "$here/lib/parity.sh" | grep 'bounded 300 census_lklfuse_gone "$be_mp"')"
 # checked, the eject cycles' bar fails for it: linuxfs busier than HFS+
 drop_stuck calm; drop_stuck busy-hfs
 r=$(PARITY_MODE_BUSY_DA=check; census_busy calm 2>&1)
@@ -809,6 +815,18 @@ r=$(reset; pair; touch "$T/b/extra"; PARITY_MODE_BUSY=record PARITY_MODE_BUSY_DA
 expect census_busy_parity_da has "$r" "^not ok - parity busy.x.da$"
 expect census_busy_parity_da_restored has "$r" "^after: record$"
 expect census_busy_forced_recorded test "$(grep -c 'census_busy_parity record "busy.$cb_fs.$cb_step"' "$here/lib/parity.sh")" -eq 1
+# a cycle whose other volume never attached proves nothing: not counted (IMAGE is still ejected)
+echo calm > "$W/census/m1-calm.img"; echo x > "$W/census/nevermount-other.img"; : > "$T/m1.log"
+r=$(census_busy_ejects calm "$W/census/m1-calm.img" "$W/census/nevermount-other.img" "$T/m1.log" 2>/dev/null | tail -n 1)
+expect census_busy_ejects_no_other test "$r" = "0 0"
+expect census_busy_ejects_no_other_said grep -q '^calm eject 1: the other volume did not attach; not counted$' "$T/m1.log"
+expect census_busy_ejects_no_other_ejected test -z "$(census_image_disk "$W/census/m1-calm.img")"
+rm -f "$W/census/m1-calm.img" "$W/census/nevermount-other.img"
+# census_lklfuse_gone MP: waits while an lklfuse serves MP (its command's last argument), and no longer
+lg() { (ps() { if test -s "$T/lg.n"; then n=$(cat "$T/lg.n"); echo $((n - 1)) > "$T/lg.n"; test "$n" -le 0 || echo "u /p/lklfuse -f -o x /dev/fd/3 /Volumes/m"; fi; echo "u /p/lklfuse -f /dev/fd/3 /Volumes/m 2"; }; bounded 100 census_lklfuse_gone /Volumes/m); }
+echo 2 > "$T/lg.n"; lg; expect census_lklfuse_gone_waits test "$(cat "$T/lg.n")" -eq -1
+echo 0 > "$T/lg.n"; lg; expect census_lklfuse_gone_other_mp test "$(cat "$T/lg.n")" -eq -1
+rm -f "$T/lg.n"
 # a side whose cycles did not all run proves nothing: not ok in check mode
 r=$(census_busy_bar busy.x.cycles check x "0 20" "0 7" 20 2>&1)
 expect census_busy_bar_short has "$r" "^not ok - parity busy.x.cycles (hfs 0 of 20, x 0 of 7)$"
