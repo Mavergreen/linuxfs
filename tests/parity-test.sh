@@ -349,6 +349,14 @@ node_of() { # a disk node, or a mount point: its node
   done
 }
 log() { echo "$(date +%H:%M:%S)   $*" >> "$PARITY_DALOG"; }
+# a linuxfs node's mount: lklfuse's own log, $STUB/lklogs/rNODE.log (the CLI's ~/Library/Logs/linuxfs/<basename of the raw
+#   device>.log, written afresh by each mount), with its names line: exact, or scanning with $STUB/names-scanning
+names_log() {
+  test "$(field "$1" disk)" = "$1" || return 0
+  mkdir -p "$STUB/lklogs"
+  if test -f "$STUB/names-scanning"; then m=scanning; else m=exact; fi
+  printf '%s\n' "lklfuse: mounting" "lklfuse: names: $m (stub)" > "$STUB/lklogs/r$1.log"
+}
 # with $STUB/da-forgets, DiskArbitration as push A saw it (item 4): a linuxfs volume's mount is named linuxfs@rdiskN, so a
 #   mount or an unmount of any other volume leaves its disk untied (.u): DiskArbitration says it is not mounted, its eject
 #   unmounts nothing and fails busy under the lklfuse still serving it; diskutil unmount of its mount point still works
@@ -394,7 +402,7 @@ hdiutil)
     # flaky (a linuxfs image): only its first attach mounts; after its first eject, ejects and detaches fail
     case $b in *hfs*) ;; *flaky*) if test -f "$STUB/flaky-attached"; then b=nevermount-$b; else : > "$STUB/flaky-attached"; fi ;; esac
     case $b in *names*) test ! -f "$STUB/names-nomount" || b=nevermount-$b ;; *hfs*) ;; *nomnt*) b=nevermount-$b ;; esac
-    case $b:$nomount in *nevermount*:) echo "/dev/$nd          	Stub" ;; *swept*:1 | *:) : > "$N/$nd.m"; untie_others "$nd"; echo "/dev/$nd          	Stub	$mp" ;;
+    case $b:$nomount in *nevermount*:) echo "/dev/$nd          	Stub" ;; *swept*:1 | *:) : > "$N/$nd.m"; names_log "$nd"; untie_others "$nd"; echo "/dev/$nd          	Stub	$mp" ;;
     *) echo "/dev/$nd          	Stub" ;; esac ;;
   detach)
     for a; do case $a in disk*|/dev/disk*) d=${a#/dev/}; case $(field "$d" vol) in *hfs*) ;; *flaky*) test ! -f "$STUB/flaky-ejected" || exit 1 ;; esac; rm -f "$N/$d" "$N/$d.m" "$N/$d.u" "$N/${d}s1" "$N/${d}s1.m" ;; esac; done ;;
@@ -418,7 +426,7 @@ diskutil)
     test -z "$(field "$nd" uuid)" || echo "   Volume UUID:              $(field "$nd" uuid)"
     printf '%s\n' "   Protocol:                 Disk Image" "   Read-Only Media:          No" "   Ejectable:                Yes" "   Internal:                 No" ;;
   mount)
-    nd=$(node_of "$2"); test -n "$nd" || exit 1; : > "$N/$nd.m"; rm -f "$N/$nd.u"; untie_others "$nd"; echo "Volume $(field "$nd" vol) on $nd mounted" ;;
+    nd=$(node_of "$2"); test -n "$nd" || exit 1; : > "$N/$nd.m"; rm -f "$N/$nd.u"; names_log "$nd"; untie_others "$nd"; echo "Volume $(field "$nd" vol) on $nd mounted" ;;
   unmount)
     t=$2; test "$t" != force || t=$3
     nd=$(node_of "$t"); test -n "$nd" || { echo "Unmount failed for $t"; exit 1; }
@@ -456,7 +464,11 @@ sudo)
   case $1 in sh|tail|cat|wc|mdutil|tmutil) exec "$@" ;; lsof) echo "COMMAND PID USER (stub lsof $*)" ;; esac ;;
 mkfile) : > "$2" ;;
 sysctl) echo "$1.version.number: stub" ;;
-mdutil) eval "echo \"\${$#}:\""; if test "$1" = -s; then echo "	Indexing enabled."; else echo "	Indexing disabled."; fi ;;
+mdutil)
+  eval "echo \"\${$#}:\""
+  if test "$1" = -s; then echo "	Indexing enabled."
+  elif test "$1:$2" = -i:on && test -f "$STUB/mdutil-400"; then echo "Error: unable to perform operation.  (-400)"; echo "	Error: unknown indexing state."
+  else echo "	Indexing disabled."; fi ;;
 mdfind) test ! -e "$2/$4" || echo "$2/$4" ;;
 tmutil)
   case $1 in
@@ -478,10 +490,19 @@ xattr)
   case $1 in -l) echo "com.apple.FinderInfo: stub" ;; -px) echo "00 00 04 00" ;; esac ;;
 guest-macosx-aqua)
   case $1 in
-  screencapture) : > "$3" ;;
+  screencapture) if test -f "$STUB/same-shots"; then echo same > "$3"; else echo "$3" > "$3"; fi ;;
   defaults) test "$2" != read || exit 1 ;;
   osascript)
     case "$*" in
+    # census_finder_dialogs: with $STUB/no-ui, System Events refuses (no assistive access); with $STUB/dialog-force, a
+    #   dialog with neither Cancel nor OK is left up
+    *AXDialog*"click button"*)
+      if test -f "$STUB/no-ui"; then echo "System Events got an error: osascript is not allowed assistive access. (-1719)"; exit 1; fi
+      if test -f "$STUB/dialog-force"; then echo "left up (Force Eject…): The disk stub wasn't ejected."; else echo "OK: The disk “stub” was ejected."; fi ;;
+    # census_await's conditions: true, but for a dialog with $STUB/no-ui and a window with $STUB/no-window
+    *AXDialog*) test -f "$STUB/no-ui" && { echo "System Events got an error: not allowed assistive access. (-1719)"; exit 1; }; echo true ;;
+    *"target of front Finder window"* | *"is information window"*) if test -f "$STUB/no-window"; then echo false; else echo true; fi ;;
+    *"current pane"*) echo true ;;
     *ejectable*) echo "true|true|false|1.34217728E+8|1.0E+8|Mac OS Extended format" ;;
     *"count items"*) echo 1 ;;
     *"with properties"*) test ! -f "$STUB/finder-fails" || { echo "Finder got an error: stub"; exit 1; } ;;
@@ -501,6 +522,7 @@ for f in ext4 btrfs xfs ntfs apfs; do echo "$f image" > "$W/img/$f.img"; done
 echo names | gzip -c > "$IN/ext4-names.img.gz"
 unbounded=$T/unbounded; : > "$unbounded"
 PARITY_XATTR_SIZES="131072 131073 262144"; PARITY_FREE_FLOOR_KB=1 PARITY_START_FLOOR_KB=1
+PARITY_LKLOGS=$S/lklogs PARITY_AWAIT_SECS=0
 
 # census_xattr_sizes: by default the probe climbs past 10.9's XATTR_MAXSIZE-free HFS+ to a size no 128 MiB control holds
 r=$(unset PARITY_XATTR_SIZES; . "$here/lib/parity.sh"; echo "$PARITY_XATTR_SIZES")
@@ -617,6 +639,10 @@ expect census_unicode_btrfs_ok has "$r" "^ok - parity unicode.btrfs.shell-open-b
 expect census_unicode_btrfs_copy grep -q '^hdiutil attach -imagekey diskimage-class=CRawDiskImage .*/census/unicode-btrfs.img$' "$S/calls"
 expect census_unicode_fat32_once not grep -q 'fat32' "$S/calls"
 expect census_unicode_names_ext4_only not grep -q 'names' "$S/calls"
+# item 1 (Task 13b): lklfuse's names mode for every linuxfs census mount, read from lklfuse's own log (as the smoke's CLI
+#   loop reads it) right after the mount, into names-mode.txt; an HFS+ or FAT32 mount has no line
+expect census_names_recorded grep -q '^disk[0-9]* .*/vols/unicode-btrfs: exact (stub)$' "$P/names-mode.txt"
+expect census_names_only_linuxfs not grep -q 'hfs\|fat32' "$P/names-mode.txt"
 # Finder failing on both sides: equal records, but the HFS+ control failed, so not ok; the fsck job is not given the
 #   Finder names (the smoke's not ok says why)
 : > "$S/finder-fails"
@@ -655,7 +681,7 @@ r=$(CA_T0=$(($(date +%s) - 120)); PARITY_CENSUS_MIN=1; census_on btrfs census_un
 expect census_on_unicode_time_notok has "$r" "^not ok - parity unicode.btrfs: not run (out of time (1 min))$"
 # skipped for its worst case (10 min gone, 13 at worst, the end at 11 + 11): that reason, not "out of time"
 r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=11; census_on btrfs census_unicode btrfs 2>&1)
-expect census_on_unicode_worst_notok has "$r" "^not ok - parity unicode.btrfs: not run (census_unicode may take 13 min, past the census's end (22 min))$"
+expect census_on_unicode_worst_notok has "$r" "^not ok - parity unicode.btrfs: not run (census_unicode may take 17 min, past the census's end (22 min))$"
 r=$(PARITY_START_FLOOR_KB=999999999999; census_on btrfs census_unicode btrfs 2>&1)
 expect census_on_unicode_room_notok has "$r" "^not ok - parity unicode.btrfs: not run (no room on "
 r=$(census_on nosuchfs census_unicode nosuchfs 2>&1)
@@ -696,6 +722,8 @@ expect census_stall_recorded has "$r" "^# recorded stall loop 2: hfs 0/2, ext4 2
 expect census_stall_quiet hasnt "$r" "not ok"
 expect census_stall_sysctl test -s "$P/stall.sysctl.txt"
 expect census_stall_detached test -z "$(attached)"
+expect census_names_stall grep -q '/vols/stall-ext4: exact (stub)$' "$P/names-mode.txt"
+expect census_names_stall_not_hfs not grep -q '/vols/stall-hfs' "$P/names-mode.txt"
 # past the deadline, no further iteration begins, and the counts say how many ran
 r=$(CA_T0=$(($(date +%s) - 120)); PARITY_CENSUS_MIN=1; PARITY_STALL_N=2; census_stall 2>&1)
 expect census_stall_cut grep -q '^hfs loop 1: 0 stalls, 0 automounts, 0 setup failures of 0 (stopped early, out of time: 2 asked)$' "$P/stall-summary.txt"
@@ -720,14 +748,18 @@ expect census_busy_dissenter grep -q '^-- dissenter' "$P/busy.ext4.cycles.txt"
 for s in shell-unmount shell-eject textedit-unmount textedit-eject finder-eject; do
   expect "census_busy_$s" test -s "$P/busy.ext4.$s.hfs.txt" -a -s "$P/busy.ext4.$s.ext4.txt"
 done
-for s in force-unmount force-eject; do
-  expect "census_busy_${s}_hfs_only" test -s "$P/busy.ext4.$s.hfs.txt" -a ! -e "$P/busy.ext4.$s.ext4.txt"
-done
+expect census_busy_force-eject_hfs_only test -s "$P/busy.ext4.force-eject.hfs.txt" -a ! -e "$P/busy.ext4.force-eject.ext4.txt"
+# Task 13b (the hfs-force-eject kit: clean on a busy ext4 volume, like HFS+): diskutil unmount force runs on both, held,
+#   and is checked by its status and whether the volume went; diskutil's words are kept apart, recorded
+expect census_busy_force_unmount_both test -s "$P/busy.ext4.force-unmount.hfs.txt" -a -s "$P/busy.ext4.force-unmount.ext4.txt"
+expect census_busy_force_unmount_checked has "$r" "^ok - parity busy.ext4.force-unmount$"
+expect census_busy_force_unmount_gone grep -q '^mounted afterwards: no$' "$P/busy.ext4.force-unmount.ext4.txt"
+expect census_busy_force_unmount_wording test "$(grep -c '^== .*/vols/busy-' "$P/busy.ext4.force-unmount-wording.txt")" -eq 2
 expect census_busy_textedit grep -q 'open -a TextEdit' "$S/calls"
 expect census_busy_finder grep -q 'eject disk' "$S/calls"
 expect census_busy_shot test "$(grep -c 'screencapture -x .*-busy-eject.png' "$S/calls")" -eq 2
 expect census_busy_force_hfs grep -q '^diskutil unmount force .*/vols/busy-hfs-ext4$' "$S/calls"
-expect census_busy_no_force_fs not grep -q '^diskutil unmount force .*/vols/busy-ext4$' "$S/calls"
+expect census_busy_force_unmount_fs grep -q '^diskutil unmount force .*/vols/busy-ext4$' "$S/calls"
 expect census_busy_eject_retried grep -q '^# census: retrying diskutil eject /dev/disk' "$P/busy.ext4.cycles.txt"
 expect census_busy_eject_lsof grep -q '^#   COMMAND PID USER (stub lsof lsof .*/vols/busy-ext4)' "$P/busy.ext4.cycles.txt"
 # (a)'s bar: ext4 busy once (the stub's busy-ext4), HFS+ never: not ok, and why; the only not ok
@@ -744,6 +776,14 @@ expect census_busy_ejects_said grep -q '^ext4: eject busy 0 of 3$' "$P/busy.ext4
 expect census_busy_shell_eject_checked has "$r" "^ok - parity busy.ext4.shell-eject$"
 for s in shell-unmount textedit-unmount textedit-eject finder-eject; do expect "census_busy_${s}_recorded" has "$r" "^# recorded busy.ext4.$s$"; done
 expect census_busy_sysctl test -s "$P/busy-ext4.sysctl.txt"
+# every mount is said, census_busy_cycles' remounts too (20 of them, and the attach)
+expect census_names_busy_remounts test "$(grep -c '/vols/busy-ext4: exact' "$P/names-mode.txt")" -ge 21
+# item 2 (Task 13b): census_finder_ask dismisses what its step left up (busy-eject's dialog) before the next side's shot
+expect census_busy_dialogs grep -q '^busy-eject: OK: ' "$P/dialogs.txt"
+# item 3 (Task 13b): each busy-eject shot waits (bounded) for a Finder dialog, after the dismissal before the step
+ask_awaits() { awk '/killall UserNotificationCenter$/ { a = 0 } /AXDialog/ && !/click button/ { a = 1 } /screencapture -x .*busy-eject.png$/ { if (!a) bad = 1; a = 0 } END { exit bad }' "$S/calls"; }
+expect census_busy_eject_awaits ask_awaits
+expect census_busy_eject_awaits_said grep -q '^busy-eject ext4: seen after [0-9]* s$' "$P/shots.txt"
 expect census_busy_detached test -z "$(attached)"
 # census_finder_ask dismisses the console's alerts before osascript starts, never between it and its shot (osascript
 #   runs in the background, so its line and the shot's come in either order: a dismissal finds both or neither)
@@ -839,8 +879,19 @@ drop_stuck calm; drop_stuck busy-hfs
 rm -f "$W/img/calm.img"
 
 # census_spotlight: read-write, then read-only (HFS+ attach -readonly against ext4 with ReadOnly on)
-: > "$S/calls"
+: > "$S/calls"; : > "$S/mdutil-400"
 r=$(census_spotlight ext4 2>&1)
+rm -f "$S/mdutil-400"
+# item 5 (Task 13b): mdutil -i on failing -400 on the HFS+ control (push C) is followed, there alone, by mdutil -E and -i on
+#   once more, all in index-on's record; and each pass keeps Spotlight's own state (the boot volume's, mds's job, its
+#   stores and the volumes' mount flags) in spotlight.ext4.PASS.diagnosis.txt
+for p in rw ro; do
+  expect "census_spotlight_${p}_index_on_400" grep -q '(-400)' "$P/spotlight.ext4.$p.index-on.hfs.txt"
+  expect "census_spotlight_${p}_index_on_erase" grep -q '^== sudo -n mdutil -E <MP>$' "$P/spotlight.ext4.$p.index-on.hfs.txt"
+  expect "census_spotlight_${p}_index_on_again" grep -q '^== sudo -n mdutil -i on <MP>, again$' "$P/spotlight.ext4.$p.index-on.hfs.txt"
+  expect "census_spotlight_${p}_diagnosis" grep -q '^== mdutil -s /$' "$P/spotlight.ext4.$p.diagnosis.txt"
+done
+expect census_spotlight_erase_hfs_only not grep -q '^sudo -n mdutil -E .*/vols/spotlight-ext4-' "$S/calls"
 for p in rw ro; do
   for s in mdutil mdfind dirs refusals privacy-off privacy-remount; do
     expect "census_spotlight_${p}_$s" test -s "$P/spotlight.ext4.$p.$s.hfs.txt" -a -s "$P/spotlight.ext4.$p.$s.ext4.txt"
@@ -880,6 +931,8 @@ expect census_spotlight_sysctl test -s "$P/spotlight-ext4.sysctl.txt"
 expect census_spotlight_recorded has "$r" "^# recorded spotlight.ext4.ro.mdfind"
 expect census_spotlight_quiet hasnt "$r" "not ok"
 expect census_spotlight_detached test -z "$(attached)"
+: > "$S/calls"; r=$(census_index_on "$T/a" 2>&1)
+expect census_index_on_plain not grep -q 'mdutil -E' "$S/calls"
 
 # census_finder: the screenshot pairs, Finder's properties against df -k, diskutil info's fields, a custom volume icon
 : > "$S/calls"
@@ -910,6 +963,9 @@ expect census_finder_restart_before_info restart_before_info
 expect census_finder_getinfo_format test "$(grep -c 'screencapture -x .*/ext4-getinfo-format.png$' "$S/calls")" -eq 1 -a "$(grep -c 'getinfo-format' "$S/calls")" -eq 1
 expect census_finder_quiet hasnt "$r" "not ok"
 expect census_finder_detached test -z "$(attached)"
+# item 3 (Task 13b): each view's shot waits (bounded) for its Finder window, and says so
+expect census_finder_awaits_window grep -q '^sidebar hfs: seen after [0-9]* s$' "$P/shots.txt"
+expect census_finder_awaits_info grep -q '^getinfo-format ext4: seen after [0-9]* s$' "$P/shots.txt"
 : > "$S/calls"
 census_finder btrfs > /dev/null 2>&1
 expect census_finder_hfs_shots_once test "$(grep -c 'screencapture -x .*/hfs-sidebar.png$' "$S/calls")" -eq 0 -a "$(grep -c 'screencapture -x .*/btrfs-sidebar.png$' "$S/calls")" -eq 1
@@ -975,6 +1031,78 @@ expect census_later_shots test "$(grep -Ec 'screencapture -x .*/(hfs|exfat|ext4)
 expect census_later_quiet hasnt "$r" "not ok"
 expect census_later_detached test -z "$(attached)"
 
+# item 3 (Task 13b): census_await says how long it waited, or that it gave up (the shot is taken anyway)
+rm -f "$P/shots.txt"
+r=$(bounded 100 census_await stepq hfs 'tell application "Finder" to return (POSIX path of (target of front Finder window as alias)) is "/x/"' 2>&1); rc=$?
+expect census_await_seen test "$rc" -eq 0 -a "$(cat "$P/shots.txt")" = "stepq hfs: seen after 0 s"
+: > "$S/no-window"
+r=$(bounded 100 census_await stepr fsq 'tell application "Finder" to return (POSIX path of (target of front Finder window as alias)) is "/x/"' 2>&1); rc=$?
+rm -f "$S/no-window"
+expect census_await_not_seen test "$rc" -ne 0
+expect census_await_not_seen_said grep -q '^stepr fsq: not seen within 0 s (photographed anyway): false$' "$P/shots.txt"
+# a pair of byte-identical shots is no pair: the filesystem's is removed and that said; the one-screen shots (the Desktop,
+#   the Privacy pane, which show every volume) are not pairs, and stay
+parity_pair disk2s1 "$T/a" CTL fsq disk3s1 "$T/b" FSQ
+rm -f "${OUT:?}"/*-pairq.png "${OUT:?}"/*-pairr.png "${OUT:?}"/*-desktop-on.png; : > "$S/same-shots"
+census_shot pairq hfs nodismiss; census_shot pairq fs nodismiss
+expect census_shot_identical_refused test -f "$OUT/hfs-pairq.png" -a ! -e "$OUT/fsq-pairq.png"
+expect census_shot_identical_said grep -q '^pairq fsq: byte-identical to hfs-pairq.png: no verdict: identical shots$' "$P/shots.txt"
+census_shot desktop-on hfs nodismiss; census_shot desktop-on fs nodismiss
+expect census_shot_one_screen_kept test -f "$OUT/fsq-desktop-on.png"
+rm -f "$S/same-shots"
+census_shot pairr hfs nodismiss; census_shot pairr fs nodismiss
+expect census_shot_distinct_kept test -f "$OUT/hfs-pairr.png" -a -f "$OUT/fsq-pairr.png"
+rm -f "${OUT:?}"/*-pairq.png "${OUT:?}"/*-pairr.png "${OUT:?}"/*-desktop-on.png
+
+# item 2 (Task 13b): Finder's own dialogs dismissed between census steps: Cancel, else OK, never the default button (Force
+#   Eject, on a busy eject's); what each said in dialogs.txt; when System Events cannot (no assistive access), or a
+#   dialog has neither button, Finder is restarted, which closes its dialogs
+rm -f "$P/dialogs.txt"; : > "$S/calls"
+census_finder_dialogs step-x > /dev/null 2>&1
+expect census_dialogs_said grep -q '^step-x: OK: The disk “stub” was ejected\.$' "$P/dialogs.txt"
+expect census_dialogs_no_restart not grep -q 'killall Finder' "$S/calls"
+expect census_dialogs_never_default test -z "$(grep -n 'AXDefaultButton\|key code 36' "$here/lib/parity.sh" | grep -v '^[0-9]*: *#')"
+: > "$S/no-ui"; : > "$S/calls"
+census_finder_dialogs step-y > /dev/null 2>&1
+rm -f "$S/no-ui"
+expect census_dialogs_no_ui grep -q '^step-y: System Events could not (.*assistive access.*): Finder restarted$' "$P/dialogs.txt"
+expect census_dialogs_no_ui_restart grep -q '^guest-macosx-aqua killall Finder$' "$S/calls"
+: > "$S/dialog-force"; : > "$S/calls"
+census_finder_dialogs step-z > /dev/null 2>&1
+rm -f "$S/dialog-force"
+expect census_dialogs_force_left grep -q '^step-z: left up (Force Eject…): .*: Finder restarted$' "$P/dialogs.txt"
+expect census_dialogs_force_restart grep -q '^guest-macosx-aqua killall Finder$' "$S/calls"
+: > "$S/calls"; r=$(census_on ext4 true 2>&1)
+expect census_on_dismisses grep -q 'click button "Cancel"' "$S/calls"
+expect census_on_dialogs_said grep -q '^after true ext4: OK: ' "$P/dialogs.txt"
+
+# item 4 (Task 13b): after each census step, every disk it attached and left is freed: a linuxfs volume still mounted
+#   (its disk untied by DiskArbitration) is unmounted by its mount point, its lklfuse waited for, then the disk ejected,
+#   never by force; Apple's are ejected; each said in census-sweep.txt, a disk that stays attached too. A disk attached
+#   before the step is not the step's
+for c in calm hfs stuck pre; do echo "sweep $c" > "$W/census/sweep-$c.img"; done
+census_attach "$W/census/sweep-pre.img" > /dev/null 2>&1; pre=disk$(cat "$S/disks")
+leave() { for c in calm hfs stuck; do census_attach "$W/census/sweep-$c.img" > /dev/null 2>&1; done; return 0; }
+: > "$S/da-forgets"; rm -f "$P/census-sweep.txt"; : > "$S/calls"
+r=$(census_on ext4 leave 2>&1)
+rm -f "$S/da-forgets"
+calm_d=$(sed -n 's,^after leave ext4: /dev/\(disk[0-9]*\) .*/sweep-calm.img: .*,\1,p' "$P/census-sweep.txt")
+expect census_sweep_linuxfs grep -q "^after leave ext4: /dev/$calm_d .*/sweep-calm.img: linuxfs at .*/vols/sweep-calm: unmounted by its mount point, then ejected$" "$P/census-sweep.txt"
+expect census_sweep_unmount_first ascending "$(grep -n '^diskutil unmount .*/vols/sweep-calm$' "$S/calls" | tail -n 1 | cut -d: -f1)" "$(grep -n "^diskutil eject /dev/$calm_d\$" "$S/calls" | tail -n 1 | cut -d: -f1)"
+expect census_sweep_apple grep -q '^after leave ext4: /dev/disk[0-9]* .*/sweep-hfs.img: ejected$' "$P/census-sweep.txt"
+expect census_sweep_stuck grep -q '^after leave ext4: /dev/disk[0-9]* .*/sweep-stuck.img: linuxfs at .*/vols/sweep-stuck: unmounted by its mount point; left attached$' "$P/census-sweep.txt"
+expect census_sweep_not_pre not grep -q 'sweep-pre' "$P/census-sweep.txt"
+expect census_sweep_left test "$(attached | tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' ')" = "$(printf '%s\n' "$pre" $(stuck_disks sweep-stuck) | sort | tr '\n' ' ')"
+drop_stuck sweep-stuck
+for c in calm hfs stuck; do echo "sweep $c" > "$W/census/sweep-$c.img"; done   # census_on's census_clean took the ejected copies
+# the sweep's time is bounded (PARITY_SWEEP_SECS, checked before each disk): what it had no time for is said, and left
+rm -f "$P/census-sweep.txt"
+r=$(PARITY_SWEEP_SECS=0; census_on ext4 leave 2>&1)
+expect census_sweep_no_time test "$(grep -c '^after leave ext4: /dev/disk[0-9]* .*: not tried: the sweep.s 0 s are up$' "$P/census-sweep.txt")" -eq 3
+drop_stuck sweep-; rm -f "${W:?}"/census/sweep-*.img
+expect census_sweep_after_stall test -n "$(sed -n '/^parity_census_all()/,/^}/p' "$here/lib/parity.sh" | grep 'census_after census_stall')"
+expect census_sweep_after_later test -n "$(sed -n '/^parity_census_all()/,/^}/p' "$here/lib/parity.sh" | grep 'census_after census_later')"
+
 # census_before_login: mdutil -s and .fseventsd only
 mkdir -p "$T/bl/.fseventsd"
 r=$(census_before_login "$T/bl" 2>&1)
@@ -1004,6 +1132,7 @@ want=$(printf '%s\n' "stall 0 50" "unicode ext4 off" "unicode btrfs off" "unicod
   "spotlight ext4 off" "finder ext4 off" "finder btrfs off" "finder xfs off" "finder ntfs on" "finder apfs off" \
   "trash_tags_case ext4 off" "trash_tags_case btrfs off" "trash_tags_case xfs off" "trash_tags_case ntfs on" "trash_tags_case apfs off" "later 0")
 expect census_all_order test "$(cat "$ran")" = "$want"
+expect census_all_names_bar has "$r" "^# recorded census names: "
 expect census_all_missing has "$r" "^# census: no .*/img/f2fs.img, so no census_finder f2fs"
 expect census_all_controls test -f "$W/ctl/hfs.img" -a -f "$W/ctl/hfsx.img" -a -f "$W/ctl/fat32.img" -a -f "$W/ctl/exfat.img"
 expect census_all_takeover_off test ! -f "$S/takeover"
@@ -1013,11 +1142,11 @@ expect census_all_cleans test ! -e "$W/census/old.img" -a -e "$W/census/left-stu
 # a step begins only when, at its worst (the console hung: every AppleScript at its bound), it ends by
 #   PARITY_CENSUS_MIN + 11; a step whose worst is 11 or less keeps the plain cutoff
 expect census_worst_default test "$(census_worst_min zzz)" -eq 11
-expect census_worst_table test "$(for c in census_unicode census_busy census_spotlight census_finder census_trash_tags_case census_later census_stall stall; do census_worst_min "$c"; done | tr '\n' ' ')" = '13 23 24 24 13 5 60 60 '
+expect census_worst_table test "$(for c in census_unicode census_busy census_spotlight census_finder census_trash_tags_case census_later census_stall stall; do census_worst_min "$c"; done | tr '\n' ' ')" = '17 30 31 30 21 9 63 63 '
 r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=20; census_due census_finder ext4 2>&1); rc=$?
 expect census_due_worst_skips test "$rc" -ne 0
-expect census_due_worst_said has "$r" "^# census: census_finder may take 24 min, past the census's end (31 min), skipped: census_finder ext4$"
-r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=24; census_due census_finder ext4 2>&1)
+expect census_due_worst_said has "$r" "^# census: census_finder may take 30 min, past the census's end (31 min), skipped: census_finder ext4$"
+r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=29; census_due census_finder ext4 2>&1)
 expect census_due_worst_fits test -z "$r"
 r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=11; census_due census_later 2>&1)
 expect census_due_plain_cutoff test -z "$r"
@@ -1058,6 +1187,27 @@ expect census_all_step_room_controls test -f "$W/ctl/hfs.img"
 : > "$ran"
 r=$(census_stall() { echo stall >> "$ran"; }; census_later() { echo later >> "$ran"; }; PARITY_CENSUS_MIN=0; parity_census_all 2>&1)
 expect census_all_room_ok grep -q '^# census: df -k .* KiB free, floor 1 KiB' "$P/census-room.txt"
+# item 1 (Task 13b): census_names_bar, from names-mode.txt: with PARITY_NAMES_WANT (the smoke's exact when macFUSE is
+#   5.5.0-mavericks.5 or later, else scanning), not ok when a mount ran the other mode, or none ran the wanted one (it
+#   would prove nothing); a mount whose log had no names line is counted, not failed; with no PARITY_NAMES_WANT, recorded
+nb() { printf '%s\n' "$@" > "$P/names-mode.txt"; census_names_bar 2>&1; }
+r=$(PARITY_NAMES_WANT=exact; nb 'disk3 /Volumes/a: exact (x)' 'disk5 /Volumes/c: none (no names line in L)')
+expect census_names_bar_ok test "$r" = "ok - census names: no linuxfs census mount ran scanning (1 exact, 0 scanning, 1 with no names line, of 2)"
+r=$(PARITY_NAMES_WANT=exact; nb 'disk3 /Volumes/a: exact (x)' 'disk4 /Volumes/b b: scanning (y)')
+expect census_names_bar_scanning_notok has "$r" "^not ok - census names: no linuxfs census mount ran scanning (1 exact, 1 scanning, 0 with no names line, of 2)$"
+expect census_names_bar_scanning_said has "$r" "^census names: 1 ran scanning, though PARITY_NAMES_WANT is exact: disk4 /Volumes/b b$"
+r=$(PARITY_NAMES_WANT=exact; nb 'disk5 /Volumes/c: none (no names line in L)')
+expect census_names_bar_none_notok has "$r" "^not ok - census names: "
+expect census_names_bar_none_said has "$r" "^census names: none ran exact, so this proves nothing$"
+rm -f "$P/names-mode.txt"; r=$(PARITY_NAMES_WANT=exact; census_names_bar 2>&1)
+expect census_names_bar_nofile_notok has "$r" "^not ok - census names: no linuxfs census mount ran scanning (0 exact, 0 scanning, 0 with no names line, of 0)$"
+r=$(PARITY_NAMES_WANT=scanning; nb 'disk4 /Volumes/b: scanning (y)')
+expect census_names_bar_older test "$r" = "ok - census names: no linuxfs census mount ran exact (0 exact, 1 scanning, 0 with no names line, of 1)"
+r=$(unset PARITY_NAMES_WANT; nb 'disk4 /Volumes/b: scanning (y)')
+expect census_names_bar_record test "$r" = "# recorded census names: (0 exact, 1 scanning, 0 with no names line, of 1)"
+r=$(PARITY_NAMES_WANT=exacT; nb 'disk4 /Volumes/b: exact (y)')
+expect census_names_bar_bad_want has "$r" "^not ok - census names$"
+rm -f "$P/names-mode.txt"
 # the deadline counts from the smoke's start, PARITY_T0
 : > "$ran"
 r=$(PARITY_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=9; census_stall() { echo stall >> "$ran"; }; census_later() { echo later >> "$ran"; }; parity_census_all 2>&1)
@@ -1141,6 +1291,24 @@ expect smoke_ignore_entry_named test -n "$(smoke_fn noauto_cycle | grep 'macfuse
 expect smoke_type_cli test "$(grep -c 'mount_type_is "$m" "$(type_of "$fs")"' "$sm")" -eq 2
 expect smoke_type_cli_apfs test "$(grep -c 'mount_type_is "$m" macfuse_apfs' "$sm")" -eq 1
 expect smoke_type_before_login ascending "$bl" "$(first_line 'mount_type_is "$mp" macfuse_ext4')"
+
+# item 1 (Task 13b): the smoke tells the census which names mode its macFUSE means, before the census
+expect smoke_names_want ascending "$(first_line 'PARITY_NAMES_WANT=exact')" "$(first_line '^ *parity_census_all$')"
+expect smoke_names_want_by_macfuse grep -q 'if macfuse_at_least 5 5 0 5; then PARITY_NAMES_WANT=exact; else PARITY_NAMES_WANT=scanning; fi' "$sm"
+# item 5 (Task 13b): the smoke returns system.log from its own start (the census's window in it), not its last 3000 lines;
+#   across newsyslog's turnover (the first line differs), the rest of system.log.0.bz2 first, then the new file
+printf '%s\n' first a b > "$T/sl"
+r=$(eval "$(smoke_fn syslog_since)"; printf '%s\n' c d >> "$T/sl"; syslog_since 3 first "$T/sl")
+expect smoke_syslog_since test "$r" = "$(printf '%s\n' c d)"
+if command -v bzip2 > /dev/null 2>&1; then
+  printf '%s\n' first a b c | bzip2 > "$T/sl.0.bz2"; printf '%s\n' new e > "$T/sl"
+  r=$(eval "$(smoke_fn syslog_since)"; syslog_since 3 first "$T/sl")
+  expect smoke_syslog_rotated test "$r" = "$(printf '%s\n' c new e)"
+else echo "ok - smoke_syslog_rotated # SKIP no bzip2"; fi
+rm -f "$T/sl" "$T/sl.0.bz2"
+expect smoke_syslog_not_tail test -z "$(grep -n 'tail -n 3000' "$sm")"
+expect smoke_syslog_mark ascending "$(first_line '^PARITY_T0=')" "$(first_line '^LOG0=')" "$(first_line '^installed=')"
+expect smoke_syslog_in_finish test -n "$(smoke_fn finish | grep 'syslog_since "$LOG0" "$LOGHEAD"')"
 
 # da_unmount and da_eject (item 4, Step 2): who holds the volume is sudo -n lsof on its mount point (every user's files,
 #   root's too), never lsof +D as the user; an eject's failure also says DiskArbitration's view, mount's line and who has

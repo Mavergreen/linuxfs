@@ -12,7 +12,8 @@
 #       character gets a safe /Volumes name; the encrypted APFS fixture shows the password dialog (screenshot), times out
 #       with no mount, mounts through --password-stdin and the keeper's --offer, then from the login keychain with no dialog;
 #       then the HFS+ parity census (tests/lib/parity.sh parity_census_all; PARITY_STALL_N=50: item 3's loop, 50 attaches per loop and volume), which records, and gates only the items it
-#       checks (item 1, Unicode names: on HFS+ and each linuxfs volume, created, listed and opened by both forms alike);
+#       checks (item 1, Unicode names: on HFS+ and each linuxfs volume, created, listed and opened by both forms alike,
+#       and every linuxfs census mount's lklfuse finding names exactly; item 4's held unmounts and ejects);
 #       last, before login (the user's console session ended), an attached ext4 disk is mounted by root (as macfuse_ext4) with allow_other and
 #       served by lklfuse as _linuxfs (with a macFUSE that cannot serve /dev/fd/N the mount program refuses, and that is what is
 #       checked: nothing mounted, the reason in system.log); with that lklfuse killed, diskutil unmount still works. No lklfuse ever runs as root. exFAT keeps no symlinks, hard links, modes or xattrs, and ntfs3 keeps no
@@ -31,6 +32,8 @@
 set -u
 # spec: tests/lib/parity.sh PARITY_CENSUS_MIN -- the census's deadline counts from the smoke's start
 PARITY_T0=$(date +%s)
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-13b-brief.md item 5 -- system.log is returned from here on (syslog_since)
+LOG0=$(wc -l < /var/log/system.log 2> /dev/null | tr -d ' ') LOGHEAD=$(head -n 1 /var/log/system.log 2> /dev/null)
 case "$(sw_vers -productVersion 2>/dev/null)" in 10.9*) ;; *) echo "not Mac OS X 10.9 -- skipping"; exit 77 ;; esac
 [ $# -eq 3 ] || { echo "usage: smoke-mavericks.sh VERSION IN OUT -- skipping"; exit 77; }
 P=/usr/local/mavergreen/linuxfs
@@ -63,6 +66,14 @@ bounded() {
 crashes() { ls "$HOME"/Library/Logs/DiagnosticReports/lklfuse_* /Library/Logs/DiagnosticReports/*.panic 2>/dev/null | wc -l | tr -d ' '; }
 mountpoint_of() { "$L" status | awk -F"$tab" -v s="$1" '$2 == s { print $3; exit }'; }
 pid_of() { "$L" status | awk -F"$tab" -v s="$1" '$2 == s { print $1; exit }'; }
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-13b-brief.md item 5 -- system.log since the smoke began (push C kept only
+#       its last 3000 lines, the census's last 9 minutes): the lines after LINES of the file whose first line was FIRST;
+#       when newsyslog turned it over since (its first line differs), the rest of LOG.0.bz2 first, then the new file
+syslog_since() {  # LINES FIRST [LOG]
+  sl=${3:-/var/log/system.log}
+  if [ "$(head -n 1 "$sl" 2> /dev/null)" = "$2" ]; then tail -n +"$((${1:-0} + 1))" "$sl"
+  else bzcat "$sl.0.bz2" 2> /dev/null | tail -n +"$((${1:-0} + 1))"; cat "$sl"; fi
+}
 finish() {
   for m in "$W"/mnt/*; do mount | grep -qF " on $m (" && { umount -f "$m" || diskutil unmount force "$m"; } > /dev/null 2>&1; done
   [ -z "$disk" ] || hdiutil detach -force "$disk" > /dev/null 2>&1
@@ -71,7 +82,7 @@ finish() {
   for f in "$W"/img/*.img; do [ -f "$f" ] && gzip -c "$f" > "$OUT/$(basename "$f").gz"; done
   # spec: .github/workflows/on-mavericks.yml -- the run's evidence comes back in OUT (copyback), uploaded even when this fails
   # platform: sudo logs every COMMAND= line to system.log, and OUT is uploaded publicly: nothing that names the keychain unlock or kcpassword goes in
-  grep -v 'unlock-keychain\|kcpassword\|security -i' /var/log/system.log 2> /dev/null | tail -n 3000 > "$OUT/system.log"
+  syslog_since "$LOG0" "$LOGHEAD" 2> /dev/null | grep -v 'unlock-keychain\|kcpassword\|security -i' | tail -n 200000 > "$OUT/system.log"
   # spec: tests/lib/attach-retry.sh attach_retries -- a retried plain attach hides a stall, so the count is always said
   ar=$(attach_retries 2> /dev/null) || ar=0; echo "# attach retries: $ar"; ok "attach retries: $ar (each logged above as '# retrying hdiutil attach', listed in OUT/parity/attach-retries.txt)"
   echo "# OUT: $(ls -l "$OUT" | awk 'NR > 1 { printf "%s (%s) ", $NF, $5 }')"
@@ -537,6 +548,8 @@ if [ -f "$tests_dir/lib/parity.sh" ]; then
   . "$tests_dir/lib/parity.sh"
   # spec: tests/lib/parity.sh census_stall -- push C: item 3's loop, 50 iterations of each loop on each volume
   PARITY_STALL_N=50
+  # spec: tests/lib/parity.sh census_names_bar -- item 1: every linuxfs census mount runs the names mode this macFUSE means
+  if macfuse_at_least 5 5 0 5; then PARITY_NAMES_WANT=exact; else PARITY_NAMES_WANT=scanning; fi
   parity_census_all
   check "no lklfuse runs as root, after the census" no_root_lklfuse
 else notok "no $tests_dir/lib/parity.sh: the census cannot run"; fi

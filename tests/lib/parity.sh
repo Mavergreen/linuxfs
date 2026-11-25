@@ -35,8 +35,8 @@
 #   census_busy FS                        item 4 (checked, but for the steps DiskArbitration's tie decides): (a)
 #                                         write-then-unmount cycles and eject-after-another-volume cycles, each
 #                                         side's busy count against HFS+'s; (b) a held file's unmount and ejects
-#                                         (forced ones on HFS+ alone unless PARITY_BUSY_FORCE=1, and recorded
-#                                         either way); a linuxfs disk that will not eject is recorded
+#                                         (diskutil unmount force on both, checked; Force Eject on HFS+ alone
+#                                         unless PARITY_BUSY_FORCE=1, recorded either way); a linuxfs disk that will not eject is recorded
 #                                         (eject-failed.txt) and left, the steps going on with a fresh copy
 #   census_spotlight FS                   item 5: read-write HFS+ against FS, then attach -readonly HFS+ against FS
 #                                         with ReadOnly on: mdutil -i on (HFS+ alone), mdutil -s, an mdfind find
@@ -54,7 +54,10 @@
 #                                         read-only: the pathconf alone)
 #   census_later                          Later: Time Machine's offer and the exFAT control, against ext4
 #   census_before_login MP                item 5 before login: mdutil -s and .fseventsd only
-#   parity_census_all                     the controls, then all of it (PARITY_STALL_N 50), within PARITY_CENSUS_MIN
+#   parity_census_all                     the controls, then all of it (PARITY_STALL_N 50), within PARITY_CENSUS_MIN;
+#                                         after each step, the disks it left are freed (census_sweep, census-sweep.txt)
+#                                         and Finder's dialogs dismissed (census_finder_dialogs, dialogs.txt); every
+#                                         linuxfs mount's names mode (names-mode.txt) barred by census_names_bar
 #   Each records sysctl vfs.generic.macfuse once, as $OUT/parity/<census>.sysctl.txt. Every console step goes through
 #   $AQUA (guest-macosx-aqua by its path), and every screenshot follows census_dismiss (a dialog's or an offer's, from
 #   before the dialog or the attach). WHAT
@@ -255,6 +258,43 @@ census_attach() {
   fi
   CA_DEV=$(printf '%s\n' "$_ca_m" | sed -n 1p) CA_MP=$(printf '%s\n' "$_ca_m" | sed -n 2p)
   CA_VOL=${CA_MP##*/}
+  census_names_mode "$CA_DEV" "$CA_MP"
+}
+
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-13b-brief.md item 1 -- lklfuse says how it finds names in its own log
+#   (patches/lkl/0012: "lklfuse: names: exact" or "scanning"), which the CLI writes afresh for each mount as
+#   ~/Library/Logs/linuxfs/<basename of the raw device>.log (cli/linuxfs: log=$LOGS/$(basename "$src").log, src=/dev/rdiskN),
+#   the mounting user's: for a DiskArbitration mount the console user's, who runs the smoke
+PARITY_LKLOGS=${PARITY_LKLOGS:-$HOME/Library/Logs/linuxfs}
+# census_names_mode NODE MP: for a linuxfs mount (mount's linuxfs@rNODE on MP), its names line, read at once (the next mount
+#   of NODE writes the log afresh), appended to names-mode.txt as "NODE MP: MODE ...", or "NODE MP: none (...)" when the
+#   log has none; nothing for any other mount (HFS+, FAT32)
+census_names_mode() {
+  _cnm_n=${1#/dev/}
+  bounded 100 mount 2>/dev/null </dev/null | grep -qF "linuxfs@r$_cnm_n on $2 (" || return 0
+  _cnm_l=$(sed -n 's/^lklfuse: names: //p' "$PARITY_LKLOGS/r$_cnm_n.log" 2>/dev/null | tail -n 1)
+  mkdir -p "$OUT/parity"
+  echo "$_cnm_n $2: ${_cnm_l:-none (no names line in $PARITY_LKLOGS/r$_cnm_n.log)}" >>"$OUT/parity/names-mode.txt"
+}
+# census_names_bar: names-mode.txt counted. With PARITY_NAMES_WANT (the smoke's: exact with macFUSE 5.5.0-mavericks.5 or
+#   later, else scanning), ok when no mount ran the other mode and one at least ran the wanted one (none would prove
+#   nothing); a mount whose log had no names line is counted, not failed. Without it, recorded; anything else not ok.
+census_names_bar() {
+  set -- $(awk '{ m = $0; sub(/^[^:]*: /, "", m); sub(/ .*/, "", m); if (m == "exact") e++; else if (m == "scanning") s++; else u++ } END { print e + 0, s + 0, u + 0, NR }' "$OUT/parity/names-mode.txt" 2>/dev/null)
+  test $# -eq 4 || set -- 0 0 0 0
+  _cnb_c="$1 exact, $2 scanning, $3 with no names line, of $4"
+  case ${PARITY_NAMES_WANT:-} in
+  '') echo "# recorded census names: ($_cnb_c)"; return 0 ;;
+  exact) _cnb_o=scanning _cnb_w=$1 _cnb_x=$2 ;;
+  scanning) _cnb_o=exact _cnb_w=$2 _cnb_x=$1 ;;
+  *) notok "census names"; echo "census names: PARITY_NAMES_WANT is '$PARITY_NAMES_WANT', not exact or scanning"; return 1 ;;
+  esac
+  if test "$_cnb_x" -eq 0 && test "$_cnb_w" -gt 0; then ok "census names: no linuxfs census mount ran $_cnb_o ($_cnb_c)"; return 0; fi
+  notok "census names: no linuxfs census mount ran $_cnb_o ($_cnb_c)"
+  if test "$_cnb_x" -gt 0; then
+    echo "census names: $_cnb_x ran $_cnb_o, though PARITY_NAMES_WANT is $PARITY_NAMES_WANT: $(awk -v o="$_cnb_o" '{ m = $0; sub(/^[^:]*: /, "", m); sub(/ .*/, "", m) } m == o { x = $0; sub(/: .*/, "", x); if (k++ < 10) l = l (l == "" ? "" : ", ") x } END { print l }' "$OUT/parity/names-mode.txt")"
+  else echo "census names: none ran $PARITY_NAMES_WANT, so this proves nothing"; fi
+  return 1
 }
 
 # census_holders DISK [MP]: what may hold DISK, as "# " lines: sudo lsof on MP (when given; empty once it is unmounted),
@@ -332,10 +372,98 @@ census_dismiss() {
 # census_shot STEP SIDE [nodismiss]: parity_shot for one side, bounded, after census_dismiss unless nodismiss (the
 #   caller dismissed before what the shot is to show: a Finder dialog, Time Machine's offer). HFS+'s side of a step is
 #   taken once: the control is the same for every filesystem, and a later census would overwrite it.
+#   A filesystem's shot byte-identical to HFS+'s is no pair (push C: names and trash-delete, one screen twice): it is
+#   removed, and "no verdict: identical shots" said in shots.txt. The Desktop and the Privacy pane show every volume on
+#   one screen, shot for each side: those are not pairs.
 census_shot() {
   test "$2" != hfs || test ! -f "$OUT/hfs-$1.png" || return 0
   test "${3:-}" = nodismiss || census_dismiss "$1"
   parity_side "$2"; bounded 300 parity_shot "$1" >/dev/null 2>&1
+  test "$2" != hfs || return 0
+  case $1 in desktop-on | desktop-off | privacy | privacy-ro) return 0 ;; esac
+  if test -f "$OUT/hfs-$1.png" && cmp -s "$OUT/hfs-$1.png" "$OUT/$PARITY_FS-$1.png"; then
+    rm -f "$OUT/$PARITY_FS-$1.png"; mkdir -p "$OUT/parity"
+    echo "$1 $PARITY_FS: byte-identical to hfs-$1.png: no verdict: identical shots" >>"$OUT/parity/shots.txt"
+  fi
+  return 0
+}
+
+# census_await STEP SIDE LINE...: before STEP's shot of SIDE, up to PARITY_AWAIT_SECS (10) s by the clock, once a second,
+#   for the AppleScript LINE... (in the console session, each try bounded at 5 s) to say true; how long it took, or that
+#   it gave up and what the script last said, goes to shots.txt (push C's shots lagged their dialogs). Run it under
+#   bounded: census_awaited does, at PARITY_AWAIT_SECS + 7 s (the last try's 5 and a sleep's 1 over).
+PARITY_AWAIT_SECS=${PARITY_AWAIT_SECS:-10}
+census_await() {
+  _caw_s=$1 _caw_d=$2; shift 2
+  _caw_n=$#
+  while test "$_caw_n" -gt 0; do set -- "$@" -e "$1"; shift; _caw_n=$((_caw_n - 1)); done
+  _caw_t0=$(date +%s)
+  mkdir -p "$OUT/parity"
+  while :; do
+    _caw_r=$(bounded 50 "$AQUA" osascript "$@" 2>&1 </dev/null | tr '\n' ' ' | sed 's/ *$//')
+    _caw_k=$(($(date +%s) - _caw_t0))
+    if test "$_caw_r" = true; then echo "$_caw_s $_caw_d: seen after $_caw_k s" >>"$OUT/parity/shots.txt"; return 0; fi
+    test "$_caw_k" -lt "$PARITY_AWAIT_SECS" || break
+    sleep 1
+  done
+  echo "$_caw_s $_caw_d: not seen within $PARITY_AWAIT_SECS s (photographed anyway): $_caw_r" >>"$OUT/parity/shots.txt"; return 1
+}
+census_awaited() { bounded $(((PARITY_AWAIT_SECS + 7) * 10)) census_await "$@" >/dev/null 2>&1; }
+# what census_await waits for: Finder's front window on a folder (census_await_window PATH), a Get Info window, a dialog
+#   of Finder's (System Events: it needs assistive access, and without it census_await gives up), the Spotlight pane
+census_await_window() { echo "tell application \"Finder\" to return (POSIX path of (target of front Finder window as alias)) is \"$1/\""; }
+census_await_info='tell application "Finder" to return (class of front window) is information window'
+census_await_dialog='tell application "System Events" to return exists (first window of process "Finder" whose subrole is "AXDialog" or subrole is "AXSystemDialog")'
+census_await_pane='tell application "System Preferences" to return (id of current pane) is "com.apple.preference.spotlight"'
+
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-13b-brief.md item 2 -- push C's "scratch 1 was ejected" dialog, Finder's,
+#   stayed up for 21 min under every shot: census_dismiss's killall reaches UserNotificationCenter's alerts only.
+#   census_finder_dialogs STEP: up to five of Finder's dialogs (System Events, subrole AXDialog) dismissed by their Cancel
+#   button, else their OK; never by the default button or Return, which on a busy eject's dialog is Force Eject (a forced
+#   eject of a busy macFUSE volume runs on QEMU first). What each said goes to dialogs.txt. When System Events cannot
+#   (no assistive access, or the script failed or hung) or a dialog has neither button, Finder is restarted, which
+#   closes its dialogs (and cancels nothing a census step still needs). Bounded: 30 s, and the restart's 36.
+census_dialogs_osa='set o to ""
+tell application "System Events"
+	if not (exists process "Finder") then return "none (no Finder)"
+	repeat 5 times
+		set ds to (every window of process "Finder" whose subrole is "AXDialog" or subrole is "AXSystemDialog")
+		if ds is {} then exit repeat
+		set w to item 1 of ds
+		set t to ""
+		try
+			set AppleScript'"'"'s text item delimiters to " "
+			set t to (value of every static text of w) as text
+		end try
+		set bs to name of every button of w
+		if bs contains "Cancel" then
+			click button "Cancel" of w
+			set o to o & "Cancel: " & t & linefeed
+		else if bs contains "OK" then
+			click button "OK" of w
+			set o to o & "OK: " & t & linefeed
+		else
+			set AppleScript'"'"'s text item delimiters to ", "
+			return o & "left up (" & (bs as text) & "): " & t
+		end if
+		delay 0.5
+	end repeat
+end tell
+if o is "" then return "none"
+return o'
+census_finder_dialogs() {
+  mkdir -p "$OUT/parity"
+  _cfd_o=$(bounded 300 "$AQUA" osascript -e "$census_dialogs_osa" 2>&1 </dev/null); _cfd_rc=$?
+  _cfd_t=$(printf '%s\n' "$_cfd_o" | sed '/^ *$/d' | awk '{ s = s (NR > 1 ? "; " : "") $0 } END { print s }')
+  if test "$_cfd_rc" -ne 0; then
+    echo "$1: System Events could not ($_cfd_t): Finder restarted" >>"$OUT/parity/dialogs.txt"; census_finder_restart
+  else
+    case $_cfd_o in
+    *"left up ("*) echo "$1: $_cfd_t: Finder restarted" >>"$OUT/parity/dialogs.txt"; census_finder_restart ;;
+    *) echo "$1: $_cfd_t" >>"$OUT/parity/dialogs.txt" ;;
+    esac
+  fi
+  return 0
 }
 
 # census_hfs_only WHAT CMD...: one step on the HFS+ side alone, recorded as parity would (WHAT.hfs.txt)
@@ -435,9 +563,10 @@ census_unicode_names() {
   parity unicode-pair.names.listdir "$PARITY_PYTHON" -c "$census_py_list" @MP@/pair
   parity unicode-pair.names.open-both "$PARITY_PYTHON" -c "$census_py_open" @MP@ 706169722f636166c3a9 706169722f63616665cc81
   for _cn_s in hfs fs; do
-    if test "$_cn_s" = hfs; then _cn_m=$2; else _cn_m=$CA_MP; fi
+    if test "$_cn_s" = hfs; then _cn_m=$2 _cn_n=hfs; else _cn_m=$CA_MP _cn_n=ext4; fi
     bounded 300 "$AQUA" osascript -e "tell application \"Finder\" to open (POSIX file \"$_cn_m/pair\" as alias)" >/dev/null 2>&1 </dev/null
-    census_pause 3
+    census_awaited names "$_cn_n" "$(census_await_window "$_cn_m/pair")"
+    census_pause 1
     census_shot names "$_cn_s"
     bounded 300 "$AQUA" osascript -e 'tell application "Finder" to close every window' >/dev/null 2>&1 </dev/null
   done
@@ -538,7 +667,7 @@ fl_plain() {
   fi
   # shellcheck disable=SC2046  # the nodes are words
   if pa_m=$(bounded 900 census_wait_mounted $(awk '/^\/dev\/disk/ { print $1 }' "$2")); then
-    PA_MP=$(printf '%s\n' "$pa_m" | sed -n 2p)
+    PA_MP=$(printf '%s\n' "$pa_m" | sed -n 2p); census_names_mode "$(printf '%s\n' "$pa_m" | sed -n 1p)" "$PA_MP"
     PA_VERDICT="automounted in $(($(date +%s) - pa_t0)) s"; return 0
   fi
   PA_VERDICT="stalled after $(($(date +%s) - pa_t0)) s: attached as $PA_DISK, never mounted"; return 1
@@ -578,7 +707,7 @@ fl_iter() {
     fi
     da_mark "$it_tag: diskutil mount"
     bounded 6000 diskutil mount "$it_dev" >/dev/null 2>&1 </dev/null; it_s3=$?
-    if it_m=$(bounded 1300 census_wait_mounted "$it_dev"); then it_mp=$(printf '%s\n' "$it_m" | sed -n 2p); else it_s3="$it_s3, not mounted"; fi
+    if it_m=$(bounded 1300 census_wait_mounted "$it_dev"); then it_mp=$(printf '%s\n' "$it_m" | sed -n 2p); census_names_mode "$it_dev" "$it_mp"; else it_s3="$it_s3, not mounted"; fi
     test "$it_vol" = hfs || bounded 6000 "$L" unignore "$it_disk" >/dev/null 2>&1 </dev/null
     if grep -q "^UUID=$it_fu " "$PARITY_FSTAB" 2>/dev/null; then
       bounded 300 sudo -n sh -c 'grep -v "^UUID=$2 " "$1" > "$1.parity"; cat "$1.parity" > "$1"; rm -f "$1.parity"' _ "$PARITY_FSTAB" "$it_fu" </dev/null
@@ -684,7 +813,7 @@ census_busy_cycles() {
     fi
     bounded 600 diskutil mount "$bc_dev" >/dev/null 2>&1 </dev/null
     if ! bc_m=$(bounded 900 census_wait_mounted "$bc_dev"); then echo "cycle $bc_k: not mounted again; stopping" >>"$3"; break; fi
-    bc_mp=$(printf '%s\n' "$bc_m" | sed -n 2p)
+    bc_mp=$(printf '%s\n' "$bc_m" | sed -n 2p); census_names_mode "$bc_dev" "$bc_mp"
   done
   census_detach "$bc_disk" "$bc_side" "$bc_mp" >>"$3"
   echo "$bc_name: busy $bc_busy of 20" >>"$3"
@@ -826,16 +955,20 @@ census_busy_release() {
 }
 
 # census_finder_ask STEP MP SCRIPT: SCRIPT by osascript in the console session, in the background; MP's side is
-#   photographed 4 s in (STEP), and osascript is given 20 s more: one still waiting is held by a dialog, and is said
-#   and stopped. Run it under bounded (parity does).
+#   photographed (STEP) once a Finder dialog is up (census_await, up to PARITY_AWAIT_SECS), and osascript is given 20 s
+#   more: one still waiting is held by a dialog, and is said and stopped. What an earlier step or the other side left
+#   up is dismissed first (census_finder_dialogs: push C's HFS+ dialog showed in ext4's shot). Run it under bounded
+#   (parity does), at 160 s: the dismissal 66, census_dismiss 20, the wait 17, the shot 30, osascript's 20, and the rest.
 census_finder_ask() {
   fe_o=$W/census/finder-ask.out
   mkdir -p "$W/census"
+  census_finder_dialogs "$1" >/dev/null 2>&1
   census_dismiss "$1"   # before the dialog, which the shot is to show
   "$AQUA" osascript -e "$3" >"$fe_o" 2>&1 </dev/null &
   fe_p=$!
-  sleep 4
-  if test "$2" = "$PARITY_CTL_MP"; then census_shot "$1" hfs nodismiss; else census_shot "$1" fs nodismiss; fi
+  if test "$2" = "$PARITY_CTL_MP"; then fe_s=hfs fe_n=hfs; else fe_s=fs fe_n=$PARITY_FS; fi
+  census_awaited "$1" "$fe_n" "$census_await_dialog"
+  census_shot "$1" "$fe_s" nodismiss
   fe_k=0; while kill -0 "$fe_p" 2>/dev/null && test "$fe_k" -lt 20; do fe_k=$((fe_k + 1)); sleep 1; done
   if kill -0 "$fe_p" 2>/dev/null; then kill "$fe_p" 2>/dev/null; echo "osascript still waiting 24 s after Finder's $1 (its dialog)"; fi
   wait "$fe_p"; fe_rc=$?
@@ -860,9 +993,18 @@ census_busy_parity() {
 #   checked by census_busy_bar (PARITY_MODE_BUSY); then census_busy_ejects on each (another HFS+ copy coming and
 #   going), barred by PARITY_MODE_BUSY_DA. (b) with a file held open (a shell, then TextEdit): diskutil unmount and
 #   eject, and Finder's eject (parity_shot busy-eject); the shell's eject is checked, the others take PARITY_MODE_BUSY_DA.
-#   diskutil unmount force and Force Eject (unmountDisk force, then eject) run on HFS+ alone unless
-#   PARITY_BUSY_FORCE=1: a forced unmount of a busy macFUSE volume runs on the QEMU kit first; either way they are
-#   recorded, never checked, until a kit result clears them (preflight F14).
+#   diskutil unmount force runs on both and is checked (census_force_unmount: its status, and whether the volume is gone),
+#   cleared by the hfs-force-eject QEMU kit (preflight F14: on a busy ext4 volume it is clean, like HFS+'s: no panic, the
+#   holder's descriptor revoked, lklfuse ended, the eject after it exit 0). Force Eject (unmountDisk force, then eject)
+#   runs on HFS+ alone unless PARITY_BUSY_FORCE=1, and is recorded, never checked.
+# census_force_unmount MP WORDING-FILE: diskutil unmount force MP; its words appended to WORDING-FILE (headed by MP: they
+#   differ by f_mntfromname, item 6, until fsname lands), its status and whether MP is still mounted printed
+census_force_unmount() {
+  _cfu_o=$(bounded 600 diskutil unmount force "$1" 2>&1 </dev/null); _cfu_rc=$?
+  { echo "== $1"; printf '%s\n' "$_cfu_o"; echo "== status $_cfu_rc"; } >>"$2"
+  echo "diskutil unmount force: status $_cfu_rc"
+  if bounded 100 mount 2>/dev/null </dev/null | grep -qF " on $1 ("; then echo "mounted afterwards: yes"; else echo "mounted afterwards: no"; fi
+}
 census_busy() {
   cb_fs=$1 CB_HOLDERS= cb_n=1
   census_sysctl "busy-$cb_fs"
@@ -886,16 +1028,21 @@ census_busy() {
     unmount) census_busy_parity "$cb_m" "busy.$cb_fs.$cb_how-unmount" diskutil unmount @MP@ ;;
     eject) census_busy_parity "$cb_m" "busy.$cb_fs.$cb_how-eject" diskutil eject @DISK@ ;;
     finder-eject)
-      census_busy_parity "$cb_m" "busy.$cb_fs.finder-eject" census_finder_eject @MP@ @VOL@
+      census_bound 1600 census_busy_parity "$cb_m" "busy.$cb_fs.finder-eject" census_finder_eject @MP@ @VOL@
       bounded 300 "$AQUA" killall Finder >/dev/null 2>&1 </dev/null; census_pause 6 ;;
     esac
     census_busy_release
   done
+  : >"$OUT/parity/busy.$cb_fs.force-unmount-wording.txt"
   for cb_step in force-unmount force-eject; do
     census_busy_up || break
-    if test "${PARITY_BUSY_FORCE:-0}" = 1; then census_busy_hold shell "$PARITY_CTL_MP" "$PARITY_FS_MP"; else census_busy_hold shell "$PARITY_CTL_MP"; fi
-    if test "$cb_step" = force-unmount; then set -- diskutil unmount force @MP@; else set -- sh -c 'diskutil unmountDisk force "$1" && diskutil eject "$1"' _ @DISK@; fi
-    if test "${PARITY_BUSY_FORCE:-0}" = 1; then census_busy_parity record "busy.$cb_fs.$cb_step" "$@"; else census_hfs_only "busy.$cb_fs.$cb_step" "$@"; fi
+    if test "$cb_step" = force-unmount || test "${PARITY_BUSY_FORCE:-0}" = 1; then census_busy_hold shell "$PARITY_CTL_MP" "$PARITY_FS_MP"; else census_busy_hold shell "$PARITY_CTL_MP"; fi
+    if test "$cb_step" = force-unmount; then
+      census_busy_parity check "busy.$cb_fs.force-unmount" census_force_unmount @MP@ "$OUT/parity/busy.$cb_fs.force-unmount-wording.txt"
+    else
+      set -- sh -c 'diskutil unmountDisk force "$1" && diskutil eject "$1"' _ @DISK@
+      if test "${PARITY_BUSY_FORCE:-0}" = 1; then census_busy_parity record "busy.$cb_fs.$cb_step" "$@"; else census_hfs_only "busy.$cb_fs.$cb_step" "$@"; fi
+    fi
     census_busy_release
   done
   census_detach "$(census_image_disk "$cb_h")" apple
@@ -909,8 +1056,9 @@ PARITY_SPOT_SECS=${PARITY_SPOT_SECS:-120}   # census_mdfind: once a second; the 
 PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/AlertStopIcon.icns}
 # The guest job has 180 min. Before the smoke: the VM's boot and the installs, about 5. The census begins nothing after
 #   PARITY_CENSUS_MIN = 135 min from the smoke's start (PARITY_T0, which the smoke sets first), and begins a step only if
-#   at its worst (census_worst_min: the console hung, spotlight and census_finder 24 min) it ends by 135 + 11 = 146:
-#   census_finder and spotlight begin by 122, busy by 123, unicode and trash/tags/case by 133. Then before login
+#   at its worst (census_worst_min: the console hung; since Task 13b spotlight 31, busy and census_finder 30, the sweep
+#   and dismissal after each counted in) it ends by 135 + 11 = 146: spotlight begins by 115, census_finder and busy by
+#   116, trash/tags/case by 125, unicode by 129, a stall iteration by 83. Then before login
 #   (about 5) and the copyback and uploads (about 5) remain: 5 + 146 + 5 + 5 = 161, leaving 19 to spare. Typical
 #   steps are shorter: spotlight about 11 (its 120 s mdfind waits, remounts, Finder's refresh, the Privacy shots); a
 #   busy census about 7, or about 11 with a stuck disk at each of its six re-attaches; one trash/tags/case census about
@@ -919,9 +1067,9 @@ PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Content
 #   well inside 135. Push C's smoke sets PARITY_STALL_N=50 (push B's set 0): the stall's 30 min come first,
 #   about 90 in all, plus item 2's Finder restart and getinfo-format shot in each census_finder (about 15 s typical, 2.5 of
 #   census_finder's 24 at worst). A stall iteration's worst is 60 min (census_worst_min), and census_stall asks census_due
-#   "stall ..." before each of its 200 iterations, so none begins after minute 86 and every one ends by 146 like every
-#   other step: 5 + 146 + 5 + 5 = 161 of 180, under the 165 allowed. A step's larger worst case (census_busy's 23)
-#   moves only when it may begin, never that end.
+#   "stall ..." before each of its 200 iterations, so none begins after minute 83 (63 since Task 13b, the sweep after
+#   it counted) and every one ends by 146 like every other step: 5 + 146 + 5 + 5 = 161 of 180, under the 165 allowed. A
+#   step's larger worst case (Task 13b's 31) moves only when it may begin, never that end.
 PARITY_CENSUS_MIN=${PARITY_CENSUS_MIN:-135}
 
 # census_pair_up CTL-IMAGE FS-IMAGE FS [readonly]: attaches both (the control -readonly when readonly) and makes them
@@ -998,12 +1146,13 @@ census_md_users() {
   ps -axww -o user=,uid=,pid=,command= 2>/dev/null |
     awk '{ c = $4; sub(/.*\//, "", c) } c == "mds" || c == "mds_stores" || c == "mdworker" || c == "mdflagwriter" || c == "fseventsd"'
 }
-# census_refresh MP: a Finder window on MP/refresh (made empty), a file made there from the shell, 3 s, then Finder's
-#   count of its items and a screenshot (refresh)
+# census_refresh MP: a Finder window on MP/refresh (made empty), awaited (census_await), a file made there from the
+#   shell, 3 s, then Finder's count of its items and a screenshot (refresh)
 census_refresh() {
   rm -rf "$1/refresh"; mkdir "$1/refresh" || return 1
   census_osa "tell application \"Finder\" to open (POSIX file \"$1/refresh\" as alias)"
-  sleep 3
+  if test "$1" = "$PARITY_CTL_MP"; then _crf_n=hfs; else _crf_n=$PARITY_FS; fi
+  census_awaited refresh "$_crf_n" "$(census_await_window "$1/refresh")"
   echo new >"$1/refresh/new.txt" || return 1
   sleep 3
   bounded 300 "$AQUA" osascript -e 'tell application "Finder" to count items of (target of front Finder window)' 2>&1 </dev/null; _crf_rc=$?
@@ -1014,17 +1163,45 @@ census_refresh() {
 # census_privacy_shot STEP: the Spotlight pane's Privacy tab, photographed for both sides (it lists every volume)
 census_privacy_shot() {
   census_osa 'tell application "System Preferences"' 'activate' 'reveal anchor "privacy" of pane id "com.apple.preference.spotlight"' 'end tell'
-  census_pause 3
+  census_awaited "$1" both "$census_await_pane"
+  census_pause 1
   census_shot "$1" hfs; census_shot "$1" fs
   census_osa 'tell application "System Preferences" to quit'
 }
 
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-13b-brief.md item 7 -- push C's sudo mdutil -i on failed -400 ("unknown
+#   indexing state") on the HFS+ control too, and its system.log no longer covered that minute: the cause is not in its
+#   evidence (item-5-findings.md, push C). census_index_on MP: sudo mdutil -i on MP; when it says -400, mdutil -E MP (the
+#   volume's store erased and rebuilt) and -i on once more, each headed: an HFS+ control only, never a linuxfs volume
+census_index_on() {
+  echo "== sudo -n mdutil -i on $1"; _cio=$(bounded 300 sudo -n mdutil -i on "$1" 2>&1 </dev/null); _cio_rc=$?
+  printf '%s\n' "$_cio"; echo "== status $_cio_rc"
+  case $_cio in *'(-400)'*) ;; *) return "$_cio_rc" ;; esac
+  echo "== sudo -n mdutil -E $1"; bounded 300 sudo -n mdutil -E "$1" 2>&1 </dev/null; echo "== status $?"
+  echo "== sudo -n mdutil -i on $1, again"; bounded 300 sudo -n mdutil -i on "$1" 2>&1 </dev/null; echo "== status $?"
+}
+# census_spotlight_diag LINE: Spotlight's own state, for why an external volume cannot be indexed: the boot volume's
+#   indexing, every volume's, mds's launchd job, the root volume's store and never-index marker, its VolumeConfiguration
+#   (the Privacy list), the pair's mount lines (their flags), and system.log's Spotlight lines since LINE
+census_spotlight_diag() {
+  echo "== mdutil -s /"; bounded 300 mdutil -s / 2>&1 </dev/null
+  echo "== mdutil -sa"; bounded 300 mdutil -sa 2>&1 </dev/null
+  echo "== sudo -n launchctl list com.apple.metadata.mds"; bounded 300 sudo -n launchctl list com.apple.metadata.mds 2>&1 </dev/null
+  echo "== sudo -n ls -la /.Spotlight-V100 /.metadata_never_index"; bounded 300 sudo -n ls -la /.Spotlight-V100 /.metadata_never_index 2>&1 </dev/null
+  echo "== sudo -n plutil -p /.Spotlight-V100/VolumeConfiguration.plist"; bounded 300 sudo -n plutil -p /.Spotlight-V100/VolumeConfiguration.plist 2>&1 </dev/null
+  echo "== mount, the pair's lines"; bounded 100 mount 2>&1 </dev/null | grep -F -e " on $PARITY_CTL_MP (" -e " on $PARITY_FS_MP ("
+  echo "== system.log since the attach: mds, mdworker, mdutil, Spotlight"; census_log_since "$1" | grep -E 'mds|mdworker|mdutil|Spotlight' | tail -n 100
+  return 0
+}
+
 # census_spotlight_steps FS PASS NAME LINE: item 5's steps on the current pair, after sudo mdutil -i on for the HFS+
-#   control alone (index-on); NAME is the file mdfind looks for, LINE system.log's length at the attach
+#   control alone (index-on, census_index_on); NAME is the file mdfind looks for, LINE system.log's length at the attach;
+#   Spotlight's own state in spotlight.FS.PASS.diagnosis.txt
 census_spotlight_steps() {
   _ss_t=spotlight.$1.$2
   # the guest leaves external volumes unindexed ("unknown indexing state"), so HFS+'s control is asked to be indexed
-  census_hfs_only "$_ss_t.index-on" sudo -n mdutil -i on @MP@
+  census_hfs_only "$_ss_t.index-on" census_index_on @MP@
+  census_spotlight_diag "$4" >"$OUT/parity/$_ss_t.diagnosis.txt" 2>&1
   parity "$_ss_t.mdutil" mdutil -s @MP@
   census_bound $((PARITY_SPOT_SECS * 10 + 400)) parity "$_ss_t.mdfind" census_mdfind @MP@ "$3" "$OUT/parity/$_ss_t.mdfind-seconds.txt"
   parity "$_ss_t.dirs" census_dirs @MP@ .Spotlight-V100 .fseventsd
@@ -1055,7 +1232,7 @@ census_spotlight() {
     if census_pair_up "$sp_h" "$sp_i" "$sp_fs" $sp_ro; then
       test "$sp_pass" = ro || parity "spotlight.$sp_fs.rw.create" sh -c 'echo spot > "$1/$2"' _ @MP@ "$sp_name"
       census_spotlight_steps "$sp_fs" "$sp_pass" "$sp_name" "${sp_log:-0}"
-      # census_refresh's worst: four 30 s bounds (open, count, shot, close) and 6 s of pauses
+      # census_refresh's worst: four 30 s bounds (open, count, shot, close), the window's wait 17 and a 3 s pause
       test "$sp_pass" = ro || census_bound 1500 parity "spotlight.$sp_fs.rw.refresh" census_refresh @MP@
       parity "spotlight.$sp_fs.$sp_pass.privacy-off" sudo -n mdutil -i off @MP@
       if census_remount_pair "$sp_h" "$sp_i" $sp_ro; then
@@ -1120,14 +1297,15 @@ census_volume_icon() {
   echo "FinderInfo: $(xattr -px com.apple.FinderInfo "$1" 2>&1 | tr -s ' \n' '  ')"
   return "$_vi_rc"
 }
-# census_finder_view SIDE STEP open|info: a Finder window (open) or Get Info window (info) on SIDE's volume, 3 s, the
-#   screenshot STEP, and every window closed
+# census_finder_view SIDE STEP open|info: a Finder window (open) or Get Info window (info) on SIDE's volume, awaited
+#   (census_await) and 1 s more, the screenshot STEP, and every window closed
 census_finder_view() {
-  if test "$1" = hfs; then _fv_m=$PARITY_CTL_MP; else _fv_m=$PARITY_FS_MP; fi
-  if test "$3" = info; then _fv_v="open information window of (disk of (POSIX file \"$_fv_m\" as alias))"
-  else _fv_v="open (POSIX file \"$_fv_m\" as alias)"; fi
+  if test "$1" = hfs; then _fv_m=$PARITY_CTL_MP _fv_n=hfs; else _fv_m=$PARITY_FS_MP _fv_n=$PARITY_FS; fi
+  if test "$3" = info; then _fv_v="open information window of (disk of (POSIX file \"$_fv_m\" as alias))" _fv_a=$census_await_info
+  else _fv_v="open (POSIX file \"$_fv_m\" as alias)" _fv_a=$(census_await_window "$_fv_m"); fi
   census_osa 'tell application "Finder"' 'activate' "$_fv_v" 'end tell'
-  census_pause 3
+  census_awaited "$2" "$_fv_n" "$_fv_a"
+  census_pause 1
   census_shot "$2" "$1"
   census_osa 'tell application "Finder" to close every window'
 }
@@ -1265,14 +1443,14 @@ census_trash_tags_case() {
   if test "$tt_fs" = apfs; then
     echo "# census_trash_tags_case apfs: read-only, so the case step alone"
   else
-    # census_finder_ask's worst: 4 s, a 30 s shot, 20 s, and the rest
-    census_bound 900 parity "trash.$tt_fs.finder-delete" census_trash_delete @MP@
+    # census_finder_ask's worst, 160 s (see it)
+    census_bound 1600 parity "trash.$tt_fs.finder-delete" census_trash_delete @MP@
     if grep -q '^osascript still waiting' "$OUT/parity/trash.$tt_fs.finder-delete.hfs.txt" "$OUT/parity/trash.$tt_fs.finder-delete.$tt_fs.txt"; then
       census_finder_restart   # a dialog was left up
     fi
     parity "trash.$tt_fs.trashes" census_trashes @MP@ "$tt_uid"
     tt_warn=$(bounded 300 "$AQUA" osascript -e 'tell application "Finder" to get warns before emptying of trash' 2>/dev/null </dev/null)
-    bounded 900 census_finder_ask trash-empty "$PARITY_CTL_MP" \
+    bounded 1600 census_finder_ask trash-empty "$PARITY_CTL_MP" \
       'tell application "Finder"
 set warns before emptying of trash to false
 empty trash
@@ -1341,26 +1519,40 @@ census_later() {
 # ---- all of it ----
 # census_worst_min CMD: the minutes census step CMD may take at its worst, with the console hung (every AppleScript, aqua
 #   call and screenshot at its bound; disks attaching and ejecting as usual). Counted from each function's bounds:
-#   census_unicode, ext4's (two Finder steps of 60 s a side on ext4 and on FAT32, the pair window and its shots), 13;
-#   census_busy, 23: the steps before census_busy_ejects (a stuck disk at each re-attach, about 9, TextEdit, Finder's
-#   eject and seven quits), 17; census_busy_ejects' attempts, up to twice PARITY_BUSY_EJECTS (3) on each side, 12 at
-#   about 15 s, 3; each linuxfs busy eject (3 at most) 10 s more and census_lklfuse_gone's 30 s bound, 2; census_holders'
-#   DiskArbitration and mount lines on those, 1: 17 + 3 + 2 + 1 = 23;
-#   census_spotlight (two passes' mdfind at 160 s a side, the refresh at 150 s a side, two Privacy panes), 24;
-#   census_finder (seven Get Info and window views of about 113 s, two Desktop passes, three restarts), 24;
-#   census_trash_tags_case (Finder's delete and empty trash, two restarts, the label, the xattr climb), 13;
-#   census_later (three dismissals and shots), 5;
-#   an item 3 iteration ("stall ..." as census_stall asks, or census_stall), 60: loop 1's bounds are attach -nomount 300 s,
-#   the UUID wait 60, the pause 6, diskutil unmount 600, ignore 600, diskutil mount 600, the mount wait 130, unignore 600,
-#   the fstab edit 30, the counted attach 600 and its mount wait 90 = 3616 s, 60 min, the (usually quick) detaches aside;
-#   loop 2's two attaches are about 25; anything else 11
+#   Before Task 13b: census_unicode 13 (two Finder steps of 60 s a side on ext4 and on FAT32, the pair window and its
+#   shots); census_busy 23: the steps before census_busy_ejects (a stuck disk at each re-attach, about 9, TextEdit,
+#   Finder's eject and seven quits), 17; census_busy_ejects' attempts, up to twice PARITY_BUSY_EJECTS (3) on each side, 12
+#   at about 15 s, 3; each linuxfs busy eject (3 at most) 10 s more and census_lklfuse_gone's 30 s bound, 2;
+#   census_holders' DiskArbitration and mount lines on those, 1: 17 + 3 + 2 + 1 = 23; census_spotlight 24 (two passes'
+#   mdfind at 160 s a side, the refresh at 150 s a side, two Privacy panes); census_finder 24 (seven Get Info and window
+#   views of about 113 s, two Desktop passes, three restarts); census_trash_tags_case 13 (Finder's delete and empty trash,
+#   two restarts, the label, the xattr climb); census_later 5 (three dismissals and shots); an item 3 iteration 60: loop
+#   1's bounds are attach -nomount 300 s, the UUID wait 60, the pause 6, diskutil unmount 600, ignore 600, diskutil mount
+#   600, the mount wait 130, unignore 600, the fstab edit 30, the counted attach 600 and its mount wait 90 = 3616 s, 60
+#   min, the (usually quick) detaches aside; loop 2's two attaches are about 25.
+#   Task 13b adds, in seconds: census_after at each census_on step's end (and census_later's), 203: census_sweep 137
+#   (hdiutil info 2, its 60 s budget, then the disk begun last: its unmount 2, census_lklfuse_gone 30, a failing
+#   census_detach 42 (two ejects of 10, two census_holders of 10, the pause 2), mount 1) and census_finder_dialogs 66
+#   (osascript 30, then Finder restarted, 30 and 6); census_after after the stall, its sweep alone, 137; a census_awaited
+#   window, pane or dialog wait, 17, in place of a pause 2 s longer than the 1 kept (census_finder_view, names, privacy:
+#   15 net) or of census_refresh's 3 (14 net) or census_finder_ask's 4 s (13 net); census_finder_ask's own dismissal, 66;
+#   census_index_on's -E and second -i on, 60 a pass, and census_spotlight_diag, 10 a pass. So:
+#   census_unicode 13 + (2 names waits 30 + 203) / 60 = 16.9, 17;
+#   census_busy 23 + (2 Finder ejects 2 x (66 + 13) = 158 + 203 + about 45 names-mode reads, 5) / 60 = 29.1, 30;
+#   census_spotlight 24 + (2 refresh waits 28 + 2 panes 30 + 2 x 60 + 2 x 10 + 203) / 60 = 30.7, 31;
+#   census_finder 24 + (7 views 105 + 203) / 60 = 29.1, 30;
+#   census_trash_tags_case 13 + (3 census_finder_ask 3 x 79 = 237 + 203) / 60 = 20.3, 21;
+#   census_later 5 + 203 / 60 = 8.4, 9;
+#   a stall iteration 60 + 137 / 60 = 62.3, 63 (counted on each, though only the last is followed by the sweep);
+#   anything else 11
 census_worst_min() {
   case $1 in
-  census_spotlight | census_finder) echo 24 ;;
-  census_busy) echo 23 ;;
-  census_unicode | census_trash_tags_case) echo 13 ;;
-  census_later) echo 5 ;;
-  stall | census_stall) echo 60 ;;
+  census_spotlight) echo 31 ;;
+  census_busy | census_finder) echo 30 ;;
+  census_trash_tags_case) echo 21 ;;
+  census_unicode) echo 17 ;;
+  census_later) echo 9 ;;
+  stall | census_stall) echo 63 ;;
   *) echo 11 ;;
   esac
 }
@@ -1398,7 +1590,9 @@ census_on() {
     _con_old=$(bounded 300 defaults read dev.mavergreen.linuxfs NTFSTakeover 2>/dev/null </dev/null)
     bounded 300 defaults write dev.mavergreen.linuxfs NTFSTakeover -bool true >/dev/null 2>&1 </dev/null
   fi
+  _con_b=$(census_attached)
   "$@"; _con_rc=$?
+  census_after "after $1 $_con_fs" "$_con_b"
   if test "$_con_fs" = ntfs; then   # as it was
     case $_con_old in
     1) set -- write dev.mavergreen.linuxfs NTFSTakeover -bool true ;;
@@ -1424,13 +1618,68 @@ census_clean() {
 }
 # census_left_attached: every census or control image still attached, and census_unicode's two $W/img images (da-ext4,
 #   da-ext4-names) (a linuxfs disk whose eject failed is never detached by force), into $OUT/parity/census-left-attached.txt ("none" when none is) and said
+# census_attached: every census or control image attached, and census_unicode's two $W/img images, "DISK PATH" a line;
+#   1 when hdiutil info fails or does not answer as itself
+census_attached() {
+  _cat_i=$(bounded 600 hdiutil info 2>/dev/null </dev/null) && census_info_ok "$_cat_i" || return 1
+  printf '%s\n' "$_cat_i" | awk -v c="$W/census/" -v k="$W/ctl/" -v e="$W/img/da-ext4.img" -v n="$W/img/da-ext4-names.img" '
+    /^image-path/ { p = $0; sub(/^image-path[ \t]*:[ \t]*/, "", p); cur = (index(p, c) == 1 || index(p, k) == 1 || p == e || p == n); next }
+    cur && /^\/dev\/disk[0-9]+[ \t]/ { print $1 " " p; cur = 0 }'
+}
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-13b-brief.md item 4 -- push C left 12 linuxfs disks attached (their
+#   ejects failed busy once DiskArbitration untied them, item 4).
+# census_sweep STEP BEFORE: every census disk attached now and not in BEFORE (census_attached's lines before STEP) is
+#   freed, each begun only within PARITY_SWEEP_SECS (60) of the sweep's start: a linuxfs volume still mounted (mount's
+#   linuxfs@rdiskN, whatever DiskArbitration says) is unmounted by its mount point, its lklfuse waited for (30 s), then
+#   the disk ejected (census_detach fs: never by force); a disk of Apple's mounted is ejected (census_detach apple); one
+#   with nothing mounted is ejected or detached (census_detach nomount). What became of each goes to census-sweep.txt
+#   ("STEP: DISK PATH: ..."), what stays attached too.
+PARITY_SWEEP_SECS=${PARITY_SWEEP_SECS:-60}
+census_sweep() {
+  mkdir -p "$OUT/parity"
+  _csw_l=$(census_attached) || { echo "$1: hdiutil info failed, so nothing is swept" >>"$OUT/parity/census-sweep.txt"; return 1; }
+  _csw_t0=$(date +%s) _csw_ifs=$IFS
+  IFS='
+'
+  for _csw_x in $_csw_l; do
+    IFS=$_csw_ifs
+    test -n "$_csw_x" || continue
+    printf '%s\n' "$2" | grep -qxF -- "$_csw_x" && continue
+    if test $(($(date +%s) - _csw_t0)) -ge "$PARITY_SWEEP_SECS"; then
+      echo "$1: $_csw_x: not tried: the sweep's $PARITY_SWEEP_SECS s are up"; continue
+    fi
+    echo "$1: $_csw_x: $(census_sweep_disk "${_csw_x%% *}")"
+  done >>"$OUT/parity/census-sweep.txt"
+  IFS=$_csw_ifs
+  return 0
+}
+# census_sweep_disk DISK: census_sweep's work on one disk; says what became of it
+census_sweep_disk() {
+  _csd_n=${1#/dev/}
+  _csd_ml=$(bounded 100 mount 2>/dev/null </dev/null)
+  _csd_mp=$(printf '%s\n' "$_csd_ml" | awk -v d="$_csd_n" 'index($0, "linuxfs@r" d " on ") == 1 || index($0, "linuxfs@r" d "s") == 1 { sub(/^[^ ]* on /, ""); sub(/ \([^(]*$/, ""); print; exit }')
+  if test -n "$_csd_mp"; then
+    _csd_u=$(bounded 600 diskutil unmount "$_csd_mp" 2>&1 </dev/null) ||
+      { echo "linuxfs at $_csd_mp: its unmount failed ($(printf '%s' "$_csd_u" | tr '\n' ' ')); left attached"; return 1; }
+    bounded 300 census_lklfuse_gone "$_csd_mp" >/dev/null 2>&1 ||
+      { echo "linuxfs at $_csd_mp: unmounted by its mount point, but an lklfuse still serves it 30 s on; left attached"; return 1; }
+    if census_detach "$1" fs "$_csd_mp" >/dev/null 2>&1; then echo "linuxfs at $_csd_mp: unmounted by its mount point, then ejected"
+    else echo "linuxfs at $_csd_mp: unmounted by its mount point; left attached"; return 1; fi
+  elif printf '%s\n' "$_csd_ml" | awk -v d="$_csd_n" 'index($0, "/dev/" d " on ") == 1 || index($0, "/dev/" d "s") == 1 { f = 1 } END { exit !f }'; then
+    if census_detach "$1" apple >/dev/null 2>&1; then echo ejected; else echo "left attached"; return 1; fi
+  else
+    if census_detach "$1" nomount >/dev/null 2>&1; then echo "nothing mounted: detached"; else echo "nothing mounted; left attached"; return 1; fi
+  fi
+}
+# census_after STEP BEFORE [nodialogs]: between census steps: census_sweep, then (unless nodialogs) census_finder_dialogs
+census_after() {
+  census_sweep "$1" "$2"
+  test "${3:-}" = nodialogs || census_finder_dialogs "$1"
+}
 census_left_attached() {
   mkdir -p "$OUT/parity" || return 1
-  _cla_i=$(bounded 600 hdiutil info 2>/dev/null </dev/null) && census_info_ok "$_cla_i" ||
+  _cla=$(census_attached) ||
     { echo "unknown: hdiutil info failed" >"$OUT/parity/census-left-attached.txt"; echo "# census: hdiutil info failed, so what is left attached is unknown"; return 1; }
-  _cla=$(printf '%s\n' "$_cla_i" | awk -v c="$W/census/" -v k="$W/ctl/" -v e="$W/img/da-ext4.img" -v n="$W/img/da-ext4-names.img" '
-    /^image-path/ { p = $0; sub(/^image-path[ \t]*:[ \t]*/, "", p); cur = (index(p, c) == 1 || index(p, k) == 1 || p == e || p == n); next }
-    cur && /^\/dev\/disk[0-9]+[ \t]/ { print $1 " " p; cur = 0 }')
   if test -z "$_cla"; then echo none >"$OUT/parity/census-left-attached.txt"; echo "# census: no census disk is left attached"; return 0; fi
   printf '%s\n' "$_cla" >"$OUT/parity/census-left-attached.txt"
   echo "# census: left attached (not detached by force): $(printf '%s\n' "$_cla" | tr '\n' ' ')"
@@ -1452,12 +1701,18 @@ parity_census_all() {
     census_left_attached; return 1
   fi
   for ca_k in hfs hfsx fat32 exfat; do parity_control "$ca_k" >/dev/null || echo "# census: cannot make the $ca_k control"; done
-  census_due census_stall && census_step_room "$W/img/ext4.img" census_stall && { census_stall; census_clean; }
+  : >"$OUT/parity/names-mode.txt"
+  if census_due census_stall && census_step_room "$W/img/ext4.img" census_stall; then
+    ca_b=$(census_attached); census_stall; census_after census_stall "$ca_b" nodialogs; census_clean
+  fi
   for ca_fs in ext4 btrfs xfs f2fs ntfs; do census_on "$ca_fs" census_unicode "$ca_fs"; done
   for ca_fs in ext4 xfs; do census_on "$ca_fs" census_busy "$ca_fs"; done
   census_on ext4 census_spotlight ext4
   for ca_fs in ext4 btrfs xfs f2fs ntfs apfs; do census_on "$ca_fs" census_finder "$ca_fs"; done
   for ca_fs in ext4 btrfs xfs f2fs ntfs apfs; do census_on "$ca_fs" census_trash_tags_case "$ca_fs"; done
-  census_due census_later && census_step_room "$W/img/ext4.img" census_later && { census_later; census_clean; }
+  if census_due census_later && census_step_room "$W/img/ext4.img" census_later; then
+    ca_b=$(census_attached); census_later; census_after census_later "$ca_b"; census_clean
+  fi
+  census_names_bar
   census_left_attached
 }
