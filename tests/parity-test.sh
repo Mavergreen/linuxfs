@@ -551,7 +551,7 @@ expect census_ttc_remount test "$(grep -c '^hdiutil attach -imagekey diskimage-c
 for f in hfs ext4; do expect "census_ttc_oversized_tried_$f" test "$(grep -c '^13107[23] bytes: exit [0-9]*$' "$P/tags.ext4.oversized.$f.txt")" -eq 2; done
 # Linux caps one exec argument at 131072 bytes with its NUL (MAX_ARG_STRLEN), so there the stub never starts; a Mac
 #   (and 10.9, ARG_MAX 262144) passes both
-if "$T/bin/stub" "$(printf '%0131073d' 0)" > /dev/null 2>&1; then
+if /bin/sh -c : "$(printf '%0131073d' 0)" > /dev/null 2>&1; then   # the same per-argument limit, logging nothing
   expect census_ttc_oversized test "$(sort -u "$S/xattr-sizes" | tr '\n' ' ')" = "131072 131073 "
 else echo "ok - census_ttc_oversized # SKIP this host cannot pass a 128 KiB argument (Linux MAX_ARG_STRLEN)"; fi
 expect census_ttc_hfsx grep -q '^hdiutil attach -imagekey diskimage-class=CRawDiskImage .*/trash-hfsx-ext4.img$' "$S/calls"
