@@ -32,7 +32,7 @@ parity_control() {
     mkdir -p "$W/ctl" || return 1
     bounded "${PARITY_BOUND:-600}" mkfile 128m "$_pc_img" </dev/null || { rm -f "$_pc_img"; return 1; }
     _pc_out=$(bounded "${PARITY_BOUND:-600}" hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$_pc_img" 2>&1 </dev/null)
-    _pc_dev=$(printf '%s\n' "$_pc_out" | sed -n '1s,^/dev/\(disk[0-9][0-9]*\).*,\1,p')
+    _pc_dev=$(printf '%s\n' "$_pc_out" | sed -n 's,^/dev/\(disk[0-9][0-9]*\).*,\1,p' | head -1)
     if test -z "$_pc_dev"; then
       echo "parity_control: hdiutil attach of $_pc_img failed: $_pc_out" >&2
       rm -f "$_pc_img"; return 1

@@ -155,6 +155,12 @@ MKFILE_FAIL=1; export MKFILE_FAIL
 parity_control exfat >/dev/null 2>&1; rc=$?
 expect control_mkfile_fails test "$rc" -ne 0 -a ! -e "$W/ctl/exfat.img"
 unset MKFILE_FAIL
+# a warning on stderr ahead of the /dev line does not fail the attach
+hdiutil() { echo "$1: warning: something odd" >&2; test "$1" = attach && echo "/dev/disk9          	GUID_partition_scheme"; return 0; }
+: >"$calls"
+r=$(parity_control fat32 2>/dev/null)
+expect control_warning_first test "$r" = "$W/ctl/fat32.img"
+rm -f "$W/ctl/fat32.img"
 # a failed attach says why on stderr
 hdiutil() { echo "hdiutil: attach failed: resource busy"; return 1; }
 r=$(parity_control fat32 2>&1 >/dev/null); rc=$?
