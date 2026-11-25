@@ -138,7 +138,7 @@ def verdict(ls, path, kept):
     except UnicodeDecodeError:
         return False, "%s is not UTF-8" % show(path)
     if not same:
-        return False, "%s: no entry of that name, in any form" % show(path)
+        return False, "%s: no entry of that name, in any form (a name that was written, but is not on disk)" % show(path)
     if same != [want]:
         return False, "%s is on disk as %s, not as its NFC %s only" % (
             show(path), ", ".join(binascii.hexlify(n).decode() for n in same), binascii.hexlify(want).decode())

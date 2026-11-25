@@ -110,6 +110,23 @@ expect timeout_both_notok has "$r" "^not ok - parity hang.both"
 expect timeout_both_message has "$r" "hang.both timed out"
 unset PARITY_BOUND PARITY_MODE_HANG
 
+# expect_ok: equal failures on both sides are parity (error parity), but not for a step that must work on HFS+
+#   (parity_ok): there the control's failing is not ok, said, whatever the other side did
+reset; pair
+PARITY_MODE_EOK=check; export PARITY_MODE_EOK
+r=$(parity eok.plain sh -c 'echo no; exit 3' 2>&1)
+expect error_parity_ok test "$r" = "ok - parity eok.plain"
+r=$(parity_ok eok.fails sh -c 'echo no; exit 3' 2>&1)
+expect expect_ok_status_notok has "$r" "^not ok - parity eok.fails"
+expect expect_ok_status_said has "$r" "^parity: eok.fails failed on the HFS+ control (status 3), so it proves nothing$"
+r=$(parity_ok eok.errno sh -c 'echo 636166c3a9 errno 2; echo 6e61 ok 6e61' 2>&1)
+expect expect_ok_errno_notok has "$r" "^parity: eok.errno failed on the HFS+ control (1 names failed), so it proves nothing$"
+r=$(parity_ok eok.fine sh -c 'echo 636166c3a9 ok 63' 2>&1)
+expect expect_ok_fine test "$r" = "ok - parity eok.fine"
+r=$(parity eok.after sh -c 'exit 3' 2>&1)
+expect expect_ok_resets test "$r" = "ok - parity eok.after"
+unset PARITY_MODE_EOK
+
 # stdin: a command reading stdin gets end of file, not the caller's input
 reset; pair
 r=$(echo typed | parity stdin.cat cat 2>&1)
@@ -255,6 +272,9 @@ EOF
   expect fat_nfc_nfd_says has "$r" "^not ok - .* is on disk as 63616665cc81, not as its NFC 636166c3a9"
   r=$(python3 -I "$here/lib/check-names.py" fat "$T/gpt-fat.img" --nfc "${uf}2f78" 2>&1); rc=$?
   expect fat_nfc_missing test "$rc" -eq 1 -a -n "$(printf '%s\n' "$r" | grep '^not ok - .*no entry')"
+  # an image check-names cannot read (no GPT) fails with no "is on disk as" line, which the fsck job blames on msdosfs
+  r=$(python3 -I "$here/lib/check-names.py" fat "$T/fat.img" --nfc "${uf}2f636166c3a9" 2>&1); rc=$?
+  expect fat_nfc_unreadable test "$rc" -ne 0 -a -z "$(printf '%s\n' "$r" | grep 'is on disk as')"
   r=$(python3 -I "$here/lib/check-names.py" fat "$T/gpt-fat.img" nowhere 2>&1); rc=$?
   expect fat_names_no_dir test "$rc" -ne 0 -a -n "$r"
   python3 -I "$here/lib/gpt-wrap.py" "$T/fat.img" "$T/gpt-linux.img" 0FC63DAF-8483-4772-8E79-3D69D8477DE4
@@ -307,6 +327,15 @@ cat > "$T/bin/stub" <<'EOF'
 #!/bin/sh
 # census_dry's stub of the Mac's disk tools: a node file per attached disk node (img, vol, mp, uuid, disk), .m when mounted
 me=${0##*/}
+# ps -ax: the host's processes, less any lklfuse (or a "not ok" in some other run's command line), and one fixed
+#   lklfuse line; the rest (ps -p) as it is
+if test "$me" = ps; then
+  case "$*" in
+  *-ax*) /bin/ps "$@" | grep -v 'lklfuse\|not ok'; echo "stubuser 4242 1 Mon Nov 25 10:00:00 2026 /stub/lklfuse -f stub-lklfuse-line" ;;
+  *) exec /bin/ps "$@" ;;
+  esac
+  exit 0
+fi
 printf '%s\n' "$me $*" | tee -a "$STUB/calls.all" >> "$STUB/calls"
 N=$STUB/nodes
 field() { sed -n "s/^$2=//p" "$N/$1" 2> /dev/null; }
@@ -345,6 +374,7 @@ hdiutil)
     case $b in *nouuid*) sed -i.x '/^uuid=/d' "$N/$nd"; rm -f "$N/$nd.x" ;; esac
     # flaky (a linuxfs image): only its first attach mounts; after its first eject, ejects and detaches fail
     case $b in *hfs*) ;; *flaky*) if test -f "$STUB/flaky-attached"; then b=nevermount-$b; else : > "$STUB/flaky-attached"; fi ;; esac
+    case $b in *names*) test ! -f "$STUB/names-nomount" || b=nevermount-$b ;; *hfs*) ;; *nomnt*) b=nevermount-$b ;; esac
     case $b:$nomount in *nevermount*:) echo "/dev/$nd          	Stub" ;; *swept*:1 | *:) : > "$N/$nd.m"; echo "/dev/$nd          	Stub	$mp" ;;
     *) echo "/dev/$nd          	Stub" ;; esac ;;
   detach)
@@ -426,6 +456,7 @@ guest-macosx-aqua)
     case "$*" in
     *ejectable*) echo "true|true|false|1.34217728E+8|1.0E+8|Mac OS Extended format" ;;
     *"count items"*) echo 1 ;;
+    *"with properties"*) test ! -f "$STUB/finder-fails" || { echo "Finder got an error: stub"; exit 1; } ;;
     *"get warns before emptying"*) echo true ;;
     esac ;;
   esac ;;
@@ -433,7 +464,7 @@ esac
 exit 0
 EOF
 chmod +x "$T/bin/stub"
-for c in hdiutil diskutil osascript sudo sysctl mkfile linuxfs mdutil mdfind tmutil defaults xattr df; do ln -sf stub "$T/bin/$c"; done
+for c in hdiutil diskutil osascript sudo sysctl mkfile linuxfs mdutil mdfind tmutil defaults xattr df ps; do ln -sf stub "$T/bin/$c"; done
 rm -f "$T/aqua/guest-macosx-aqua"; ln -sf ../bin/stub "$T/aqua/guest-macosx-aqua"
 expect census_aqua_off_path not command -v guest-macosx-aqua
 L=$T/bin/linuxfs; IN=$T/in
@@ -477,6 +508,30 @@ bounded() { ( PARITY_TEST_BOUNDED=1; shift; "$@" ); }
 sleep() { test -n "${PARITY_TEST_BOUNDED:-}" || { echo "sleep $* outside bounded" >> "$unbounded"; return 1; }; }
 attached() { ls "$S/nodes" | grep -v '\.m$' | tr '\n' ' '; }
 
+# platform: the stub volumes are plain directories, and only a Mac's (HFS+) finds a name by its other form, which the
+#   checked steps need on the HFS+ side; elsewhere the census's Python gets that lookup (both sides alike) from a
+#   sitecustomize: a missing name under $T/vols opens the entry of the same NFD, as HFS+ (and lklfuse) would
+if test "$(uname -s)" != Darwin; then
+  mkdir -p "$T/hfsfold"
+  cat > "$T/hfsfold/sitecustomize.py" <<'EOF2'
+import builtins, os, unicodedata
+_root, _open = os.environ.get("PARITY_TEST_VOLS", "").encode(), builtins.open
+def _fold(p):
+    if not _root or not isinstance(p, bytes) or not os.path.normpath(p).startswith(_root) or os.path.lexists(p):
+        return p
+    d, n = os.path.split(p)
+    try:
+        want = unicodedata.normalize("NFD", n.decode())
+        for e in os.listdir(d):
+            if unicodedata.normalize("NFD", e.decode()) == want:
+                return os.path.join(d, e)
+    except (OSError, UnicodeDecodeError):
+        pass
+    return p
+builtins.open = lambda p, *a, **k: _open(_fold(p), *a, **k)
+EOF2
+  PYTHONPATH=$T/hfsfold PARITY_TEST_VOLS=$T/vols; export PYTHONPATH PARITY_TEST_VOLS
+fi
 # census_unicode: item 1 is checked (PARITY_MODE_UNICODE defaults to check): the shell's and Finder's names on the
 #   pair, created then opened by both forms; ext4's on its da-ext4 image (returned by the smoke), whose names it lists
 #   for the fsck job; the Linux-made names image, attached as da-ext4-names.img, its root's names opened by both forms
@@ -522,13 +577,57 @@ expect census_unicode_btrfs_ok has "$r" "^ok - parity unicode.btrfs.shell-open-b
 expect census_unicode_btrfs_copy grep -q '^hdiutil attach -imagekey diskimage-class=CRawDiskImage .*/census/unicode-btrfs.img$' "$S/calls"
 expect census_unicode_fat32_once not grep -q 'fat32' "$S/calls"
 expect census_unicode_names_ext4_only not grep -q 'names' "$S/calls"
-# no da-ext4 image (the DiskArbitration section made none): said, and no ext4 names are listed for the fsck job
-rm -f "$W/img/da-ext4.img" "$OUT/da-ext4.names"
+# Finder failing on both sides: equal records, but the HFS+ control failed, so not ok; the fsck job is not given the
+#   Finder names (the smoke's not ok says why)
+: > "$S/finder-fails"
 r=$(census_unicode ext4 2>&1)
-expect census_unicode_no_da_said has "$r" "^# census_unicode ext4: no .*/img/da-ext4.img"
+expect census_unicode_finder_fails_notok has "$r" "^not ok - parity unicode.ext4.finder-newfolder$"
+expect census_unicode_finder_fails_said has "$r" "^parity: unicode.ext4.finder-newfolder failed on the HFS+ control (status 1), so it proves nothing$"
+expect census_unicode_finder_fails_list test "$(cat "$OUT/da-ext4.names")" = "$(printf '%s\n' "${uni}2f636166c3a9" "${uni}2f6e6169cc887665" "${uni}2f6e61c3af76652d66696e646572")"
+rm -f "$S/finder-fails"
+# the names image not mounted: not ok, and no da-ext4-names.names (an untouched image must not pass the fsck job)
+: > "$S/names-nomount"
+r=$(census_unicode ext4 2>&1)
+expect census_unicode_names_nomount_notok has "$r" "^not ok - parity unicode.names: not run (da-ext4-names.img not attached and mounted)$"
+expect census_unicode_names_nomount_list test ! -e "$OUT/da-ext4-names.names"
+expect census_unicode_names_nomount_detached test -z "$(attached)"
+rm -f "$S/names-nomount"
+# no ext4-names.img.gz: not ok
+mv "$IN/ext4-names.img.gz" "$T/names.gz"
+r=$(census_unicode ext4 2>&1)
+expect census_unicode_names_none_notok has "$r" "^not ok - parity unicode.names: not run (no .*/ext4-names.img.gz"
+mv "$T/names.gz" "$IN/ext4-names.img.gz"
+# no da-ext4 image (the DiskArbitration section made none): not ok, and no ext4 names are listed for the fsck job
+rm -f "$W/img/da-ext4.img"
+r=$(census_unicode ext4 2>&1)
+expect census_unicode_no_da_said has "$r" "^not ok - parity unicode.ext4: not run (no .*/img/da-ext4.img"
 expect census_unicode_no_da_list test ! -e "$OUT/da-ext4.names"
 expect census_unicode_no_da_detached test -z "$(attached)"
 rm -f "$W/img/da-ext4-names.img"
+# a filesystem whose image is not mounted (its HFS+ control is): not ok, naming why
+echo "nomnt image" > "$W/img/nomnt.img"
+r=$(census_unicode nomnt 2>&1)
+expect census_unicode_nomount_notok has "$r" "^not ok - parity unicode.nomnt: not run (unicode-nomnt.img not attached and mounted)$"
+expect census_unicode_nomount_detached test -z "$(attached)"
+rm -f "$W/img/nomnt.img"
+# census_on's skips (time, room, no image) of census_unicode are not ok; of a recording census, only said
+r=$(CA_T0=$(($(date +%s) - 120)); PARITY_CENSUS_MIN=1; census_on btrfs census_unicode btrfs 2>&1)
+expect census_on_unicode_time_notok has "$r" "^not ok - parity unicode.btrfs: not run (out of time (1 min))$"
+r=$(PARITY_START_FLOOR_KB=999999999999; census_on btrfs census_unicode btrfs 2>&1)
+expect census_on_unicode_room_notok has "$r" "^not ok - parity unicode.btrfs: not run (no room on "
+r=$(census_on nosuchfs census_unicode nosuchfs 2>&1)
+expect census_on_unicode_noimg_notok has "$r" "^not ok - parity unicode.nosuchfs: not run (no nosuchfs.img)$"
+r=$(CA_T0=$(($(date +%s) - 120)); PARITY_CENSUS_MIN=1; census_on btrfs census_finder btrfs 2>&1)
+expect census_on_other_time_quiet hasnt "$r" "not ok"
+# recorded (item 1 not checked), a skip is only said
+r=$(PARITY_MODE_UNICODE=record; CA_T0=$(($(date +%s) - 120)); PARITY_CENSUS_MIN=1; census_on btrfs census_unicode btrfs 2>&1)
+expect census_on_unicode_record_said has "$r" "^# census: census_unicode btrfs not run: out of time (1 min)$"
+expect census_on_unicode_record_quiet hasnt "$r" "not ok"
+# census_left_attached names census_unicode's own $W/img images when one is left attached
+r=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage "$W/img/da-ext4.img" 2>&1)
+census_left_attached > /dev/null 2>&1
+expect census_left_da_ext4 grep -q "^/dev/disk[0-9]* $W/img/da-ext4.img\$" "$P/census-left-attached.txt"
+for f in "$S"/nodes/*; do case $f in *.m) ;; *) test -f "$f" || continue; case $(sed -n 's/^vol=//p' "$f") in da-ext4) rm -f "$f" "$f.m" ;; esac ;; esac; done
 
 # census_stall: not run at 0; at 2, both loops on both volumes, counted, with probe times and Fisher's p
 : > "$S/calls"
@@ -589,8 +688,9 @@ expect census_busy_recorded has "$r" "^# recorded busy.ext4.cycles: hfs 0 of 20,
 expect census_busy_quiet hasnt "$r" "not ok"
 expect census_busy_sysctl test -s "$P/busy-ext4.sysctl.txt"
 expect census_busy_detached test -z "$(attached)"
-# census_finder_ask dismisses the console's alerts before osascript starts, never between it and its shot
-ask_dismissed_first() { awk '/killall UserNotificationCenter$/ { if (a) bad = 1; d = 1; next } /osascript .*eject disk/ { if (!d) bad = 1; a = 1; d = 0 } /screencapture -x .*busy-eject.png$/ { a = 0 } END { exit bad }' "$S/calls"; }
+# census_finder_ask dismisses the console's alerts before osascript starts, never between it and its shot (osascript
+#   runs in the background, so its line and the shot's come in either order: a dismissal finds both or neither)
+ask_dismissed_first() { awk '/killall UserNotificationCenter$/ { if (o != s) bad = 1; o = 0; s = 0; d = 1; next } /osascript .*eject disk/ { if (!d || o) bad = 1; o = 1; d = 0 } /screencapture -x .*busy-eject.png$/ { if (s) bad = 1; s = 1 } END { exit bad || o != s }' "$S/calls"; }
 expect census_busy_finder_dismissed_first ask_dismissed_first
 expect census_busy_eject_failed_record grep -q '^#   COMMAND PID USER (stub lsof lsof .*/vols/busy-ext4)' "$P/eject-failed.txt"
 # a linuxfs disk whose eject fails is recorded (lsof on its device, the lklfuse processes) and left attached, not
@@ -603,6 +703,7 @@ done
 for s in force-unmount force-eject; do expect "census_busy_stuck_$s" test -s "$P/busy.stuck6.$s.hfs.txt"; done
 expect census_busy_stuck_lsof_dev grep -q '^#   COMMAND PID USER (stub lsof lsof /dev/disk[0-9]* /dev/rdisk[0-9]*)$' "$P/eject-failed.txt"
 expect census_busy_stuck_lklfuse grep -q '^# census: lklfuse processes' "$P/eject-failed.txt"
+expect census_busy_stuck_ps_stub grep -q '^#   stubuser 4242 1 .*stub-lklfuse-line$' "$P/eject-failed.txt"
 expect census_busy_stuck_fresh has "$r" "^# census_busy stuck6: .* left attached; the steps go on with a fresh copy"
 expect census_busy_stuck_quiet hasnt "$r" "not ok"
 expect census_busy_stuck_df grep -q '^# census: df -k .*: [0-9]* KiB free, floor 1 KiB and [0-9]* KiB to copy' "$P/eject-failed.txt"

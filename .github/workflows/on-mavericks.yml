@@ -176,9 +176,14 @@ jobs:
           sed 's/^/# ctl-fat32 uni-fat32 name: /' "$t"
           [ "$rc" -eq 0 ] || echo "# check-names.py fat failed on ctl-fat32.img (exit $rc; its output is above)"
           uf=756e692d6661743332
-          python3 -I tests/lib/check-names.py fat "$RUNNER_TEMP/ctl-fat32.img" --nfc "${uf}2f636166c3a9" "${uf}2f6e6169cc887665"; rc=$?
-          if [ "$rc" -ne 0 ]; then
+          python3 -I tests/lib/check-names.py fat "$RUNNER_TEMP/ctl-fat32.img" --nfc "${uf}2f636166c3a9" "${uf}2f6e6169cc887665" > "$t" 2>&1; rc=$?
+          cat "$t"
+          if grep -q '^not ok - .* is on disk as ' "$t"; then
             echo "::error::Apple's msdosfs did not write NFC to the FAT32 control (above), yet patch 0012 gives vfat and exfat NF_STORE_NFC: they should take the form it did write (item-1-findings.md, Task 7 Step 1)"
+          elif grep -q '^not ok - .*no entry' "$t"; then
+            echo "::error::the FAT32 control lacks a name the census wrote (above): the census's FAT32 shell steps did not write it (see the smoke's unicode-ctl records), so the form msdosfs writes is still unknown"
+          elif [ "$rc" -ne 0 ]; then
+            echo "::error::check-names.py could not read the FAT32 control (exit $rc, above): no answer on the form msdosfs writes"
           fi
           exit $rc
       - name: e2fsck -fn, btrfs check, xfs_repair -n, ntfsfix -n, fsck.exfat -n and fsck.f2fs --dry-run, and ext4's names, in the build container
@@ -200,8 +205,9 @@ jobs:
             #       bytes, and da-ext4-names keeps its Linux-made forms (--kept); the census lists them in IMG.names
             for c in da-ext4 da-ext4-names; do
               img=$1/$c.img
-              if [ ! -f "$img" ] || [ ! -f "$1/$c.names" ]; then echo "not ok - $c: the guest returned no $c.img or $c.names (census_unicode ext4 did not run)"; rc=1
+              if [ ! -f "$img" ]; then echo "not ok - $c: the guest returned no $c.img"; rc=1
+              elif [ ! -f "$1/$c.names" ]; then echo "not ok - $c: no $c.names: census_unicode never read $c through linuxfs (the smoke says why: parity unicode.ext4 or unicode.names: not run), so its names went unchecked"; rc=1
               elif python3 -I tests/lib/check-names.py ext4 "$img" $(cat "$1/$c.names"); then echo "ok - $c: its names are as check-names.py ext4 wants"
-              else echo "not ok - $c: check-names.py ext4 (above)"; rc=1; fi
+              else echo "not ok - $c: a name census_unicode wrote, or a Linux-made one it read, is wrong on disk (check-names.py ext4, above; .names lists only the steps that ran)"; rc=1; fi
             done
             exit $rc' _ "$d"

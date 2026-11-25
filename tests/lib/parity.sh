@@ -15,6 +15,10 @@
 #                                         mode is PARITY_MODE_<ITEM> (record|check), ITEM being
 #                                         WHAT up to its first dot, upper-cased, other characters
 #                                         becoming _; default record, anything else is not ok
+#   parity_ok WHAT CMD...                 parity, for a step that must work on HFS+: in check mode, the control's
+#                                         failing (status not 0, or a census_py_* "HEX errno N" line) is not ok,
+#                                         since equal failures on both sides prove nothing (other steps keep error
+#                                         parity: equal failures pass)
 #   parity_norm MP VOL DISK               filter: MP, VOL and diskNsM become <MP>, <VOL>, <DISK>
 #   parity_shot STEP                      screenshot into $OUT/<side>-STEP.png, never compared
 #
@@ -23,7 +27,9 @@
 #                                         on HFS+ against FS (ext4: the smoke's da-ext4.img, the names it wrote
 #                                         listed in $OUT/da-ext4.names), each opened by both forms; for ext4, IN's
 #                                         ext4-names.img too, as $W/img/da-ext4-names.img ($OUT/da-ext4-names.names);
-#                                         once, the FAT32 control (recorded), returned as $OUT/ctl-fat32.img.gz
+#                                         once, the FAT32 control (recorded), returned as $OUT/ctl-fat32.img.gz.
+#                                         A filesystem whose steps did not run (no image, attach, time or room) is
+#                                         not ok; the .names lists are written only once their image was read
 #   census_stall                          item 3: spike round 4's attach loops on HFS+ and ext4, PARITY_STALL_N times
 #                                         each (unset or 0 runs nothing); counts, probe times and Fisher's p
 #   census_busy FS                        item 4: write-then-unmount cycles, and a held file's unmount and ejects
@@ -156,17 +162,26 @@ parity() {
     else
       _pw_hung=0
     fi
-    if _pw_d=$(diff -u "$_pw_dir/$_pw_what.hfs.txt" "$_pw_dir/$_pw_what.$PARITY_FS.txt") && test "$_pw_hung" -eq 0; then
+    _pw_ctl=
+    if test -n "${PARITY_EXPECT_OK:-}"; then
+      _pw_st=$(sed -n 's/^== status //p' "$_pw_dir/$_pw_what.hfs.txt")
+      if test "$_pw_st" != 0; then _pw_ctl="status $_pw_st"
+      elif grep -q '^[0-9a-f]* errno [0-9]*$' "$_pw_dir/$_pw_what.hfs.txt"; then _pw_ctl="$(grep -c '^[0-9a-f]* errno [0-9]*$' "$_pw_dir/$_pw_what.hfs.txt") names failed"; fi
+    fi
+    if _pw_d=$(diff -u "$_pw_dir/$_pw_what.hfs.txt" "$_pw_dir/$_pw_what.$PARITY_FS.txt") && test "$_pw_hung" -eq 0 && test -z "$_pw_ctl"; then
       ok "parity $_pw_what"
     else
       notok "parity $_pw_what"
       test "$_pw_hung" -eq 0 || echo "parity: $_pw_what timed out (status 124)"
+      test -z "$_pw_ctl" || echo "parity: $_pw_what failed on the HFS+ control ($_pw_ctl), so it proves nothing"
       printf '%s\n' "$_pw_d"
     fi
   else
     echo "# recorded $_pw_what"
   fi
 }
+
+parity_ok() { PARITY_EXPECT_OK=1; parity "$@"; _po_rc=$?; PARITY_EXPECT_OK=; return "$_po_rc"; }
 
 parity_shot() {
   if test "$PARITY_SIDE" = hfs; then _psh_side=hfs; else _psh_side=$PARITY_FS; fi
@@ -354,22 +369,36 @@ for h in sys.argv[2:]:
 #   an NFC name and one renamed to another, listed. Each step is ITEM.TAG.* (default unicode, checked).
 census_unicode_steps() {
   _cs_t=$1 _cs_w=${2:-unicode}
-  parity "$_cs_w.$_cs_t.shell-create" "$PARITY_PYTHON" -c "$census_py_create" "@MP@/uni-$_cs_t" 636166c3a9 6e6169cc887665
-  parity "$_cs_w.$_cs_t.shell-listdir" "$PARITY_PYTHON" -c "$census_py_list" "@MP@/uni-$_cs_t"
-  parity "$_cs_w.$_cs_t.shell-open-both" "$PARITY_PYTHON" -c "$census_py_open" "@MP@/uni-$_cs_t" \
+  parity_ok "$_cs_w.$_cs_t.shell-create" "$PARITY_PYTHON" -c "$census_py_create" "@MP@/uni-$_cs_t" 636166c3a9 6e6169cc887665
+  parity_ok "$_cs_w.$_cs_t.shell-listdir" "$PARITY_PYTHON" -c "$census_py_list" "@MP@/uni-$_cs_t"
+  parity_ok "$_cs_w.$_cs_t.shell-open-both" "$PARITY_PYTHON" -c "$census_py_open" "@MP@/uni-$_cs_t" \
     636166c3a9 63616665cc81 6e6169cc887665 6e61c3af7665
-  parity "$_cs_w.$_cs_t.finder-newfolder" "$AQUA" osascript \
+  parity_ok "$_cs_w.$_cs_t.finder-newfolder" "$AQUA" osascript \
     -e "tell application \"Finder\" to make new folder at (POSIX file \"@MP@/uni-$_cs_t\" as alias) with properties {name:\"caf\" & (character id 233) & \"-finder\"}"
-  parity "$_cs_w.$_cs_t.finder-rename" "$AQUA" osascript -e 'tell application "Finder"' \
+  parity_ok "$_cs_w.$_cs_t.finder-rename" "$AQUA" osascript -e 'tell application "Finder"' \
     -e "set f to make new folder at (POSIX file \"@MP@/uni-$_cs_t\" as alias)" \
     -e 'set name of f to "na" & (character id 239) & "ve-finder"' -e 'end tell'
-  parity "$_cs_w.$_cs_t.finder-listdir" "$PARITY_PYTHON" -c "$census_py_list" "@MP@/uni-$_cs_t"
+  parity_ok "$_cs_w.$_cs_t.finder-listdir" "$PARITY_PYTHON" -c "$census_py_list" "@MP@/uni-$_cs_t"
 }
-# census_unicode_paths TAG: the paths census_unicode_steps writes, as hex (check-names.py's PATH), one per line: the two
-#   shell names as given (NFC caf\xc3\xa9, NFD nai\xcc\x88ve) and Finder's two NFC names
+# census_unicode_paths TAG: the paths census_unicode_steps wrote on FS, as hex (check-names.py's PATH), one per line: the
+#   two shell names as given (NFC caf\xc3\xa9, NFD nai\xcc\x88ve), and each Finder NFC name whose step exited 0 on FS (a
+#   Finder step that failed there is the smoke's not ok, not a name for the fsck job to miss)
 census_unicode_paths() {
   _cup=$(printf 'uni-%s' "$1" | od -An -tx1 | tr -d ' \n')2f
-  printf '%s\n' "${_cup}636166c3a9" "${_cup}6e6169cc887665" "${_cup}636166c3a92d66696e646572" "${_cup}6e61c3af76652d66696e646572"
+  printf '%s\n' "${_cup}636166c3a9" "${_cup}6e6169cc887665"
+  for _cup_s in newfolder:636166c3a92d66696e646572 rename:6e61c3af76652d66696e646572; do
+    grep -q '^== status 0$' "$OUT/parity/unicode.$1.finder-${_cup_s%%:*}.$1.txt" 2>/dev/null && echo "${_cup}${_cup_s#*:}"
+  done
+  return 0
+}
+# census_not_run CMD FS WHY: a census call that did not run: for census_unicode in check mode (item 1 gates) not ok, with
+#   why, so a filesystem never compared cannot pass; recorded, it is said; any other census's skip was said already
+census_not_run() {
+  case $1:${PARITY_MODE_UNICODE:-record} in
+  census_unicode:check) notok "parity unicode.$2: not run ($3)" ;;
+  census_unicode:*) echo "# census: census_unicode $2 not run: $3" ;;
+  esac
+  return 0
 }
 
 # census_unicode_names HFS-DISK HFS-MP HFS-VOL: the Linux-made ext4-names.img, attached as $W/img/da-ext4-names.img (the
@@ -378,13 +407,15 @@ census_unicode_paths() {
 #   names), recorded: HFS+ holds one of pair/'s two names. $OUT/da-ext4-names.names gives the fsck job's check-names.py
 #   what must still be on disk: caf\xc3\xa9 as NFC, and the Linux-made forms as they were (--kept).
 census_unicode_names() {
-  if test ! -f "$IN/ext4-names.img.gz"; then echo "# census_unicode: no $IN/ext4-names.img.gz (tests/lib/unicode-images.sh)"; return 0; fi
-  gunzip -c "$IN/ext4-names.img.gz" >"$W/img/da-ext4-names.img" || return 1
-  printf '%s\n' 636166c3a9 '--kept 6e6169cc887665' '--kept 706169722f636166c3a9' '--kept 706169722f63616665cc81' >"$OUT/da-ext4-names.names"
+  rm -f "$OUT/da-ext4-names.names"
+  if test ! -f "$IN/ext4-names.img.gz"; then census_not_run census_unicode names "no $IN/ext4-names.img.gz (tests/lib/unicode-images.sh)"; return 1; fi
+  gunzip -c "$IN/ext4-names.img.gz" >"$W/img/da-ext4-names.img" || { census_not_run census_unicode names "cannot unpack ext4-names.img.gz"; return 1; }
   bounded 600 "$PARITY_PYTHON" -c "$census_py_create" "$2" 636166c3a9 6e6169cc887665 706169722f636166c3a9 706169722f63616665cc81 >/dev/null 2>&1 </dev/null
-  census_attach "$W/img/da-ext4-names.img" || return 1
+  census_attach "$W/img/da-ext4-names.img" || { census_not_run census_unicode names "da-ext4-names.img not attached and mounted"; return 1; }
   parity_pair "$1" "$2" "$3" ext4 "$CA_DISK" "$CA_MP" "$CA_VOL"
-  parity unicode.names.open-both "$PARITY_PYTHON" -c "$census_py_open" @MP@ 636166c3a9 63616665cc81 6e6169cc887665 6e61c3af7665
+  parity_ok unicode.names.open-both "$PARITY_PYTHON" -c "$census_py_open" @MP@ 636166c3a9 63616665cc81 6e6169cc887665 6e61c3af7665
+  # only now, with the image mounted and read through linuxfs, is it worth the fsck job's check
+  printf '%s\n' 636166c3a9 '--kept 6e6169cc887665' '--kept 706169722f636166c3a9' '--kept 706169722f63616665cc81' >"$OUT/da-ext4-names.names"
   parity unicode-pair.names.listdir "$PARITY_PYTHON" -c "$census_py_list" @MP@/pair
   parity unicode-pair.names.open-both "$PARITY_PYTHON" -c "$census_py_open" @MP@ 706169722f636166c3a9 706169722f63616665cc81
   for _cn_s in hfs fs; do
@@ -404,20 +435,21 @@ census_unicode_names() {
 census_unicode() {
   _cu_fs=$1
   census_sysctl "unicode-$_cu_fs"
+  test "$_cu_fs" != ext4 || rm -f "$OUT/da-ext4.names"
   if test "$_cu_fs" = ext4; then
     _cu_i=$W/img/da-ext4.img
-    test -f "$_cu_i" || { echo "# census_unicode ext4: no $_cu_i (the DiskArbitration section makes it), so no ext4 names"; return 1; }
-  else _cu_i=$(census_copy "$W/img/$_cu_fs.img" "unicode-$_cu_fs") || { echo "# census_unicode $_cu_fs: no images"; return 1; }; fi
+    test -f "$_cu_i" || { census_not_run census_unicode ext4 "no $_cu_i (the DiskArbitration section makes it)"; return 1; }
+  else _cu_i=$(census_copy "$W/img/$_cu_fs.img" "unicode-$_cu_fs") || { census_not_run census_unicode "$_cu_fs" "cannot copy $_cu_fs.img"; return 1; }; fi
   _cu_c=$(parity_control hfs) && _cu_h=$(census_copy "$_cu_c" "unicode-hfs-$_cu_fs") ||
-    { echo "# census_unicode $_cu_fs: no images"; return 1; }
-  census_attach "$_cu_h" || return 1
+    { census_not_run census_unicode "$_cu_fs" "no HFS+ control"; return 1; }
+  census_attach "$_cu_h" || { census_not_run census_unicode "$_cu_fs" "the HFS+ control not attached and mounted"; return 1; }
   _cu_hd=$CA_DISK _cu_hm=$CA_MP _cu_hv=$CA_VOL
   if census_attach "$_cu_i"; then
-    test "$_cu_fs" != ext4 || census_unicode_paths ext4 >"$OUT/da-ext4.names"
     parity_pair "$_cu_hd" "$_cu_hm" "$_cu_hv" "$_cu_fs" "$CA_DISK" "$CA_MP" "$CA_VOL"
     census_unicode_steps "$_cu_fs"
+    test "$_cu_fs" != ext4 || census_unicode_paths ext4 >"$OUT/da-ext4.names"
     census_detach "$CA_DISK" fs "$CA_MP"
-  fi
+  else census_not_run census_unicode "$_cu_fs" "${_cu_i##*/} not attached and mounted"; fi
   test "$_cu_fs" != ext4 || census_unicode_names "$_cu_hd" "$_cu_hm" "$_cu_hv"
   if test ! -f "$W/census/ctl-fat32.done"; then
     if _cu_c=$(parity_control fat32) && _cu_f=$(census_copy "$_cu_c" ctl-fat32) && census_attach "$_cu_f"; then
@@ -1215,9 +1247,9 @@ census_step_room() {
   echo "# census: $CR_SAID, skipped: $*" | tee -a "$OUT/parity/census-room.txt"; return 1
 }
 census_on() {
-  census_due "$2" "$1" || return 1
-  test -f "$W/img/$1.img" || { echo "# census: no $W/img/$1.img, so no $2 $1"; return 1; }
-  census_step_room "$W/img/$1.img" "$2" "$1" || return 1
+  census_due "$2" "$1" || { census_not_run "$2" "$1" "out of time ($PARITY_CENSUS_MIN min)"; return 1; }
+  test -f "$W/img/$1.img" || { echo "# census: no $W/img/$1.img, so no $2 $1"; census_not_run "$2" "$1" "no $1.img"; return 1; }
+  census_step_room "$W/img/$1.img" "$2" "$1" || { census_not_run "$2" "$1" "no room on $W"; return 1; }
   _con_fs=$1; shift
   if test "$_con_fs" = ntfs; then
     _con_old=$(bounded 300 defaults read dev.mavergreen.linuxfs NTFSTakeover 2>/dev/null </dev/null)
@@ -1247,14 +1279,14 @@ census_clean() {
     printf '%s\n' "$_ccl_att" | grep -qxF -- "$_ccl_f" || rm -f "$_ccl_f"
   done
 }
-# census_left_attached: every census or control image still attached (a linuxfs disk whose eject failed is never
-#   detached by force), into $OUT/parity/census-left-attached.txt ("none" when none is) and said
+# census_left_attached: every census or control image still attached, and census_unicode's two $W/img images (da-ext4,
+#   da-ext4-names) (a linuxfs disk whose eject failed is never detached by force), into $OUT/parity/census-left-attached.txt ("none" when none is) and said
 census_left_attached() {
   mkdir -p "$OUT/parity" || return 1
   _cla_i=$(bounded 600 hdiutil info 2>/dev/null </dev/null) && census_info_ok "$_cla_i" ||
     { echo "unknown: hdiutil info failed" >"$OUT/parity/census-left-attached.txt"; echo "# census: hdiutil info failed, so what is left attached is unknown"; return 1; }
-  _cla=$(printf '%s\n' "$_cla_i" | awk -v c="$W/census/" -v k="$W/ctl/" '
-    /^image-path/ { p = $0; sub(/^image-path[ \t]*:[ \t]*/, "", p); cur = (index(p, c) == 1 || index(p, k) == 1); next }
+  _cla=$(printf '%s\n' "$_cla_i" | awk -v c="$W/census/" -v k="$W/ctl/" -v e="$W/img/da-ext4.img" -v n="$W/img/da-ext4-names.img" '
+    /^image-path/ { p = $0; sub(/^image-path[ \t]*:[ \t]*/, "", p); cur = (index(p, c) == 1 || index(p, k) == 1 || p == e || p == n); next }
     cur && /^\/dev\/disk[0-9]+[ \t]/ { print $1 " " p; cur = 0 }')
   if test -z "$_cla"; then echo none >"$OUT/parity/census-left-attached.txt"; echo "# census: no census disk is left attached"; return 0; fi
   printf '%s\n' "$_cla" >"$OUT/parity/census-left-attached.txt"
@@ -1272,7 +1304,9 @@ parity_census_all() {
   CA_T0=${PARITY_T0:-$(date +%s)}
   # room for the four 128 MiB controls (each step checks its own copies: census_step_room)
   if ! census_room $((4 * 131072)) "$OUT/parity/census-room.txt" "$PARITY_START_FLOOR_KB"; then
-    echo "# census: $CR_SAID: no census" | tee -a "$OUT/parity/census-room.txt"; census_left_attached; return 1
+    echo "# census: $CR_SAID: no census" | tee -a "$OUT/parity/census-room.txt"
+    for ca_fs in ext4 btrfs xfs f2fs ntfs; do census_not_run census_unicode "$ca_fs" "no room on $W for the census"; done
+    census_left_attached; return 1
   fi
   for ca_k in hfs hfsx fat32 exfat; do parity_control "$ca_k" >/dev/null || echo "# census: cannot make the $ca_k control"; done
   census_due census_stall && census_step_room "$W/img/ext4.img" census_stall && { census_stall; census_clean; }
