@@ -107,8 +107,9 @@ linuxfs prefs NTFSTakeover on
 
 ### Known issues
 
-- **A plain `hdiutil attach` of a disk image can fail with "no mountable file systems".** The image is attached and then
-  ejected again before the Mac mounts it. This is a race inside Mac OS X 10.9's `hdiutil` and its `diskimages-helper`, not
-  something linuxfs does, and `diskutil mount` on the disk works. An earlier test saw it in 5 of 18 attaches; a later one
-  saw it in none of 100 attaches, on an ordinary HFS+ volume or on ext4 alike, so it is not specific to linuxfs. Disks
-  that are not disk images (a USB drive, say) do not go through that helper. If it happens, attach again.
+- **A plain `hdiutil attach` of a disk image has sometimes failed with "no mountable file systems".** The image is
+  attached and then ejected again before the Mac mounts it, and `diskutil mount` on the disk works. It was seen with
+  linuxfs images in an earlier test (5 of 18 plain attaches); a later test of 100 plain attaches of an ext4 image and 100
+  of an HFS+ one did not reproduce it, and an HFS+ stall has never been seen. The log shows `hdiutil`'s
+  `diskimages-helper` claiming and ejecting the disk, which suggests an `hdiutil` problem on 10.9, but the cause is not
+  confirmed. If it happens, attach again.

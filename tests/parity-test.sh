@@ -923,16 +923,16 @@ expect census_all_left_said has "$r" "^# census: left attached .*left-stuck.img"
 expect census_all_cleans test ! -e "$W/census/old.img" -a -e "$W/census/left-stuck.img"
 # a step begins only when, at its worst (the console hung: every AppleScript at its bound), it ends by
 #   PARITY_CENSUS_MIN + 11; a step whose worst is 11 or less keeps the plain cutoff
-expect census_worst_table test "$(for c in census_unicode census_busy census_spotlight census_finder census_trash_tags_case census_later census_stall stall; do census_worst_min "$c"; done | tr '\n' ' ')" = '13 17 24 24 13 5 11 11 '
+expect census_worst_table test "$(for c in census_unicode census_busy census_spotlight census_finder census_trash_tags_case census_later census_stall stall; do census_worst_min "$c"; done | tr '\n' ' ')" = '13 17 24 24 13 5 60 60 '
 r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=20; census_due census_finder ext4 2>&1); rc=$?
 expect census_due_worst_skips test "$rc" -ne 0
 expect census_due_worst_said has "$r" "^# census: census_finder may take 24 min, past the census's end (31 min), skipped: census_finder ext4$"
 r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=24; census_due census_finder ext4 2>&1)
 expect census_due_worst_fits test -z "$r"
-r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=11; census_due census_stall 2>&1)
+r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=11; census_due census_later 2>&1)
 expect census_due_plain_cutoff test -z "$r"
-r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=10; census_due census_stall 2>&1)
-expect census_due_plain_cutoff_said has "$r" "^# census: out of time (10 min), skipped: census_stall$"
+r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=10; census_due census_later 2>&1)
+expect census_due_plain_cutoff_said has "$r" "^# census: out of time (10 min), skipped: census_later$"
 : > "$ran"
 r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=20; census_finder() { echo finder >> "$ran"; }; census_on ext4 census_finder ext4 2>&1)
 expect census_on_worst_skips test ! -s "$ran"
@@ -972,7 +972,7 @@ expect census_all_room_ok grep -q '^# census: df -k .* KiB free, floor 1 KiB' "$
 : > "$ran"
 r=$(PARITY_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=9; census_stall() { echo stall >> "$ran"; }; census_later() { echo later >> "$ran"; }; parity_census_all 2>&1)
 expect census_all_from_smoke_start test ! -s "$ran"
-r=$(PARITY_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=11; census_stall() { echo stall >> "$ran"; }; census_later() { echo later >> "$ran"; }; parity_census_all 2>&1)
+r=$(PARITY_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=60; census_stall() { echo stall >> "$ran"; }; census_later() { echo later >> "$ran"; }; parity_census_all 2>&1)
 expect census_all_within test "$(head -n 1 "$ran")" = stall
 # NTFSTakeover is put back as it was, not deleted
 echo 0 > "$S/takeover"
@@ -1103,6 +1103,17 @@ expect attach_retry_always_fails test "$rc" -ne 0
 expect attach_retry_always_once test "$(printf '%s\n' "$r" | grep -c '^# retrying hdiutil attach')" -eq 1
 expect attach_retry_always_recorded test "$(grep -c "retry-always.img" "$P/attach-retries.txt")" -eq 1
 expect attach_retry_counted test "$(attach_retries)" -eq 2
+# any other failure is not retried: no retry line, no record
+echo ar > "$W/img/other-fail.img"
+mkdir -p "$T/bin2"; printf '#!/bin/sh\necho "hdiutil: attach failed - Resource temporarily unavailable" >&2; exit 1\n' > "$T/bin2/hdiutil"; chmod +x "$T/bin2/hdiutil"
+r=$(PATH=$T/bin2:$PATH; da_attach_retry "$W/img/other-fail.img" 2>&1); rc=$?
+expect attach_retry_other_fails test "$rc" -ne 0
+expect attach_retry_other_quiet hasnt "$r" "retrying"
+expect attach_retry_other_unrecorded test "$(attach_retries)" -eq 2
+rm -f "$W/img/other-fail.img"; rm -rf "$T/bin2"
+# the census counts stalls, so it never retries one; the smoke's finish says the count
+expect attach_retry_not_in_census test "$(grep -c 'da_attach_retry' "$here/lib/parity.sh")" -eq 0
+expect attach_retry_count_said grep -q '^  ar=$(attach_retries' "$here/smoke-mavericks.sh"
 rm -f "$W/img"/retry-*.img "$W/img/plain-ar.img"
 
 test "$fails" -eq 0

@@ -13,8 +13,9 @@ da_attach_retry() {
     _ar_line=$(printf '%s\n' "$out" | grep 'no mountable file systems' | tail -n 1)
     echo "# retrying hdiutil attach: $_ar_line"
     mkdir -p "$OUT/parity" && echo "$(date +%H:%M:%S) $1: no mountable file systems" >> "$OUT/parity/attach-retries.txt"
-    _ar_d=$(image_disk "$1")
-    test -z "$_ar_d" || bounded 600 hdiutil detach -force "$_ar_d" > /dev/null 2>&1
+    _ar_d=$(bounded 300 image_disk "$1")
+    # a plain detach first: a mount that came late is not forced away
+    test -z "$_ar_d" || bounded 600 hdiutil detach "$_ar_d" > /dev/null 2>&1 || bounded 600 hdiutil detach -force "$_ar_d" > /dev/null 2>&1
     sleep 2
     out=$(bounded 3000 hdiutil attach -imagekey diskimage-class=CRawDiskImage "$1" 2>&1); _ar_rc=$?
   fi

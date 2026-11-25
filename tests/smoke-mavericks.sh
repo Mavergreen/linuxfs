@@ -72,6 +72,8 @@ finish() {
   # spec: .github/workflows/on-mavericks.yml -- the run's evidence comes back in OUT (copyback), uploaded even when this fails
   # platform: sudo logs every COMMAND= line to system.log, and OUT is uploaded publicly: nothing that names the keychain unlock or kcpassword goes in
   grep -v 'unlock-keychain\|kcpassword\|security -i' /var/log/system.log 2> /dev/null | tail -n 3000 > "$OUT/system.log"
+  # spec: tests/lib/attach-retry.sh attach_retries -- a retried plain attach hides a stall, so the count is always said
+  ar=$(attach_retries 2> /dev/null) || ar=0; echo "# attach retries: $ar"; ok "attach retries: $ar (each logged above as '# retrying hdiutil attach', listed in OUT/parity/attach-retries.txt)"
   echo "# OUT: $(ls -l "$OUT" | awk 'NR > 1 { printf "%s (%s) ", $NF, $5 }')"
   echo "1..$n"
   exit "$bad"
@@ -272,7 +274,7 @@ persona_is() {  # DEV PERSONALITY FS: on failure, what diskutil info said
   diskutil info "$1" 2>&1; return 1
 }
 # spec: tests/smoke-mavericks.sh header -- the disk hdiutil attached IMAGE as, if it is still attached
-image_disk() { hdiutil info 2> /dev/null | awk -v p="$1" '/^image-path/ { sub(/^image-path[ \t]*:[ \t]*/, ""); cur = ($0 == p) } cur && /^\/dev\/disk[0-9]+[ \t]/ { print $1; exit }'; }
+image_disk() { bounded 300 hdiutil info 2> /dev/null | awk -v p="$1" '/^image-path/ { sub(/^image-path[ \t]*:[ \t]*/, ""); cur = ($0 == p) } cur && /^\/dev\/disk[0-9]+[ \t]/ { print $1; exit }'; }
 # spec: tests/smoke-mavericks.sh header -- a failing section never ends the smoke: whatever it attached is ejected before the next
 cleanup_disk() {
   [ -z "$disk" ] || { bounded 600 diskutil eject "$disk" > /dev/null 2>&1 || bounded 300 hdiutil detach "$disk" > /dev/null 2>&1; }

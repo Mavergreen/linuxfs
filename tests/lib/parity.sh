@@ -819,9 +819,9 @@ PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Content
 #   run, took 50 min (the stall 30 of them); with them, and stuck disks in both busy censuses, about 90 are expected,
 #   well inside 135. Push C's smoke sets PARITY_STALL_N=50 (push B's set 0): the stall's 30 min come first,
 #   about 90 in all, plus item 2's Finder restart and getinfo-format shot in each census_finder (about 15 s typical, 2.5 of
-#   census_finder's 24 at worst). The stall's worst is counted per iteration: census_stall asks census_due "stall ..."
-#   (11 min at worst, the default) before each of its 200 iterations, so none begins after minute 135 and the step ends by
-#   146 like every other: 5 + 146 + 5 + 5 = 161 of 180, under the 165 allowed.
+#   census_finder's 24 at worst). A stall iteration's worst is 60 min (census_worst_min), and census_stall asks census_due
+#   "stall ..." before each of its 200 iterations, so none begins after minute 86 and every one ends by 146 like every
+#   other step: 5 + 146 + 5 + 5 = 161 of 180, under the 165 allowed.
 PARITY_CENSUS_MIN=${PARITY_CENSUS_MIN:-135}
 
 # census_pair_up CTL-IMAGE FS-IMAGE FS [readonly]: attaches both (the control -readonly when readonly) and makes them
@@ -1246,13 +1246,18 @@ census_later() {
 #   census_spotlight (two passes' mdfind at 160 s a side, the refresh at 150 s a side, two Privacy panes), 24;
 #   census_finder (seven Get Info and window views of about 113 s, two Desktop passes, three restarts), 24;
 #   census_trash_tags_case (Finder's delete and empty trash, two restarts, the label, the xattr climb), 13;
-#   census_later (three dismissals and shots), 5; anything else, the stall's iterations among them, 11
+#   census_later (three dismissals and shots), 5;
+#   an item 3 iteration ("stall ..." as census_stall asks, or census_stall), 60: loop 1's bounds are attach -nomount 300 s,
+#   the UUID wait 60, the pause 6, diskutil unmount 600, ignore 600, diskutil mount 600, the mount wait 130, unignore 600,
+#   the fstab edit 30, the counted attach 600 and its mount wait 90 = 3616 s, 60 min, the (usually quick) detaches aside;
+#   loop 2's two attaches are about 25; anything else 11
 census_worst_min() {
   case $1 in
   census_spotlight | census_finder) echo 24 ;;
   census_busy) echo 17 ;;
   census_unicode | census_trash_tags_case) echo 13 ;;
   census_later) echo 5 ;;
+  stall | census_stall) echo 60 ;;
   *) echo 11 ;;
   esac
 }
