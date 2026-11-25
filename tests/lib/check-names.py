@@ -6,9 +6,20 @@
 #          a name with no long-name entry is its 8.3 short name. The partition is the GPT entry of the Microsoft basic
 #          data type, not "partition 1", in case diskutil eraseDisk adds an EFI partition (also FAT) before it. Exits 1
 #          when there is no such partition or DIR.
+#          python3 -I check-names.py fat IMAGE --nfc PATH...
+#          python3 -I check-names.py ext4 IMAGE [--kept PATH]... PATH...
+#          Asserts names on disk, one TAP line ("ok - ..." or "not ok - ...") per PATH; exits 1 when any is not ok.
+#          Each PATH is the hex of its UTF-8 bytes ("/" is 2f), as the smoke wrote it (either form). Its directories are
+#          found by their exact bytes; its last component must be on disk as exactly one entry of that name in any
+#          form (compared by NFC), and that entry's bytes must be the name's NFC. --kept PATH instead asserts that an
+#          entry of exactly PATH's bytes is still there (a Linux-made name in some other form, left as it was). ext4's
+#          names are read with debugfs -R 'ls -p DIR' (Linux's e2fsprogs; the build container has it), FAT32's as
+#          above. NFC is Python's unicodedata, which for these names is the same as lklfuse's (patch 0012).
 import binascii
 import struct
+import subprocess
 import sys
+import unicodedata
 import uuid
 
 BASIC_DATA = uuid.UUID("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7")
@@ -77,25 +88,95 @@ def entries(f, geo, cluster):
     return out
 
 
-def names(f, base, path):
-    geo = geometry(f, base)
-    cluster = geo[3]
-    for part in [p for p in path.split("/") if p]:
-        want = part.encode("utf-8")
-        found = [c for n, a, c in entries(f, geo, cluster) if n == want and a & 0x10]
-        if not found:
-            sys.exit("check-names.py: no directory %s" % path)
-        cluster = found[0]
-    return [n for n, _, _ in entries(f, geo, cluster)]
+def fat_lister(image):
+    def ls(d):
+        with open(image, "rb") as f:
+            base = fat_partition(f)
+            geo = geometry(f, base)
+            cluster = geo[3]
+            for part in [p for p in d.split(b"/") if p]:
+                found = [c for n, a, c in entries(f, geo, cluster) if n == part and a & 0x10]
+                if not found:
+                    return None
+                cluster = found[0]
+            return [n for n, _, _ in entries(f, geo, cluster)]
+    return ls
+
+
+def ext4_lister(image):
+    def ls(d):
+        r = subprocess.run(["debugfs", "-R", b"ls -p /" + d, image], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # one line per entry, raw bytes: /inode/mode/uid/gid/name/size/ (a name holds no "/"); a missing directory
+        # gives none (not even "." and ".."), and says so on stderr
+        rows = [f for f in (line.split(b"/") for line in r.stdout.split(b"\n")) if len(f) == 8 and f[0] == f[7] == b""]
+        if r.returncode != 0 or not rows:
+            return None
+        return [f[5] for f in rows if f[5] not in (b".", b"..")]
+    return ls
+
+
+def nfc(b):
+    return unicodedata.normalize("NFC", b.decode("utf-8")).encode("utf-8")
+
+
+def show(b):
+    return "%s (%s)" % (b.decode("utf-8", "replace"), binascii.hexlify(b).decode())
+
+
+def verdict(ls, path, kept):
+    d, _, leaf = path.rpartition(b"/")
+    there = ls(d)
+    if there is None:
+        return False, "%s: no directory /%s" % (show(path), d.decode("utf-8", "replace"))
+    if kept:
+        if leaf in there:
+            return True, "%s is on disk as it was" % show(path)
+        return False, "%s is not on disk in that form" % show(path)
+    try:
+        want = nfc(leaf)
+        same = [n for n in there if nfc(n) == want]
+    except UnicodeDecodeError:
+        return False, "%s is not UTF-8" % show(path)
+    if not same:
+        return False, "%s: no entry of that name, in any form" % show(path)
+    if same != [want]:
+        return False, "%s is on disk as %s, not as its NFC %s only" % (
+            show(path), ", ".join(binascii.hexlify(n).decode() for n in same), binascii.hexlify(want).decode())
+    return True, "%s is on disk as its NFC %s" % (show(path), binascii.hexlify(want).decode())
+
+
+def check(ls, args):
+    bad, kept = 0, False
+    for a in args:
+        if a == "--kept":
+            kept = True
+            continue
+        ok, what = verdict(ls, binascii.unhexlify(a), kept)
+        kept = False
+        print("%s - %s" % ("ok" if ok else "not ok", what))
+        bad += not ok
+    return 1 if bad else 0
+
+
+USAGE = "usage: check-names.py fat IMAGE [DIR]\n" \
+        "       check-names.py fat IMAGE --nfc PATH...\n" \
+        "       check-names.py ext4 IMAGE [--kept PATH]... PATH...\n"
 
 
 def main(argv):
+    if len(argv) >= 5 and argv[1] == "fat" and argv[3] == "--nfc" and "--kept" not in argv[4:]:
+        return check(fat_lister(argv[2]), argv[4:])
+    if len(argv) >= 4 and argv[1] == "ext4" and argv[-1] != "--kept":
+        return check(ext4_lister(argv[2]), argv[3:])
     if len(argv) not in (3, 4) or argv[1] != "fat":
-        sys.stderr.write("usage: check-names.py fat IMAGE [DIR]\n")
+        sys.stderr.write(USAGE)
         return 2
-    with open(argv[2], "rb") as f:
-        for name in names(f, fat_partition(f), argv[3] if len(argv) == 4 else ""):
-            print(binascii.hexlify(name).decode())
+    d = argv[3] if len(argv) == 4 else ""
+    found = fat_lister(argv[2])(d.encode("utf-8"))
+    if found is None:
+        sys.exit("check-names.py: no directory %s" % d)
+    for name in found:
+        print(binascii.hexlify(name).decode())
     return 0
 
 

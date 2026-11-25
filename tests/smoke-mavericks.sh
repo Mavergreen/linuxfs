@@ -9,7 +9,8 @@
 #       ReadOnly in the user's plist (read by the root mount program) mounts read-only; a label with a slash or a control
 #       character gets a safe /Volumes name; the encrypted APFS fixture shows the password dialog (screenshot), times out
 #       with no mount, mounts through --password-stdin and the keeper's --offer, then from the login keychain with no dialog;
-#       then the HFS+ parity census (tests/lib/parity.sh parity_census_all), which records and never gates;
+#       then the HFS+ parity census (tests/lib/parity.sh parity_census_all), which records, and gates only the items it
+#       checks (item 1, Unicode names: on HFS+ and each linuxfs volume, created, listed and opened by both forms alike);
 #       last, before login (the user's console session ended), an attached ext4 disk is mounted by root with allow_other and
 #       served by lklfuse as _linuxfs (with a macFUSE that cannot serve /dev/fd/N the mount program refuses, and that is what is
 #       checked: nothing mounted, the reason in system.log); with that lklfuse killed, diskutil unmount still works. No lklfuse ever runs as root. exFAT keeps no symlinks, hard links, modes or xattrs, and ntfs3 keeps no
@@ -19,7 +20,9 @@
 #          VERSION is the run's version (the pkg installed). IN holds ext4, btrfs, xfs, ntfs, exfat, f2fs and apfs .img.gz
 #          from tests/lib/probe-images.sh, gpt-<fs>.img.gz (each in its own partition type), gpt-ext4-basic.img.gz and gpt-enc.img.gz (tests/lib/gpt-wrap.py), ext4-slash and
 #          ext4-ctl .img.gz (tests/lib/label-images.sh), and ext4-names.img.gz (tests/lib/unicode-images.sh). OUT receives every image as it is after the run, gzipped (da-*.img.gz
-#          are the disks DiskArbitration mounted; ctl-fat32.img.gz is the census's FAT32 control), the screenshots, and the
+#          are the disks DiskArbitration mounted, da-ext4-names.img.gz the Linux-made names as the census attached them; ctl-fat32.img.gz
+#          is the census's FAT32 control; da-ext4.names and da-ext4-names.names list, for check-names.py, the names to find on
+#          da-ext4 and da-ext4-names), the screenshots, and the
 #          census's records in OUT/parity (tests/lib/parity.sh). Run as the guest's user over ssh, not root and not in
 #          the console session: the steps that need it go through /usr/local/bin/guest-macosx-aqua.
 #          Exits 77 where it cannot run (not 10.9, product not installed, wrong arguments); the job treats 77 as failure.
@@ -472,7 +475,7 @@ check "the keychain keeper is still running" pgrep -f "$P/libexec/linuxfs-agent"
 check "no lklfuse runs as root, after everything" no_root_lklfuse
 
 # spec: tests/lib/parity.sh parity_census_all -- the HFS+ parity census: each behaviour on an HFS+ control and on linuxfs
-#       volumes, recorded into OUT/parity (record-only until an item's task sets its PARITY_MODE_ to check), with its
+#       volumes, recorded into OUT/parity (record-only until an item's task sets its PARITY_MODE_ to check: item 1's is), with its
 #       screenshots in OUT; before the before-login section, which must stay last
 tests_dir=$(cd "$(dirname "$0")" && pwd)
 if [ -f "$tests_dir/lib/parity.sh" ]; then

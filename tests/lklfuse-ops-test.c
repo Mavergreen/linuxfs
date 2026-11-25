@@ -188,8 +188,11 @@ static void unicode_tests(void)
 	is(lklfuse_nfmode_for("f2fs"), NF_STORE_NFC, "f2fs stores NFC");
 	is(lklfuse_nfmode_for("ntfs3"), NF_STORE_NFC, "ntfs3 stores NFC");
 	is(lklfuse_nfmode_for("apfs"), NF_AS_GIVEN, "apfs stores names as given");
-	is(lklfuse_nfmode_for("vfat"), NF_OFF, "vfat: off (Task 7)");
-	is(lklfuse_nfmode_for("exfat"), NF_OFF, "exfat: off (Task 7)");
+	/* vfat_mode_nfc: `linuxfs mount` mounts FAT and exFAT images, which take the form Apple's msdosfs writes (NFC;
+	 * the census's FAT32 control checks it, item-1-findings.md) */
+	is(lklfuse_nfmode_for("vfat"), NF_STORE_NFC, "vfat_mode_nfc: vfat stores NFC, as Apple's msdosfs does");
+	is(lklfuse_nfmode_for("exfat"), NF_STORE_NFC, "vfat_mode_nfc: exfat stores NFC, as Apple's msdosfs does");
+	is(lklfuse_nfmode_for("msdos"), NF_OFF, "a type with no mode: off");
 	is(lklfuse_nf, NF_STORE_NFC, "the ext4 mount stores NFC");
 
 	/* the conversions */

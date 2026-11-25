@@ -239,12 +239,22 @@ with open(sys.argv[1], "r+b") as f:
     f.write(lfn_pair(u"uni-fat32", b"UNI-FA~1   ", 0x10, 3))
     f.seek(data + (3 - 2) * spc * bps)
     f.write(lfn_pair(u"cafe\u0301", b"CAFE~1  TXT", 0x20, 0))
+    f.write(lfn_pair(u"na\u00efve", b"NAVE~1  TXT", 0x20, 0))
 EOF
   python3 -I "$here/lib/gpt-wrap.py" "$T/fat.img" "$T/gpt-fat.img" EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
   r=$(python3 -I "$here/lib/check-names.py" fat "$T/gpt-fat.img" 2>&1)
   expect fat_names_root test "$r" = 756e692d6661743332
   r=$(python3 -I "$here/lib/check-names.py" fat "$T/gpt-fat.img" uni-fat32 2>&1)
-  expect fat_names test "$r" = 63616665cc81
+  expect fat_names test "$r" = "$(printf '%s\n' 63616665cc81 6e61c3af7665)"
+  # fat --nfc: what the smoke wrote (either form) is on the FAT32 control as its NFC, or a clear not ok
+  uf=756e692d6661743332
+  r=$(python3 -I "$here/lib/check-names.py" fat "$T/gpt-fat.img" --nfc "${uf}2f6e6169cc887665" 2>&1); rc=$?
+  expect fat_nfc_ok test "$rc" -eq 0 -a "$(printf '%s\n' "$r" | grep -c '^ok - ')" -eq 1
+  r=$(python3 -I "$here/lib/check-names.py" fat "$T/gpt-fat.img" --nfc "${uf}2f636166c3a9" 2>&1); rc=$?
+  expect fat_nfc_nfd_notok test "$rc" -eq 1
+  expect fat_nfc_nfd_says has "$r" "^not ok - .* is on disk as 63616665cc81, not as its NFC 636166c3a9"
+  r=$(python3 -I "$here/lib/check-names.py" fat "$T/gpt-fat.img" --nfc "${uf}2f78" 2>&1); rc=$?
+  expect fat_nfc_missing test "$rc" -eq 1 -a -n "$(printf '%s\n' "$r" | grep '^not ok - .*no entry')"
   r=$(python3 -I "$here/lib/check-names.py" fat "$T/gpt-fat.img" nowhere 2>&1); rc=$?
   expect fat_names_no_dir test "$rc" -ne 0 -a -n "$r"
   python3 -I "$here/lib/gpt-wrap.py" "$T/fat.img" "$T/gpt-linux.img" 0FC63DAF-8483-4772-8E79-3D69D8477DE4
@@ -254,7 +264,7 @@ EOF
 else echo "ok - fat_names # SKIP needs Linux, mkfs.vfat and python3"; fi
 
 # unicode_image: unicode-images.sh's ext4-names.img holds both byte forms of one name in /pair, each file holding its name
-if test "$(uname -s)" = Linux && command -v mkfs.ext4 > /dev/null 2>&1 && command -v debugfs > /dev/null 2>&1; then
+if test "$(uname -s)" = Linux && command -v mkfs.ext4 > /dev/null 2>&1 && command -v debugfs > /dev/null 2>&1 && command -v python3 > /dev/null 2>&1; then
   sh "$here/lib/unicode-images.sh" "$T/uni" > /dev/null 2>&1
   r=$(debugfs -R 'ls -p /pair' "$T/uni/ext4-names.img" 2> /dev/null)
   expect unicode_image_nfc has "$r" "/$(printf 'caf\303\251')/"
@@ -263,8 +273,26 @@ if test "$(uname -s)" = Linux && command -v mkfs.ext4 > /dev/null 2>&1 && comman
   expect unicode_image_root has "$r" "/$(printf 'nai\314\210ve')/"
   r=$(debugfs -R "cat /pair/$(printf 'cafe\314\201')" "$T/uni/ext4-names.img" 2> /dev/null)
   expect unicode_image_content test "$r" = "$(printf 'cafe\314\201')"
+  # check-names.py ext4: a name the smoke wrote, in either form, is on disk as its NFC, and only so; --kept: exactly these
+  #   bytes are still there (the Linux-made NFD name, and pair/'s two forms)
+  i=$T/uni/ext4-names.img
+  r=$(python3 -I "$here/lib/check-names.py" ext4 "$i" 636166c3a9 63616665cc81 2>&1); rc=$?
+  expect check_names_ext4_nfc test "$rc" -eq 0 -a "$(printf '%s\n' "$r" | grep -c '^ok - .* is on disk as its NFC 636166c3a9$')" -eq 2
+  r=$(python3 -I "$here/lib/check-names.py" ext4 "$i" 6e6169cc887665 2>&1); rc=$?
+  expect check_names_ext4_nfd_notok test "$rc" -eq 1
+  expect check_names_ext4_nfd_says has "$r" "^not ok - .* is on disk as 6e6169cc887665, not as its NFC 6e61c3af7665 only"
+  r=$(python3 -I "$here/lib/check-names.py" ext4 "$i" 706169722f636166c3a9 2>&1); rc=$?
+  expect check_names_ext4_both_forms_notok test "$rc" -eq 1
+  r=$(python3 -I "$here/lib/check-names.py" ext4 "$i" --kept 6e6169cc887665 --kept 706169722f636166c3a9 --kept 706169722f63616665cc81 636166c3a9 2>&1); rc=$?
+  expect check_names_ext4_kept test "$rc" -eq 0 -a "$(printf '%s\n' "$r" | grep -c '^ok - ')" -eq 4
+  r=$(python3 -I "$here/lib/check-names.py" ext4 "$i" --kept 6e61c3af7665 2>&1); rc=$?
+  expect check_names_ext4_kept_notok test "$rc" -eq 1
+  r=$(python3 -I "$here/lib/check-names.py" ext4 "$i" 6e6f77686572652f78 2>&1); rc=$?
+  expect check_names_ext4_no_dir test "$rc" -eq 1 -a -n "$(printf '%s\n' "$r" | grep '^not ok - .*no directory /nowhere')"
+  r=$(python3 -I "$here/lib/check-names.py" ext4 "$i" 78 2>&1); rc=$?
+  expect check_names_ext4_missing test "$rc" -eq 1 -a -n "$(printf '%s\n' "$r" | grep '^not ok - .*no entry')"
   rm -rf "$T/uni"
-else echo "ok - unicode_image # SKIP needs Linux, mkfs.ext4 and debugfs"; fi
+else echo "ok - unicode_image # SKIP needs Linux, mkfs.ext4, debugfs and python3"; fi
 
 # census_dry: each census function against stub diskutil, hdiutil, osascript, guest-macosx-aqua, sudo, sysctl and linuxfs,
 #   with directories for volumes. The stub bounded marks what runs under it, and a stub sleep outside it is a failure.
@@ -449,29 +477,58 @@ bounded() { ( PARITY_TEST_BOUNDED=1; shift; "$@" ); }
 sleep() { test -n "${PARITY_TEST_BOUNDED:-}" || { echo "sleep $* outside bounded" >> "$unbounded"; return 1; }; }
 attached() { ls "$S/nodes" | grep -v '\.m$' | tr '\n' ' '; }
 
-# census_unicode: the shell's and Finder's names on the pair, the FAT32 control once, the Linux-made names image for ext4
+# census_unicode: item 1 is checked (PARITY_MODE_UNICODE defaults to check): the shell's and Finder's names on the
+#   pair, created then opened by both forms; ext4's on its da-ext4 image (returned by the smoke), whose names it lists
+#   for the fsck job; the Linux-made names image, attached as da-ext4-names.img, its root's names opened by both forms
+#   (checked) and pair/ recorded (HFS+ cannot hold both forms); the FAT32 control once, recorded
+r=$(unset PARITY_MODE_UNICODE; . "$here/lib/parity.sh"; echo "$PARITY_MODE_UNICODE")
+expect census_unicode_checked test "$r" = check
+PARITY_MODE_UNICODE=check
+echo "da-ext4 image" > "$W/img/da-ext4.img"
+mkdir -p "$T/vols/da-ext4-names"   # the stub's volume: the Linux-made names, as the census makes them on HFS+
+"$PARITY_PYTHON" -c "$census_py_create" "$T/vols/da-ext4-names" 636166c3a9 6e6169cc887665 > /dev/null 2>&1
 r=$(census_unicode ext4 2>&1)
 P=$OUT/parity
-for s in shell-create shell-listdir shell-open-other finder-newfolder finder-rename finder-listdir; do
+for s in shell-create shell-listdir shell-open-both finder-newfolder finder-rename finder-listdir; do
   expect "census_unicode_$s" test -s "$P/unicode.ext4.$s.hfs.txt" -a -s "$P/unicode.ext4.$s.ext4.txt"
-  expect "census_unicode_fat32_$s" test -s "$P/unicode.fat32.$s.hfs.txt" -a -s "$P/unicode.fat32.$s.fat32.txt"
+  expect "census_unicode_${s}_ok" has "$r" "^ok - parity unicode.ext4.$s\$"
+  expect "census_unicode_fat32_$s" test -s "$P/unicode-ctl.fat32.$s.hfs.txt" -a -s "$P/unicode-ctl.fat32.$s.fat32.txt"
+  expect "census_unicode_fat32_${s}_recorded" has "$r" "^# recorded unicode-ctl.fat32.$s\$"
 done
-for s in listdir-pair open-both; do expect "census_unicode_names_$s" test -s "$P/unicode.names.$s.ext4.txt"; done
+expect census_unicode_names_open_both has "$r" "^ok - parity unicode.names.open-both\$"
+expect census_unicode_names_open_both_root test "$(grep -c '^[0-9a-f]* \(ok\|errno\)' "$P/unicode.names.open-both.ext4.txt")" -eq 4
+for s in listdir open-both; do expect "census_unicode_pair_$s" has "$r" "^# recorded unicode-pair.names.$s\$"; done
 expect census_unicode_listdir_bytes test "$(grep -c '^[0-9a-f][0-9a-f]*$' "$P/unicode.ext4.shell-listdir.ext4.txt")" -eq 2
-expect census_unicode_open_other grep -Eq '^63616665cc81 (ok 636166c3a9|errno 2)$' "$P/unicode.ext4.shell-open-other.ext4.txt"
+for h in 636166c3a9 63616665cc81 6e6169cc887665 6e61c3af7665; do
+  expect "census_unicode_open_both_$h" grep -Eq "^$h (ok [0-9a-f]+|errno 2)\$" "$P/unicode.ext4.shell-open-both.ext4.txt"
+done
+expect census_unicode_on_da_ext4 grep -q '^hdiutil attach -imagekey diskimage-class=CRawDiskImage .*/img/da-ext4.img$' "$S/calls"
+expect census_unicode_names_da grep -q '^hdiutil attach -imagekey diskimage-class=CRawDiskImage .*/img/da-ext4-names.img$' "$S/calls"
+expect census_unicode_names_returned test -s "$W/img/da-ext4-names.img"
+uni=756e692d65787434
+expect census_unicode_da_list test "$(cat "$OUT/da-ext4.names")" = "$(printf '%s\n' "${uni}2f636166c3a9" "${uni}2f6e6169cc887665" "${uni}2f636166c3a92d66696e646572" "${uni}2f6e61c3af76652d66696e646572")"
+expect census_unicode_names_list test "$(cat "$OUT/da-ext4-names.names")" = "$(printf '%s\n' 636166c3a9 '--kept 6e6169cc887665' '--kept 706169722f636166c3a9' '--kept 706169722f63616665cc81')"
 expect census_unicode_finder grep -q 'character id 233' "$S/calls"
 expect census_unicode_shots test "$(grep -c 'screencapture -x .*-names.png' "$S/calls")" -eq 2
 expect census_unicode_fat32_out test -s "$OUT/ctl-fat32.img.gz"
 expect census_unicode_fat32_copy grep -q '^hdiutil attach -imagekey diskimage-class=CRawDiskImage .*/census/ctl-fat32.img$' "$S/calls"
 expect census_unicode_fat32_control_kept not grep -q '^hdiutil attach -imagekey diskimage-class=CRawDiskImage .*/ctl/fat32.img$' "$S/calls"
 expect census_unicode_sysctl grep -q 'vfs.generic.macfuse' "$P/unicode-ext4.sysctl.txt"
-expect census_unicode_recorded has "$r" "^# recorded unicode.ext4.shell-create"
 expect census_unicode_quiet hasnt "$r" "not ok"
 expect census_unicode_detached test -z "$(attached)"
 : > "$S/calls"
-census_unicode btrfs > /dev/null 2>&1
+r=$(census_unicode btrfs 2>&1)
+expect census_unicode_btrfs_ok has "$r" "^ok - parity unicode.btrfs.shell-open-both\$"
+expect census_unicode_btrfs_copy grep -q '^hdiutil attach -imagekey diskimage-class=CRawDiskImage .*/census/unicode-btrfs.img$' "$S/calls"
 expect census_unicode_fat32_once not grep -q 'fat32' "$S/calls"
-expect census_unicode_names_ext4_only not test -e "$P/unicode.names.listdir-pair.btrfs.txt"
+expect census_unicode_names_ext4_only not grep -q 'names' "$S/calls"
+# no da-ext4 image (the DiskArbitration section made none): said, and no ext4 names are listed for the fsck job
+rm -f "$W/img/da-ext4.img" "$OUT/da-ext4.names"
+r=$(census_unicode ext4 2>&1)
+expect census_unicode_no_da_said has "$r" "^# census_unicode ext4: no .*/img/da-ext4.img"
+expect census_unicode_no_da_list test ! -e "$OUT/da-ext4.names"
+expect census_unicode_no_da_detached test -z "$(attached)"
+rm -f "$W/img/da-ext4-names.img"
 
 # census_stall: not run at 0; at 2, both loops on both volumes, counted, with probe times and Fisher's p
 : > "$S/calls"

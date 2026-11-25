@@ -19,9 +19,11 @@
 #   parity_shot STEP                      screenshot into $OUT/<side>-STEP.png, never compared
 #
 #   The census (record-only until an item's task sets PARITY_MODE_<ITEM>=check; also reads IN and L, the smoke's):
-#   census_unicode FS                     item 1: names made in NFC and NFD from the shell and by Finder, on HFS+
-#                                         against FS; for ext4, IN's ext4-names.img too; once, the FAT32 control,
-#                                         returned as $OUT/ctl-fat32.img.gz
+#   census_unicode FS                     item 1 (checked): names made in NFC and NFD from the shell and by Finder,
+#                                         on HFS+ against FS (ext4: the smoke's da-ext4.img, the names it wrote
+#                                         listed in $OUT/da-ext4.names), each opened by both forms; for ext4, IN's
+#                                         ext4-names.img too, as $W/img/da-ext4-names.img ($OUT/da-ext4-names.names);
+#                                         once, the FAT32 control (recorded), returned as $OUT/ctl-fat32.img.gz
 #   census_stall                          item 3: spike round 4's attach loops on HFS+ and ext4, PARITY_STALL_N times
 #                                         each (unset or 0 runs nothing); counts, probe times and Fisher's p
 #   census_busy FS                        item 4: write-then-unmount cycles, and a held file's unmount and ejects
@@ -48,8 +50,12 @@
 #   $AQUA (guest-macosx-aqua by its path), and every screenshot follows census_dismiss (a dialog's or an offer's, from
 #   before the dialog or the attach). WHAT
 #   prefixes (the items whose PARITY_MODE_ a later task sets): unicode, busy, spotlight, finder, trash, tags, case,
-#   later. What cannot be equal on two volumes (pids, times, sizes, volume names) is a plain record,
+#   later. unicode is checked; unicode-ctl (Apple's own FAT32 against HFS+) and unicode-pair (both forms of one name,
+#   which HFS+ cannot hold) stay records. What cannot be equal on two volumes (pids, times, sizes, volume names) is a plain record,
 #   $OUT/parity/<what>.txt, never a parity step.
+
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-7-brief.md -- item 1 is proven: its parity steps say ok or not ok
+PARITY_MODE_UNICODE=${PARITY_MODE_UNICODE:-check}
 
 # The console session's helper: not on the ssh PATH, so always by its path (the smoke sets AQUA to the same)
 AQUA=${AQUA:-/usr/local/bin/guest-macosx-aqua}
@@ -310,8 +316,9 @@ census_hfs_only() {
 
 # ---- item 1: Unicode names ----
 # Python (2.7 in the guest, 3 in the tests) given hex names: create (each file holding its own leaf name, or the errno;
-# a failed name does not stop the next), list (the directory's names as hex bytes, sorted) and open (each name: ok and
-# its content, or the errno)
+# a failed name does not stop the next), list (the directory's names as hex bytes, sorted; Finder's .DS_Store and ._
+# files left out, which noappledouble keeps off a linuxfs volume and HFS+ may have) and open (each name: ok and its
+# content, or the errno)
 census_py_create='import binascii, os, sys
 d = sys.argv[1]
 d = d if isinstance(d, bytes) else os.fsencode(d)
@@ -329,6 +336,8 @@ census_py_list='import binascii, os, sys
 d = sys.argv[1]
 d = d if isinstance(d, bytes) else os.fsencode(d)
 for n in sorted(os.listdir(d)):
+    if n == b".DS_Store" or n.startswith(b"._"):
+        continue
     print(binascii.hexlify(n).decode())'
 census_py_open='import binascii, os, sys
 d = sys.argv[1]
@@ -340,32 +349,44 @@ for h in sys.argv[2:]:
     except (IOError, OSError) as e:
         print(h + " errno " + str(e.errno))'
 
-# census_unicode_steps TAG: on the current pair, in uni-TAG: NFC caf\xc3\xa9 and NFD nai\xcc\x88ve made from the shell,
-#   listed, and opened by the other form; then a Finder New Folder with an NFC name and one renamed to another, listed
+# census_unicode_steps TAG [ITEM]: on the current pair, in uni-TAG: NFC caf\xc3\xa9 and NFD nai\xcc\x88ve made from the
+#   shell, listed, and each opened by both forms (create then open: the ENXIO of push A); then a Finder New Folder with
+#   an NFC name and one renamed to another, listed. Each step is ITEM.TAG.* (default unicode, checked).
 census_unicode_steps() {
-  _cs_t=$1
-  parity "unicode.$_cs_t.shell-create" "$PARITY_PYTHON" -c "$census_py_create" "@MP@/uni-$_cs_t" 636166c3a9 6e6169cc887665
-  parity "unicode.$_cs_t.shell-listdir" "$PARITY_PYTHON" -c "$census_py_list" "@MP@/uni-$_cs_t"
-  parity "unicode.$_cs_t.shell-open-other" "$PARITY_PYTHON" -c "$census_py_open" "@MP@/uni-$_cs_t" 63616665cc81 6e61c3af7665
-  parity "unicode.$_cs_t.finder-newfolder" "$AQUA" osascript \
+  _cs_t=$1 _cs_w=${2:-unicode}
+  parity "$_cs_w.$_cs_t.shell-create" "$PARITY_PYTHON" -c "$census_py_create" "@MP@/uni-$_cs_t" 636166c3a9 6e6169cc887665
+  parity "$_cs_w.$_cs_t.shell-listdir" "$PARITY_PYTHON" -c "$census_py_list" "@MP@/uni-$_cs_t"
+  parity "$_cs_w.$_cs_t.shell-open-both" "$PARITY_PYTHON" -c "$census_py_open" "@MP@/uni-$_cs_t" \
+    636166c3a9 63616665cc81 6e6169cc887665 6e61c3af7665
+  parity "$_cs_w.$_cs_t.finder-newfolder" "$AQUA" osascript \
     -e "tell application \"Finder\" to make new folder at (POSIX file \"@MP@/uni-$_cs_t\" as alias) with properties {name:\"caf\" & (character id 233) & \"-finder\"}"
-  parity "unicode.$_cs_t.finder-rename" "$AQUA" osascript -e 'tell application "Finder"' \
+  parity "$_cs_w.$_cs_t.finder-rename" "$AQUA" osascript -e 'tell application "Finder"' \
     -e "set f to make new folder at (POSIX file \"@MP@/uni-$_cs_t\" as alias)" \
     -e 'set name of f to "na" & (character id 239) & "ve-finder"' -e 'end tell'
-  parity "unicode.$_cs_t.finder-listdir" "$PARITY_PYTHON" -c "$census_py_list" "@MP@/uni-$_cs_t"
+  parity "$_cs_w.$_cs_t.finder-listdir" "$PARITY_PYTHON" -c "$census_py_list" "@MP@/uni-$_cs_t"
+}
+# census_unicode_paths TAG: the paths census_unicode_steps writes, as hex (check-names.py's PATH), one per line: the two
+#   shell names as given (NFC caf\xc3\xa9, NFD nai\xcc\x88ve) and Finder's two NFC names
+census_unicode_paths() {
+  _cup=$(printf 'uni-%s' "$1" | od -An -tx1 | tr -d ' \n')2f
+  printf '%s\n' "${_cup}636166c3a9" "${_cup}6e6169cc887665" "${_cup}636166c3a92d66696e646572" "${_cup}6e61c3af76652d66696e646572"
 }
 
-# census_unicode_names HFS-DISK HFS-MP HFS-VOL: the Linux-made ext4-names.img against the same names made on HFS+ from
-#   the shell: pair/ listed, every name opened by both forms, and pair/ shown in Finder (parity_shot names)
+# census_unicode_names HFS-DISK HFS-MP HFS-VOL: the Linux-made ext4-names.img, attached as $W/img/da-ext4-names.img (the
+#   smoke returns it), against the same names made on HFS+ from the shell: the root's NFC caf\xc3\xa9 and NFD
+#   nai\xcc\x88ve opened by both forms (checked); pair/ listed and opened by both forms, and shown in Finder (parity_shot
+#   names), recorded: HFS+ holds one of pair/'s two names. $OUT/da-ext4-names.names gives the fsck job's check-names.py
+#   what must still be on disk: caf\xc3\xa9 as NFC, and the Linux-made forms as they were (--kept).
 census_unicode_names() {
   if test ! -f "$IN/ext4-names.img.gz"; then echo "# census_unicode: no $IN/ext4-names.img.gz (tests/lib/unicode-images.sh)"; return 0; fi
-  mkdir -p "$W/census" && gunzip -c "$IN/ext4-names.img.gz" >"$W/census/ext4-names.img" || return 1
+  gunzip -c "$IN/ext4-names.img.gz" >"$W/img/da-ext4-names.img" || return 1
+  printf '%s\n' 636166c3a9 '--kept 6e6169cc887665' '--kept 706169722f636166c3a9' '--kept 706169722f63616665cc81' >"$OUT/da-ext4-names.names"
   bounded 600 "$PARITY_PYTHON" -c "$census_py_create" "$2" 636166c3a9 6e6169cc887665 706169722f636166c3a9 706169722f63616665cc81 >/dev/null 2>&1 </dev/null
-  census_attach "$W/census/ext4-names.img" || return 1
+  census_attach "$W/img/da-ext4-names.img" || return 1
   parity_pair "$1" "$2" "$3" ext4 "$CA_DISK" "$CA_MP" "$CA_VOL"
-  parity unicode.names.listdir-pair "$PARITY_PYTHON" -c "$census_py_list" @MP@/pair
-  parity unicode.names.open-both "$PARITY_PYTHON" -c "$census_py_open" @MP@ \
-    636166c3a9 63616665cc81 6e6169cc887665 6e61c3af7665 706169722f636166c3a9 706169722f63616665cc81
+  parity unicode.names.open-both "$PARITY_PYTHON" -c "$census_py_open" @MP@ 636166c3a9 63616665cc81 6e6169cc887665 6e61c3af7665
+  parity unicode-pair.names.listdir "$PARITY_PYTHON" -c "$census_py_list" @MP@/pair
+  parity unicode-pair.names.open-both "$PARITY_PYTHON" -c "$census_py_open" @MP@ 706169722f636166c3a9 706169722f63616665cc81
   for _cn_s in hfs fs; do
     if test "$_cn_s" = hfs; then _cn_m=$2; else _cn_m=$CA_MP; fi
     bounded 300 "$AQUA" osascript -e "tell application \"Finder\" to open (POSIX file \"$_cn_m/pair\" as alias)" >/dev/null 2>&1 </dev/null
@@ -376,16 +397,23 @@ census_unicode_names() {
   census_detach "$CA_DISK" fs "$CA_MP"
 }
 
-# census_unicode FS: item 1 on the HFS+ control against FS; for ext4 also the Linux-made names; and once, the FAT32
-#   control (a copy) against HFS+, that copy then gzipped into OUT as ctl-fat32.img.gz for the fsck job's check-names.py
+# census_unicode FS: item 1 on the HFS+ control against FS (ext4: the smoke's da-ext4.img itself, which the fsck job's
+#   check-names.py reads with $OUT/da-ext4.names; the others: a copy); for ext4 also the Linux-made names; and once, the
+#   FAT32 control (a copy) against HFS+, recorded (unicode-ctl), that copy then gzipped into OUT as ctl-fat32.img.gz for
+#   the fsck job's check-names.py, which checks Apple's msdosfs wrote NFC (0012 gives vfat and exfat NF_STORE_NFC)
 census_unicode() {
   _cu_fs=$1
   census_sysctl "unicode-$_cu_fs"
-  _cu_c=$(parity_control hfs) && _cu_h=$(census_copy "$_cu_c" "unicode-hfs-$_cu_fs") && _cu_i=$(census_copy "$W/img/$_cu_fs.img" "unicode-$_cu_fs") ||
+  if test "$_cu_fs" = ext4; then
+    _cu_i=$W/img/da-ext4.img
+    test -f "$_cu_i" || { echo "# census_unicode ext4: no $_cu_i (the DiskArbitration section makes it), so no ext4 names"; return 1; }
+  else _cu_i=$(census_copy "$W/img/$_cu_fs.img" "unicode-$_cu_fs") || { echo "# census_unicode $_cu_fs: no images"; return 1; }; fi
+  _cu_c=$(parity_control hfs) && _cu_h=$(census_copy "$_cu_c" "unicode-hfs-$_cu_fs") ||
     { echo "# census_unicode $_cu_fs: no images"; return 1; }
   census_attach "$_cu_h" || return 1
   _cu_hd=$CA_DISK _cu_hm=$CA_MP _cu_hv=$CA_VOL
   if census_attach "$_cu_i"; then
+    test "$_cu_fs" != ext4 || census_unicode_paths ext4 >"$OUT/da-ext4.names"
     parity_pair "$_cu_hd" "$_cu_hm" "$_cu_hv" "$_cu_fs" "$CA_DISK" "$CA_MP" "$CA_VOL"
     census_unicode_steps "$_cu_fs"
     census_detach "$CA_DISK" fs "$CA_MP"
@@ -394,7 +422,7 @@ census_unicode() {
   if test ! -f "$W/census/ctl-fat32.done"; then
     if _cu_c=$(parity_control fat32) && _cu_f=$(census_copy "$_cu_c" ctl-fat32) && census_attach "$_cu_f"; then
       parity_pair "$_cu_hd" "$_cu_hm" "$_cu_hv" fat32 "$CA_DISK" "$CA_MP" "$CA_VOL"
-      census_unicode_steps fat32
+      census_unicode_steps fat32 unicode-ctl
       census_detach "$CA_DISK" apple
       gzip -c "$_cu_f" >"$OUT/ctl-fat32.img.gz" && : >"$W/census/ctl-fat32.done"
     else echo "# census_unicode: no FAT32 control"; fi

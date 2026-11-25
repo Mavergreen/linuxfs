@@ -15,8 +15,9 @@ On Darwin, for the filesystems that store names as given:
   HFS+'s NFD form; a non-ASCII name found by none of them is looked for by scanning its directory, comparing full
   NFC forms, which also match libfuse's ICU NFD of HFS+'s excluded characters (U+2126 as U+03A9). An ASCII miss, the
   usual lookup before a create, never scans. A name on disk is never rewritten;
-- a new entry (create, mknod, mkdir, symlink, link, rename's target) is stored NFC on ext2/3/4, btrfs, xfs, f2fs and
-  ntfs3, and as given on apfs (as macOS does there); an existing entry in another form is used instead, so O_CREAT
+- a new entry (create, mknod, mkdir, symlink, link, rename's target) is stored NFC on ext2/3/4, btrfs, xfs, f2fs,
+  ntfs3, vfat and exfat (FAT and exFAT as Apple's msdosfs stores them, checked on a FAT32 control), and as given on
+  apfs (as macOS does there); an existing entry in another form is used instead, so O_CREAT
   opens it, O_EXCL gives EEXIST and rename replaces it;
 - a symlink's target is stored NFC, since Linux resolves it byte for byte;
 - readdir and readlink hand names out in HFS+'s NFD (CFStringGetFileSystemRepresentation), or as stored when that
@@ -25,7 +26,7 @@ On Darwin, for the filesystems that store names as given:
   singletons such as U+2126 and U+212B are stored as created (10.9's CoreFoundation would decompose U+2F800-U+2FAFF,
   and NFC would replace the singletons); and U+FEFF is never handed to CoreFoundation at a string's start, where it
   would be dropped as a byte order mark, so a U+FEFF-led name is never taken for its sibling without one.
-Other filesystems (vfat, exfat) are unchanged for now. The conversions are CoreFoundation's (CFStringNormalize), so
+Other filesystems are unchanged. The conversions are CoreFoundation's (CFStringNormalize), so
 lklfuse links it, run by run between the kept characters (all starters, so nothing reorders across them; a kept
 character is never composed with the marks after it, so U+2190 U+0338 stays as given, as HFS+ stores it, and the scan's
 full-NFC key still finds a Linux-made U+219A). The paths it rewrites are sized by LKL's PATH_MAX (4096), not Darwin's
@@ -83,7 +84,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +
 +static enum lklfuse_nfmode lklfuse_nfmode_for(const char *type)
 +{
-+	static const char *const nfc[] = { "ext4", "ext2", "ext3", "btrfs", "xfs", "f2fs", "ntfs3" };
++	static const char *const nfc[] = { "ext4", "ext2", "ext3", "btrfs", "xfs", "f2fs", "ntfs3", "vfat", "exfat" };
 +	size_t i;
 +
 +	if (!type)

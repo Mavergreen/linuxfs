@@ -6,7 +6,8 @@ name: on-mavericks
 #       tested with) and the run's pkg, and runs tests/smoke-mavericks.sh, which mounts, writes, unmounts and reads back each
 #       image through `linuxfs mount`, checks DiskArbitration mounts attached disks (raw and GPT-wrapped) through the six
 #       bundles, the password dialog and keychain for encrypted APFS, and the before-login mount (root mounts, lklfuse as _linuxfs serves); then Linux checks every image
-#       the guest wrote with its own fsck (tests/lib/check-fs.sh). Any panic, hang, skip (77) or failed fsck fails.
+#       the guest wrote with its own fsck (tests/lib/check-fs.sh), and the Unicode names it wrote (tests/lib/check-names.py:
+#       NFC on ext4 and on Apple's FAT32). Any panic, hang, skip (77), failed fsck or wrong name fails.
 #       release.yml calls it, and its publish job needs it.
 on:
   workflow_call:
@@ -146,7 +147,9 @@ jobs:
         with:
           name: linuxfs-images-after
           if-no-files-found: warn
-          path: images-after/*.img.gz
+          path: |
+            images-after/*.img.gz
+            images-after/*.names
 
   fsck:
     name: Linux's own fsck on every image the guest wrote
@@ -159,30 +162,46 @@ jobs:
       - uses: Mavergreen/shipyard/.github/actions/install@v1
       - uses: actions/download-artifact@v8
         with: { name: linuxfs-images-after, path: "${{ runner.temp }}/after" }
-      # spec: tests/lib/parity.sh census_unicode -- the census records, never gates: the names Apple's msdosfs wrote to the
-      #       FAT32 control (ctl-fat32.img, in its uni-fat32 directory), as Linux reads them, one hex line per name
-      - name: The FAT32 control's names as Linux reads them (census, recorded only)
+      # spec: tests/lib/parity.sh census_unicode -- the names Apple's msdosfs wrote to the FAT32 control (ctl-fat32.img, in its
+      #       uni-fat32 directory), as Linux reads them, one hex line per name; then the shell's two names (NFC caf\xc3\xa9,
+      #       NFD nai\xcc\x88ve) must be there as their NFC, the form patch 0012 gives vfat and exfat (item-1-findings.md)
+      - name: The FAT32 control's names are NFC, the form linuxfs gives vfat and exfat
         run: |
           set +e
           d="$RUNNER_TEMP/after" t="$RUNNER_TEMP/check-names.out"
-          if [ ! -f "$d/ctl-fat32.img.gz" ]; then echo "# the guest returned no ctl-fat32.img.gz (the census did not run)"; exit 0; fi
+          if [ ! -f "$d/ctl-fat32.img.gz" ]; then echo "not ok - the guest returned no ctl-fat32.img.gz (census_unicode made no FAT32 control)"; exit 1; fi
           gzip -dc "$d/ctl-fat32.img.gz" > "$RUNNER_TEMP/ctl-fat32.img" 2> "$t"; rc=$?
-          if [ "$rc" -ne 0 ]; then echo "# gzip -dc ctl-fat32.img.gz failed (exit $rc):"; sed 's/^/#   /' "$t"; exit 0; fi
+          if [ "$rc" -ne 0 ]; then echo "not ok - gzip -dc ctl-fat32.img.gz failed (exit $rc):"; sed 's/^/#   /' "$t"; exit 1; fi
           python3 -I tests/lib/check-names.py fat "$RUNNER_TEMP/ctl-fat32.img" uni-fat32 > "$t" 2>&1; rc=$?
           sed 's/^/# ctl-fat32 uni-fat32 name: /' "$t"
           [ "$rc" -eq 0 ] || echo "# check-names.py fat failed on ctl-fat32.img (exit $rc; its output is above)"
-          exit 0
-      - name: e2fsck -fn, btrfs check, xfs_repair -n, ntfsfix -n, fsck.exfat -n and fsck.f2fs --dry-run, in the build container
+          uf=756e692d6661743332
+          python3 -I tests/lib/check-names.py fat "$RUNNER_TEMP/ctl-fat32.img" --nfc "${uf}2f636166c3a9" "${uf}2f6e6169cc887665"; rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Apple's msdosfs did not write NFC to the FAT32 control (above), yet patch 0012 gives vfat and exfat NF_STORE_NFC: they should take the form it did write (item-1-findings.md, Task 7 Step 1)"
+          fi
+          exit $rc
+      - name: e2fsck -fn, btrfs check, xfs_repair -n, ntfsfix -n, fsck.exfat -n and fsck.f2fs --dry-run, and ext4's names, in the build container
+        # the FAT32 step above failing still leaves every image checked
+        if: ${{ !cancelled() }}
         run: |
           set -eu
           d="$RUNNER_TEMP/after"
           for z in "$d"/*.img.gz; do gunzip "$z"; done
           LINUX_HOST_SHARE="$HOME" sh build/linux-host.sh sh -c '
             rc=0
-            for c in ext4:ext4 btrfs:btrfs xfs:xfs ntfs:ntfs exfat:exfat f2fs:f2fs ext4:da-ext4 btrfs:da-btrfs xfs:da-xfs ntfs:da-ntfs f2fs:da-f2fs ext4:da-ext4-noauto ntfs:da-ntfs-noauto ext4:da-ext4-ro ext4:login-ext4; do
+            for c in ext4:ext4 btrfs:btrfs xfs:xfs ntfs:ntfs exfat:exfat f2fs:f2fs ext4:da-ext4 btrfs:da-btrfs xfs:da-xfs ntfs:da-ntfs f2fs:da-f2fs ext4:da-ext4-noauto ntfs:da-ntfs-noauto ext4:da-ext4-ro ext4:login-ext4 ext4:da-ext4-names; do
               fs=${c%%:*} img=$1/${c#*:}.img
               if [ ! -f "$img" ]; then echo "not ok - $img: the guest returned no such image"; rc=1
               elif sh tests/lib/check-fs.sh "$fs" "$img"; then echo "ok - $img is clean ($fs)"
               else echo "not ok - $img is not clean ($fs)"; rc=1; fi
+            done
+            # spec: tests/lib/parity.sh census_unicode -- item 1 on disk: each name the census wrote on da-ext4 is NFC
+            #       bytes, and da-ext4-names keeps its Linux-made forms (--kept); the census lists them in IMG.names
+            for c in da-ext4 da-ext4-names; do
+              img=$1/$c.img
+              if [ ! -f "$img" ] || [ ! -f "$1/$c.names" ]; then echo "not ok - $c: the guest returned no $c.img or $c.names (census_unicode ext4 did not run)"; rc=1
+              elif python3 -I tests/lib/check-names.py ext4 "$img" $(cat "$1/$c.names"); then echo "ok - $c: its names are as check-names.py ext4 wants"
+              else echo "not ok - $c: check-names.py ext4 (above)"; rc=1; fi
             done
             exit $rc' _ "$d"
