@@ -29,10 +29,12 @@ streams, a new label goes in the blob Samba reads). The volume's is chosen once 
 entries, else fruit's if a stream is, else user.N. The carriers are never reachable by a Mac name, in any spelling:
 not by their own names, nor fruit's AFP_AfpInfo and AFP_Resource, nor a stream's NAME:$DATA, nor anything DosStream*
 (EPERM to set, ENOATTR to get or remove, never listed). They are listed only as the attributes they carry, and a stream
-is an attribute's only when its name maps back to it. Inside a blob or an AfpInfo only the Finder Info's 32 bytes are
+is an attribute's only when its name maps back to it (com.apple.FinderInfo and com.apple.ResourceFork are only the
+AFP_AfpInfo and AFP_Resource streams'.) Inside a blob or an AfpInfo only the Finder Info's 32 bytes are
 ever written; one that is malformed (too short, a wrong magic, a stream in extents) is neither read (ENOATTR) nor
 written (EIO), so another server's data is never damaged. As on HFS+: an all-zero Finder Info is no Finder Info,
-wherever it is kept (setting one removes user.N's, zeroes it in the blob, which keeps netatalk's other data, and
+wherever it is kept (a label over a stored all-zero user.N one is new, so it goes in the volume's scheme and the
+zero copy is removed; setting one removes user.N's, zeroes it in the blob, which keeps netatalk's other data, and
 removes the AfpInfo, as Samba does; a stored one reads as none and is not listed); a Finder Info is 32 bytes (ERANGE
 otherwise); and a value
 the filesystem cannot hold is refused with ENOSPC, the only refusal HFS+ gave (it took 64 MiB + 1; linuxfs gave E2BIG
@@ -45,16 +47,18 @@ Darwin only: on Linux the names are passed as given, as before.
 diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 --- a/tools/lkl/lklfuse.c
 +++ b/tools/lkl/lklfuse.c
-@@ -139,6 +139,8 @@
+@@ -139,6 +139,10 @@
  
  /* LKL's PATH_MAX, for the paths lklfuse rewrites (Darwin's own PATH_MAX is 1024) */
  #define LKLFUSE_PATH_MAX 4096
 +#define LKLFUSE_FINDERINFO "com.apple.FinderInfo"
 +#define LKLFUSE_FINDERINFO_LEN 32
++#define LKLFUSE_XCREATE 1	/* Linux's XATTR_CREATE and XATTR_REPLACE */
++#define LKLFUSE_XREPLACE 2
  
  #ifdef __APPLE__
  #include <sys/xattr.h>
-@@ -773,9 +775,707 @@
+@@ -773,9 +777,722 @@
  {
  	return fuse_new(args, ops, size, data);
  }
@@ -87,8 +91,6 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +static const char *lklfuse_xpre = "user.";	/* the Linux namespace Mac names live in */
 +static enum lklfuse_xscheme lklfuse_xs_vol;	/* the volume's scheme, for new attributes */
 +
-+#define LKLFUSE_XCREATE 1	/* Linux's XATTR_CREATE and XATTR_REPLACE */
-+#define LKLFUSE_XREPLACE 2
 +#define LKLFUSE_XNAME_MAX 512	/* a Linux xattr name lklfuse builds (Linux's own limit is 255) */
 +#define LKLFUSE_XVAL_MAX 65536	/* Linux's XATTR_SIZE_MAX: no carrier is larger */
 +#define LKLFUSE_RESOURCEFORK "com.apple.ResourceFork"
@@ -583,6 +585,13 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +			return -LKL_ENODATA;
 +		if (lklfuse_xzero(val, LKLFUSE_FINDERINFO_LEN))
 +			return lkl_sys_removexattr(path, at->name);
++		if (at->zero && lklfuse_xs_vol != XS_OURS) {	/* none there: a new one, so in the volume's scheme */
++			long ret = lklfuse_xnew(path, mac, val, size, 0);
++
++			if (ret >= 0)
++				lkl_sys_removexattr(path, at->name);
++			return ret;
++		}
 +		return lkl_sys_setxattr(path, at->name, val, size, 0);
 +	}
 +	if (at->loc == XL_USER || at->loc == XL_RSRC)
@@ -679,6 +688,14 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +	return lklfuse_err(ret);
 +}
 +
++/* stream X (past user.DosStream.) is fruit's AFP stream AFP: the only stream the FinderInfo and ResourceFork aliases read */
++static int lklfuse_xafp_stream(const char *x, const char *afp)
++{
++	size_t n = strlen(afp);
++
++	return strncmp(x, afp, n) == 0 && (!x[n] || strcmp(x + n, LKLFUSE_XSTREAM_TYPE) == 0);
++}
++
 +/* carrier LNAME of PATH: the Mac name of what it carries into MAC (1), or 0 when it carries nothing the Mac can read */
 +static int lklfuse_xcarried(const char *path, const char *lname, char *mac, size_t len)
 +{
@@ -697,7 +714,9 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +	if (strcmp(x, LKLFUSE_XMETA) == 0) {
 +		snprintf(mac, len, "%s", LKLFUSE_FINDERINFO);
 +		loc = XL_BLOB;
-+	} else if (strncmp(x, LKLFUSE_XSTREAM, s) == 0 && lklfuse_xstream_mac(x + s, mac, len) == 0 && lklfuse_xmac_ok(mac)) {
++	} else if (strncmp(x, LKLFUSE_XSTREAM, s) == 0 && lklfuse_xstream_mac(x + s, mac, len) == 0 && lklfuse_xmac_ok(mac) &&
++		   (strcmp(mac, LKLFUSE_FINDERINFO) || lklfuse_xafp_stream(x + s, LKLFUSE_XAFPINFO)) &&
++		   (strcmp(mac, LKLFUSE_RESOURCEFORK) || lklfuse_xafp_stream(x + s, LKLFUSE_XAFPRSRC))) {
 +		loc = strcmp(mac, LKLFUSE_FINDERINFO) == 0 ? XL_AFPINFO : XL_STREAM;	/* listed only as what getxattr reads */
 +	} else {
 +		return 0;
@@ -762,7 +781,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  #define lklfuse_rename_flags(flags) (flags)
  
  static inline int lklfuse_resolve(const char *path, char *buf, size_t len, int create, const char **out)
-@@ -1229,7 +1929,7 @@
+@@ -1229,7 +1946,7 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
  
@@ -771,7 +790,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  }
  
  static int lklfuse_getxattr(const char *path, const char *name, char *val,
-@@ -1238,7 +1938,7 @@
+@@ -1238,7 +1955,7 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
  
@@ -780,7 +799,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  }
  
  static int lklfuse_listxattr(const char *path, char *list, size_t size)
-@@ -1246,7 +1946,7 @@
+@@ -1246,7 +1963,7 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
  
@@ -789,7 +808,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  }
  
  static int lklfuse_removexattr(const char *path, const char *name)
-@@ -1254,7 +1954,7 @@
+@@ -1254,7 +1971,7 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
  
@@ -798,7 +817,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  }
  
  static int lklfuse_opendir(const char *path, struct fuse_file_info *fi)
-@@ -1711,6 +2411,8 @@
+@@ -1711,6 +2428,8 @@
  
  #ifdef __APPLE__
  	lklfuse_nf = lklfuse_nfmode_for(lklfuse.type);

@@ -1061,6 +1061,14 @@ static void volicon_tests(void)
 	is(lklfuse_getxattr("/", FI, b, sizeof(b)), 32, "volicon rmw: with none stored, the synthetic one");
 	is(lklfuse_setxattr("/", FI, b, 32, 0), 0, "volicon rmw: written back unchanged");
 	is(raw_has("/", "user.com.apple.FinderInfo"), 0, "volicon rmw: stores nothing (all zero without the flag: none)");
+	/* the root's FinderInfo is there while the icon shows (getxattr returns one), so the flags see it as there */
+	memset(b, 0, 32);
+	b[9] = 0x0c;
+	is(lklfuse_setxattr("/", FI, b, 32, XATTR_CREATE), -EEXIST, "volicon flags: XATTR_CREATE with nothing stored: EEXIST");
+	is(raw_has("/", "user.com.apple.FinderInfo"), 0, "volicon flags: and nothing stored");
+	is(lklfuse_setxattr("/", FI, b, 32, XATTR_REPLACE), 0, "volicon flags: XATTR_REPLACE with nothing stored works");
+	is(lkl_sys_getxattr("/", "user.com.apple.FinderInfo", b, sizeof(b)) == 32 && b[9] == 0x0c, 1, "volicon flags: and stores it");
+	lkl_sys_removexattr("/", "user.com.apple.FinderInfo");
 	/* a stored FinderInfo that is not one is passed on as an error, not hidden behind zeros and the flag */
 	memset(b, 0, 40);
 	lkl_sys_setxattr("/", "user.com.apple.FinderInfo", b, 40, 0);
@@ -1341,6 +1349,15 @@ static void xa_netatalk_tests(void)
 	is(memcmp(b + 122, fi_new, 32), 0, "netatalk: holding the new FinderInfo");
 	is(raw_has("/n", "user.com.apple.FinderInfo"), 0, "netatalk: and no user.com.apple.FinderInfo");
 	is(fi_is("/n", fi_new), 1, "netatalk: read back");
+	/* a stored all-zero user.com.apple.FinderInfo is none: a label over it is new, so in the volume's scheme */
+	plant("/zn", "z");
+	lkl_sys_setxattr("/zn", "user.com.apple.FinderInfo", fi_zero, 32, 0);
+	is(lklfuse_setxattr("/zn", XFI, fi_new, 32, 0), 0, "netatalk zero: a label over a zero user.com.apple.FinderInfo");
+	is(lkl_sys_getxattr("/zn", XMETA, b, sizeof(b)) == 402 && memcmp(b + 122, fi_new, 32) == 0, 1,
+	   "netatalk zero: goes in a new blob, the volume's scheme");
+	is(raw_has("/zn", "user.com.apple.FinderInfo"), 0, "netatalk zero: and the zero copy is gone");
+	is(fi_is("/zn", fi_new), 1, "netatalk zero: read back");
+	lkl_sys_unlink("/zn");
 	/* removing it zeroes the 32 bytes in the blob, which keeps the rest */
 	is(lklfuse_removexattr("/f", XFI), 0, "netatalk: removexattr FinderInfo");
 	is(lklfuse_getxattr("/f", XFI, b, sizeof(b)), -HOST_ENOATTR, "netatalk: then it is gone (all-zero Finder Info, as HFS+)");
@@ -1379,6 +1396,7 @@ static void carrier_tests(void)
 	long na = lkl_sys_getxattr("/f", XAFPI, afp, sizeof(afp)), nr;
 	size_t i;
 
+	plant("/g", "g");
 	lkl_sys_setxattr("/f", "user.DosStream.AFP_Resource:$DATA", "rsrc", 5, 0);
 	lkl_sys_setxattr("/f", "user.DosStream.k:$DATA", "v", 2, 0);
 	nr = lkl_sys_getxattr("/f", "user.DosStream.AFP_Resource:$DATA", rsrc, sizeof(rsrc));
@@ -1406,6 +1424,16 @@ static void carrier_tests(void)
 	lkl_sys_setxattr("/f", "user.AFP_AfpInfo", "v", 1, 0);
 	is(listed("/f", "DosStream", 1) + listed("/f", "org.netatalk", 1) + listed("/f", "y:", 1) + listed("/f", "AFP_", 1), 0,
 	   "carriers: listxattr hides streams whose names are carriers' or stream spellings");
+	/* the alias names are only the AFP streams': a stream spelled with the alias itself is never read, so not listed */
+	lkl_sys_removexattr("/f", "user.DosStream.AFP_Resource:$DATA");
+	lkl_sys_setxattr("/f", "user.DosStream.com.apple.ResourceFork:$DATA", "r", 2, 0);
+	is(listed("/f", "com.apple.ResourceFork", 0), 0, "carriers: a stream named com.apple.ResourceFork is not listed");
+	is(lklfuse_getxattr("/f", "com.apple.ResourceFork", b, sizeof(b)), -HOST_ENOATTR, "carriers: (getxattr does not read it)");
+	lkl_sys_removexattr("/f", "user.DosStream.com.apple.ResourceFork:$DATA");
+	lkl_sys_setxattr("/f", "user.DosStream.AFP_Resource:$DATA", "rsrc", 5, 0);
+	lkl_sys_setxattr("/g", "user.DosStream.com.apple.FinderInfo:$DATA", afp, 61, 0);
+	is(listed("/g", XFI, 0), 0, "carriers: a stream named com.apple.FinderInfo, AfpInfo-shaped, is not listed");
+	is(lklfuse_getxattr("/g", XFI, b, sizeof(b)), -HOST_ENOATTR, "carriers: (getxattr does not read it)");
 	is(listed("/f", "com.apple.ResourceFork", 0) + listed("/f", "k", 0) + listed("/f", "a:b", 0), 3,
 	   "carriers: and lists the rest by their Mac names");
 	lkl_sys_removexattr("/f", "user.DosStream.DosStream.x:$DATA");
@@ -1415,6 +1443,7 @@ static void carrier_tests(void)
 	lkl_sys_removexattr("/f", "user.DosStream.a\xef\x80\xa2" "b:$DATA");
 	lkl_sys_removexattr("/f", "user.DosStream.AFP_Resource:$DATA");
 	lkl_sys_removexattr("/f", "user.DosStream.k:$DATA");
+	lkl_sys_unlink("/g");
 }
 
 /* listxattr's size query is its length, and one byte short is ERANGE */
