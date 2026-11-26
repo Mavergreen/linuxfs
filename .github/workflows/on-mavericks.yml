@@ -53,6 +53,10 @@ jobs:
           gzip -c "$d/ext4-names.img" > "$RUNNER_TEMP/up/ext4-names.img.gz"
           for l in slash ctl; do [ ! -f "$d/ext4-$l.img" ] || gzip -c "$d/ext4-$l.img" > "$RUNNER_TEMP/up/ext4-$l.img.gz"; done
           for s in ours netatalk fruit mixed; do gzip -c "$d/ext4-xa-$s.img" > "$RUNNER_TEMP/up/ext4-xa-$s.img.gz"; done
+          # spec: final review C1 -- gpt2-ext4.img, one disk with two ext4 partitions ("part one", "part two"), which the smoke mounts
+          #       side by side (tests/lib/twopart-images.sh)
+          LINUX_HOST_SHARE="$HOME" sh build/linux-host.sh sh tests/lib/twopart-images.sh "$d"
+          gzip -c "$d/gpt2-ext4.img" > "$RUNNER_TEMP/up/gpt2-ext4.img.gz"
       # spec: tests/lib/gpt-wrap.py -- the same images in a GPT wrapper with each filesystem's own partition type (Linux data, basic data for NTFS, APFS), plus ext4 in the basic-data type,
       #       as an external disk formatted by macOS is laid out,
       #       and the encrypted APFS fixture (password linuxfs-test) in one too: its partition UUID is the keychain's account

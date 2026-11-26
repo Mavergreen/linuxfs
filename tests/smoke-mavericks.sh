@@ -36,7 +36,7 @@
 #       fails it. Linux checks the images afterwards (on-mavericks.yml's fsck job).
 #   usage: smoke-mavericks.sh VERSION IN OUT
 #          VERSION is the run's version (the pkg installed). IN holds ext4, btrfs, xfs, ntfs, exfat, f2fs and apfs .img.gz
-#          from tests/lib/probe-images.sh, gpt-<fs>.img.gz (each in its own partition type), gpt-ext4-basic.img.gz and gpt-enc.img.gz (tests/lib/gpt-wrap.py), ext4-slash and
+#          from tests/lib/probe-images.sh, gpt-<fs>.img.gz (each in its own partition type), gpt-ext4-basic.img.gz and gpt-enc.img.gz (tests/lib/gpt-wrap.py), gpt2-ext4.img.gz (tests/lib/twopart-images.sh), ext4-slash and
 #          ext4-ctl .img.gz (tests/lib/label-images.sh), ext4-names.img.gz (tests/lib/unicode-images.sh) and ext4-xa-{ours,netatalk,fruit,mixed}.img.gz
 #          (tests/lib/xattr-images.sh). OUT receives every image as it is after the run, gzipped (da-*.img.gz
 #          are the disks DiskArbitration mounted, da-ext4-names.img.gz the Linux-made names as the census attached them; ctl-fat32.img.gz
@@ -652,6 +652,80 @@ if gunzip -c "$IN/gpt-ext4-basic.img.gz" > "$W/gpt-ext4-basic.img"; then da_cycl
 else notok "ext4: cannot unpack $IN/gpt-ext4-basic.img.gz"; fi
 rm -f "$W/gpt-ext4-basic.img"
 defaults delete dev.mavergreen.linuxfs NTFSTakeover
+
+# spec: final review C1 -- one disk's two partitions mount side by side (tests/lib/twopart-images.sh's gpt2-ext4.img: ext4 "part
+#       one" and "part two"): the attach mounts both within 30 s, each root's and served by its own _linuxfs lklfuse, each
+#       read-write; the user's eject takes both and leaves no lklfuse. Before C1 the second was refused ("another mount of the
+#       disk is under way", or "mounted already") and fell back to a mount of the user's own
+two_mounted() {  # DISK: both partitions' mount points within 30 s, as tp_mp1 and tp_mp2; else what each was
+  tm_i=0; while :; do
+    tp_mp1= tp_mp2=
+    test "$(info "${1}s1" Mounted)" != Yes || tp_mp1=$(info "${1}s1" "Mount Point")
+    test "$(info "${1}s2" Mounted)" != Yes || tp_mp2=$(info "${1}s2" "Mount Point")
+    test -z "$tp_mp1" || test -z "$tp_mp2" || { echo "${1}s1 at $tp_mp1, ${1}s2 at $tp_mp2"; return 0; }
+    tm_i=$((tm_i + 1)); test $tm_i -le 30 || { echo "after 30 s: ${1}s1 at ${tp_mp1:-nothing}, ${1}s2 at ${tp_mp2:-nothing}"; return 1; }
+    sleep 1
+  done
+}
+tp_gone() {  # PID MP: after the eject, PID (MP's lklfuse) gone within 30 s and MP unmounted
+  test -z "$1" || bounded 300 pid_gone "$1" || { echo "lklfuse $1 still runs"; return 1; }
+  ! mount | grep -qF " on $2 (" || { echo "$2 is still mounted"; return 1; }
+}
+tp_img=$W/gpt2-ext4.img
+if gunzip -c "$IN/gpt2-ext4.img.gz" > "$tp_img"; then
+  pos=$(log_pos)
+  if ! da_attach "$tp_img"; then notok "two partitions: hdiutil attach"; disk=$(image_disk "$tp_img"); cleanup_disk
+  elif check "two partitions: both of $disk's mounted within 30 s (side by side)" two_mounted "$disk"; then
+    for s in 1 2; do
+      eval "tp_mp=\$tp_mp$s"; tp_dev=${disk}s$s
+      check "two partitions: $tp_dev, root's mount (no fallback to the user's own) with fsname=$tp_dev" bounded 300 da_root_mount "$tp_mp" "$tp_dev" ext4 "$pos"
+      check "two partitions: $tp_dev, served by a _linuxfs lklfuse; none as root" bounded 300 da_served "$tp_mp"
+      check "two partitions: $tp_dev, reads and writes work" rw_works "$tp_mp"
+    done
+    check "two partitions: no mount_macfuse or libfuse mount failure in system.log since the attach" bounded 300 no_mount_failed "$pos"
+    tp_p2=$(root_lklfuse_of "$tp_mp2")
+    if check "two partitions: diskutil eject (the user's, no sudo) takes both" da_eject "$disk" "$tp_mp1"; then
+      check "two partitions: the eject leaves no lklfuse on $tp_mp1" da_lklfuse_gone "$tp_mp1"
+      check "two partitions: nor on $tp_mp2, which is unmounted" tp_gone "$tp_p2" "$tp_mp2"
+    fi
+  fi
+  cleanup_disk
+else notok "two partitions: cannot unpack $IN/gpt2-ext4.img.gz"; fi
+rm -f "$tp_img"
+
+# spec: final review I1 -- one image is never served by two lklfuse writers, in either order: an image hdiutil attached (its volume
+#       root's mount) is refused by linuxfs mount IMAGE, which says where it is attached; an image linuxfs mount serves (lklfuse's
+#       exclusive flock on it, patches/lkl/0019) is refused by hdiutil attach, which diskimages-helper takes a flock for. No retries
+i1_img=$W/i1-ext4.img i1_mp=$W/mnt/i1
+i1_refused() {  # linuxfs mount IMAGE of the attached image: exit 1, "already attached as", nothing mounted at i1_mp, no lklfuse on it
+  i1_o=$(bounded 600 "$L" mount "$i1_img" "$i1_mp" 2>&1); i1_rc=$?
+  echo "linuxfs mount: exit $i1_rc: $i1_o"
+  test "$i1_rc" -ne 0 && printf '%s\n' "$i1_o" | grep -q "already attached as $disk" || return 1
+  ! mount | grep -qF " on $i1_mp (" && test -z "$(lklfuse_on "$i1_mp")"
+}
+i1_attach_refused() {  # hdiutil attach of the image linuxfs mount serves: fails, and nothing is attached from it
+  i1_o=$(bounded 600 hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$i1_img" 2>&1); i1_rc=$?
+  echo "hdiutil attach: exit $i1_rc: $i1_o"
+  i1_d=$(image_disk "$i1_img")
+  test -z "$i1_d" || { echo "attached as $i1_d"; disk=$i1_d; return 1; }
+  test "$i1_rc" -ne 0
+}
+mkdir -p "$i1_mp"
+if gunzip -c "$IN/ext4.img.gz" > "$i1_img"; then
+  if ! da_attach "$i1_img"; then notok "one writer: hdiutil attach"; disk=$(image_disk "$i1_img"); cleanup_disk
+  elif da_wait 300; then
+    check "one writer: linuxfs mount of the image attached as $disk (mounted at $mp) is refused, and says so" i1_refused
+    i1_amp=$mp
+    check "one writer: diskutil eject (the user's)" da_eject "$disk" "$i1_amp" && check "one writer: the eject leaves no lklfuse" da_lklfuse_gone "$i1_amp"
+  else notok "one writer: mounted by DiskArbitration within 30 s"; fi
+  cleanup_disk
+  if check "one writer: linuxfs mount of the image" bounded 600 "$L" mount "$i1_img" "$i1_mp"; then
+    check "one writer: hdiutil attach of the image linuxfs mount serves fails, and attaches nothing" i1_attach_refused
+    cleanup_disk
+    check "one writer: linuxfs unmount" bounded 600 "$L" unmount "$i1_mp"
+  fi
+else notok "one writer: cannot unpack $IN/ext4.img.gz"; fi
+rm -f "$i1_img"
 
 # spec: tests/lib/check-xattrs.sh header, and task-17-report.md concern 4 -- item 7 on disk: tests/lib/xattr-images.sh's four ext4
 #       images, each holding a file f whose Finder Info and tag are in one Mac-xattr scheme (ours, netatalk's, Samba vfs_fruit's;

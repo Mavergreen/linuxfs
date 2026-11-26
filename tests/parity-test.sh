@@ -2656,4 +2656,39 @@ mna_l='Nov 25 linuxfs-mountd[9]: mountd: refused uid 0: not the console user'; e
 mna_l='Nov 25 linuxfs-mount[9]: mount_ext4: disk5 on /Volumes/x: the mount daemon said no (3: busy)'; expect smoke_mountd_not_asked_program not mna
 expect smoke_mountd_not_asked_since test -n "$(smoke_fn mountd_not_asked | grep 'log_since "$1"')" -a -z "$(smoke_fn mountd_not_asked | grep 'tail -n')"
 
+# final review C1: one disk's two partitions, mounted side by side within 30 s (two_mounted), each served and unmounted after
+#   the eject (tp_gone); in the smoke after the DiskArbitration cycles, before the census
+tm() { (eval "$(smoke_fn two_mounted)"; info() { case "$1:$2" in *s1:Mounted) echo "$tm_s1" ;; *s2:Mounted) echo "$tm_s2" ;; *s1:"Mount Point") echo "/Volumes/part one" ;; *s2:"Mount Point") echo "/Volumes/part two" ;; esac; }
+  sleep() { :; }; two_mounted /dev/disk9 && test "$tp_mp1" = "/Volumes/part one" && test "$tp_mp2" = "/Volumes/part two") > /dev/null 2>&1; }
+tm_s1=Yes tm_s2=Yes; expect smoke_two_mounted tm
+tm_s1=Yes tm_s2=No; expect smoke_two_mounted_not_one not tm
+tm_s1=No tm_s2=Yes; expect smoke_two_mounted_not_other not tm
+expect smoke_two_mounted_bounded test -n "$(smoke_fn two_mounted | grep 'test $tm_i -le 30')"
+tg() { (eval "$(smoke_fn tp_gone)"; bounded() { shift; "$@"; }; pid_gone() { test "$1" != 7; }; mount() { printf '%s\n' "$tg_m"; }; tp_gone "$tg_p" "/Volumes/part two") > /dev/null 2>&1; }
+tg_p=5 tg_m='/dev/disk9s1 on /Volumes/x (macfuse_ext4, local)'; expect smoke_tp_gone tg
+tg_p=7; expect smoke_tp_gone_pid not tg
+tg_p=5 tg_m='/dev/disk9s2 on /Volumes/part two (macfuse_ext4, local)'; expect smoke_tp_gone_mounted not tg
+expect smoke_two_partitions_image test -n "$(grep -n 'gunzip -c "$IN/gpt2-ext4.img.gz" > "$tp_img"' "$sm")"
+expect smoke_two_partitions_eject test -n "$(grep -n 'check "two partitions: diskutil eject (the user'"'"'s, no sudo) takes both" da_eject "$disk" "$tp_mp1"' "$sm")"
+expect smoke_two_partitions_before_census test "$(grep -n 'gpt2-ext4.img.gz" > "$tp_img"' "$sm" | cut -d: -f1)" -lt "$(grep -n '^  parity_census_all$' "$sm" | cut -d: -f1)"
+expect images_two_partitions test -n "$(grep -n 'sh build/linux-host.sh sh tests/lib/twopart-images.sh "$d"' "$wf")" -a -n "$(grep -n 'gzip -c "$d/gpt2-ext4.img" > "$RUNNER_TEMP/up/gpt2-ext4.img.gz"' "$wf")"
+# final review I1: one image, one writer, in both orders: linuxfs mount refuses the attached image (i1_refused), and hdiutil
+#   attach of the image linuxfs mount serves fails and attaches nothing (i1_attach_refused)
+ir() { (eval "$(smoke_fn i1_refused)"; L=linuxfs i1_img=/w/i1-ext4.img i1_mp=/w/mnt/i1 disk=/dev/disk9
+  bounded() { shift; "$@"; }; linuxfs() { echo "$ir_o"; return "$ir_rc"; }; mount() { printf '%s\n' "$ir_m"; }; lklfuse_on() { printf '%s' "$ir_l"; }
+  i1_refused) > /dev/null 2>&1; }
+ir_o='linuxfs: /w/i1-ext4.img is already attached as /dev/disk9 (hdiutil): ...' ir_rc=1 ir_m= ir_l=; expect smoke_i1_refused ir
+ir_rc=0; expect smoke_i1_refused_exit not ir
+ir_rc=1 ir_o='linuxfs: cannot lock'; expect smoke_i1_refused_said not ir
+ir_o='linuxfs: /w/i1-ext4.img is already attached as /dev/disk9 (hdiutil): ...' ir_m='linuxfs@disk9 on /w/mnt/i1 (macfuse_ext4)'; expect smoke_i1_refused_mounted not ir
+ir_m= ir_l='me 5 lklfuse /w/i1-ext4.img /w/mnt/i1'; expect smoke_i1_refused_lklfuse not ir
+ia() { (eval "$(smoke_fn i1_attach_refused)"; i1_img=/w/i1-ext4.img disk=
+  bounded() { shift; "$@"; }; hdiutil() { echo "$ia_o"; return "$ia_rc"; }; image_disk() { printf '%s' "$ia_d"; }
+  i1_attach_refused; r=$?; test "$disk" = "$ia_d" && exit $r; exit 9) > /dev/null 2>&1; }
+ia_o='hdiutil: attach failed - Resource temporarily unavailable' ia_rc=1 ia_d=; expect smoke_i1_attach_refused ia
+ia_rc=0 ia_d=/dev/disk9; expect smoke_i1_attach_refused_attached not ia
+ia_rc=0 ia_d=; expect smoke_i1_attach_refused_exit not ia
+expect smoke_i1_both_orders test -n "$(grep -n 'check "one writer: linuxfs mount of the image attached as $disk (mounted at $mp) is refused, and says so" i1_refused' "$sm")" -a -n "$(grep -n 'check "one writer: hdiutil attach of the image linuxfs mount serves fails, and attaches nothing" i1_attach_refused' "$sm")"
+expect smoke_i1_before_census test "$(grep -n 'gunzip -c "$IN/ext4.img.gz" > "$i1_img"' "$sm" | cut -d: -f1)" -lt "$(grep -n '^  parity_census_all$' "$sm" | cut -d: -f1)"
+
 test "$fails" -eq 0
