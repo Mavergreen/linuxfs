@@ -16,8 +16,8 @@
 #          ttxt) kept where xattr-images.sh planted them (so the Finder Info was changed in place, not replaced), and no
 #          other scheme's Finder Info made beside it. One "ok -" or "not ok -" line per check; exits 1 if any is not ok.
 set -u
-[ "$(uname -s)" = Linux ] || { echo "check-xattrs.sh: needs Linux's debugfs" >&2; exit 77; }
-[ "$#" -ge 1 ] || { echo "usage: check-xattrs.sh DIR [TAG]" >&2; exit 2; }
+test "$(uname -s)" = Linux || { echo "check-xattrs.sh: needs Linux's debugfs" >&2; exit 77; }
+test "$#" -ge 1 || { echo "usage: check-xattrs.sh DIR [TAG]" >&2; exit 2; }
 d=$1 tag=${2:-Parity} rc=0
 t=$(mktemp -d "${TMPDIR:-/tmp}/check-xattrs.XXXXXX") || exit 1
 trap 'rm -rf "$t"' EXIT

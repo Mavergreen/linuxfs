@@ -29,7 +29,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  "    -o opts=options        mount options (use \\ to escape , and =)\n"
  );
  }
-@@ -1527,6 +1530,14 @@
+@@ -1579,6 +1582,14 @@
  	lklfuse.set_owner = 0;
  	if (!lklfuse.owner)
  		return 0;
@@ -44,7 +44,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if (strcmp(lklfuse.owner, "root") == 0) {
  		ret = lkl_sys_newfstatat(LKL_AT_FDCWD, "/", &st, 0);
  		if (ret < 0)
-@@ -1543,11 +1554,72 @@
+@@ -1595,11 +1606,72 @@
  	return 0;
  }
  
@@ -120,7 +120,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	return lklfuse_err(ret);
  }
  
-@@ -1749,6 +1821,7 @@
+@@ -1801,6 +1873,7 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	int flags = fi->flags;
  	int ret, tries;
@@ -128,7 +128,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  
  	/* an existing entry in any form is opened (EEXIST with O_EXCL); only a new one gets the stored form */
  	if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 1, &path)))
-@@ -1775,7 +1848,8 @@
+@@ -1827,7 +1900,8 @@
  	}
  	if (tries == 4 && (ret = lklfuse_open3(path, true, mode, fi)) != 0)
  		return ret;

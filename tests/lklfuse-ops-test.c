@@ -862,6 +862,8 @@ static int listed(const char *path, const char *name, int prefix)
 	return count;
 }
 
+static int raw_has(const char *path, const char *name);
+
 static void volicon_tests(void)
 {
 	const char *V = "/.VolumeIcon.icns", *FI = "com.apple.FinderInfo";
@@ -1042,6 +1044,30 @@ static void volicon_tests(void)
 	is(lklfuse_getxattr("/", FI, b, 4), -ERANGE, "volicon: the merged one, a buffer too small: ERANGE");
 	is(listed("/", FI, 0), 1, "volicon: listed once");
 	is(lkl_sys_getxattr("/", "user.com.apple.FinderInfo", b, sizeof(b)) == 32 && b[8] == 0, 1, "volicon: the flag is never written");
+	/* a read-modify-write (vsdbutil's volume ID, a Finder FolderInfo update) hands the merged flag back: not stored */
+	is(lklfuse_getxattr("/", FI, b, sizeof(b)), 32, "volicon rmw: read the merged FinderInfo");
+	b[24] = 0x77;
+	is(lklfuse_setxattr("/", FI, b, 32, 0), 0, "volicon rmw: write it back with byte 24 changed");
+	is(lkl_sys_getxattr("/", "user.com.apple.FinderInfo", b, sizeof(b)) == 32 && b[8] == 0 && b[9] == 0x0c && b[24] == 0x77, 1,
+	   "volicon rmw: stored with byte 24 changed and without kHasCustomIcon");
+	b[8] = 0x04;
+	lkl_sys_setxattr("/", "user.com.apple.FinderInfo", b, 32, 0);
+	is(lklfuse_getxattr("/", FI, b, sizeof(b)), 32, "volicon rmw: a volume whose own FinderInfo has the flag");
+	b[25] = 0x66;
+	is(lklfuse_setxattr("/", FI, b, 32, 0), 0, "volicon rmw: written back");
+	is(lkl_sys_getxattr("/", "user.com.apple.FinderInfo", b, sizeof(b)) == 32 && b[8] == 0x04 && b[25] == 0x66, 1,
+	   "volicon rmw: keeps its own flag");
+	lkl_sys_removexattr("/", "user.com.apple.FinderInfo");
+	is(lklfuse_getxattr("/", FI, b, sizeof(b)), 32, "volicon rmw: with none stored, the synthetic one");
+	is(lklfuse_setxattr("/", FI, b, 32, 0), 0, "volicon rmw: written back unchanged");
+	is(raw_has("/", "user.com.apple.FinderInfo"), 0, "volicon rmw: stores nothing (all zero without the flag: none)");
+	/* a stored FinderInfo that is not one is passed on as an error, not hidden behind zeros and the flag */
+	memset(b, 0, 40);
+	lkl_sys_setxattr("/", "user.com.apple.FinderInfo", b, 40, 0);
+	is(lklfuse_getxattr("/", FI, b, sizeof(b)), -EIO, "volicon: a stored FinderInfo of 40 bytes: EIO, not the synthetic one");
+	memset(b, 0, 32);
+	b[9] = 0x0c;
+	lkl_sys_setxattr("/", "user.com.apple.FinderInfo", b, 32, 0);
 	is(lklfuse_getxattr("/c", FI, b, sizeof(b)), -HOST_ENOATTR, "volicon: another folder's FinderInfo is its own (none)");
 	/* a real one wins, at once, and the synthetic one is back as soon as it is gone */
 	plant(V, "real");
@@ -1068,7 +1094,7 @@ static void volicon_tests(void)
 /*
  * Mac xattrs (patch 0013, spec: item 7). A Mac name N is the Linux name user.N, always; Linux's other namespaces and
  * the carriers of netatalk's and Samba's schemes are never shown under their own names. A file's attribute is read
- * where it already is, changed there, and a new one goes in the file's own scheme, else the volume's. The four images
+ * where it already is, changed there, and a new one goes in the volume's scheme. The four images
  * are tests/lib/xattr-images.sh's (one per scheme, and one that mixes them), each mounted in turn beside the test
  * volume; the raw names and bytes are checked with lkl_sys_getxattr, as Linux sees them.
  */
@@ -1084,7 +1110,7 @@ static const char *const xa_type[] = { "ext4", "ext4", "ext4", "ext4", "ntfs3" }
 static struct lkl_disk xa_disk[XA_N];
 static int xa_id[XA_N] = { -1, -1, -1, -1, -1 };
 static long xa_oldroot = -1;
-static char fi_planted[32] = "TEXTttxt", fi_new[32] = "TEXTttxt\x00\x0c";
+static char fi_planted[32] = "TEXTttxt", fi_new[32] = "TEXTttxt\x00\x0c", fi_zero[32];
 
 /* before start_lkl: DIR's images (xattr-images.sh's four, and a blank NTFS one), as LKL disks */
 static void xa_add(const char *dir)
@@ -1170,6 +1196,8 @@ static void xname_tests(void)
 		"security.selinux", "trusted.x", "system.posix_acl_access", "osx.k", "user.", XMETA,
 		"user.org.netatalk.ResourceFork", XAFPI, "user.DosStream.k:$DATA", "user.DosStreamExt.1.k:$DATA",
 		"$LXUID", "$LXMOD", "k", "com.apple", "com.applex.k",
+		"user.AFP_AfpInfo", "user.AFP_Resource", "user.AFP_AfpInfo:$DATA", "user.AFP_Resource:$DATA", "user.k:$DATA",
+		"user.DosStreamX", "user.DosStream", "com.apple.k:$DATA",
 	};
 	char b[300], what[160], longname[300];
 	size_t i;
@@ -1230,6 +1258,13 @@ static void volume_scheme_tests(void)
 	lkl_sys_removexattr("/", XMETA);
 	lkl_sys_unlink("/xs-entry");
 	is(lklfuse_volume_xscheme(), XS_OURS, "volume_scheme: ours once the markers are gone");
+	plant("/xs-entry", "x");
+	lkl_sys_setxattr("/xs-entry", "user.org.netatalk.ResourceFork", "r", 1, 0);
+	is(lklfuse_volume_xscheme(), XS_NETATALK, "volume_scheme: netatalk's resource fork xattr is netatalk's mark");
+	lkl_sys_removexattr("/xs-entry", "user.org.netatalk.ResourceFork");
+	lkl_sys_setxattr("/xs-entry", "user.DosStreamExt.1.k:$DATA", "v", 2, 0);
+	is(lklfuse_volume_xscheme(), XS_OURS, "volume_scheme: a stream extent alone is no mark");
+	lkl_sys_unlink("/xs-entry");
 }
 
 static void xa_ours_tests(void)
@@ -1248,6 +1283,21 @@ static void xa_ours_tests(void)
 	is(raw_is("/n", "user.com.apple.FinderInfo", fi_new, 32), 1, "ours: goes in the volume's scheme, ours");
 	is(lklfuse_setxattr("/n", XTAGS, "tag", 3, 0), 0, "ours: a new file's tag");
 	is(raw_is("/n", "user." XTAGS, "tag", 3), 1, "ours: stored as user.com.apple.metadata:_kMDItemUserTags");
+	/* as on HFS+ and in the carriers: an all-zero Finder Info is none */
+	plant("/z", "z");
+	is(lklfuse_setxattr("/z", XFI, fi_zero, 32, 0), 0, "ours zero: a new all-zero FinderInfo is accepted");
+	is(raw_has("/z", "user.com.apple.FinderInfo"), 0, "ours zero: and nothing stored");
+	is(lklfuse_setxattr("/z", XFI, fi_new, 32, 0) == 0 && lklfuse_setxattr("/z", XFI, fi_zero, 32, 0) == 0, 1,
+	   "ours zero: set one, then all zero");
+	is(raw_has("/z", "user.com.apple.FinderInfo"), 0, "ours zero: removes user.com.apple.FinderInfo");
+	lkl_sys_setxattr("/z", "user.com.apple.FinderInfo", fi_zero, 32, 0);
+	is(lklfuse_getxattr("/z", XFI, NULL, 0), -HOST_ENOATTR, "ours zero: a stored all-zero one reads as none (ENOATTR)");
+	is(listed("/z", XFI, 0), 0, "ours zero: and is not listed");
+	is(lklfuse_setxattr("/z", XFI, fi_new, 32, XATTR_REPLACE), -HOST_ENOATTR, "ours zero: XATTR_REPLACE of it: ENOATTR");
+	is(lklfuse_removexattr("/z", XFI), -HOST_ENOATTR, "ours zero: removexattr of it: ENOATTR");
+	is(lklfuse_setxattr("/z", XFI, fi_new, 32, XATTR_CREATE), 0, "ours zero: XATTR_CREATE over it works");
+	is(raw_is("/z", "user.com.apple.FinderInfo", fi_new, 32), 1, "ours zero: and stores it");
+	lkl_sys_unlink("/z");
 	xa_tag("/f");
 	xa_leave(0);
 }
@@ -1310,6 +1360,75 @@ static void xa_netatalk_tests(void)
 	xa_leave(1);
 }
 
+/* lklfuse's xattr NAME of PATH is exactly LEN bytes VAL */
+static int mac_is(const char *path, const char *name, const void *val, int len)
+{
+	char b[4096];
+
+	return lklfuse_getxattr(path, name, b, sizeof(b)) == len && memcmp(b, val, len) == 0;
+}
+
+/* on the fruit image: no carrier, in any spelling, is reachable by a Mac name (EPERM to set, ENOATTR to get or remove) */
+static void carrier_tests(void)
+{
+	static const char *const reserved[] = {
+		"AFP_AfpInfo:$DATA", "AFP_Resource:$DATA", "AFP_AfpInfo", "AFP_Resource", "DosStream.AFP_AfpInfo:$DATA",
+		"DosStream.k:$DATA", "DosStreamExt.k", "DosStreamX", "k:$DATA", "org.netatalk.Metadata", "org.netatalk.ResourceFork",
+	};
+	char afp[128], rsrc[16], b[128], what[128];
+	long na = lkl_sys_getxattr("/f", XAFPI, afp, sizeof(afp)), nr;
+	size_t i;
+
+	lkl_sys_setxattr("/f", "user.DosStream.AFP_Resource:$DATA", "rsrc", 5, 0);
+	lkl_sys_setxattr("/f", "user.DosStream.k:$DATA", "v", 2, 0);
+	nr = lkl_sys_getxattr("/f", "user.DosStream.AFP_Resource:$DATA", rsrc, sizeof(rsrc));
+	for (i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i++) {
+		snprintf(what, sizeof(what), "carriers: %s: setxattr EPERM", reserved[i]);
+		is(lklfuse_setxattr("/f", reserved[i], "junk", 4, 0), -EPERM, what);
+		snprintf(what, sizeof(what), "carriers: %s: getxattr ENOATTR", reserved[i]);
+		is(lklfuse_getxattr("/f", reserved[i], b, sizeof(b)), -HOST_ENOATTR, what);
+		snprintf(what, sizeof(what), "carriers: %s: removexattr ENOATTR", reserved[i]);
+		is(lklfuse_removexattr("/f", reserved[i]), -HOST_ENOATTR, what);
+	}
+	is(na == 61 && raw_is("/f", XAFPI, afp, 61), 1, "carriers: the AfpInfo is unchanged");
+	is(nr == 5 && raw_is("/f", "user.DosStream.AFP_Resource:$DATA", rsrc, 5), 1, "carriers: the resource fork stream too");
+	is(mac_is("/f", "com.apple.ResourceFork", "rsrc", 4), 1, "carriers: which reads as com.apple.ResourceFork");
+	is(raw_is("/f", "user.DosStream.k:$DATA", "v", 2), 1, "carriers: and k's stream is unchanged");
+	/* a stream reached only by a name it does not map back to is not that name's */
+	lkl_sys_setxattr("/f", "user.DosStream.a\xef\x80\xa2" "b:$DATA", "v", 2, 0);
+	is(mac_is("/f", "a:b", "v", 1), 1, "carriers: a\\uF022b's stream is a:b's");
+	is(lklfuse_getxattr("/f", "a\xef\x80\xa2" "b", b, sizeof(b)), -HOST_ENOATTR, "carriers: not the name with U+F022 itself");
+	is(lklfuse_setxattr("/f", "a\xef\x80\xa2" "b", "w", 1, 0), -EPERM, "carriers: which cannot be set as a stream either");
+	/* listxattr names only what getxattr reads */
+	lkl_sys_setxattr("/f", "user.DosStream.DosStream.x:$DATA", "v", 2, 0);
+	lkl_sys_setxattr("/f", "user.DosStream.org.netatalk.Metadata:$DATA", "v", 2, 0);
+	lkl_sys_setxattr("/f", "user.DosStream.y:$DATA:$DATA", "v", 2, 0);
+	lkl_sys_setxattr("/f", "user.AFP_AfpInfo", "v", 1, 0);
+	is(listed("/f", "DosStream", 1) + listed("/f", "org.netatalk", 1) + listed("/f", "y:", 1) + listed("/f", "AFP_", 1), 0,
+	   "carriers: listxattr hides streams whose names are carriers' or stream spellings");
+	is(listed("/f", "com.apple.ResourceFork", 0) + listed("/f", "k", 0) + listed("/f", "a:b", 0), 3,
+	   "carriers: and lists the rest by their Mac names");
+	lkl_sys_removexattr("/f", "user.DosStream.DosStream.x:$DATA");
+	lkl_sys_removexattr("/f", "user.DosStream.org.netatalk.Metadata:$DATA");
+	lkl_sys_removexattr("/f", "user.DosStream.y:$DATA:$DATA");
+	lkl_sys_removexattr("/f", "user.AFP_AfpInfo");
+	lkl_sys_removexattr("/f", "user.DosStream.a\xef\x80\xa2" "b:$DATA");
+	lkl_sys_removexattr("/f", "user.DosStream.AFP_Resource:$DATA");
+	lkl_sys_removexattr("/f", "user.DosStream.k:$DATA");
+}
+
+/* listxattr's size query is its length, and one byte short is ERANGE */
+static void list_sized(const char *path, const char *what)
+{
+	char b[4096], w[160];
+	int n = lklfuse_listxattr(path, NULL, 0);
+
+	snprintf(w, sizeof(w), "%s: listxattr's size query is its length", what);
+	is(n > 0 && n == lklfuse_listxattr(path, b, sizeof(b)), 1, w);
+	snprintf(w, sizeof(w), "%s: one byte short: ERANGE", what);
+	is(lklfuse_listxattr(path, b, (size_t)n - 1), -ERANGE, w);
+}
+
 static void xa_fruit_tests(void)
 {
 	char b[512], raw[512];
@@ -1357,6 +1476,8 @@ static void xa_fruit_tests(void)
 	is(lklfuse_getxattr("/f", "big", b, sizeof(b)), -HOST_ENOATTR, "fruit: nor read");
 	is(lklfuse_setxattr("/f", "big", "x", 1, 0), -EIO, "fruit: nor written");
 	is(raw_is("/f", "user.DosStream.big:$DATA", "ab\x01", 3), 1, "fruit: and it is unchanged");
+	lkl_sys_removexattr("/f", "user.DosStream.big:$DATA");
+	carrier_tests();
 	xa_tag("/f");
 	xa_leave(2);
 }
@@ -1380,20 +1501,32 @@ static void xa_mixed_tests(void)
 	is(lklfuse_setxattr("/n", XFI, fi_new, 32, 0), 0, "mixed_follows_file: a new file's FinderInfo");
 	is(lkl_sys_getxattr("/n", XMETA, b, sizeof(b)) == 402 && memcmp(b + 122, fi_new, 32) == 0, 1,
 	   "mixed_follows_file: gets the volume's scheme (a netatalk blob)");
+	/* every new attribute goes in the volume's scheme: a default Samba share keeps Finder Info in the blob, tags in streams */
+	plant("/d", "d");
+	lkl_sys_setxattr("/d", XTAGS_STREAM, "t", 2, 0);
+	is(lklfuse_setxattr("/d", XFI, fi_new, 32, 0), 0, "new_in_volume: a label on a file with only a tag stream");
+	is(lkl_sys_getxattr("/d", XMETA, b, sizeof(b)) == 402 && memcmp(b + 122, fi_new, 32) == 0, 1,
+	   "new_in_volume: goes in a netatalk blob, the volume's scheme");
+	is(raw_has("/d", XAFPI) + raw_has("/d", "user.com.apple.FinderInfo"), 0, "new_in_volume: not an AfpInfo stream");
+	is(lklfuse_setxattr("/d", XTAGS, "u", 1, 0) == 0 && raw_is("/d", XTAGS_STREAM, "u", 2) && !raw_has("/d", "user." XTAGS), 1,
+	   "new_in_volume: the tag it had changes where it is, in its stream");
+	is(lklfuse_setxattr("/s", "k", "v", 1, 0), 0, "new_in_volume: a new attribute on the fruit file");
+	is(raw_is("/s", "user.k", "v", 1) && !raw_has("/s", "user.DosStream.k:$DATA"), 1, "new_in_volume: is user.N, the volume's");
+	lkl_sys_removexattr("/s", "user.k");
+	lkl_sys_unlink("/d");
+	list_sized("/f", "list_sized: the netatalk file (a blob, a user.N tag)");
+	plant("/dup", "d");
+	lkl_sys_setxattr("/dup", "user.k", "a", 1, 0);
+	lkl_sys_setxattr("/dup", "user.DosStream.k:$DATA", "b", 2, 0);
+	is(listed("/dup", "k", 0), 1, "list_sized: a name both as user.N and as a stream is listed once");
+	list_sized("/dup", "list_sized: that file");
+	lkl_sys_unlink("/dup");
 	xa_tag("/f");
 	xa_tag("/o");
 	xa_tag("/s");
 	plant("/new", "new");
 	xa_tag("/new");
 	xa_leave(3);
-}
-
-/* lklfuse's xattr NAME of PATH is exactly LEN bytes VAL */
-static int mac_is(const char *path, const char *name, const void *val, int len)
-{
-	char b[4096];
-
-	return lklfuse_getxattr(path, name, b, sizeof(b)) == len && memcmp(b, val, len) == 0;
 }
 
 /*

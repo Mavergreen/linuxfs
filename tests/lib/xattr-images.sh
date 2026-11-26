@@ -16,8 +16,8 @@
 #          a label or tag set later from the Mac shows as a change, and type and creator kept show it changed in place
 #          (tests/lib/check-xattrs.sh). The xattrs are written with debugfs, so nothing is mounted.
 set -u
-[ "$(uname -s)" = Linux ] || { echo "xattr-images.sh: needs Linux's mkfs.ext4 and debugfs" >&2; exit 77; }
-[ "$#" -eq 1 ] || { echo "usage: xattr-images.sh DIR" >&2; exit 2; }
+test "$(uname -s)" = Linux || { echo "xattr-images.sh: needs Linux's mkfs.ext4 and debugfs" >&2; exit 77; }
+test "$#" -eq 1 || { echo "usage: xattr-images.sh DIR" >&2; exit 2; }
 mkdir -p "$1" && cd "$1" || exit 1
 t=$(mktemp -d "${TMPDIR:-/tmp}/xattr-images.XXXXXX") || exit 1
 trap 'rm -rf "$t"' EXIT
