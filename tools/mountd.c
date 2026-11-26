@@ -13,7 +13,8 @@
  * - the user at the console: "hi", the peer's uid and groups to syslog, then a child, at most MOUNTD_SLOTS_UID per uid and
  *   MOUNTD_SLOTS in all. Beyond that, MOUNTD_QUEUE per uid wait first in, first out; past MOUNTD_QUEUE_WAIT, or beyond the
  *   queue, "user<TAB>busy" (nothing was touched, so the mount program's own path is safe).
- * The child reads the one request line within MOUNTD_REQUEST seconds in all, and parses it (mountd_parse). The daemon exits 0 after
+ * The child reads the one request line within MOUNTD_REQUEST seconds in all, and parses it (mountd_parse); a mount point
+ * not directly under /Volumes is answered "user" (the user's own mount), never run. The daemon exits 0 after
  * MOUNTD_IDLE seconds with no child and nothing queued, and on SIGTERM (whose handler only sets a flag). The socket
  * (/var/run/dev.mavergreen.linuxfs.mountd.sock) sits in a directory group daemon may write: the mount program checks that
  * its peer is root before it sends anything. Syslog gets the peers, refusals and results; stderr (the log file) only a
@@ -31,8 +32,10 @@
  * PATH alone and 0-2 only, its output drained (the first 64 KiB to syslog, and its first "cli-pgid N"). At MOUNTD_DEADLINE
  * it gets SIGTERM; MOUNTD_GRACE later, SIGKILL to its group and to the CLI's group N as mountd_snap_refresh keeps it: the
  * _linuxfs members first seen and their children, frozen once the group is seen empty or recycled, each still itself.
- * "ok" only when it exited 0, root's mount of /dev/BSD is on top of MNT and /dev/BSD is still the device judged; any other
- * reply gives an adopted mount point back when nothing is mounted on it. One result line per request goes to syslog, or,
+ * "ok" only when it exited 0 (after SIGTERM too), root's mount of /dev/BSD is on top of MNT and /dev/BSD is still the device
+ * judged. Before any "no" after "begin", root's mount of the disk still on top of MNT is unmounted (undo_orphan, MNT_FORCE),
+ * so no mount is ever left beside a "no"; any reply other than "ok" gives an adopted mount point back when nothing is mounted
+ * on it. One result line per request goes to syslog, or,
  * after "too slow", one from the parent.
  *
  * The test build (LINUXFS_MOUNTD_TEST, never shipped) binds its own socket and takes the console's uid (or a file to read

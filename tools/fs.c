@@ -21,8 +21,10 @@
  *                                                  mount_macfuse reports the mount, all through paths that are root's alone
  *                                                  (path_trusted); with an older macFUSE, refuses ("too old to mount before login").
  *                                                  SIGTERM (the daemon's deadline) only sets a flag; every wait sees it, and root
- *                                                  stops the CLI's group, unmounts its own mount, stops mount_macfuse (15 s at most)
- *                                                  and exits 1. It says "cli-pgid N" on stderr once the CLI has its group.
+ *                                                  stops the CLI's group (SIGTERM, up to 5 s, then SIGKILL), unmounts its own
+ *                                                  mount, stops mount_macfuse (15 s at most) and exits 1. Once "ok" is decided,
+ *                                                  SIGTERM is blocked: the mount stays and the exit is 0, never 1 beside a mount.
+ *                                                  It says "cli-pgid N" on stderr once the CLI has its group.
  *
  * -DLINUXFS_FS_TEST_DROP (tests only, never in the shipped binary) takes the root path as whatever user runs it, up to the
  * drop: the privileged calls (initgroups, setgid, setuid) are replaced by printing the plan; the macFUSE manifest, the

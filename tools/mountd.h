@@ -35,7 +35,8 @@
 #define MOUNTD_QUEUE 16
 #define MOUNTD_IDLE 60
 
-/* One request: FS one of the six, BSD diskN or diskNsM, MNT /Volumes/<one name>; ro and owners from FLAGS. */
+/* One request: FS one of the six, BSD diskN or diskNsM, MNT /Volumes/<one name> (or, when mountd_parse gives 1, a mount point
+ * elsewhere, answered "user"); ro and owners from FLAGS. */
 struct mountd_req { char fs[8], bsd[40], mnt[1024]; int ro, owners; };
 
 /* Reads exactly one line of LEN bytes, mount<TAB>FS<TAB>BSD<TAB>FLAGS<TAB>MNT<LF>, at most 1024 bytes, no NUL:

@@ -27,7 +27,7 @@ devs=
 mdpid= tp= wd= lastcg=
 cleanup() {
   for p in $mdpid $tp $wd; do kill "$p" 2>/dev/null; done
-  test -z "$lastcg" || kill -9 -- "-$lastcg" 2>/dev/null
+  test -z "$lastcg" || ! kill -0 -- "-$lastcg" 2>/dev/null || kill -9 -- "-$lastcg" 2>/dev/null
   for d in $devs; do hdiutil detach -quiet -force "$d" 2>/dev/null; done; }
 trap cleanup EXIT
 trap 'exit 1' INT TERM HUP
@@ -955,7 +955,8 @@ test $rc = 0 && ! grep -qx connected "$ML"; ok $? "ask: the root plan (drop buil
 grp_gone() { # PGID: no live process is left in that group (bounded, 3 s)
   test -n "$1" || return 1
   i=0; while ps -axo pgid=,stat= | awk -v g="$1" '$1 == g && $2 !~ /^Z/ { f = 1 } END { exit !f }' && test $i -lt 30; do sleep 0.1; i=$((i + 1)); done
-  test $i -lt 30; }
+  test $i -lt 30 || return 1
+  test "$1" != "$lastcg" || lastcg=; }	# gone: never killed again by number at exit (findings-r1 n1)
 hst() { # HELPER-MODE CLI-MODE FILE PATTERN: root's mount with both stand-ins, in the background; once FILE has a line matching
         # PATTERN (bounded, 10 s), SIGTERM; rc, the seconds from the signal to its end in $t, output in $M/plan; HS_ENV adds to its environment
   rm -f "$D/drop/mhelper.log" "$M/fdcli.log"
