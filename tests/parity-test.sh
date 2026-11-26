@@ -2077,11 +2077,12 @@ expect smoke_login_lock_not_first test -z "$(grep -e '/\*\.lock' "$sm")"
 
 # da_unmount and da_eject (item 4, Step 2): who holds the volume is sudo -n lsof on its mount point (every user's files,
 #   root's too), never lsof +D as the user; an eject's failure also says DiskArbitration's view, mount's line and who has
-#   the disk's devices open; the one retry stays (preflight F13), printed
+#   the disk's devices open. Final review r0 I2 (the ruling): no retry is left (HFS+ 0 of 20 busy, ext4 0 of 20; item 4's
+#   Proof): busy_once runs CMD once, and its first failure stands
 expect smoke_no_lsof_D test -z "$(grep -n 'lsof +D' "$sm")"
-busyfn() { # FAILS CMD...: the smoke's retry_busy (and da_unmount), diskutil failing FAILS times; calls in $T/busy.calls
+busyfn() { # FAILS CMD...: the smoke's busy_once (and da_unmount), diskutil failing FAILS times; calls in $T/busy.calls
   : > "$T/busy.calls"; echo "$1" > "$T/busy.left"; shift
-  (eval "$(smoke_fn info)"; eval "$(smoke_fn holders)"; eval "$(smoke_fn retry_busy)"; eval "$(smoke_fn da_unmount)"
+  (eval "$(smoke_fn info)"; eval "$(smoke_fn holders)"; eval "$(smoke_fn busy_once)"; eval "$(smoke_fn da_unmount)"
    eval "$(smoke_fn stop_and_ask)"; eval "$(smoke_fn mounted_by_root)"
    bounded() { shift; "$@"; }; sleep() { echo "sleep $*" >> "$T/busy.calls"; }
    diskutil() {
@@ -2094,19 +2095,21 @@ busyfn() { # FAILS CMD...: the smoke's retry_busy (and da_unmount), diskutil fai
    "$@")
 }
 r=$(busyfn 1 da_unmount /Volumes/x 2>&1); rc=$?
-expect smoke_da_unmount_retried test "$rc" -eq 0
+expect smoke_da_unmount_first_failure_stands test "$rc" -ne 0
 expect smoke_da_unmount_sudo_lsof grep -qx 'sudo -n lsof /Volumes/x' "$T/busy.calls"
 expect smoke_da_unmount_said has "$r" "^# diskutil unmount /Volumes/x failed; who holds /Volumes/x:$"
-expect smoke_da_unmount_retry_said has "$r" "^# retrying diskutil unmount /Volumes/x$"
-expect smoke_da_unmount_once test "$(grep -c '^diskutil unmount' "$T/busy.calls")" -eq 2
+expect smoke_da_unmount_output_said has "$r" "^Volume failed to eject$"
+expect smoke_da_unmount_not_retried test -z "$(printf '%s\n' "$r" | grep 'retrying')" -a -z "$(grep '^sleep' "$T/busy.calls")"
+expect smoke_da_unmount_once test "$(grep -c '^diskutil unmount' "$T/busy.calls")" -eq 1
 r=$(busyfn 0 da_unmount /Volumes/x 2>&1); rc=$?
 expect smoke_da_unmount_quiet test "$rc" -eq 0 -a -z "$r" -a "$(grep -c . "$T/busy.calls")" -eq 1
-r=$(busyfn 2 retry_busy /Volumes/x /dev/disk9 diskutil eject /dev/disk9 2>&1); rc=$?
-expect smoke_eject_fails_twice test "$rc" -ne 0 -a "$(grep -c '^diskutil eject' "$T/busy.calls")" -eq 2
+r=$(busyfn 1 busy_once /Volumes/x /dev/disk9 diskutil eject /dev/disk9 2>&1); rc=$?
+expect smoke_eject_fails_once test "$rc" -ne 0 -a "$(grep -c '^diskutil eject' "$T/busy.calls")" -eq 1
 expect smoke_eject_da_view has "$r" "^#   DiskArbitration: disk9 Mounted: No$"
 expect smoke_eject_mount_line has "$r" "^#   mount: /dev/disk9 on /Volumes/x (macfuse_ext4"
 expect smoke_eject_lsof_mp grep -qx 'sudo -n lsof /Volumes/x' "$T/busy.calls"
-expect smoke_da_eject_uses_retry test -n "$(smoke_fn da_eject | grep 'retry_busy "$2" "$1" diskutil eject "$1"')"
+expect smoke_da_eject_uses_busy_once test -n "$(smoke_fn da_eject | grep 'busy_once "$2" "$1" diskutil eject "$1"')"
+expect smoke_no_retry_busy test -z "$(grep -n 'retry_busy\|# retrying diskutil' "$sm")"
 
 # no forced unmount, eject or detach ever targets a linuxfs disk (QEMU first)
 forced=
@@ -2555,13 +2558,13 @@ expect smoke_before_login_loglp test -n "$(printf '%s\n' "$after" | grep 'loglog
 expect smoke_before_login_not_asked_in_section ascending "$bl" "$(first_line 'check "before login: the mount daemon was not asked"')" "$(first_line '^  restore_login$')"
 
 # ---- Task 16l fix round 1 ----
-# r0 I3: when the user's diskutil unmount or eject of root's mount fails twice and the volume is still root's, with nothing saying
-#   busy (diskutil's busy or dissent, or a holder in lsof), retry_busy prints the fixed STOP-AND-ASK: marker (risk 1); never for a
-#   busy volume, a user mount, or a retry that worked
-sa() { # FAILS MSG LSOF MOUNTLINE CMD...: the smoke's retry_busy, diskutil failing FAILS times saying MSG, lsof saying LSOF
+# r0 I3: when the user's diskutil unmount or eject of root's mount fails and the volume is still root's, with nothing saying
+#   busy (diskutil's busy or dissent, or a holder in lsof), busy_once prints the fixed STOP-AND-ASK: marker (risk 1); never for a
+#   busy volume, a user mount, or a command that worked. Final review r0 I2: on its first failure (no retry is left)
+sa() { # FAILS MSG LSOF MOUNTLINE CMD...: the smoke's busy_once, diskutil failing FAILS times saying MSG, lsof saying LSOF
   : > "$T/sa.calls"; echo "$1" > "$T/sa.left"; sa_msg=$2 sa_lsof=$3 sa_mount=$4; shift 4
-  (eval "$(smoke_fn info)"; eval "$(smoke_fn holders)"; eval "$(smoke_fn retry_busy)"; eval "$(smoke_fn da_unmount)"; eval "$(smoke_fn mounted_by_root)"
-   eval "$(smoke_fn stop_and_ask)"; rb_was=${sa_was:-}
+  (eval "$(smoke_fn info)"; eval "$(smoke_fn holders)"; eval "$(smoke_fn busy_once)"; eval "$(smoke_fn da_unmount)"; eval "$(smoke_fn mounted_by_root)"
+   eval "$(smoke_fn stop_and_ask)"; bo_was=${sa_was:-}
    bounded() { shift; "$@"; }; sleep() { :; }
    diskutil() {
      echo "diskutil $*" >> "$T/sa.calls"
@@ -2574,44 +2577,44 @@ sa() { # FAILS MSG LSOF MOUNTLINE CMD...: the smoke's retry_busy, diskutil faili
 }
 rootl="/dev/disk9 on /Volumes/x (macfuse_ext4, local, nodev, nosuid, synchronous)"
 userl="/dev/disk9 on /Volumes/x (macfuse_ext4, local, nodev, nosuid, synchronous, mounted by u)"
-r=$(sa 2 "Unmount failed for /Volumes/x" "" "$rootl" da_unmount /Volumes/x)
+r=$(sa 1 "Unmount failed for /Volumes/x" "" "$rootl" da_unmount /Volumes/x)
 expect smoke_stop_and_ask_unmount has "$r" "^STOP-AND-ASK: the user's diskutil unmount /Volumes/x of root's mount at /Volumes/x was refused"
 expect smoke_stop_and_ask_once test "$(printf '%s\n' "$r" | grep -c 'STOP-AND-ASK:')" -eq 1
 expect smoke_stop_and_ask_says_output has "$r" "^STOP-AND-ASK: .*: Unmount failed for /Volumes/x$"
-r=$(sa 2 "Volume failed to eject" "" "$rootl" retry_busy /Volumes/x /dev/disk9 diskutil eject /dev/disk9)
+r=$(sa 1 "Volume failed to eject" "" "$rootl" busy_once /Volumes/x /dev/disk9 diskutil eject /dev/disk9)
 expect smoke_stop_and_ask_eject has "$r" "^STOP-AND-ASK: the user's diskutil eject /dev/disk9 of root's mount at /Volumes/x was refused"
 # r1 m1 (the ruling): DiskArbitration words its own refusals as dissents too: a dissent is not busy; privilege or permitted
 #   always prints the marker (a holder notwithstanding); busy and in use never do
-r=$(sa 2 "Volume x on disk9 failed to unmount: dissented by PID 0 (/usr/libexec/diskarbitrationd): Not privileged" "" "$rootl" da_unmount /Volumes/x)
+r=$(sa 1 "Volume x on disk9 failed to unmount: dissented by PID 0 (/usr/libexec/diskarbitrationd): Not privileged" "" "$rootl" da_unmount /Volumes/x)
 expect smoke_stop_and_ask_dissent_privilege has "$r" "^STOP-AND-ASK: the user's diskutil unmount /Volumes/x of root's mount at /Volumes/x was refused"
-r=$(sa 2 "Unmount failed for /Volumes/x: Not permitted" "mds 77 root 5r REG /Volumes/x/.Spotlight-V100/store" "$rootl" da_unmount /Volumes/x)
+r=$(sa 1 "Unmount failed for /Volumes/x: Not permitted" "mds 77 root 5r REG /Volumes/x/.Spotlight-V100/store" "$rootl" da_unmount /Volumes/x)
 expect smoke_stop_and_ask_permitted_held has "$r" "^STOP-AND-ASK: "
-r=$(sa 2 "Volume x on disk9 failed to unmount: dissented by PID 77 (/usr/bin/foo)" "" "$rootl" da_unmount /Volumes/x)
+r=$(sa 1 "Volume x on disk9 failed to unmount: dissented by PID 77 (/usr/bin/foo)" "" "$rootl" da_unmount /Volumes/x)
 expect smoke_stop_and_ask_dissent_not_busy has "$r" "^STOP-AND-ASK: "
-r=$(sa 2 "Volume x on disk9 failed to unmount: dissented by PID 77 (/usr/bin/foo): Resource busy" "" "$rootl" da_unmount /Volumes/x)
+r=$(sa 1 "Volume x on disk9 failed to unmount: dissented by PID 77 (/usr/bin/foo): Resource busy" "" "$rootl" da_unmount /Volumes/x)
 expect smoke_stop_and_ask_not_dissent_busy test -z "$(printf '%s\n' "$r" | grep 'STOP-AND-ASK')"
-r=$(sa 2 "Volume x on disk9 failed to unmount: in use by another process" "" "$rootl" da_unmount /Volumes/x)
+r=$(sa 1 "Volume x on disk9 failed to unmount: in use by another process" "" "$rootl" da_unmount /Volumes/x)
 expect smoke_stop_and_ask_not_in_use test -z "$(printf '%s\n' "$r" | grep 'STOP-AND-ASK')"
-# r1 m2: da_eject passes ej_was in (rb_was): a volume root's before the eject, unmounted by it, then the disk's eject refused
-r=$(sa_was=$rootl sa 2 "Volume failed to eject" "" "" retry_busy /Volumes/x /dev/disk9 diskutil eject /dev/disk9)
+# r1 m2: da_eject passes ej_was in (bo_was): a volume root's before the eject, unmounted by it, then the disk's eject refused
+r=$(sa_was=$rootl sa 1 "Volume failed to eject" "" "" busy_once /Volumes/x /dev/disk9 diskutil eject /dev/disk9)
 expect smoke_stop_and_ask_unmounted_eject has "$r" "^STOP-AND-ASK: the user's diskutil eject /dev/disk9 of root's mount at /Volumes/x: the volume was unmounted, the eject was refused"
-r=$(sa_was=$userl sa 2 "Volume failed to eject" "" "" retry_busy /Volumes/x /dev/disk9 diskutil eject /dev/disk9)
+r=$(sa_was=$userl sa 1 "Volume failed to eject" "" "" busy_once /Volumes/x /dev/disk9 diskutil eject /dev/disk9)
 expect smoke_stop_and_ask_unmounted_user test -z "$(printf '%s\n' "$r" | grep 'STOP-AND-ASK')"
-r=$(sa_was=$rootl sa 2 "Volume failed to eject: Resource busy" "" "" retry_busy /Volumes/x /dev/disk9 diskutil eject /dev/disk9)
+r=$(sa_was=$rootl sa 1 "Volume failed to eject: Resource busy" "" "" busy_once /Volumes/x /dev/disk9 diskutil eject /dev/disk9)
 expect smoke_stop_and_ask_unmounted_busy test -z "$(printf '%s\n' "$r" | grep 'STOP-AND-ASK')"
-expect da_eject_passes_was test -n "$(smoke_fn da_eject | grep 'rb_was=$ej_was')" -a -n "$(smoke_fn retry_busy | grep 'stop_and_ask "$rb_mp" "$\*" "$rb_o" "${rb_was:-}"')"
-r=$(sa 2 "Unmount failed: Resource busy" "" "$rootl" da_unmount /Volumes/x)
+expect da_eject_passes_was test -n "$(smoke_fn da_eject | grep 'bo_was=$ej_was')" -a -n "$(smoke_fn busy_once | grep 'stop_and_ask "$bo_mp" "$\*" "$bo_o" "${bo_was:-}"')"
+r=$(sa 1 "Unmount failed: Resource busy" "" "$rootl" da_unmount /Volumes/x)
 expect smoke_stop_and_ask_not_busy test -z "$(printf '%s\n' "$r" | grep 'STOP-AND-ASK')"
-r=$(sa 2 "Unmount failed for /Volumes/x" "mdworker 77 root cwd DIR /Volumes/x" "$rootl" da_unmount /Volumes/x)
+r=$(sa 1 "Unmount failed for /Volumes/x" "mdworker 77 root cwd DIR /Volumes/x" "$rootl" da_unmount /Volumes/x)
 expect smoke_stop_and_ask_not_held test -z "$(printf '%s\n' "$r" | grep 'STOP-AND-ASK')"
-r=$(sa 2 "Unmount failed for /Volumes/x" "" "$userl" da_unmount /Volumes/x)
+r=$(sa 1 "Unmount failed for /Volumes/x" "" "$userl" da_unmount /Volumes/x)
 expect smoke_stop_and_ask_not_user_mount test -z "$(printf '%s\n' "$r" | grep 'STOP-AND-ASK')"
-r=$(sa 2 "Unmount failed for /Volumes/x" "" "" da_unmount /Volumes/x)
+r=$(sa 1 "Unmount failed for /Volumes/x" "" "" da_unmount /Volumes/x)
 expect smoke_stop_and_ask_not_unmounted test -z "$(printf '%s\n' "$r" | grep 'STOP-AND-ASK')"
-r=$(sa 1 "Unmount failed for /Volumes/x" "" "$rootl" da_unmount /Volumes/x)
-expect smoke_stop_and_ask_not_retried test -z "$(printf '%s\n' "$r" | grep 'STOP-AND-ASK')"
+r=$(sa 0 "Unmount failed for /Volumes/x" "" "$rootl" da_unmount /Volumes/x)
+expect smoke_stop_and_ask_not_when_it_worked test -z "$(printf '%s\n' "$r" | grep 'STOP-AND-ASK')"
 rm -f "${T:?}/sa.calls" "${T:?}/sa.left"
-expect smoke_stop_and_ask_in_retry test -n "$(smoke_fn retry_busy | grep 'stop_and_ask ')"
+expect smoke_stop_and_ask_in_busy_once test -n "$(smoke_fn busy_once | grep 'stop_and_ask ')"
 # r0 I3: da_cycle's eject is two checks: the user's eject (no sudo), then, only when it worked, that it leaves no lklfuse
 expect da_cycle_eject_split test -n "$(printf '%s\n' "$dc" | grep '^ *if check "$tag: diskutil eject (the user'"'"'s, no sudo)" da_eject "$disk" "$mp"; then')" \
   -a -n "$(printf '%s\n' "$dc" | grep 'check "$tag: the eject leaves no lklfuse" da_lklfuse_gone "$mp"')"

@@ -353,21 +353,19 @@ holders() {  # MOUNTPOINT [DISK]
   # shellcheck disable=SC2086  # the device nodes are words
   echo "#   sudo -n lsof$hdv:"; test -z "$hdv" || bounded 300 sudo -n lsof $hdv 2>&1 < /dev/null | sed 's/^/#     /' | head -n 20
 }
-# spec: tests/smoke-mavericks.sh header -- a volume can be briefly busy right after writes (run 45436964610: xfs GPT
-#       "Unmount failed" once; run 45449093147: ext4 GPT eject once): CMD; when it fails, who holds MOUNTPOINT (holders),
-#       then CMD once more after 2 s; the retry is printed, so a flake stays visible. The retries stay until push D's
-#       Spotlight-on measurement (preflight F13)
-retry_busy() {  # MOUNTPOINT DISK|"" CMD...
-  rb_mp=$1 rb_d=$2; shift 2
-  bounded 600 "$@" && return 0
-  echo "# $* failed; who holds $rb_mp:"; holders "$rb_mp" $rb_d
-  sleep 2; echo "# retrying $*"
-  rb_o=$(bounded 600 "$@" 2>&1); rb_rc=$?; test -z "$rb_o" || printf '%s\n' "$rb_o"
-  test "$rb_rc" -eq 0 && return 0
-  stop_and_ask "$rb_mp" "$*" "$rb_o" "${rb_was:-}"; return "$rb_rc"
+# spec: docs/superpowers/specs/2026-11-25-hfs-parity-design.md item 4, Proof ("0 if HFS+ shows 0, in which case no retries are
+#       left in the smoke"), and the final review's ruling (r0 I2): HFS+ showed 0 of 20 busy (pushes A and C) and ext4 0 of 20
+#       (F2, G), so a busy volume is not retried: CMD once, its output printed; when it fails, who holds MOUNTPOINT (holders)
+#       and the stop-and-ask's marker, and the failure stands (not ok), as a user's eject that fails would
+busy_once() {  # MOUNTPOINT DISK|"" CMD...
+  bo_mp=$1 bo_d=$2; shift 2
+  bo_o=$(bounded 600 "$@" 2>&1); bo_rc=$?; test -z "$bo_o" || printf '%s\n' "$bo_o"
+  test "$bo_rc" -eq 0 && return 0
+  echo "# $* failed; who holds $bo_mp:"; holders "$bo_mp" $bo_d
+  stop_and_ask "$bo_mp" "$*" "$bo_o" "${bo_was:-}"; return "$bo_rc"
 }
 # spec: docs/superpowers/plans/2026-11-25-hfs-parity.md 16l-push Step 3 -- the user's unmount or eject of root's mount refused is
-#       the stop-and-ask (risk 1 of the amendment), not a busy volume's flake: after the retry failed, when MOUNTPOINT is still
+#       the stop-and-ask (risk 1 of the amendment), not a busy volume's flake: when CMD failed (busy_once), when MOUNTPOINT is still
 #       root's, or was before CMD (WAS, mount's line then: da_eject's ej_was, so an eject that unmounted the volume and was
 #       refused the disk), one fixed marker line: always when diskutil says privilege or permitted; else when nothing says
 #       busy (diskutil's busy or in use, or a holder in sudo -n lsof). A dissent alone is not busy: DiskArbitration words
@@ -384,7 +382,7 @@ stop_and_ask() {  # MOUNTPOINT CMD OUTPUT [WAS]
   case $sa_how in :*) ;; *) sa_how=" $sa_how" ;; esac
   echo "STOP-AND-ASK: the user's $2 of root's mount at $1$sa_how (risk 1 of the amendment): $(printf '%s' "$3" | tr '\n' ' ' | sed 's/ *$//')"
 }
-da_unmount() { retry_busy "$1" "" diskutil unmount "$1"; }  # MOUNTPOINT
+da_unmount() { busy_once "$1" "" diskutil unmount "$1"; }  # MOUNTPOINT
 login_unmount() { bounded 600 sudo -n diskutil unmount "$1" && ! mount | grep -qF " on $1 ("; }
 # spec: cli/linuxfs image_lock -- login_lock IMG DEV: the lock file the CLI takes for DEV, a disk hdiutil attached from IMG: in
 #       _linuxfs's lock directory, named for IMG's inode and device, with -sN for a partition. (Task 19b: since Task 16 every
@@ -403,7 +401,7 @@ da_eject() {  # whole disk, mount point: the user's eject (no sudo); first, for 
   #             pids of the lklfuse serving it (ej_pids: root's mount's, by its record; else the user path's, by its command)
   ej_was=$(mount | grep -F " on $2 (")
   ej_pids=$(root_lklfuse_of "$2"); test -n "$ej_pids" || ej_pids=$(lklfuse_on "$2" | awk '{ print $2 }')
-  rb_was=$ej_was; retry_busy "$2" "$1" diskutil eject "$1"; ej_rc=$?; rb_was=; return "$ej_rc"
+  bo_was=$ej_was; busy_once "$2" "$1" diskutil eject "$1"; ej_rc=$?; bo_was=; return "$ej_rc"
 }
 pid_gone() { while ps -p "$1" > /dev/null 2>&1; do sleep 0.1; done; }  # PID
 da_lklfuse_gone() {  # MP: after da_eject, each of its ej_pids gone (30 s each), and no lklfuse whose command ends in MP within 10 s;
@@ -557,7 +555,7 @@ mountd_unshared_peer() {  # DEV POS
 # spec: tests/smoke-mavericks.sh header -- NAME IMAGE PERSONALITY KIND(rw|ro) VIA(raw|GPT): attach, mounted within 30 s, personality, reads and writes,
 #       unmount then mount, eject, then it leaves no lklfuse; after each mount, root's (da_root_mount, da_served, no_owner_pseudo,
 #       da_info_node), and the unmount and eject the user's own, with no sudo (a refusal is a stop-and-ask, risk 1 of the
-#       amendment: retry_busy marks it STOP-AND-ASK:)
+#       amendment: busy_once marks it STOP-AND-ASK:)
 da_cycle() {
   nm=$1 img=$2 want=$3 kind=$4 via=$5 tag="$1 ($5)"
   pos=$(log_pos)
