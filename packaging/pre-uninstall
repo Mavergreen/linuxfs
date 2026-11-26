@@ -9,7 +9,7 @@
 #          directories), and removes the _linuxfs account and its home when nothing runs as it. An lklfuse under the .d directory counts as mounted too.
 #          The mount daemon is unloaded first, so no root mount can start during the check; then it waits, polling each second
 #          for up to 30 s, while a request already runs (spec §6: its processes are abandoned process groups, which unloading
-#          does not stop): a root mountd process (by its full path), a root mount_macfuse_<fs> (one of the six), or a disk's
+#          does not stop): a root mountd process (by its full path), a root mount_macfuse_<fs> (one of the six; root: effective and real uid 0), or a disk's
 #          lock held. If one still runs ("a mount is under way"), or a volume is mounted, it loads mountd again (saying so if
 #          that fails) and exits 1. A check that cannot run (ps, awk or perl failing), or a lock directory that is not root's
 #          own 0700 one, is said and fails open. Once no lock is held it removes the lock directory too; the daemon's log,
@@ -24,13 +24,14 @@ wait_s=30
 mountd_plist=/Library/LaunchDaemons/dev.mavergreen.linuxfs.mountd.plist
 launchctl unload "$mountd_plist" 2>/dev/null || :
 # requests: root's processes of the mount daemon (a request's child before it takes a lock) and of the bundles' mount programs,
-# each of the six named exactly, as running. Only uid 0 counts: every request runs as root, and anyone can name a process so.
+# each of the six named exactly, as running. Only a process whose effective and real uid are both 0 counts: every request runs
+# as root, anyone can name a process so, and a setuid-root program (su at its prompt) anyone starts has an effective uid of 0.
 # It fails (status 1, nothing printed) when ps or awk does.
 requests() {
-  rq_ps="$(ps -axww -o uid=,command= 2>/dev/null)" && [ -n "$rq_ps" ] || return 1
+  rq_ps="$(ps -axww -o uid=,ruid=,command= 2>/dev/null)" && [ -n "$rq_ps" ] || return 1
   printf '%s\n' "$rq_ps" | awk -v m="$mountd" '
-    { u = $1; c = $0; sub(/^[ \t]*[0-9]+[ \t]+/, "", c); n = c; sub(/[ \t].*/, "", n); sub(/.*\//, "", n) }
-    u != "0" { next }
+    { u = $1; r = $2; c = $0; sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]+/, "", c); n = c; sub(/[ \t].*/, "", n); sub(/.*\//, "", n) }
+    u != "0" || r != "0" { next }
     c == m || index(c, m " ") == 1 { print c; next }
     n ~ /^mount_macfuse_(ext4|ntfs|btrfs|xfs|f2fs|apfs)$/ { print c }'
 }
