@@ -555,6 +555,8 @@ xattr)
   #   volicon), else a short record with no flag
   case $1 in
   -l) echo "com.apple.FinderInfo: stub" ;;
+  # a bare path: the names -wx kept for it, one a line
+  /*) k=$(printf '%s' "$1" | tr / _).; ls "$STUB/xattrs" 2> /dev/null | while read -r x; do case $x in "$k"*) echo "${x#"$k"}" ;; esac; done ;;
   -wx) mkdir -p "$STUB/xattrs"; echo "$3" > "$STUB/xattrs/$(printf '%s' "$4" | tr / _).$2" ;;
   -px)
     k=$STUB/xattrs/$(printf '%s' "$3" | tr / _).$2; nd=$(node_of "$3")
@@ -700,6 +702,16 @@ def _fold(p):
 builtins.open = lambda p, *a, **k: _open(_fold(p), *a, **k)
 EOF2
   PYTHONPATH=$T/hfsfold PARITY_TEST_VOLS=$T/vols; export PYTHONPATH PARITY_TEST_VOLS
+  # the census's BSD stat -f '%N %Sp %u:%g' (census_trashes), as GNU stat -c says it
+  cat > "$T/bin/stat" <<'EOF2'
+#!/bin/sh
+if test "$1" = -f && test "$2" = '%N %Sp %u:%g'; then shift 2; exec /usr/bin/stat -c '%n %A %u:%g' "$@"; fi
+exec /usr/bin/stat "$@"
+EOF2
+  chmod +x "$T/bin/stat"
+  # big-src's 256 KiB xattr: a container's /tmp may hold no user. xattr of that size, and the Mac's census makes it with 10.9's
+  #   Python; here the file alone, which the stub xattr and Finder never read
+  census_py_big='import sys'
 fi
 # census_unicode: item 1 is checked (PARITY_MODE_UNICODE defaults to check): the shell's and Finder's names on the
 #   pair, created then opened by both forms; ext4's on its da-ext4 image (returned by the smoke), whose names it lists
@@ -1257,9 +1269,31 @@ r=$(reset; pair; touch "$T/b/extra"; PARITY_MODE_SPOTLIGHT_DA=record CS_INDEX_MO
 expect census_spot_parity_da_record has "$r" "^# recorded spotlight.x.d$"
 expect census_spot_parity_da_restored has "$r" "^after: check$"
 
+# Task 19 (preflight F2): items 6 and 7 are checked: finder., trash., tags. and case.; later. stays a record
+r=$(unset PARITY_MODE_FINDER PARITY_MODE_TRASH PARITY_MODE_TAGS PARITY_MODE_CASE PARITY_MODE_LATER; . "$here/lib/parity.sh"; echo "$PARITY_MODE_FINDER $PARITY_MODE_TRASH $PARITY_MODE_TAGS $PARITY_MODE_CASE ${PARITY_MODE_LATER:-record}")
+expect census_modes_items_6_7 test "$r" = "check check check check record"
+# census_record WHAT CMD...: parity WHAT recorded, whatever its item's mode, which is then as it was (set or not)
+r=$(reset; pair; touch "$T/b/extra"; PARITY_MODE_TAGS=check; census_record tags.x.r ls @MP@ 2>&1; echo "after: $PARITY_MODE_TAGS"; unset PARITY_MODE_ZZ; census_record zz.x ls @MP@ 2>&1; echo "zz: ${PARITY_MODE_ZZ-unset}")
+expect census_record_records has "$r" "^# recorded tags.x.r$"
+expect census_record_restored has "$r" "^after: check$"
+expect census_record_unset_kept has "$r" "^zz: unset$"
+# census_unpack GZ NAME: GZ unpacked as $W/census/NAME.img, its path printed
+echo "gpt ext4 image" | gzip -c > "$IN/gpt-ext4.img.gz"
+r=$(census_unpack "$IN/gpt-ext4.img.gz" unpack-t 2>&1)
+expect census_unpack test "$r" = "$W/census/unpack-t.img" -a "$(cat "$W/census/unpack-t.img" 2>/dev/null)" = "gpt ext4 image"
+rm -f "$W/census/unpack-t.img"
+
 # census_finder: the screenshot pairs, Finder's properties against df -k, diskutil info's fields, a custom volume icon
 : > "$S/calls"
 r=$(census_finder ext4 2>&1)
+# Task 19: the GPT-wrapped image when IN has one (the control is GPT-partitioned, so diskutil's Whole compares); else the
+#   bare image, said
+expect census_finder_gpt has "$r" "^# census_finder ext4: IN's gpt-ext4.img.gz, partitioned as the HFS+ control is$"
+for s in properties diskutil-info diskutil-info-dev volumeicon; do expect "census_finder_checked_$s" has "$r" "^ok - parity finder.ext4.$s$"; done
+# Finder's ignore privileges: macFUSE cannot say noowners (QUEUE "Ignore ownership" on linuxfs volumes), so a record of its own
+expect census_finder_props_no_ignore hasnt "$(cat "$P/finder.ext4.properties.ext4.txt")" "ignore privileges"
+expect census_finder_ignore_recorded has "$r" "^# recorded finder.ext4.ignore-privileges$"
+expect census_finder_ignore_value test "$(sed -n 's/^ignore privileges: //p' "$P/finder.ext4.ignore-privileges.ext4.txt")" = false
 for s in properties diskutil-info diskutil-info-dev volumeicon; do expect "census_finder_$s" test -s "$P/finder.ext4.$s.hfs.txt" -a -s "$P/finder.ext4.$s.ext4.txt"; done
 # 10.9's diskutil info has no Removable Media or Device Location: its own names, by mount point and by device
 for f in Protocol Read-Only.Media Ejectable Internal; do expect "census_finder_du_$f" grep -q "^$f: " "$P/finder.ext4.diskutil-info-dev.ext4.txt"; done
@@ -1270,11 +1304,11 @@ dismissed_first() { awk '/killall UserNotificationCenter$/ { d = 1; next } /scre
 expect census_finder_alert_dismissed dismissed_first
 expect census_finder_alert_record grep -q 'UserNotificationCenter' "$P/alerts.txt"
 for s in sidebar getinfo desktop-on desktop-off icon; do expect "census_finder_shot_$s" test "$(grep -Ec "screencapture -x .*/(hfs|ext4)-$s.png$" "$S/calls")" -eq 2; done
-# spec: item 6's amendment -- the icon pair's difference is recorded as expected, once, for the fs side only: census_volume_icon's
-#       cp puts a real .VolumeIcon.icns on the volume (it wins over the linuxfs icon), and its Finder Info flag cannot be stored
-#       until item 7 (Task 19), so Finder shows macFUSE's icon there
-expect census_finder_icon_expected test "$(grep -c '^icon ext4: differs from hfs-icon.png, as expected until item 7 (Task 19): ' "$P/shots.txt")" -eq 1
-expect census_finder_icon_expected_only_icon test "$(grep -c 'as expected until item 7' "$P/shots.txt")" -eq 1
+# spec: item 6's amendment, and item 7 (Task 19) -- census_volume_icon's cp puts a real .VolumeIcon.icns on the volume (it wins
+#       over the linuxfs icon), and its Finder Info flag is stored since Task 17, so the icon pair is read as a pair, said once
+#       for the fs side only
+expect census_finder_icon_pair test "$(grep -c '^icon ext4: read against hfs-icon.png: ' "$P/shots.txt")" -eq 1
+expect census_finder_icon_no_until test "$(grep -c 'until item 7' "$P/shots.txt")" -eq 0
 expect census_finder_icon_not_by_design test "$(grep -c 'by design' "$P/shots.txt")" -eq 0
 expect census_finder_props grep -q '^capacity equals df -k' "$P/finder.ext4.properties.ext4.txt"
 expect census_finder_props_ejectable grep -q '^ejectable: true$' "$P/finder.ext4.properties.hfs.txt"
@@ -1314,11 +1348,69 @@ census_finder btrfs > /dev/null 2>&1
 expect census_finder_hfs_shots_once test "$(grep -c 'screencapture -x .*/hfs-sidebar.png$' "$S/calls")" -eq 0 -a "$(grep -c 'screencapture -x .*/btrfs-sidebar.png$' "$S/calls")" -eq 1
 expect census_finder_restart_before_info_each restart_before_info
 expect census_finder_getinfo_format_each test "$(grep -c 'screencapture -x .*/btrfs-getinfo-format.png$' "$S/calls")" -eq 1
+# no GPT-wrapped btrfs in IN: the bare image, and why Whole may differ, said
+: > "$S/calls"
+r=$(census_finder btrfs 2>&1)
+expect census_finder_bare_said has "$r" "^# census_finder btrfs: no gpt-btrfs.img.gz in IN, so the bare image: diskutil's Whole differs from the partitioned control's$"
+# APFS is read-only: no .VolumeIcon.icns of its own, so no volumeicon step, and its icon shot is the linuxfs icon, by design
+: > "$S/calls"; rm -f "$P/shots.txt"
+r=$(census_finder apfs 2>&1)
+expect census_finder_apfs_no_volumeicon test ! -e "$P/finder.apfs.volumeicon.hfs.txt" -a ! -e "$P/finder.apfs.volumeicon.apfs.txt"
+expect census_finder_apfs_no_volumeicon_said has "$r" "^# census_finder apfs: read-only, so no .VolumeIcon.icns of its own: no volumeicon step$"
+expect census_finder_apfs_icon_by_design test "$(grep -c '^icon apfs: differs from hfs-icon.png by design: ' "$P/shots.txt")" -eq 1
 
 # census_trash_tags_case: Finder's delete, .Trashes and empty trash; a tag and a label, after a remount too; the
 #   oversized xattr; pathconf against HFS+ and against HFSX. APFS, read-only, gets the case step alone.
-: > "$S/calls"
+# census_trashes MP UID: .Trashes/UID alone (its mode, owner and group, then what it holds, less Finder's .DS_Store and ._
+#   files, which noappledouble keeps off a linuxfs volume); census_trashes_dir MP: .Trashes itself, a record
+mkdir -p "$T/tr/.Trashes/501"; : > "$T/tr/.Trashes/501/.DS_Store"; : > "$T/tr/.Trashes/501/._trash-me"; : > "$T/tr/.Trashes/501/trash-me"
+r=$(census_trashes "$T/tr" 501 2>&1)
+expect census_trashes_uid_only test "$(printf '%s\n' "$r" | grep -c '/\.Trashes ')" -eq 0 -a "$(printf '%s\n' "$r" | grep -c '/\.Trashes/501 ')" -eq 1
+expect census_trashes_lists has "$r" "^trash-me$"
+expect census_trashes_no_finder_files hasnt "$r" 'DS_Store\|^\._'
+r=$(census_trashes_dir "$T/tr" 2>&1)
+expect census_trashes_dir test "$(printf '%s\n' "$r" | grep -c '/\.Trashes ')" -eq 1
+rm -rf "$T/tr"
+# census_trash_delete MP: Finder's answer, the kinds it names each item by (document file, folder, item, disk) left out: on
+#   HFS+ .Trashes is d-wx-wx-wt, so Finder names 501 an item; its own answer kept raw in trash.FS.finder-delete-raw.txt
+mkdir -p "$T/td"
+r=$(census_finder_ask() { echo "document file trash-me of folder 501 of item .Trashes of disk FSX"; }; PARITY_FS=fsx; census_trash_delete "$T/td" 2>&1)
+expect census_trash_delete_kinds test "$r" = "trash-me of 501 of .Trashes of FSX"
+expect census_trash_delete_raw grep -q '^document file trash-me of folder 501 of item .Trashes of disk FSX$' "$P/trash.fsx.finder-delete-raw.txt"
+rm -rf "$T/td"
+# census_xattrs FILE: FILE's xattrs by name, in order (listxattr's order is each filesystem's own), each with its value
+mkdir -p "$T/xs"; : > "$T/xs/f"; xattr -wx b.k 0102 "$T/xs/f"; xattr -wx a.k 03 "$T/xs/f"
+r=$(census_xattrs "$T/xs/f" 2>&1)
+expect census_xattrs_sorted test "$r" = "$(printf '%s\n' 'a.k: 03' 'b.k: 01 02')"
+rm -rf "$T/xs"
+# case: pathconf(_PC_CASE_SENSITIVE) from a stand-in that says 1 for a volume holding .cs
+pc_real=$census_py_pathconf
+census_py_pathconf='import os, sys
+print("pathconf(_PC_CASE_SENSITIVE) = %d" % (1 if os.path.exists(os.path.join(sys.argv[1], ".cs")) else 0))'
+mkdir -p "$T/vols/trash-ext4" "$T/vols/trash-hfsx-ext4" "$T/vols/trash-hfsx-btrfs" "$T/vols/trash-hfsx-apfs"
+: > "$T/vols/trash-ext4/.cs"; : > "$T/vols/trash-hfsx-ext4/.cs"; : > "$T/vols/trash-hfsx-btrfs/.cs"; : > "$T/vols/trash-hfsx-apfs/.cs"
+: > "$S/calls"; rm -f "$P/shots.txt"
 r=$(census_trash_tags_case ext4 2>&1)
+# Task 19: checked, but for what cannot or need not be equal: .Trashes itself (Apple's mode for it, recorded), the
+#   oversized xattr (recorded: the controller's ruling), Finder's copy of one (recorded), and the case step against the
+#   control the filesystem does not match (the case-sensitive ones match HFSX)
+for s in trash.ext4.finder-delete trash.ext4.trashes trash.ext4.after-empty tags.ext4.set tags.ext4.read tags.ext4.after-remount case.ext4.pathconf-hfsx; do
+  expect "census_ttc_checked_$s" has "$r" "^ok - parity $s$"
+done
+for s in trash.ext4.trashes-dir tags.ext4.oversized tags.ext4.oversized-finder case.ext4.pathconf; do
+  expect "census_ttc_recorded_$s" has "$r" "^# recorded $s$"
+done
+expect census_ttc_case_bar has "$r" "^ok - census ext4: pathconf(_PC_CASE_SENSITIVE) is 1, case-sensitive like HFSX$"
+# what Finder's Trash holds before Empty Trash, every volume's (a record: one osascript, bounded)
+expect census_ttc_finder_trash grep -q 'every item of trash' "$S/calls"
+expect census_ttc_finder_trash_record test -s "$P/trash.ext4.finder-trash.txt"
+# Finder's reaction to an xattr the volume cannot hold: big-src (on the boot volume, with a 256 KiB xattr) duplicated by
+#   Finder onto each side, photographed (oversized-finder), then what landed
+expect census_ttc_big_copy grep -q 'duplicate (POSIX file ".*/census/big-src" as alias) to (POSIX file ".*/vols/trash-ext4" as alias)' "$S/calls"
+expect census_ttc_big_copy_hfs grep -q 'duplicate (POSIX file ".*/census/big-src" as alias) to (POSIX file ".*/vols/trash-hfs-ext4" as alias)' "$S/calls"
+expect census_ttc_big_shot test "$(grep -Ec 'screencapture -x .*/(hfs|ext4)-oversized-finder.png$' "$S/calls")" -eq 2
+expect census_ttc_big_said grep -q '^big-src on <MP>: ' "$P/tags.ext4.oversized-finder.ext4.txt"
+expect census_ttc_xattrs_listed grep -q '^xattr .*/vols/trash-ext4/tagged$' "$S/calls"
 for s in trash.ext4.finder-delete trash.ext4.trashes trash.ext4.after-empty tags.ext4.set tags.ext4.read tags.ext4.after-remount tags.ext4.oversized case.ext4.pathconf case.ext4.pathconf-hfsx; do
   expect "census_ttc_$s" test -s "$P/$s.hfs.txt" -a -s "$P/$s.ext4.txt"
 done
@@ -1355,10 +1447,21 @@ rm -f "$W/img/stuck4.img"
 # the oversized probe is bounded at 1 min a side (2 min for the step), so a trash/tags/case census stays in its envelope
 r=$(census_xattr_big() { echo "${PARITY_BOUND:-unset}" > "$T/xb-bound"; }; census_trash_tags_case btrfs 2>&1)
 expect census_ttc_oversized_bound test "$(cat "$T/xb-bound" 2>/dev/null)" = 600
+# a case-sensitive filesystem reporting 0 (btrfs's volume holds no .cs here): not ok against HFSX, and the bar says what it got
+expect census_ttc_case_hfsx_notok has "$r" "^not ok - parity case.btrfs.pathconf-hfsx$"
+expect census_ttc_case_bar_notok has "$r" "^not ok - census btrfs: pathconf(_PC_CASE_SENSITIVE) is 1, case-sensitive like HFSX (it is 0)$"
 r=$(census_trash_tags_case apfs 2>&1)
 expect census_ttc_apfs_case test -s "$P/case.apfs.pathconf.apfs.txt" -a -s "$P/case.apfs.pathconf-hfsx.apfs.txt"
-expect census_ttc_apfs_case_only test -z "$(ls "$P" | grep -E '^(trash|tags)\.apfs\.')"
+# the case-insensitive APFS image (mkapfs's default) matches HFS+, checked; against HFSX, recorded
+expect census_ttc_apfs_case_checked has "$r" "^ok - parity case.apfs.pathconf$"
+expect census_ttc_apfs_case_hfsx_recorded has "$r" "^# recorded case.apfs.pathconf-hfsx$"
+expect census_ttc_apfs_case_bar has "$r" "^ok - census apfs: pathconf(_PC_CASE_SENSITIVE) is 0, case-insensitive like HFS+$"
+# the APFS fixture's tagged file (osx.N on Linux): until the maintainer regenerates enc.img (tests/fixtures/apfs/tagged.txt), a record
+expect census_ttc_apfs_fixture grep -q '^tests/fixtures/apfs/tagged.txt: absent' "$P/tags.apfs.fixture.txt"
+expect census_ttc_apfs_case_only test -z "$(ls "$P" | grep -E '^(trash|tags)\.apfs\.' | grep -v '^tags\.apfs\.fixture\.txt$')"
 expect census_ttc_apfs_detached test -z "$(attached)"
+census_py_pathconf=$pc_real
+rm -f "$T/vols/trash-ext4/.cs" "$T/vols/trash-hfsx-ext4/.cs" "$T/vols/trash-hfsx-btrfs/.cs" "$T/vols/trash-hfsx-apfs/.cs"
 
 # census_later: Time Machine, the exFAT control against ext4 (each beside HFS+)
 : > "$S/calls"; rm -f "$P/shots.txt"
@@ -1596,7 +1699,9 @@ expect census_all_cleans test ! -e "$W/census/old.img" -a -e "$W/census/left-stu
 #   PARITY_CENSUS_MIN + 11; a step whose worst is 11 or less keeps the plain cutoff
 expect census_worst_default test "$(census_worst_min zzz)" -eq 11
 # Task 16l: census_pair_up's census_da_root (bounded at 10 s) on each pair it makes: spotlight 33, census_finder 31, trash/tags/case 22
-expect census_worst_table test "$(for c in census_unicode census_busy census_spotlight census_finder census_trash_tags_case census_later census_stall stall; do census_worst_min "$c"; done | tr '\n' ' ')" = '17 32 33 31 22 9 63 63 '
+# Task 19: trash/tags/case adds what Finder's Trash holds (30 s), Finder's copy of an oversized xattr on each side (two
+#   census_finder_ask, 2 x 160 s) and big-src's making (30 s): 20.8 + 380 / 60 = 27.1, 28
+expect census_worst_table test "$(for c in census_unicode census_busy census_spotlight census_finder census_trash_tags_case census_later census_stall stall; do census_worst_min "$c"; done | tr '\n' ' ')" = '17 32 33 31 28 9 63 63 '
 # Task 15: the census begins nothing past 132 min (it was 135), for the refusals bar and the non-admin mount after it
 r=$(unset PARITY_CENSUS_MIN; . "$here/lib/parity.sh"; echo "$PARITY_CENSUS_MIN")
 expect census_min_default test "$r" -eq 132
@@ -1699,8 +1804,9 @@ expect smoke_runs_census ascending "$(first_line '^ *parity_census_all$')" "$bl"
 expect smoke_before_login_census ascending "$bl" "$(first_line 'census_before_login "\$mp"')"
 expect workflow_parity_upload grep -q '^ *images-after/parity/\*\*$' "$wf"
 expect workflow_guest_timeout awk '/^  guest:/ { g = 1 } /^  fsck:/ { g = 0 } g && /^    timeout-minutes: 180$/ { f = 1 } END { exit !f }' "$wf"
-# push C's census runs item 3's loop, 50 iterations, before the census
-expect smoke_stall_on ascending "$(first_line '^ *PARITY_STALL_N=50$')" "$(first_line '^ *parity_census_all$')"
+# push G (Task 19): item 3's loop is done with (push C ran it, 50 iterations): PARITY_STALL_N=0 before the census
+expect smoke_stall_off ascending "$(first_line '^ *PARITY_STALL_N=0$')" "$(first_line '^ *parity_census_all$')"
+expect smoke_stall_not_50 not grep -q '^ *PARITY_STALL_N=50$' "$sm"
 # item 5 (Task 15): a user outside macFUSE's admin_group, lfs_nonadmin, made with dscl after the census and removed
 #   before the before-login section (and by finish), mounts an ext4 image without the CLI's SHARE_OPT, which the smoke
 #   reads from the installed CLI and never writes itself
@@ -1709,6 +1815,37 @@ expect smoke_nonadmin_after_census ascending "$(first_line '^ *parity_census_all
 expect smoke_nonadmin_removed ascending "$na_l" "$(first_line '^ *check "non-admin: .* removed" nonadmin_remove$')" "$bl"
 # smoke_fn NAME: the smoke's definition of the function NAME (one line, or up to its closing brace)
 smoke_fn() { awk -v n="$1() " 'index($0, n) == 1 { p = 1; print; if ($0 !~ /[{] *(#.*)?$/) exit; next } p { print } p && /^}/ { exit }' "$sm"; }
+# Task 19 (task-17-report.md concern 4, check-xattrs.sh's header): the xattr-scheme images, after the DiskArbitration cycles
+#   and before the census, unpacked into W/img (finish returns them for the fsck job), each mounted by an attach; on each f
+#   (the mixed image's f, o, s and a new file it makes) Finder sets a label and xattr -wx the tag Parity, read back on the Mac
+xa_l=$(first_line '^for xa in ours netatalk fruit mixed; do$')
+expect smoke_xa_before_census ascending "$(first_line '^check "the mount daemon is loaded')" "$xa_l" "$(first_line '^ *parity_census_all$')"
+expect smoke_xa_unpacked_into_img grep -qF 'gunzip -c "$IN/ext4-xa-$xa.img.gz" > "$W/img/ext4-xa-$xa.img"' "$sm"
+expect smoke_xa_mixed_files grep -q '^  case \$xa in mixed) xa_files="f o s new" ;; \*) xa_files=f ;; esac$' "$sm"
+expect smoke_xa_contract grep -q 'mixed) check ext4-xa-mixed.img f netatalk 1; check ext4-xa-mixed.img o ours 1; check ext4-xa-mixed.img s fruit 1' "$here/lib/check-xattrs.sh"
+xc=$(smoke_fn xa_case)
+for w in 'da_attach "$xc_img"' 'da_wait 300' 'echo new > "$mp/new"' 'xa_label "$mp/$xc_f"' 'xattr -wx com.apple.metadata:_kMDItemUserTags "$census_tag_plist" "$mp/$xc_f"' 'xa_reads "$mp/$xc_f"' 'da_eject "$disk" "$mp"' 'da_lklfuse_gone "$mp"' 'cleanup_disk'; do
+  expect "smoke_xa_case_has_$w" has "$xc" "$(printf '%s' "$w" | sed 's/[][\.*^$/]/\\&/g')"
+done
+expect smoke_xa_label_bounded has "$(smoke_fn xa_label)" 'bounded 300 "$AQUA" osascript -e "tell application \\"Finder\\" to set label index of (POSIX file \\"$1\\" as alias) to 2"'
+# xa_reads FILE: the Finder Info's colour bits (byte 9 & 0x0E) are set, and the tag is census_tag_plist's, as xattr -px prints them
+xrw() { (XR_FI=$1 XR_TAG=$2; eval "$(smoke_fn xa_reads)"; xattr() { case "$1:$2" in -px:com.apple.FinderInfo) printf '%s\n' "$XR_FI" ;; -px:com.apple.metadata:_kMDItemUserTags) printf '%s\n' "$XR_TAG" ;; esac; }; xa_reads /x/f) > /dev/null 2>&1; }
+fi_red=$(printf '%s\n' '54 45 58 54 74 74 78 74 00 0C 00 00 00 00 00 00' '00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00')
+fi_none=$(printf '%s\n' '54 45 58 54 74 74 78 74 00 00 00 00 00 00 00 00' '00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00')
+tag_up=$(printf '%s' "$census_tag_plist" | tr a-f A-F | sed 's/../& /g')
+expect smoke_xa_reads xrw "$fi_red" "$tag_up"
+expect smoke_xa_reads_no_label not xrw "$fi_none" "$tag_up"
+expect smoke_xa_reads_wrong_tag not xrw "$fi_red" "62 70 6C 69 73 74"
+expect smoke_xa_reads_no_finderinfo not xrw "xattr: No such xattr: com.apple.FinderInfo" "$tag_up"
+# Task 19 (item 6's ownership): with noowners (no /etc/fstab owners line), ls -ln shows what the user wrote as the user's ids
+#   (lklfuse's uid=99,gid=99 read as the caller, as HFS+ shows an external disk's files), on the ext4 raw cycle
+mkdir -p "$T/du"; : > "$T/du/da-file"
+expect smoke_da_user_ids sh -c 'eval "$1"; da_user_ids "$2"' _ "$(smoke_fn da_user_ids)" "$T/du"
+r=$(eval "$(smoke_fn da_user_ids)"; ls() { echo "-rw-r--r--  1 0  0  3 Nov 26 10:00 da-file"; }; da_user_ids "$T/du" 2>&1); rc=$?
+expect smoke_da_user_ids_root test "$rc" -ne 0
+expect smoke_da_user_ids_said has "$r" "^ls -ln: 0 0 (want $(id -u) $(id -g))$"
+rm -rf "$T/du"
+expect smoke_da_user_ids_in_cycle has "$(smoke_fn da_cycle)" 'if test "$nm.$via.$kind" = ext4.raw.rw; then check "$tag: ls -ln shows what the user wrote as the user'"'"'s ($(id -u) $(id -g)), as on HFS+ (noowners)" da_user_ids "$mp"; fi'
 expect smoke_finish_removes_nonadmin has "$(smoke_fn finish)" 'nonadmin_remove'
 expect smoke_share_opt_not_written not grep -q 'allow_root' "$sm"
 r=$(eval "$(smoke_fn share_opt_of)"; share_opt_of "$here/../cli/linuxfs")

@@ -10,18 +10,23 @@
 #       DiskArbitration says, no mount_macfuse failure, root's mount_macfuse -o allow_other with fsname=/dev/<bsd>, nodev and
 #       nosuid, served by a _linuxfs lklfuse with uid=99,gid=99 (no lklfuse as root), no ?owner= entry and diskutil info naming
 #       the disk, and unmounted and ejected by the user with no sudo (a refusal of root's mount marked STOP-AND-ASK:); once, on a
-#       fresh image, the daemon's peer (the console user, outside macFUSE's admin_group) gets .fseventsd; NTFS with NTFSTakeover off is Apple's; `linuxfs ignore` (an /etc/fstab noauto entry: ext4 by device, NTFS by
+#       fresh image, the daemon's peer (the console user, outside macFUSE's admin_group) gets .fseventsd, and ls -ln shows what the
+#       user wrote as the user's (noowners); tests/lib/xattr-images.sh's four ext4 images (one Mac-xattr scheme each, and one
+#       mixing them), each mounted by an attach, a Finder label and the tag Parity set on each tagged file and a new one, read back
+#       on the Mac, and returned for the fsck job's check-xattrs.sh; NTFS with NTFSTakeover off is Apple's; `linuxfs ignore` (an /etc/fstab noauto entry: ext4 by device, NTFS by
 #       label; ext4 by a label with a space, written as LABEL=my\040data; each entry's type macfuse_<fs>) mounts nothing on a plain attach and never runs the mount program, `diskutil mount` mounts it, and after `linuxfs unignore` a plain attach does;
 #       ReadOnly in the user's plist (read by the root mount program) mounts read-only; an /etc/fstab rw,owners line shows
 #       Linux's ids, refuses the user's write to Linux root's 0644 file, and gives what the user makes to the user; a label with a slash or a control
 #       character gets a safe /Volumes name; the encrypted APFS fixture shows the password dialog (screenshot), times out
 #       with no mount, mounts through --password-stdin and the keeper's --offer, then from the login keychain with no dialog;
-#       then the HFS+ parity census (tests/lib/parity.sh parity_census_all; PARITY_STALL_N=50: item 3's loop, 50 attaches per loop and volume), which records, and gates only the items it
+#       then the HFS+ parity census (tests/lib/parity.sh parity_census_all; PARITY_STALL_N=0: item 3's loop is done with), which records, and gates only the items it
 #       checks (item 1, Unicode names: on HFS+ and each linuxfs volume, created, listed and opened by both forms alike,
 #       and every linuxfs census mount's lklfuse finding names exactly; item 4's held unmounts and ejects; item 5: Spotlight's indexing steps when the
 #       guest will index the HFS+ control, .fseventsd on a linuxfs volume as on HFS+ and no fseventsd, mds or mdworker refused
 #       on one (PARITY_MODE_FSEVENTS_DA, checked again now the mount daemon makes those mounts root's); each pair's linuxfs
-#       volume root's and true to DiskArbitration, as in the cycles); then a user outside macFUSE's admin_group (lfs_nonadmin, made with dscl and
+#       volume root's and true to DiskArbitration, as in the cycles; item 6: Finder's properties and diskutil info's fields, a
+#       custom .VolumeIcon.icns; item 7: the Trash's listing and Empty Trash, a tag and a label after a remount, and pathconf,
+#       1 on the case-sensitive filesystems as on HFSX, 0 on case-insensitive APFS as on HFS+); then a user outside macFUSE's admin_group (lfs_nonadmin, made with dscl and
 #       removed) mounts an ext4 image without the CLI's SHARE_OPT;
 #       last, before login (the user's console session ended), an attached ext4 disk is mounted by root (as macfuse_ext4, nosuid and nodev) with allow_other and
 #       served by lklfuse as _linuxfs (with a macFUSE that cannot serve /dev/fd/N the mount program refuses, and that is what is
@@ -32,7 +37,8 @@
 #   usage: smoke-mavericks.sh VERSION IN OUT
 #          VERSION is the run's version (the pkg installed). IN holds ext4, btrfs, xfs, ntfs, exfat, f2fs and apfs .img.gz
 #          from tests/lib/probe-images.sh, gpt-<fs>.img.gz (each in its own partition type), gpt-ext4-basic.img.gz and gpt-enc.img.gz (tests/lib/gpt-wrap.py), ext4-slash and
-#          ext4-ctl .img.gz (tests/lib/label-images.sh), and ext4-names.img.gz (tests/lib/unicode-images.sh). OUT receives every image as it is after the run, gzipped (da-*.img.gz
+#          ext4-ctl .img.gz (tests/lib/label-images.sh), ext4-names.img.gz (tests/lib/unicode-images.sh) and ext4-xa-{ours,netatalk,fruit,mixed}.img.gz
+#          (tests/lib/xattr-images.sh). OUT receives every image as it is after the run, gzipped (da-*.img.gz
 #          are the disks DiskArbitration mounted, da-ext4-names.img.gz the Linux-made names as the census attached them; ctl-fat32.img.gz
 #          is the census's FAT32 control; da-ext4.names and da-ext4-names.names list, for check-names.py, the names to find on
 #          da-ext4 and da-ext4-names), the screenshots, and the
@@ -402,6 +408,13 @@ da_lklfuse_gone() {  # MP: after da_eject, each of its ej_pids gone (30 s each),
 }
 rw_works() { echo da > "$1/da-file" && [ "$(cat "$1/da-file")" = da ] && mkdir "$1/da-dir" && echo two > "$1/da-dir/f" && [ "$(cat "$1/da-dir/f")" = two ]; }
 rw_reads() { [ "$(cat "$1/da-file")" = da ] && [ "$(cat "$1/da-dir/f")" = two ]; }
+# spec: docs/superpowers/specs/2026-11-25-hfs-parity-design.md item 6, Proof -- "Ignore ownership" checked (noowners, no /etc/fstab
+#   owners line): ls -ln shows MP/da-file, which the user wrote, as the user's ids, as HFS+ shows an external disk's files (lklfuse's
+#   uid=99,gid=99 read as the caller's); owners_case shows Linux's ids with it unchecked
+da_user_ids() {  # MP
+  dui=$(ls -ln "$1/da-file" | awk '{ print $3, $4 }'); echo "ls -ln: ${dui:-nothing} (want $(id -u) $(id -g))"
+  test "$dui" = "$(id -u) $(id -g)"
+}
 
 # spec: tools/fsrules.c names -- item 2: the personality, Type (Bundle) macfuse_FS and Name (User Visible) FS's FSName
 persona_is() {  # DEV PERSONALITY FS: on failure, what diskutil info said
@@ -555,6 +568,7 @@ da_cycle() {
   check "$tag: no lklfuse runs as root" no_root_lklfuse
   if [ "$kind" = rw ]; then
     check "$tag: reads and writes work" rw_works "$mp"
+    if test "$nm.$via.$kind" = ext4.raw.rw; then check "$tag: ls -ln shows what the user wrote as the user's ($(id -u) $(id -g)), as on HFS+ (noowners)" da_user_ids "$mp"; fi
   else
     check "$tag: it lists, and a write is refused (read-only)" sh -c 'ls "$1" > /dev/null && ! ( echo x > "$1/c" ) 2> /dev/null' _ "$mp"
   fi
@@ -629,6 +643,44 @@ if gunzip -c "$IN/gpt-ext4-basic.img.gz" > "$W/gpt-ext4-basic.img"; then da_cycl
 else notok "ext4: cannot unpack $IN/gpt-ext4-basic.img.gz"; fi
 rm -f "$W/gpt-ext4-basic.img"
 defaults delete dev.mavergreen.linuxfs NTFSTakeover
+
+# spec: tests/lib/check-xattrs.sh header, and task-17-report.md concern 4 -- item 7 on disk: tests/lib/xattr-images.sh's four ext4
+#       images, each holding a file f whose Finder Info and tag are in one Mac-xattr scheme (ours, netatalk's, Samba vfs_fruit's;
+#       the mixed one f, o and s, one each), mounted by an attach (DiskArbitration, root's mount); on each f (and the mixed one's o, s
+#       and a file new it makes) Finder sets a label and xattr -wx the tag Parity (census_tag_plist), read back on the Mac. Unpacked
+#       into W/img, so finish returns each as OUT/ext4-xa-*.img.gz, where the fsck job's check-xattrs.sh finds each in its scheme
+xa_label() { bounded 300 "$AQUA" osascript -e "tell application \"Finder\" to set label index of (POSIX file \"$1\" as alias) to 2"; }  # FILE
+xa_reads() {  # FILE: on the Mac, its Finder Info has a label (byte 9's colour bits, 0x0E) and its tag is census_tag_plist's
+  xr_fi=$(xattr -px com.apple.FinderInfo "$1" 2>&1 | tr -d ' \n' | tr A-F a-f) xr_t=$(xattr -px com.apple.metadata:_kMDItemUserTags "$1" 2>&1 | tr -d ' \n' | tr A-F a-f)
+  echo "com.apple.FinderInfo: $xr_fi; com.apple.metadata:_kMDItemUserTags: $xr_t"
+  test "${#xr_fi}" -eq 64 && test -z "$(printf '%s' "$xr_fi" | tr -d 0-9a-f)" || return 1
+  test $((0x$(printf '%s' "$xr_fi" | cut -c 19-20) & 14)) -ne 0 && test "$xr_t" = "$census_tag_plist"
+}
+xa_case() {  # SCHEME FILE...: W/img/ext4-xa-SCHEME.img attached and mounted; each FILE labelled, tagged and read back; ejected
+  xc_s=$1 xc_img=$W/img/ext4-xa-$1.img; shift
+  if ! da_attach "$xc_img"; then notok "xattr images: $xc_s: hdiutil attach"; disk=$(image_disk "$xc_img"); cleanup_disk; return 1; fi
+  if ! da_wait 300; then notok "xattr images: $xc_s: mounted by DiskArbitration within 30 s"; cleanup_disk; return 1; fi
+  ok "xattr images: $xc_s: $dev mounted at $mp"
+  for xc_f; do
+    if test "$xc_f" = new; then
+      if echo new > "$mp/new"; then ok "xattr images: $xc_s: a new file, new, made"; else notok "xattr images: $xc_s: a new file, new, made"; fi
+    fi
+    check "xattr images: $xc_s: Finder gives $xc_f a label" xa_label "$mp/$xc_f"
+    check "xattr images: $xc_s: $xc_f gets the tag Parity (xattr -wx)" xattr -wx com.apple.metadata:_kMDItemUserTags "$census_tag_plist" "$mp/$xc_f"
+    check "xattr images: $xc_s: $xc_f reads back its label and its tag on the Mac" xa_reads "$mp/$xc_f"
+  done
+  if check "xattr images: $xc_s: diskutil eject (the user's, no sudo)" da_eject "$disk" "$mp"; then
+    check "xattr images: $xc_s: the eject leaves no lklfuse" da_lklfuse_gone "$mp"
+  fi
+  cleanup_disk
+}
+if test -n "$parity_lib"; then
+for xa in ours netatalk fruit mixed; do
+  case $xa in mixed) xa_files="f o s new" ;; *) xa_files=f ;; esac
+  if gunzip -c "$IN/ext4-xa-$xa.img.gz" > "$W/img/ext4-xa-$xa.img"; then xa_case "$xa" $xa_files
+  else notok "xattr images: no $IN/ext4-xa-$xa.img.gz (tests/lib/xattr-images.sh's)"; rm -f "$W/img/ext4-xa-$xa.img"; fi
+done
+else notok "xattr images: no $tests_dir/lib/parity.sh, so no census_tag_plist to tag with"; fi
 
 # spec: tests/smoke-mavericks.sh header -- NTFSTakeover off (the default): Apple's own ntfs mounts it
 if da_attach "$W/img/ntfs.img"; then
@@ -846,8 +898,9 @@ check "no lklfuse runs as root, after everything" no_root_lklfuse
 #       volumes, recorded into OUT/parity (record-only until an item's task sets its PARITY_MODE_ to check: item 1's is), with its
 #       screenshots in OUT; before the before-login section, which must stay last
 if test -n "$parity_lib"; then
-  # spec: tests/lib/parity.sh census_stall -- push C: item 3's loop, 50 iterations of each loop on each volume
-  PARITY_STALL_N=50
+  # spec: .superpowers/sdd/2026-11-25-hfs-parity/task-19-brief.md Step 3 -- push G: item 3's loop is done with (push C ran it, 50
+  #       iterations of each loop on each volume), so census_stall runs nothing
+  PARITY_STALL_N=0
   # spec: tests/lib/parity.sh census_names_bar -- item 1: every linuxfs census mount runs the names mode this macFUSE means
   if macfuse_at_least 5 5 0 5; then PARITY_NAMES_WANT=exact; else PARITY_NAMES_WANT=scanning; fi
   # spec: tests/lib/parity.sh census_busy -- Task 16e-fix: the HFS+ control carries the custom volume icon linuxfs serves,

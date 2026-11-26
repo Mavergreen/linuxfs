@@ -47,14 +47,16 @@
 #                                         system.log's refusals (each one's uid), who runs mds, mdworker and
 #                                         fseventsd, Finder's refresh (read-write only), mdutil -i off kept across a
 #                                         remount
-#   census_finder FS                      item 6: screenshots (sidebar, getinfo, desktop-on, desktop-off, icon),
+#   census_finder FS                      item 6 (checked): screenshots (sidebar, getinfo, desktop-on, desktop-off, icon),
 #                                         and item 2's FS-only getinfo-format (Finder restarted just before),
-#                                         Finder's disk properties against df -k, diskutil info's fields (by mount
-#                                         point and by device), a custom .VolumeIcon.icns
-#   census_trash_tags_case FS             item 7: Finder's delete, .Trashes/<uid> and empty trash; a tag and a label
-#                                         read back, after a remount too; xattrs of 128 KiB to 128 MiB, to a refusal;
-#                                         pathconf(_PC_CASE_SENSITIVE) against HFS+ and against HFSX (FS apfs,
-#                                         read-only: the pathconf alone)
+#                                         Finder's disk properties against df -k (ignore privileges a record), diskutil
+#                                         info's fields (by mount point and by device; FS's GPT-wrapped image from IN, as
+#                                         the control is partitioned), a custom .VolumeIcon.icns (not on read-only APFS)
+#   census_trash_tags_case FS             item 7 (checked): Finder's delete, .Trashes/<uid> and empty trash; a tag and a
+#                                         label read back, after a remount too; xattrs of 128 KiB to 128 MiB, to a
+#                                         refusal, and Finder's copy of a 256 KiB one (records); pathconf(_PC_CASE_SENSITIVE)
+#                                         against HFS+ and against HFSX, the one FS matches checked, and its value barred
+#                                         (FS apfs, read-only: the pathconf alone)
 #   census_later                          Later: Time Machine's offer and the exFAT control, against ext4
 #   census_before_login MP                item 5 before login: mdutil -s and .fseventsd only
 #   parity_census_all                     the controls, then all of it (PARITY_STALL_N 50), within PARITY_CENSUS_MIN;
@@ -67,7 +69,7 @@
 #   $AQUA (guest-macosx-aqua by its path), and every screenshot follows census_dismiss (a dialog's or an offer's, from
 #   before the dialog or the attach). WHAT
 #   prefixes (the items whose PARITY_MODE_ a later task sets): unicode, busy, spotlight, finder, trash, tags, case,
-#   later. unicode, busy and spotlight are checked; unicode-ctl (Apple's own FAT32 against HFS+) and unicode-pair (both forms of one name,
+#   later. unicode, busy, spotlight, finder, trash, tags and case are checked (later is a record); unicode-ctl (Apple's own FAT32 against HFS+) and unicode-pair (both forms of one name,
 #   which HFS+ cannot hold) stay records. What cannot be equal on two volumes (pids, times, sizes, volume names) is a plain record,
 #   $OUT/parity/<what>.txt, never a parity step.
 
@@ -105,6 +107,27 @@ PARITY_MODE_SPOTLIGHT_DA=${PARITY_MODE_SPOTLIGHT_DA:-check}
 #   it is record (root's mds). Task 16l: those mounts are root's now (the mount daemon, on demand: allow_other is root's to give,
 #   and census_da_root checks each pair's is), so it is check again, the index steps with it. record stays a mode it takes.
 PARITY_MODE_FSEVENTS_DA=${PARITY_MODE_FSEVENTS_DA:-check}
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-19-brief.md, and preflight F2's ruling -- items 6 and 7 are checked (push G):
+#   finder. (Finder's properties and diskutil info's fields, a custom .VolumeIcon.icns: census_finder), trash. (the Trash's
+#   listing, .Trashes/<uid>, and Empty Trash), tags. (a tag and a label, read back and after a remount, on each filesystem) and
+#   case. (pathconf against the control the filesystem matches: HFSX for the case-sensitive ones, HFS+ for case-insensitive
+#   APFS). What need not or cannot be equal stays a record of its own (census_record): .Trashes itself, Finder's ignore
+#   privileges (QUEUE: macFUSE cannot say noowners), the oversized xattr and Finder's copy of one (the controller's ruling:
+#   ENOSPC, recorded), and the other control's pathconf. later. stays a record (spec: non-goals)
+PARITY_MODE_FINDER=${PARITY_MODE_FINDER:-check}
+PARITY_MODE_TRASH=${PARITY_MODE_TRASH:-check}
+PARITY_MODE_TAGS=${PARITY_MODE_TAGS:-check}
+PARITY_MODE_CASE=${PARITY_MODE_CASE:-check}
+# census_record WHAT CMD...: parity WHAT recorded, whatever its item's mode (PARITY_MODE_<ITEM>, as parity reads WHAT), which
+#   is then as it was, set or not
+census_record() {
+  _crd_i=$(printf '%s' "${1%%.*}" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Za-z0-9\n' _)
+  eval "_crd_s=\${PARITY_MODE_$_crd_i+set} _crd_m=\${PARITY_MODE_$_crd_i-}"
+  eval "PARITY_MODE_$_crd_i=record"
+  parity "$@"; _crd_rc=$?
+  if test -n "$_crd_s"; then eval "PARITY_MODE_$_crd_i=\$_crd_m"; else unset "PARITY_MODE_$_crd_i"; fi
+  return "$_crd_rc"
+}
 # census_fsevents_mode: for a step that needs root's processes let in on a DiskArbitration volume, CFM, the mode it takes
 #   (PARITY_MODE_FSEVENTS_DA while PARITY_MODE_SPOTLIGHT is check, else PARITY_MODE_SPOTLIGHT's), and CFM_VAR, whose it is
 census_fsevents_mode() {
@@ -427,6 +450,12 @@ census_copy() {
   mkdir -p "$W/census" && cp "$1" "$W/census/$2.img" || { echo "# census: cannot copy $1" >&2; return 1; }
   echo "$W/census/$2.img"
 }
+# census_unpack GZ NAME: GZ unpacked as $W/census/NAME.img (bounded at 60 s, a census_copy's work); prints its path
+census_unpack() {
+  mkdir -p "$W/census" && bounded 600 sh -c 'gunzip -c "$1" > "$2"' _ "$1" "$W/census/$2.img" </dev/null ||
+    { rm -f "$W/census/$2.img"; echo "# census: cannot unpack $1" >&2; return 1; }
+  echo "$W/census/$2.img"
+}
 
 # census_dismiss STEP: the console's alerts dismissed: the unsigned-kext one ("not from an identified developer",
 #   kextd's CFUserNotification) is UserNotificationCenter's, a launchd agent that comes back on demand; whether one
@@ -449,12 +478,17 @@ census_shot() {
   test "${3:-}" = nodismiss || census_dismiss "$1"
   parity_side "$2"; bounded 300 parity_shot "$1" >/dev/null 2>&1
   test "$2" != hfs || return 0
-  # spec: docs/superpowers/specs/2026-11-25-hfs-parity-design.md item 6's amendment -- the icon pair differs from HFS+, as expected:
-  #       census_volume_icon's cp put a real .VolumeIcon.icns on the volume, which wins over the linuxfs icon, and its xattr -wx of
-  #       the root's Finder Info flag fails until item 7 stores Mac xattrs (Task 19), so Finder shows macFUSE's icon there
+  # spec: docs/superpowers/specs/2026-11-25-hfs-parity-design.md item 6's amendment, and item 7 (Task 19) -- census_volume_icon's cp
+  #       put a real .VolumeIcon.icns on the volume, which wins over the linuxfs icon, and its xattr -wx of the root's Finder Info
+  #       flag is stored since Task 17, so the pair is read as a pair; read-only APFS gets no icon of its own, so its shot shows the
+  #       linuxfs volume icon, by design
   if test "$1" = icon; then
     mkdir -p "$OUT/parity"
-    echo "icon $PARITY_FS: differs from hfs-icon.png, as expected until item 7 (Task 19): the volume's own .VolumeIcon.icns (census_volume_icon) wins over the linuxfs icon, but its Finder Info flag cannot be stored yet, so Finder shows macFUSE's icon" >>"$OUT/parity/shots.txt"
+    if test "$PARITY_FS" = apfs; then
+      echo "icon apfs: differs from hfs-icon.png by design: read-only, so no .VolumeIcon.icns of its own, and Finder shows the linuxfs volume icon (item 6's amendment)" >>"$OUT/parity/shots.txt"
+    else
+      echo "icon $PARITY_FS: read against hfs-icon.png: both show the volume's own .VolumeIcon.icns (census_volume_icon), its Finder Info custom-icon flag stored since item 7 (Task 17)" >>"$OUT/parity/shots.txt"
+    fi
   fi
   case $1 in desktop-on | desktop-off | privacy | privacy-ro) return 0 ;; esac
   if test -f "$OUT/hfs-$1.png" && cmp -s "$OUT/hfs-$1.png" "$OUT/$PARITY_FS-$1.png"; then
@@ -1348,7 +1382,7 @@ PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Content
 #   PARITY_CENSUS_MIN = 132 min from the smoke's start (PARITY_T0, which the smoke sets first), and begins a step only if
 #   at its worst (census_worst_min: the console hung; spotlight 33 and census_finder 31 since Task 16l, busy 32 since Task 16e-fix,
 #   the sweep and dismissal after each counted in) it ends by 132 + 11 = 143: spotlight begins by 110, busy by 111, census_finder
-#   by 112, trash/tags/case by 121, unicode by 126, a stall iteration by 80. Task 15 adds after the census
+#   by 112, trash/tags/case by 115 (28 since Task 19), unicode by 126, a stall iteration by 80. Task 15 adds after the census
 #   census_refusals_bar (its system.log read bounded at 60 s: 1 min) and the smoke's non-admin mount (290 s at its
 #   bounds since fix round 1: 5 min), so PARITY_CENSUS_MIN went from 135 to 132. Then before login (about 5) and the copyback and uploads
 #   (about 5) remain: 5 + 143 + 1 + 5 + 5 + 5 = 164 of 180, under the 165 allowed. Task 16l adds after the census one step, in
@@ -1362,7 +1396,7 @@ PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Content
 #   busy census about 7, or about 11 with a stuck disk at each of its six re-attaches; one trash/tags/case census about
 #   3; one stall iteration under 1. Push A's census, its Finder steps not
 #   run, took 50 min (the stall 30 of them); with them, and stuck disks in both busy censuses, about 90 are expected,
-#   well inside 135. Push C's smoke sets PARITY_STALL_N=50 (push B's set 0): the stall's 30 min come first,
+#   well inside 135. Push C's smoke sets PARITY_STALL_N=50 (push B's set 0; push G's, Task 19, 0 again): the stall's 30 min come first,
 #   about 90 in all, plus item 2's Finder restart and getinfo-format shot in each census_finder (about 15 s typical, 2.5 of
 #   census_finder's 24 at worst). A stall iteration's worst is 60 min (census_worst_min), and census_stall asks census_due
 #   "stall ..." before each of its 200 iterations, so none begins after minute 80 (63 since Task 13b, the sweep after
@@ -1743,12 +1777,20 @@ census_finder_props() {
   { echo "Finder (ejectable|local volume|ignore privileges|capacity|free space|format): $_fp_o"; echo "df -k (size, available): $_fp_df"
     census_space "$1" "after Finder's query"; } >>"$2"
   if test "$_fp_rc" -ne 0; then echo "Finder: $_fp_o"; return "$_fp_rc"; fi
+  # (ignore privileges is census_finder_ignore's, a record: Task 19)
   printf '%s\n' "$_fp_o" | awk -F'|' -v df="$_fp_df" '{
     n = split(df, k, " "); c = $4 + 0; f = $5 + 0
-    print "ejectable: " $1; print "local volume: " $2; print "ignore privileges: " $3
+    print "ejectable: " $1; print "local volume: " $2
     d = c - k[1] * 1024; if (d < 0) d = -d; print "capacity equals df -k size (within 1 KiB): " (n == 2 && d < 1024 ? "yes" : "no")
     d = f - k[2] * 1024; if (d < 0) d = -d; print "free space equals df -k available (within 1 MiB): " (n == 2 && d < 1048576 ? "yes" : "no")
   }'
+}
+# spec: .superpowers/QUEUE.md "Ignore ownership" on linuxfs volumes -- census_finder_ignore MP RAW-FILE: Finder's ignore privileges
+#   for MP, from what census_finder_props put in RAW-FILE (no second question to Finder). HFS+ says true; a linuxfs volume false,
+#   since mount_macfuse has no noowners and the kext never sets MNT_IGNORE_OWNERSHIP (task-16b-report.md): macFUSE's to change
+#   (fuse-gg), so a record of its own, never part of the checked properties
+census_finder_ignore() {
+  awk -v m="$1" '$0 == "== " m { p = 1; next } /^== / { p = 0 } p && /^Finder \(/ { sub(/^[^:]*: /, ""); split($0, a, "|"); print "ignore privileges: " a[3]; exit }' "$2"
 }
 # census_du_fields MP|DEVICE: the fields 10.9's diskutil info prints that bear on Finder's presentation (it has no
 #   Removable Media or Device Location): Protocol, Read-Only Media, Ejectable, Whole and Internal
@@ -1804,13 +1846,20 @@ census_desktop() {
 census_finder() {
   cf_fs=$1
   census_sysctl "finder-$cf_fs"
-  cf_c=$(parity_control hfs) && cf_h=$(census_copy "$cf_c" "finder-hfs-$cf_fs") && cf_i=$(census_copy "$W/img/$cf_fs.img" "finder-$cf_fs") ||
+  # Task 19: the control is GPT-partitioned (diskutil's Whole: No), so FS's GPT-wrapped image from IN (Whole: No too), when
+  #   IN has it; else the bare image, and why Whole may differ, said
+  cf_gz=${IN:-}/gpt-$cf_fs.img.gz
+  if test -f "$cf_gz"; then echo "# census_finder $cf_fs: IN's gpt-$cf_fs.img.gz, partitioned as the HFS+ control is"
+  else echo "# census_finder $cf_fs: no gpt-$cf_fs.img.gz in IN, so the bare image: diskutil's Whole differs from the partitioned control's"; cf_gz=; fi
+  cf_c=$(parity_control hfs) && cf_h=$(census_copy "$cf_c" "finder-hfs-$cf_fs") &&
+    if test -n "$cf_gz"; then cf_i=$(census_unpack "$cf_gz" "finder-$cf_fs"); else cf_i=$(census_copy "$W/img/$cf_fs.img" "finder-$cf_fs"); fi ||
     { echo "# census_finder $cf_fs: no images"; return 1; }
   census_pair_up "$cf_h" "$cf_i" "$cf_fs" || { echo "# census_finder $cf_fs: cannot attach both volumes"; return 1; }
   cf_old=$(bounded 300 "$AQUA" defaults read com.apple.finder ShowExternalHardDrivesOnDesktop 2>/dev/null </dev/null)
   for cf_s in hfs fs; do census_finder_view "$cf_s" sidebar open; done
   : >"$OUT/parity/finder.$cf_fs.raw.txt"
   parity "finder.$cf_fs.properties" census_finder_props @MP@ "$OUT/parity/finder.$cf_fs.raw.txt"
+  census_record "finder.$cf_fs.ignore-privileges" census_finder_ignore @MP@ "$OUT/parity/finder.$cf_fs.raw.txt"
   parity "finder.$cf_fs.diskutil-info" census_du_fields @MP@
   parity "finder.$cf_fs.diskutil-info-dev" census_du_fields_dev @MP@
   census_du_raw "$OUT/parity/finder.$cf_fs.diskutil-info-raw.txt"
@@ -1823,7 +1872,8 @@ census_finder() {
     if test "$cf_s" = hfs; then cf_m=$PARITY_CTL_MP; else cf_m=$PARITY_FS_MP; fi
     { echo "== $cf_m"; census_space "$cf_m" "beside Get Info"; } >>"$OUT/parity/finder.$cf_fs.raw.txt"
   done
-  parity "finder.$cf_fs.volumeicon" census_volume_icon @MP@
+  if test "$cf_fs" = apfs; then echo "# census_finder apfs: read-only, so no .VolumeIcon.icns of its own: no volumeicon step"
+  else parity "finder.$cf_fs.volumeicon" census_volume_icon @MP@; fi
   census_desktop true desktop-on
   for cf_s in hfs fs; do census_finder_view "$cf_s" icon info; done
   census_desktop false desktop-off
@@ -1840,17 +1890,38 @@ census_finder() {
 # ---- item 7: Trash, tags and labels, case-sensitivity ----
 # census_trash_delete MP: MP/trash-me made, then deleted by Finder (census_finder_ask: a "delete immediately?" dialog
 #   leaves osascript waiting, photographed as trash-delete)
+#   Task 19: Finder's answer is printed without the kinds it names each item by (document file, folder, item, disk): on HFS+
+#   .Trashes is d-wx-wx-wt (Apple's mode for it, census_trashes_dir's record), so Finder names 501 an item; where the file went is
+#   what is compared. Finder's own answer goes to trash.FS.finder-delete-raw.txt, each side's headed by its mount point
 census_trash_delete() {
   echo trash >"$1/trash-me" || return 1
-  census_finder_ask trash-delete "$1" "tell application \"Finder\" to delete (POSIX file \"$1/trash-me\" as alias)"
+  mkdir -p "$W/census" "$OUT/parity"
+  census_finder_ask trash-delete "$1" "tell application \"Finder\" to delete (POSIX file \"$1/trash-me\" as alias)" >"$W/census/trash-delete.out" 2>&1
+  _ctd_rc=$?
+  { echo "== $1"; cat "$W/census/trash-delete.out"; } >>"$OUT/parity/trash.$PARITY_FS.finder-delete-raw.txt"
+  sed -E 's/^(document file|folder|item) //; s/ of (document file|folder|item|disk) / of /g' "$W/census/trash-delete.out"
+  rm -f "$W/census/trash-delete.out"
+  return "$_ctd_rc"
 }
-# census_trashes MP UID: .Trashes and .Trashes/UID: mode, owner and group, then what the latter holds
+# census_trashes MP UID: .Trashes/UID (spec item 7: the user's own trash): its mode, owner and group, then what it holds, less
+#   Finder's .DS_Store and ._ files, which noappledouble keeps off a linuxfs volume (an anti-goal keeps noappledouble)
 census_trashes() {
-  for _ct_p in "$1/.Trashes" "$1/.Trashes/$2"; do
-    if test -e "$_ct_p"; then stat -f '%N %Sp %u:%g' "$_ct_p" 2>&1; else echo "$_ct_p: absent"; fi
-  done
-  echo "-- in .Trashes/$2:"; ls -A "$1/.Trashes/$2" 2>&1
+  if test -e "$1/.Trashes/$2"; then stat -f '%N %Sp %u:%g' "$1/.Trashes/$2" 2>&1; else echo "$1/.Trashes/$2: absent"; fi
+  echo "-- in .Trashes/$2:"; ls -A "$1/.Trashes/$2" 2>&1 | grep -v -e '^\.DS_Store$' -e '^\._'
   return 0
+}
+# census_trashes_dir MP: .Trashes itself, its mode, owner and group: a record (push C: HFS+'s d-wx-wx-wt was made when the control
+#   was erased, a linuxfs volume's by Finder's first delete, drwxrwxrwt: Apple's choice of mode, not linuxfs's)
+census_trashes_dir() {
+  if test -e "$1/.Trashes"; then stat -f '%N %Sp %u:%g' "$1/.Trashes" 2>&1; else echo "$1/.Trashes: absent"; fi
+  return 0
+}
+# census_finder_trash: what Finder's Trash holds, every volume's, as POSIX paths (one osascript, bounded at 30 s): before Empty
+#   Trash, whether Finder counts the linuxfs volume's .Trashes/<uid> in it (push C and E: Empty Trash left it full)
+census_finder_trash() {
+  bounded 300 "$AQUA" osascript -e 'set o to ""' -e 'tell application "Finder"' -e 'repeat with i in (every item of trash)' \
+    -e 'set o to o & (POSIX path of (i as alias)) & linefeed' -e 'end repeat' -e 'end tell' -e 'return o' 2>&1 </dev/null
+  echo "== status $?"
 }
 # a binary plist of the one-tag array ("Parity"), as com.apple.metadata:_kMDItemUserTags holds it (plutil -convert binary1)
 census_tag_plist=62706c6973743030a10156506172697479080a0000000000000101000000000000000200000000000000000000000000000011
@@ -1860,6 +1931,13 @@ census_tag_set() {
   xattr -wx com.apple.metadata:_kMDItemUserTags "$census_tag_plist" "$1/tagged" 2>&1; echo "tag (xattr -wx): exit $?"
   "$AQUA" osascript -e "tell application \"Finder\" to set label index of (POSIX file \"$1/tagged\" as alias) to 2" 2>&1 </dev/null
   echo "label (Finder): exit $?"
+}
+# census_xattrs FILE: FILE's xattrs by name, in order (listxattr's order is each filesystem's own, and Finder's tags and labels
+#   do not depend on it; HFS+ lists FinderInfo first), each with its value as xattr -px gives it, on one line
+census_xattrs() {
+  xattr "$1" 2>&1 | LC_ALL=C sort | while IFS= read -r _cx_n; do
+    echo "$_cx_n: $(xattr -px "$_cx_n" "$1" 2>&1 | tr -s ' \n' '  ' | sed 's/^ *//; s/ *$//')"
+  done
 }
 # census_py_xattr FILE N...: setxattr user.parity-big of N bytes on FILE, for each N in order, the attribute removed
 #   before each (so each size has the volume's space to itself) and after the last: "N bytes: ok", or its errno and
@@ -1906,16 +1984,77 @@ census_xattr_big() {
   # shellcheck disable=SC2086  # the sizes are words
   "$PARITY_PYTHON" -c "$census_py_xattr" "$1/big-xattr" $PARITY_XATTR_SIZES 2>&1
 }
+# spec: the controller's ruling (Task 17 concern 2) -- an oversized xattr gives ENOSPC, the census records Finder's reaction and
+#   HFS+'s, recorded, not gated. census_big_src: once a census, $W/census/big-src, on the boot volume (HFS+), with an xattr
+#   parity-big of 256 KiB (ext4's block holds 4): by Python's xattr (10.9's) or os.setxattr (Python 3 on Linux, as user.)
+census_py_big='import sys
+p = sys.argv[1]
+v = b"x" * 262144
+try:
+    import xattr
+    xattr.setxattr(p, "parity-big", v)
+except ImportError:
+    import os
+    os.setxattr(p, "user.parity-big", v)'
+census_big_src() {
+  test -f "$W/census/big-src" && return 0
+  mkdir -p "$W/census" && echo big >"$W/census/big-src" && bounded 300 "$PARITY_PYTHON" -c "$census_py_big" "$W/census/big-src" </dev/null
+}
+# census_finder_copy MP: Finder duplicates big-src onto MP (census_finder_ask: a dialog photographed as oversized-finder), then
+#   what landed: the copy's size and its xattrs' names and sizes, and the copy is removed
+census_finder_copy() {
+  census_finder_ask oversized-finder "$1" "tell application \"Finder\" to duplicate (POSIX file \"$W/census/big-src\" as alias) to (POSIX file \"$1\" as alias) with replacing"
+  echo "Finder's duplicate: exit $?"
+  if test -e "$1/big-src"; then
+    echo "big-src on $1: $(wc -c <"$1/big-src" | tr -d ' ') bytes"
+    xattr "$1/big-src" 2>&1 | LC_ALL=C sort | while IFS= read -r _cfc_n; do echo "xattr $_cfc_n: $(xattr -p "$_cfc_n" "$1/big-src" 2>&1 | wc -c | tr -d ' ') bytes"; done
+  else echo "big-src on $1: none"; fi
+  rm -f "$1/big-src"
+  return 0
+}
 census_py_pathconf='import os, sys
 try:
     print("pathconf(_PC_CASE_SENSITIVE) = %d" % os.pathconf(sys.argv[1], 11))
 except (IOError, OSError) as e:
     print("errno " + str(e.errno))'
 
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-18-report.md concern 1 -- census_case_bar FS: pathconf(_PC_CASE_SENSITIVE) on
+#   FS's volume, read from case.FS.pathconf.FS.txt, is 1 (case-sensitive, as HFSX) for ext4, btrfs, xfs, f2fs and NTFS, and 0
+#   (case-insensitive, as HFS+) for the APFS image (mkapfs's default: patch 0014's nocase); under PARITY_MODE_CASE
+census_case_bar() {
+  if test "$1" = apfs; then _ccb_w=0 _ccb_l="0, case-insensitive like HFS+"; else _ccb_w=1 _ccb_l="1, case-sensitive like HFSX"; fi
+  _ccb_g=$(sed -n 's/^pathconf(_PC_CASE_SENSITIVE) = //p' "$OUT/parity/case.$1.pathconf.$1.txt" 2>/dev/null)
+  if test "${PARITY_MODE_CASE:-record}" != check; then echo "# recorded census $1: pathconf(_PC_CASE_SENSITIVE) is ${_ccb_g:-unknown}"
+  elif test "$_ccb_g" = "$_ccb_w"; then ok "census $1: pathconf(_PC_CASE_SENSITIVE) is $_ccb_l"
+  else notok "census $1: pathconf(_PC_CASE_SENSITIVE) is $_ccb_l (it is ${_ccb_g:-unknown})"; fi
+}
+# census_case FS PAIRED-WITH WHAT: the case step: parity WHAT of pathconf, checked when FS matches the control it is paired with
+#   (hfs or hfsx: the case-sensitive filesystems match HFSX, case-insensitive APFS matches HFS+), else recorded
+census_case() {
+  if test "$1" = apfs; then _cc_m=hfs; else _cc_m=hfsx; fi
+  if test "$2" = "$_cc_m"; then parity "$3" "$PARITY_PYTHON" -c "$census_py_pathconf" @MP@
+  else census_record "$3" "$PARITY_PYTHON" -c "$census_py_pathconf" @MP@; fi
+}
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-17-report.md section 5 -- the APFS fixture's tagged file (osx.N on Linux) is
+#   checked once the maintainer regenerates enc.img with make-apfs-fixtures.sh (tests/fixtures/apfs/tagged.txt arrives with it);
+#   until then the controller's ruling keeps it a record, said in tags.apfs.fixture.txt
+PARITY_APFS_TAGGED=${PARITY_APFS_TAGGED:-$PARITY_LIB/../fixtures/apfs/tagged.txt}
+census_apfs_tagged() {
+  mkdir -p "$OUT/parity"
+  if test -f "$PARITY_APFS_TAGGED"; then
+    echo "tests/fixtures/apfs/tagged.txt: present: the regenerated fixture has arrived; its tagged file is not yet read by the census (Task 19 records it)" >"$OUT/parity/tags.apfs.fixture.txt"
+  else
+    echo "tests/fixtures/apfs/tagged.txt: absent: enc.img is not regenerated yet (make-apfs-fixtures.sh needs macOS 10.13 or later), so the APFS tag mapping (osx.N) is recorded, not checked" >"$OUT/parity/tags.apfs.fixture.txt"
+  fi
+  echo "# recorded tags.apfs.fixture: $(cat "$OUT/parity/tags.apfs.fixture.txt")"
+}
+
 # census_trash_tags_case FS: item 7 on the HFS+ control against FS. Trash: Finder's delete (trash-delete photographed),
-#   .Trashes/<uid>, then empty trash (once: it empties every volume; trash.FS.empty-trash.txt) and what is left. Tags: a
-#   tag and a label, xattr -l, again after a remount, and the oversized xattr. Case: pathconf against HFS+ (case.FS.pathconf)
-#   and against HFSX (case.FS.pathconf-hfsx, whose .hfs.txt is HFSX's). APFS is read-only: the case step alone.
+#   .Trashes/<uid> (and .Trashes itself, a record), what Finder's Trash holds (trash.FS.finder-trash.txt), then empty trash (once:
+#   it empties every volume; trash.FS.empty-trash.txt) and what is left. Tags: a tag and a label, their xattrs by name, again
+#   after a remount; the oversized xattr and Finder's copy of one (records). Case: pathconf against HFS+ (case.FS.pathconf) and
+#   against HFSX (case.FS.pathconf-hfsx, whose .hfs.txt is HFSX's), the one FS matches checked (census_case), and census_case_bar.
+#   APFS is read-only: the case step alone, and the fixture's tagged file said (census_apfs_tagged).
 census_trash_tags_case() {
   tt_fs=$1 tt_uid=$(id -u)
   census_sysctl "trash-$tt_fs"
@@ -1925,13 +2064,16 @@ census_trash_tags_case() {
   census_pair_up "$tt_h" "$tt_i" "$tt_fs" || { echo "# census_trash_tags_case $tt_fs: cannot attach both volumes"; return 1; }
   if test "$tt_fs" = apfs; then
     echo "# census_trash_tags_case apfs: read-only, so the case step alone"
+    census_apfs_tagged
   else
     # census_finder_ask's worst, 160 s (see it)
     census_bound 1600 parity "trash.$tt_fs.finder-delete" census_trash_delete @MP@
-    if grep -q '^osascript still waiting' "$OUT/parity/trash.$tt_fs.finder-delete.hfs.txt" "$OUT/parity/trash.$tt_fs.finder-delete.$tt_fs.txt"; then
+    if grep -q '^osascript still waiting' "$OUT/parity/trash.$tt_fs.finder-delete-raw.txt"; then
       census_finder_restart   # a dialog was left up
     fi
     parity "trash.$tt_fs.trashes" census_trashes @MP@ "$tt_uid"
+    census_record "trash.$tt_fs.trashes-dir" census_trashes_dir @MP@
+    census_finder_trash >"$OUT/parity/trash.$tt_fs.finder-trash.txt" 2>&1
     tt_warn=$(bounded 300 "$AQUA" osascript -e 'tell application "Finder" to get warns before emptying of trash' 2>/dev/null </dev/null)
     bounded 1600 census_finder_ask trash-empty "$PARITY_CTL_MP" \
       'tell application "Finder"
@@ -1943,11 +2085,13 @@ end tell' >"$OUT/parity/trash.$tt_fs.empty-trash.txt" 2>&1
     case $tt_warn in true|false) census_osa "tell application \"Finder\" to set warns before emptying of trash to $tt_warn" ;; esac
     parity "trash.$tt_fs.after-empty" census_trashes @MP@ "$tt_uid"
     parity "tags.$tt_fs.set" census_tag_set @MP@
-    parity "tags.$tt_fs.read" xattr -l @MP@/tagged
+    parity "tags.$tt_fs.read" census_xattrs @MP@/tagged
     # up to 128 MiB written to a disk image (0.94 s on the dev box): 1 min a side, 2 for the step
-    census_bound 600 parity "tags.$tt_fs.oversized" census_xattr_big @MP@
+    census_bound 600 census_record "tags.$tt_fs.oversized" census_xattr_big @MP@
+    if census_big_src >/dev/null 2>&1; then census_bound 1600 census_record "tags.$tt_fs.oversized-finder" census_finder_copy @MP@
+    else echo "# census_trash_tags_case $tt_fs: no big-src (its 256 KiB xattr could not be made), so no Finder copy of one"; fi
     if census_remount_pair "$tt_h" "$tt_i"; then
-      parity "tags.$tt_fs.after-remount" xattr -l @MP@/tagged
+      parity "tags.$tt_fs.after-remount" census_xattrs @MP@/tagged
     else
       echo "# census_trash_tags_case $tt_fs: no remount, so no tags read after one"
       tt_live=$(census_image_disk "$tt_i")
@@ -1962,11 +2106,12 @@ end tell' >"$OUT/parity/trash.$tt_fs.empty-trash.txt" 2>&1
       fi
     fi
   fi
-  parity "case.$tt_fs.pathconf" "$PARITY_PYTHON" -c "$census_py_pathconf" @MP@
+  census_case "$tt_fs" hfs "case.$tt_fs.pathconf"
+  census_case_bar "$tt_fs"
   tt_hd=$PARITY_CTL_DISK tt_hm=$PARITY_CTL_MP tt_hv=$PARITY_CTL_VOL
   if census_attach "$tt_x"; then
     parity_pair "$CA_DISK" "$CA_MP" "$CA_VOL" "$tt_fs" "$PARITY_FS_DISK" "$PARITY_FS_MP" "$PARITY_FS_VOL"
-    parity "case.$tt_fs.pathconf-hfsx" "$PARITY_PYTHON" -c "$census_py_pathconf" @MP@
+    census_case "$tt_fs" hfsx "case.$tt_fs.pathconf-hfsx"
     census_detach "$CA_DISK" apple
     parity_pair "$tt_hd" "$tt_hm" "$tt_hv" "$tt_fs" "$PARITY_FS_DISK" "$PARITY_FS_MP" "$PARITY_FS_VOL"
   else echo "# census_trash_tags_case $tt_fs: no HFSX control attached"; fi
@@ -2061,6 +2206,10 @@ census_later() {
 #   stall's would fit its iteration's 63 regardless: 62.3 + 20 / 60 = 62.6); census_names_mode's sudo cat of _linuxfs's log
 #   after each root attach (bounded at 10 s; about 45 a busy census, one a stall iteration) is a local read, counted as
 #   typical within the names reads' 5 s, as they are, not at its bound (r1 m3);
+#   Task 19 adds to census_trash_tags_case, in seconds: census_finder_trash's osascript, 30; census_big_src's Python, 30 (once a
+#   census, counted on each); Finder's copy of big-src on each side (census_finder_copy: census_finder_ask, 160 at its worst
+#   under its census_bound, and the copy's reads), 2 x 160: 380, 20.8 + 380 / 60 = 27.1, 28. trash/tags/case now begins by
+#   115; census_finder's GPT image (census_unpack, a census_copy's work, counted as disks as usual) does not move its 31;
 #   census_later 5 + 205 / 60 = 8.4, 9;
 #   a stall iteration 60 + 137 / 60 = 62.3, 63 (counted on each, though only the last is followed by the sweep);
 #   anything else 11
@@ -2069,7 +2218,7 @@ census_worst_min() {
   census_spotlight) echo 33 ;;
   census_busy) echo 32 ;;
   census_finder) echo 31 ;;
-  census_trash_tags_case) echo 22 ;;
+  census_trash_tags_case) echo 28 ;;
   census_unicode) echo 17 ;;
   census_later) echo 9 ;;
   stall | census_stall) echo 63 ;;
