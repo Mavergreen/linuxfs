@@ -368,7 +368,9 @@ replies "$D/sadf.out" | grep -q "^hi|no${T}1${T}the mount point is not empty|\$"
 mnt NAME; : > "$V/NAME/.autodiskmounted"; : > "$V/NAME/other"; prog mount
 cl send "$(rq ext4 "$E" - NAME)" > "$D/sado.out"
 replies "$D/sado.out" | grep -q "^hi|no${T}1${T}the mount point is not empty|\$" && ! ran; ok $? "serve_autodiskmounted: that file and another: not empty ($(replies "$D/sado.out"))"
-rm -rf "$V/NAME"
+mnt NAME; : > "$V/NAME/.AutoDiskMounted"; prog mount
+cl send "$(rq ext4 "$E" - NAME)" > "$D/sadc.out"
+replies "$D/sadc.out" | grep -q "^hi|no${T}1${T}the mount point is not empty|\$" && ! ran; ok $? "serve_autodiskmounted: a regular .AutoDiskMounted (the name matched exactly): not empty ($(replies "$D/sadc.out"))"
 rm -rf "$V/NAME"; mkdir -p "$D/elsewhere"; ln -s "$D/elsewhere" "$V/NAME"
 cl send "$(rq ext4 "$E" - NAME)" > "$D/ssym.out"
 replies "$D/ssym.out" | grep -q "^hi|no${T}1${T}[^|]*|\$" && ! ran; ok $? "serve_mnt_refusals: a symlink: no 1, before begin"
