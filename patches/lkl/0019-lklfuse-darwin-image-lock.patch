@@ -12,12 +12,13 @@ unmount (lklfuse_let_go) or exit. Only another holder (EWOULDBLOCK) refuses, say
 linuxfs's CLI reads as "already mounted"; an image on a file system that cannot flock (NFS with no lockd, ENOLCK; a FUSE
 volume, ENOTSUP) is served unlocked, as before, with a note in other words (final review r1 N1). tests/lklfuse-ops-test.c
 takes the lock twice, after let go, beside a shared lock and a device, on an image lklfuse-ops-darwin.sh attached -nomount,
-and through a stub flock failing with ENOTSUP, ENOLCK, EOPNOTSUPP and EINVAL.
+and through a stub flock failing with ENOTSUP, ENOLCK, EOPNOTSUPP and EINVAL (the stub's pointer exists only in that test's
+build, LKLFUSE_OPS_TEST; lklfuse itself calls flock).
 
 diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 --- a/tools/lkl/lklfuse.c
 +++ b/tools/lkl/lklfuse.c
-@@ -2961,6 +2961,52 @@
+@@ -2961,6 +2961,56 @@
  	return lklfuse_open_path(lklfuse.file, lklfuse.ro);
  }
  
@@ -34,7 +35,11 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 + * (final review r1 N1). 0 (locked, or a device), 1 with errno (cannot be locked here), or -1 with errno (EWOULDBLOCK:
 + * another holds it; or fstat failed).
 + */
-+static int (*lklfuse_image_flock)(int, int) = flock;	/* the tests' stub stands in for a file system's answer */
++#ifdef LKLFUSE_OPS_TEST
++static int (*lklfuse_image_flock)(int, int) = flock;	/* tests/lklfuse-ops-test.c stubs a file system's answer */
++#else
++#define lklfuse_image_flock flock
++#endif
 +
 +static int lklfuse_lock_image(int fd)
 +{
@@ -70,7 +75,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  int main(int argc, char **argv)
  {
  	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
-@@ -3021,6 +3067,13 @@
+@@ -3021,6 +3071,13 @@
  		perror(lklfuse.file);
  		goto out_free;
  	}
@@ -84,7 +89,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  
  	lklfuse.disk.fd = ret;
  	lklfuse.disk.ro = lklfuse.ro;
-@@ -3050,6 +3103,13 @@
+@@ -3050,6 +3107,13 @@
  			ret = -1;
  			goto out_close_disk;
  		}

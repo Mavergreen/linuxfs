@@ -6,6 +6,7 @@
  *        XATTR-IMAGE-DIR (Darwin): tests/lib/xattr-images.sh's four images, for the Mac xattr schemes (patch 0013)
  */
 #define main lklfuse_main
+#define LKLFUSE_OPS_TEST	/* lklfuse.c's test hooks: the image lock's flock, which a test stubs (patch 0019) */
 #define fuse_get_context test_fuse_get_context	/* the FUSE caller, which a test sets (owner=caller) */
 #ifdef __APPLE__	/* libfuse's own, which this test does not link: what lklfuse_init asks of macFUSE (nocase) */
 #define fuse_darwin_set_feature_flag test_fuse_darwin_set_feature_flag
@@ -859,7 +860,6 @@ static int lists(const char *path, const char *name)
 	return 0;
 }
 
-/* how many times listxattr of PATH has NAME; or, with PREFIX set, names starting with NAME */
 #ifdef __APPLE__
 /* final review r1 N1: flock as a file system that cannot lock answers (stub_flock_err) */
 static int stub_flock_err;
@@ -873,6 +873,7 @@ static int stub_flock(int fd, int op)
 }
 #endif
 
+/* how many times listxattr of PATH has NAME; or, with PREFIX set, names starting with NAME */
 static int listed(const char *path, const char *name, int prefix)
 {
 	char b[4096];
