@@ -13,7 +13,7 @@
  * - the user at the console: "hi", the peer's uid and groups to syslog, then a child, at most MOUNTD_SLOTS_UID per uid and
  *   MOUNTD_SLOTS in all. Beyond that, MOUNTD_QUEUE per uid wait first in, first out; past MOUNTD_QUEUE_WAIT, or beyond the
  *   queue, "user<TAB>busy" (nothing was touched, so the mount program's own path is safe).
- * The child reads the one request line within MOUNTD_REQUEST seconds in all, and parses it (mountd_parse). It exits 0 after
+ * The child reads the one request line within MOUNTD_REQUEST seconds in all, and parses it (mountd_parse). The daemon exits 0 after
  * MOUNTD_IDLE seconds with no child and nothing queued, and on SIGTERM (whose handler only sets a flag). The socket
  * (/var/run/dev.mavergreen.linuxfs.mountd.sock) sits in a directory group daemon may write: the mount program checks that
  * its peer is root before it sends anything. Syslog gets the peers, refusals and results; stderr (the log file) only a
@@ -22,10 +22,26 @@
  * The parent takes at most ACCEPT_BATCH connections per pass, so a flood never keeps it from reaping, dispatching, SIGTERM
  * or the idle exit (I1). A queued request is served only if its uid is still the console user's (m2).
  *
+ * The work (the child, after the parse; spec §1): DiskArbitration describes the disk (within DA_WAIT s); /dev/BSD's owner and
+ * device, the mount table, a superblock probe of /dev/rBSD and the console user's preferences go to mountd_judge; the mount
+ * point is opened without following a symlink, flocked for the request's life (two disks never stack on one), and judged
+ * (mountd_mnt_facts). Until then nothing is changed, and a SIGALRM handler answers "user" when it takes longer than
+ * MOUNTD_PREBEGIN. Then "begin"; a mount point of the peer's is adopted (root's, 0755, checked again, given back on any
+ * doubt); the bundle's mount_macfuse_<fs>, trusted (trust_path), is spawned in a process group of its own with a fixed argv,
+ * PATH alone and 0-2 only, its output drained (the first 64 KiB to syslog, and its first "cli-pgid N"). At MOUNTD_DEADLINE
+ * it gets SIGTERM; MOUNTD_GRACE later, SIGKILL to its group and to the members of the CLI's group N that run as _linuxfs and
+ * were in the last once-a-second snapshot with the same start time. "ok" only when it exited 0, root's mount of /dev/BSD is
+ * on top of MNT and /dev/BSD is still the device judged. One result line per request goes to syslog.
+ *
  * The test build (LINUXFS_MOUNTD_TEST, never shipped) binds its own socket and takes the console's uid (or a file to read
  * it from), the slots, the queue and the idle time as options; --foreign-pgid stands peers of one process group in for
- * another uid. It logs to stderr as well as syslog, its stub child sleeps LINUXFS_MOUNTD_TEST_CHILD_SLEEP seconds, and
- * LINUXFS_MOUNTD_TEST_CRED_FAIL makes every credential unreadable.
+ * another uid. It logs to stderr as well as syslog, and LINUXFS_MOUNTD_TEST_CRED_FAIL makes every credential unreadable.
+ * Without LINUXFS_MOUNTD_TEST_PROGRAM its child is a stub that sleeps LINUXFS_MOUNTD_TEST_CHILD_SLEEP seconds and answers
+ * "user not yet" (the front door's tests). With it, the child does the work with stand-ins: the program's directory
+ * (trusted as the test user's), LINUXFS_MOUNTD_TEST_DA (a key=value file for DiskArbitration; _DA_SLEEP delays it),
+ * _VOLUMES, _MNTTAB, _RUNAS (the group kill's _linuxfs), _ADOPT_SWAP, _RDEV_SHIFT, and --deadline and --grace. Adoption
+ * and giving back are said ("adopt MNT", "giveback MNT UID MODE") rather than done. --describe BSD prints what the real
+ * DiskArbitration says of BSD, read in a forked child as the daemon reads it.
  */
 #include "mountd.h"
 #include <stdio.h>
@@ -233,20 +249,33 @@ size_t mountd_reply(char *buf, size_t len, enum mountd_verdict v, int rc, const 
 }
 
 #ifndef LINUXFS_MOUNTD_NO_MAIN
+#include <CoreFoundation/CoreFoundation.h>
+#include <DiskArbitration/DiskArbitration.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <launch.h>
+#include <libproc.h>
+#include <limits.h>
 #include <mach/mach_time.h>
 #include <poll.h>
+#include <pwd.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <sys/file.h>
+#include <sys/mount.h>
+#include <sys/param.h>
 #include <sys/socket.h>
 #include <sys/ucred.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <syslog.h>
 #include <unistd.h>
+#include "plist.h"
+#include "probe.h"
+#include "trust.h"
 
 #define LISTENER "Listener"	/* the plist's Sockets key (16k) */
 #define CHILDREN_MAX 64	/* room for the slots (MOUNTD_SLOTS, or the test build's --max) */
@@ -255,8 +284,23 @@ size_t mountd_reply(char *buf, size_t len, enum mountd_verdict v, int rc, const 
 #define REFUSALS 16	/* uids remembered for that */
 #define ACCEPT_BATCH 16	/* connections taken per pass of the loop (I1) */
 
-struct limits { int slots_uid, slots, queue, queue_wait, idle, status; uid_t console; int console_given; };
-static struct limits lim = { MOUNTD_SLOTS_UID, MOUNTD_SLOTS, MOUNTD_QUEUE, MOUNTD_QUEUE_WAIT, MOUNTD_IDLE, 0, 0, 0 };
+#define DA_WAIT 15	/* seconds DiskArbitration may take (M6), of MOUNTD_PREBEGIN */
+#define RUN_USER "_linuxfs"	/* who runs the CLI and lklfuse: the only uid the group kill reaches in the CLI's group */
+#define PROGRAM_FMT "/System/Library/Filesystems/macfuse_%s.fs/Contents/Resources/mount_macfuse_%s"
+#define PROGRAM_PATH "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
+#define OUTPUT_LOGGED (64 * 1024)	/* the program's output to syslog; the rest is drained unread (M5) */
+#define SNAPSHOT_MAX 256	/* members of the CLI's group remembered (R1) */
+
+struct limits { int slots_uid, slots, queue, queue_wait, idle, status; uid_t console; int console_given; int deadline, grace; };
+static struct limits lim = { MOUNTD_SLOTS_UID, MOUNTD_SLOTS, MOUNTD_QUEUE, MOUNTD_QUEUE_WAIT, MOUNTD_IDLE, 0, 0, 0,
+			     MOUNTD_DEADLINE, MOUNTD_GRACE };
+
+/* The test build's hooks; the shipped build has neither their names nor their effect */
+#ifdef LINUXFS_MOUNTD_TEST
+#define TEST_ENV(name) getenv(name)
+#else
+#define TEST_ENV(name) ((char *)NULL)
+#endif
 static struct { pid_t pid; uid_t uid; } kids[CHILDREN_MAX];
 static int nkids;
 static struct { int fd; uid_t uid; long long since; } queue[QUEUE_MAX];
@@ -285,18 +329,35 @@ static long long now_ms(void)
 
 /* one line to syslog. The test build also writes it to stderr, for the tests to read; it still calls syslog, so its
  * children are forked from a parent that has used syslog (ASL), as the shipped daemon's are (m5). */
+static void say_at(int pri, const char *fmt, va_list ap)
+{
+#ifdef LINUXFS_MOUNTD_TEST
+	va_list cp;
+
+	va_copy(cp, ap);
+	vfprintf(stderr, fmt, cp);
+	fputc('\n', stderr);
+	va_end(cp);
+#endif
+	vsyslog(pri, fmt, ap);
+}
+
 static void say(const char *fmt, ...)
 {
 	va_list ap;
 
-#ifdef LINUXFS_MOUNTD_TEST
 	va_start(ap, fmt);
-	vfprintf(stderr, fmt, ap);
-	fputc('\n', stderr);
+	say_at(LOG_NOTICE, fmt, ap);
 	va_end(ap);
-#endif
+}
+
+/* the same, loudly (LOG_ERR): the deadline */
+static void shout(const char *fmt, ...)
+{
+	va_list ap;
+
 	va_start(ap, fmt);
-	vsyslog(LOG_NOTICE, fmt, ap);
+	say_at(LOG_ERR, fmt, ap);
 	va_end(ap);
 }
 
@@ -434,6 +495,679 @@ static ssize_t read_request(int c, char *buf, size_t len)
 	return (ssize_t)got;
 }
 
+/* ---- the child's work (16i): describe, judge, adopt, spawn, reply ---- */
+
+static int conn = -1;	/* the request's connection, for the pre-begin alarm */
+static struct { const char *bsd, *mnt; uid_t peer; long long da_ms; } job;
+
+/* Before begin (N2): nothing has been changed, so the mount program's own path is safe. A handler, since a blocked mach_msg
+ * (DiskArbitration) is not reliably interrupted: the reply, then out. */
+static void too_slow(int sig)
+{
+	static const char r[] = "user\tthe daemon was too slow: your own mount\n";
+
+	(void)sig;
+	if (write(conn, r, sizeof r - 1) < 0) {
+		/* the peer is gone: nothing to do */
+	}
+	_exit(0);
+}
+
+/* The reply V/RC/WHY, the one result line to syslog, and the end of the child (the mount point's lock with it). */
+static void __attribute__((noreturn)) finish(enum mountd_verdict v, int rc, const char *why)
+{
+	answer(conn, v, rc, why);
+	if (v == MD_MOUNT)
+		say("mountd: %s on %s: ok (peer %u, DA %lldms)", job.bsd, job.mnt, (unsigned)job.peer, job.da_ms);
+	else if (v == MD_USER)
+		say("mountd: %s on %s: user (peer %u, DA %lldms): %s", job.bsd, job.mnt, (unsigned)job.peer, job.da_ms, why);
+	else
+		say("mountd: %s on %s: no %d (peer %u, DA %lldms): %s", job.bsd, job.mnt, mountd_rc(rc), (unsigned)job.peer,
+		    job.da_ms, why);
+	_exit(0);
+}
+
+static const char *volumes_dir(void)
+{
+	const char *v = TEST_ENV("LINUXFS_MOUNTD_TEST_VOLUMES");
+
+	return v && *v ? v : "/Volumes";
+}
+
+/* V (a CFString, CFBoolean, CFURL or CFNumber) as text into OUT (LEN bytes); "" when it is none of those or does not fit */
+static void cf_text(CFTypeRef v, char *out, size_t len)
+{
+	long long n;
+
+	out[0] = '\0';
+	if (!v)
+		return;
+	if (CFGetTypeID(v) == CFStringGetTypeID()) {
+		if (!CFStringGetCString((CFStringRef)v, out, (CFIndex)len, kCFStringEncodingUTF8))
+			out[0] = '\0';
+	} else if (CFGetTypeID(v) == CFBooleanGetTypeID()) {
+		snprintf(out, len, "%s", CFBooleanGetValue((CFBooleanRef)v) ? "true" : "false");
+	} else if (CFGetTypeID(v) == CFURLGetTypeID()) {
+		if (!CFURLGetFileSystemRepresentation((CFURLRef)v, true, (UInt8 *)out, (CFIndex)len))
+			out[0] = '\0';
+	} else if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+		if (CFNumberGetValue((CFNumberRef)v, kCFNumberLongLongType, &n))
+			snprintf(out, len, "%lld", n);
+	}
+}
+
+static int cf_true(CFDictionaryRef d, CFStringRef k)
+{
+	CFTypeRef v = CFDictionaryGetValue(d, k);
+
+	return v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)v);
+}
+
+/* S without trailing spaces (IOKit pads some device strings) */
+static void trim(char *s)
+{
+	size_t n = strlen(s);
+
+	while (n && s[n - 1] == ' ')
+		s[--n] = '\0';
+}
+
+/* DiskArbitration's description of BSD into D (all but node_uid); with PRINT, each key it reads as KEY=VALUE on stdout
+ * (the test build's --describe). removable is 1 always: DiskArbitration-266, 10.9's, probes with the literals "removable
+ * readonly" (DAFileSystem.c, DAFileSystemProbe), so that is what the util saw (item-5-findings.md). 0, or -1 when
+ * DiskArbitration does not know the disk. */
+static int da_describe(const char *bsd, struct mountd_disk *d, int print)
+{
+	const CFStringRef keys[] = {
+		kDADiskDescriptionMediaBSDNameKey, kDADiskDescriptionMediaLeafKey, kDADiskDescriptionMediaContentKey,
+		kDADiskDescriptionMediaEjectableKey, kDADiskDescriptionMediaRemovableKey, kDADiskDescriptionDeviceModelKey,
+		kDADiskDescriptionDeviceProtocolKey, kDADiskDescriptionVolumeKindKey, kDADiskDescriptionVolumePathKey,
+	};
+	DASessionRef s = DASessionCreate(kCFAllocatorDefault);
+	DADiskRef disk = s ? DADiskCreateFromBSDName(kCFAllocatorDefault, s, bsd) : NULL;
+	CFDictionaryRef desc = disk ? DADiskCopyDescription(disk) : NULL;
+	char model[128], protocol[128];
+	size_t i;
+
+	if (desc && print)
+		for (i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+			CFTypeRef v = CFDictionaryGetValue(desc, keys[i]);
+			char k[64], t[1024];
+
+			if (!v)
+				continue;
+			cf_text(keys[i], k, sizeof k);
+			cf_text(v, t, sizeof t);
+			printf("%s=%s\n", k, t);
+		}
+	if (desc) {
+		cf_text(CFDictionaryGetValue(desc, kDADiskDescriptionMediaBSDNameKey), d->bsd, sizeof d->bsd);
+		cf_text(CFDictionaryGetValue(desc, kDADiskDescriptionVolumeKindKey), d->kind, sizeof d->kind);
+		cf_text(CFDictionaryGetValue(desc, kDADiskDescriptionMediaContentKey), d->content, sizeof d->content);
+		d->has_path = CFDictionaryGetValue(desc, kDADiskDescriptionVolumePathKey) != NULL;
+		d->leaf = cf_true(desc, kDADiskDescriptionMediaLeafKey);
+		d->ejectable = cf_true(desc, kDADiskDescriptionMediaEjectableKey) || cf_true(desc, kDADiskDescriptionMediaRemovableKey);
+		d->removable = 1;
+		cf_text(CFDictionaryGetValue(desc, kDADiskDescriptionDeviceModelKey), model, sizeof model);
+		cf_text(CFDictionaryGetValue(desc, kDADiskDescriptionDeviceProtocolKey), protocol, sizeof protocol);
+		trim(model);
+		trim(protocol);
+		d->image = strcmp(model, "Disk Image") == 0 || strcmp(protocol, "Virtual Interface") == 0;
+		CFRelease(desc);
+	}
+	if (disk)
+		CFRelease(disk);
+	if (s)
+		CFRelease(s);
+	return desc ? 0 : -1;
+}
+
+#ifdef LINUXFS_MOUNTD_TEST
+/* The test build's DiskArbitration: FILE's key=value lines (bsd, kind, content, has_path, leaf, ejectable, image, node_uid;
+ * the last of a key wins), BSD's unless it says otherwise; *NODE the node's owner it gives, or -1 */
+static int da_test(const char *file, const char *bsd, struct mountd_disk *d, long *node)
+{
+	char line[256], *v;
+	FILE *f = fopen(file, "r");
+
+	if (!f)
+		return -1;
+	snprintf(d->bsd, sizeof d->bsd, "%s", bsd);
+	while (fgets(line, sizeof line, f)) {
+		line[strcspn(line, "\n")] = '\0';
+		if (!(v = strchr(line, '=')))
+			continue;
+		*v++ = '\0';
+		if (!strcmp(line, "bsd"))
+			snprintf(d->bsd, sizeof d->bsd, "%s", v);
+		else if (!strcmp(line, "kind"))
+			snprintf(d->kind, sizeof d->kind, "%s", v);
+		else if (!strcmp(line, "content"))
+			snprintf(d->content, sizeof d->content, "%s", v);
+		else if (!strcmp(line, "has_path"))
+			d->has_path = atoi(v);
+		else if (!strcmp(line, "leaf"))
+			d->leaf = atoi(v);
+		else if (!strcmp(line, "ejectable"))
+			d->ejectable = atoi(v);
+		else if (!strcmp(line, "image"))
+			d->image = atoi(v);
+		else if (!strcmp(line, "node_uid"))
+			*node = atol(v);
+	}
+	fclose(f);
+	d->removable = 1;
+	return 0;
+}
+#endif
+
+/* What DiskArbitration says of BSD, into D; *NODE a stand-in for the node's owner (the test build), or -1. 0 or -1. */
+static int describe(const char *bsd, struct mountd_disk *d, long *node)
+{
+#ifdef LINUXFS_MOUNTD_TEST
+	const char *s = getenv("LINUXFS_MOUNTD_TEST_DA_SLEEP");
+
+	if (s)
+		sleep((unsigned)atoi(s));
+	if ((s = getenv("LINUXFS_MOUNTD_TEST_DA")) != NULL)
+		return da_test(s, bsd, d, node);
+#endif
+	*node = -1;
+	return da_describe(bsd, d, 0);
+}
+
+/* The mount table, as getmntinfo(MNT_NOWAIT) gives it (asking no file system, so nothing to bound): the number of entries, in
+ * *m, or -1. The test build reads LINUXFS_MOUNTD_TEST_MNTTAB's TYPE<TAB>FROM<TAB>ON<TAB>OWNER lines instead, the last on top. */
+static int mnt_table(struct statfs **m)
+{
+	int n;
+#ifdef LINUXFS_MOUNTD_TEST
+	const char *tab = getenv("LINUXFS_MOUNTD_TEST_MNTTAB");
+
+	if (tab && *tab) {
+		static struct statfs t[64];
+		char line[3 * MAXPATHLEN + 64];
+		FILE *f = fopen(tab, "r");
+
+		if (!f)
+			return -1;
+		n = 0;
+		while (n < (int)(sizeof t / sizeof t[0]) && fgets(line, sizeof line, f)) {
+			char *a = line, *b, *c, *e;
+
+			line[strcspn(line, "\n")] = '\0';
+			if (!(b = strchr(a, '\t')) || !(c = strchr(b + 1, '\t')) || !(e = strchr(c + 1, '\t')))
+				continue;
+			*b++ = *c++ = *e++ = '\0';
+			memset(&t[n], 0, sizeof t[n]);
+			snprintf(t[n].f_fstypename, sizeof t[n].f_fstypename, "%s", a);
+			snprintf(t[n].f_mntfromname, sizeof t[n].f_mntfromname, "%s", b);
+			snprintf(t[n].f_mntonname, sizeof t[n].f_mntonname, "%s", c);
+			t[n].f_owner = (uid_t)strtoul(e, NULL, 10);
+			n++;
+		}
+		fclose(f);
+		*m = t;
+		return n;
+	}
+#endif
+	n = getmntinfo(m, MNT_NOWAIT);
+	return n > 0 ? n : -1;
+}
+
+/* Whether anything is mounted from the disk WHOLE or any of its partitions (*from_disk), and anything on MNT (*on_mnt), as
+ * root's mount program checks (16f): 0, or -1 when the table cannot be read */
+static int table_facts(const char *whole, const char *mnt, int *from_disk, int *on_mnt)
+{
+	struct statfs *m;
+	int n = mnt_table(&m), i;
+
+	if (n < 0)
+		return -1;
+	for (i = 0; i < n; i++) {
+		*from_disk |= fsrules_from_disk(m[i].f_mntfromname, whole);
+		*on_mnt |= strcmp(m[i].f_mntonname, mnt) == 0;
+	}
+	return 0;
+}
+
+/* Whether the topmost mount on MNT is root's own mount of FS from /dev/BSD */
+static int topmost_is_roots(const char *fs, const char *bsd, const char *mnt)
+{
+	struct statfs *m;
+	int n = mnt_table(&m), i;
+
+	for (i = n - 1; i >= 0; i--)
+		if (strcmp(m[i].f_mntonname, mnt) == 0)
+			return fsrules_mount_is_roots(fs, bsd, m[i].f_fstypename, m[i].f_mntfromname, (unsigned)m[i].f_owner);
+	return 0;
+}
+
+/* Whether the directory open on FD is empty (1), not (0), or cannot be read (-1). 10.9 has no fdopendir: the child stands in
+ * the directory itself (fchdir, so a rename of MNT changes nothing) and reads ".", then goes back to /. */
+static int dir_empty(int fd)
+{
+	struct dirent *e;
+	DIR *dir;
+	int n = -1;
+
+	if (fchdir(fd) == 0 && (dir = opendir(".")) != NULL) {
+		n = 1;
+		while ((e = readdir(dir)) != NULL)
+			if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0) {
+				n = 0;
+				break;
+			}
+		closedir(dir);
+	}
+	if (chdir("/") != 0)
+		n = -1;
+	return n;
+}
+
+/* MNT, open on FD and adopted, back to PEER with its mode before (WAS) (N9); the test build says "giveback MNT UID MODE" */
+static void give_back(int fd, const char *mnt, uid_t peer, const struct stat *was)
+{
+#ifdef LINUXFS_MOUNTD_TEST
+	(void)fd;
+	fprintf(stderr, "giveback %s %u %o\n", mnt, (unsigned)peer, (unsigned)(was->st_mode & 07777));
+#else
+	if (fchown(fd, peer, (gid_t)-1) != 0 || fchmod(fd, was->st_mode & 07777) != 0)
+		say("mountd: %s: the mount point cannot be given back: %s", mnt, strerror(errno));
+#endif
+}
+
+/* Adoption (M1, N9): MNT, open on FD and the peer's (WAS: its fstat before begin), becomes root's and 0755; then it must still
+ * be the same directory, root's, 0755 and empty (mountd_adopted). 0; or -1 with *why, the directory given back to PEER with
+ * its mode. The test build says "adopt MNT" instead of changing it, and takes its own uid for root's. */
+static int adopt(int fd, const char *mnt, uid_t peer, const struct stat *was, const char **why)
+{
+	struct stat after, entry;
+	int empty;
+
+#ifdef LINUXFS_MOUNTD_TEST
+	fprintf(stderr, "adopt %s\n", mnt);
+	if (getenv("LINUXFS_MOUNTD_TEST_ADOPT_SWAP")) {
+		char moved[PATH_MAX];
+
+		snprintf(moved, sizeof moved, "%s.swapped", mnt);
+		if (rename(mnt, moved) != 0 || mkdir(mnt, 0755) != 0)
+			fprintf(stderr, "mountd: the swap failed: %s\n", strerror(errno));
+	}
+#else
+	if (fchown(fd, 0, 0) != 0 || fchmod(fd, 0755) != 0) {
+		say("mountd: %s: the mount point cannot be adopted: %s", mnt, strerror(errno));
+		memset(&after, 0, sizeof after);
+	}
+#endif
+	if (fstat(fd, &after) != 0)
+		memset(&after, 0, sizeof after);
+	if (lstat(mnt, &entry) != 0)
+		memset(&entry, 0, sizeof entry);
+	empty = dir_empty(fd) == 1;
+#ifdef LINUXFS_MOUNTD_TEST
+	if (after.st_uid == getuid())
+		after.st_uid = 0;
+#endif
+	if (mountd_adopted(&after, &entry, empty, peer, why) == 0)
+		return 0;
+	give_back(fd, mnt, peer, was);
+	return -1;
+}
+
+/* The bundle's mount program for R, on MNT, trusted (trust_path) and spawned in a process group of its own, with default
+ * signals, no mask, 0-2 only (stdin /dev/null, stdout and stderr *OUT's pipe), PATH alone and the fixed argv. Its pid; -1
+ * with *why. The test build runs LINUXFS_MOUNTD_TEST_PROGRAM's mount_macfuse_<fs>, trusted as the test user's. */
+static pid_t spawn_program(const struct mountd_req *r, const char *mnt, int *out, const char **why)
+{
+	char prog[PATH_MAX], resolved[PATH_MAX], opts[64], dev[64];
+	char *argv[6], *envp[] = { PROGRAM_PATH, NULL };
+	const char *dir = TEST_ENV("LINUXFS_MOUNTD_TEST_PROGRAM"), *trust_root = NULL;
+	uid_t owner = 0;
+	posix_spawn_file_actions_t fa;
+	posix_spawnattr_t at;
+	sigset_t def, none;
+	pid_t pid;
+	int pp[2], e;
+
+	if (dir) {
+		snprintf(prog, sizeof prog, "%s/mount_macfuse_%s", dir, r->fs);
+		owner = getuid();
+		trust_root = dir;
+	} else {
+		snprintf(prog, sizeof prog, PROGRAM_FMT, r->fs, r->fs);
+	}
+	if (trust_path(prog, owner, trust_root, resolved, sizeof resolved) != 0) {
+		*why = "the mount program is not root's alone";
+		return -1;
+	}
+	snprintf(opts, sizeof opts, "nodev,nosuid,%s%s", r->owners ? "owners" : "noowners", r->ro ? ",rdonly" : "");
+	snprintf(dev, sizeof dev, "/dev/%s", r->bsd);
+	argv[0] = resolved;
+	argv[1] = "-o";
+	argv[2] = opts;
+	argv[3] = dev;
+	argv[4] = (char *)mnt;
+	argv[5] = NULL;
+	if (pipe(pp) != 0) {
+		*why = "cannot make the mount program's pipe";
+		return -1;
+	}
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+	posix_spawn_file_actions_adddup2(&fa, pp[1], 1);
+	posix_spawn_file_actions_adddup2(&fa, pp[1], 2);
+	posix_spawnattr_init(&at);
+	posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK |
+				 POSIX_SPAWN_CLOEXEC_DEFAULT);
+	posix_spawnattr_setpgroup(&at, 0);
+	sigemptyset(&def);
+	sigaddset(&def, SIGPIPE);
+	sigaddset(&def, SIGCHLD);
+	sigaddset(&def, SIGALRM);
+	sigaddset(&def, SIGTERM);
+	posix_spawnattr_setsigdefault(&at, &def);
+	sigemptyset(&none);
+	posix_spawnattr_setsigmask(&at, &none);
+	e = posix_spawn(&pid, resolved, &fa, &at, argv, envp);
+	posix_spawn_file_actions_destroy(&fa);
+	posix_spawnattr_destroy(&at);
+	close(pp[1]);
+	if (e != 0) {
+		close(pp[0]);
+		say("mountd: %s: posix_spawn: %s", resolved, strerror(e));
+		*why = "the mount program cannot be run";
+		return -1;
+	}
+	*out = pp[0];
+	return pid;
+}
+
+/* The uid the CLI and lklfuse run as: _linuxfs's (the test build: LINUXFS_MOUNTD_TEST_RUNAS), or 0 for none */
+static uid_t run_as(void)
+{
+	const char *t = TEST_ENV("LINUXFS_MOUNTD_TEST_RUNAS");
+	struct passwd *pw;
+
+	if (t)
+		return (uid_t)strtoul(t, NULL, 10);
+	pw = getpwnam(RUN_USER);
+	return pw ? pw->pw_uid : 0;
+}
+
+/* One member of the CLI's group, as it was seen (R1): its pid and when it started */
+struct member { pid_t pid; uint64_t sec, usec; };
+
+/* PID's start time and effective uid; 0, or -1 when it is gone */
+static int proc_facts(pid_t pid, struct proc_bsdinfo *bi)
+{
+	return proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, bi, sizeof *bi) == (int)sizeof *bi ? 0 : -1;
+}
+
+/* The members of process group PGID that run as RUNAS, into M (at most MAX): how many */
+static int snapshot(pid_t pgid, uid_t runas, struct member *m, int max)
+{
+	static pid_t pids[1024];
+	struct proc_bsdinfo bi;
+	int n = proc_listpids(PROC_PGRP_ONLY, (uint32_t)pgid, pids, sizeof pids), i, k = 0;
+
+	for (i = 0; n > 0 && i < n / (int)sizeof(pid_t) && k < max; i++)
+		if (pids[i] > 1 && proc_facts(pids[i], &bi) == 0 && bi.pbi_uid == runas && (pid_t)bi.pbi_pgid == pgid) {
+			m[k].pid = pids[i];
+			m[k].sec = bi.pbi_start_tvsec;
+			m[k].usec = bi.pbi_start_tvusec;
+			k++;
+		}
+	return k;
+}
+
+/* SIGKILL to each member of the last snapshot still alive, still RUNAS's, and started when it was seen: never a pid reused
+ * since (a recycled group id may be another mount's CLI, started after the snapshot). How many. */
+static int kill_snapshot(const struct member *m, int n, uid_t runas)
+{
+	struct proc_bsdinfo bi;
+	int i, k = 0;
+
+	for (i = 0; i < n; i++)
+		if (proc_facts(m[i].pid, &bi) == 0 && bi.pbi_uid == runas && bi.pbi_start_tvsec == m[i].sec &&
+		    bi.pbi_start_tvusec == m[i].usec && kill(m[i].pid, SIGKILL) == 0)
+			k++;
+	return k;
+}
+
+/* The program's output, as it comes: the first OUTPUT_LOGGED bytes to syslog, a line at a time, and the first "cli-pgid N"
+ * line's N into *cli (N5). Lines past LINE_MAX bytes are cut. */
+struct output { char line[1024]; size_t len, logged; int cut; pid_t cli; const char *name; };
+
+static void output_line(struct output *o)
+{
+	char *end;
+	long n;
+
+	o->line[o->len] = '\0';
+	if (o->logged < OUTPUT_LOGGED)
+		say("mountd: %s: %s", o->name, o->line);
+	o->logged += o->len + 1;
+	if (!o->cli && !o->cut && strncmp(o->line, "cli-pgid ", 9) == 0) {
+		n = strtol(o->line + 9, &end, 10);
+		if (end != o->line + 9 && !*end && n > 1 && n < INT_MAX)
+			o->cli = (pid_t)n;
+	}
+	o->len = 0;
+	o->cut = 0;
+}
+
+static void output_take(struct output *o, const char *buf, size_t n)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		if (buf[i] == '\n') {
+			output_line(o);
+		} else if (o->len < sizeof o->line - 1) {
+			o->line[o->len++] = buf[i];
+		} else {
+			o->cut = 1;
+		}
+	}
+}
+
+/* The mount program PID, its output on OUT, to the end or the deadline (I4): a timed loop of poll and waitpid. At
+ * lim.deadline, SIGTERM to the program (the root path cleans up); lim.grace later, SIGKILL to its process group and to the
+ * last snapshot of the CLI's group (N5, R1), refreshed once a second, and "deadline". Then the reply. */
+static void await(const struct mountd_req *r, const char *mnt, pid_t pid, int out, dev_t rdev)
+{
+	struct output o;
+	struct member snap[SNAPSHOT_MAX];
+	struct stat node;
+	char buf[16384], path[64];
+	long long start = now_ms(), t, next_snap = 0, term_at = -1, next, wait;
+	uid_t runas = run_as();
+	int st = 0, nsnap = 0, killed;
+	ssize_t n;
+	int i;
+
+	memset(&o, 0, sizeof o);
+	o.name = r->fs;
+	for (;;) {
+		if (waitpid(pid, &st, WNOHANG) == pid)
+			break;
+		t = now_ms();
+		if (o.cli && runas != 0 && t >= next_snap) {
+			nsnap = snapshot(o.cli, runas, snap, SNAPSHOT_MAX);
+			next_snap = t + 1000;
+		}
+		if (term_at < 0 && t - start >= lim.deadline * 1000LL) {
+			shout("mountd: %s on %s: the mount program passed its %d s: SIGTERM", r->bsd, r->mnt, lim.deadline);
+			kill(pid, SIGTERM);
+			term_at = t;
+		}
+		if (term_at >= 0 && t - term_at >= lim.grace * 1000LL) {
+			kill(-pid, SIGKILL);
+			killed = o.cli ? kill_snapshot(snap, nsnap, runas) : 0;
+			shout("mountd: %s on %s: still running %d s later: SIGKILL to its group %d and to %d of the CLI's group %d",
+			      r->bsd, r->mnt, lim.grace, (int)pid, killed, (int)o.cli);
+			for (i = 0; i < 10 && waitpid(pid, &st, WNOHANG) == 0; i++)
+				usleep(100000);	/* reaped, when it goes at once; else launchd reaps it */
+			finish(MD_REFUSE, 1, "deadline");
+		}
+		next = term_at < 0 ? start + lim.deadline * 1000LL : term_at + lim.grace * 1000LL;
+		if (o.cli && runas != 0 && next_snap < next)
+			next = next_snap;
+		wait = next - t;
+		if (wait > 100)
+			wait = 100;	/* the program's exit: SIGCHLD is not caught, so look often */
+		if (wait < 0)
+			wait = 0;
+		if (out >= 0) {
+			struct pollfd p = { out, POLLIN, 0 };
+
+			if (poll(&p, 1, (int)wait) > 0) {
+				n = read(out, buf, sizeof buf);
+				if (n > 0) {
+					output_take(&o, buf, (size_t)n);
+				} else if (n == 0 || (errno != EINTR && errno != EAGAIN)) {
+					close(out);
+					out = -1;
+				}
+			}
+		} else {
+			usleep((useconds_t)wait * 1000);
+		}
+	}
+	/* what is left in the pipe now; its writers may outlive the program (mount_macfuse keeps 0-2) */
+	if (out >= 0) {
+		fcntl(out, F_SETFL, fcntl(out, F_GETFL) | O_NONBLOCK);
+		while ((n = read(out, buf, sizeof buf)) > 0)
+			output_take(&o, buf, (size_t)n);
+		close(out);
+	}
+	if (o.len)
+		output_line(&o);
+	if (term_at >= 0) {
+		shout("mountd: %s on %s: the mount program ended after SIGTERM", r->bsd, r->mnt);
+		finish(MD_REFUSE, 1, "deadline");
+	}
+	if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+		finish(MD_REFUSE, WIFEXITED(st) ? WEXITSTATUS(st) : 1, "the mount program failed");
+	if (!topmost_is_roots(r->fs, r->bsd, mnt))
+		finish(MD_REFUSE, 1, "root's mount of the disk is not on the mount point");
+	snprintf(path, sizeof path, "/dev/%s", r->bsd);
+	if (stat(path, &node) != 0)
+		finish(MD_REFUSE, 1, "the disk is gone");
+#ifdef LINUXFS_MOUNTD_TEST
+	if (getenv("LINUXFS_MOUNTD_TEST_RDEV_SHIFT"))
+		node.st_rdev += atoi(getenv("LINUXFS_MOUNTD_TEST_RDEV_SHIFT"));
+#endif
+	if (node.st_rdev != rdev)
+		finish(MD_REFUSE, 1, "another disk has the disk's name now");
+	finish(MD_MOUNT, 0, "");
+}
+
+/* One parsed request R from PEER on C: the spec's §1, in order. Before begin nothing is changed, and SIGALRM's handler
+ * answers "user" (too slow) if DiskArbitration (DA_WAIT s) or the rest (MOUNTD_PREBEGIN in all) takes too long. */
+static void work(int c, uid_t peer, const struct mountd_req *r)
+{
+	struct sigaction sa;
+	struct mountd_disk d;
+	struct stat node, opened, entry, vols;
+	struct fsprefs p;
+	char path[64], whole[40], mnt[PATH_MAX], label[256];
+	const char *type = NULL, *why;
+	long long t0;
+	long node_given = -1;
+	int fd, mfd, rc, err = 0, from_disk = 0, on_mnt = 0, adopting = 0, empty, out = -1;
+	unsigned flags = 0;
+	enum mountd_verdict v;
+	pid_t pid;
+
+	conn = c;
+	job.bsd = r->bsd;
+	job.mnt = r->mnt;
+	job.peer = peer;
+	job.da_ms = -1;
+	while ((fd = open("/dev/null", O_RDWR)) >= 0 && fd < 3)
+		;	/* 0-2 open, so no pipe or descriptor below takes their place */
+	if (fd >= 3)
+		close(fd);
+	memset(&sa, 0, sizeof sa);
+	sa.sa_handler = too_slow;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGALRM, &sa, NULL);
+
+	/* 1. DiskArbitration, under its own bound (M6) */
+	memset(&d, 0, sizeof d);
+	alarm(DA_WAIT);
+	t0 = now_ms();
+	if (describe(r->bsd, &d, &node_given) != 0) {
+		job.da_ms = now_ms() - t0;
+		finish(MD_REFUSE, 1, "DiskArbitration does not know the disk");
+	}
+	job.da_ms = now_ms() - t0;
+	alarm(MOUNTD_PREBEGIN - DA_WAIT);
+
+	/* 2. the node (its owner, and its device, kept: M8) and the mount table */
+	snprintf(path, sizeof path, "/dev/%s", r->bsd);
+	if (stat(path, &node) != 0 || !S_ISBLK(node.st_mode))
+		finish(MD_REFUSE, 1, "the disk's node cannot be read");
+	d.node_uid = node_given >= 0 ? (uid_t)node_given : node.st_uid;
+	if (!fsrules_whole_disk(r->bsd, whole, sizeof whole) ||
+	    snprintf(mnt, sizeof mnt, "%s/%s", volumes_dir(), r->mnt + strlen(VOLUMES)) >= (int)sizeof mnt)
+		finish(MD_REFUSE, 1, "not a BSD disk name");
+	if (table_facts(whole, mnt, &from_disk, &on_mnt) != 0)
+		finish(MD_REFUSE, 1, "the mount table cannot be read");
+
+	/* 3. the probe (a superblock), the console user's preferences, the verdict */
+	snprintf(path, sizeof path, "/dev/r%s", r->bsd);
+	if ((fd = open(path, O_RDONLY | O_NOCTTY)) >= 0) {
+		struct stat rs;
+
+		if (fstat(fd, &rs) == 0 && S_ISCHR(rs.st_mode) &&
+		    (type = linuxfs_probe_fd(fd, label, sizeof label, &err)) != NULL)
+			flags = fsrules_probe_flags(linuxfs_probe_extra(), linuxfs_probe_flags());
+		close(fd);
+	}
+	prefs_read(&p);
+	v = mountd_judge(r, &d, peer, type, flags, &p, from_disk, on_mnt, &rc, &why);
+	if (v != MD_MOUNT)
+		finish(v, rc, why);
+
+	/* 4. the mount point: opened without following a symlink, locked for the request's life (M10), then judged */
+	mfd = open(mnt, O_RDONLY | O_NOFOLLOW | O_DIRECTORY | O_NONBLOCK | O_NOCTTY);
+	if (mfd < 0)
+		finish(MD_REFUSE, 1, "the mount point is missing, a symlink or not a directory");
+	if (flock(mfd, LOCK_EX | LOCK_NB) != 0)
+		finish(MD_REFUSE, 1, errno == EWOULDBLOCK ? "another mount on the mount point is under way"
+							  : "the mount point cannot be locked");
+	if (fstat(mfd, &opened) != 0 || lstat(mnt, &entry) != 0 || stat(volumes_dir(), &vols) != 0 ||
+	    (empty = dir_empty(mfd)) < 0)
+		finish(MD_REFUSE, 1, "the mount point cannot be read");
+	if (mountd_mnt_facts(&opened, &entry, &vols, empty, peer, &adopting, &why) != 0)
+		finish(MD_REFUSE, 1, why);
+
+	/* 5. begin (I5): nothing above changed anything; what follows may. No alarm from here: the deadline is await's. */
+	alarm(0);
+	signal(SIGALRM, SIG_IGN);
+	if (write(c, "begin\n", 6) != 6) {
+		say("mountd: %s on %s: the peer left before begin", r->bsd, r->mnt);
+		_exit(0);
+	}
+
+	/* 6. adoption, when the mount point is the peer's */
+	if (adopting && adopt(mfd, mnt, peer, &opened, &why) != 0)
+		finish(MD_REFUSE, 1, why);
+
+	/* 7. the bundle's mount program; not run, nothing was mounted, so an adopted mount point goes back */
+	if ((pid = spawn_program(r, mnt, &out, &why)) < 0) {
+		if (adopting)
+			give_back(mfd, mnt, peer, &opened);
+		finish(MD_REFUSE, 1, why);
+	}
+
+	/* 8, 9. the deadline, and the reply */
+	await(r, mnt, pid, out, node.st_rdev);
+}
+
 /* One request from the console user UID on C, in a forked child. */
 static void serve(int c, uid_t uid)
 {
@@ -470,11 +1204,15 @@ static void serve(int c, uid_t uid)
 	}
 	say("mountd: request from uid %u: %s %s on %s", (unsigned)uid, r.fs, r.bsd, r.mnt);
 #ifdef LINUXFS_MOUNTD_TEST
-	if (getenv("LINUXFS_MOUNTD_TEST_CHILD_SLEEP"))
-		sleep((unsigned)atoi(getenv("LINUXFS_MOUNTD_TEST_CHILD_SLEEP")));
+	/* the front door's tests: with no stand-in program, a stub child that sleeps, then replies "user not yet" */
+	if (!getenv("LINUXFS_MOUNTD_TEST_PROGRAM")) {
+		if (getenv("LINUXFS_MOUNTD_TEST_CHILD_SLEEP"))
+			sleep((unsigned)atoi(getenv("LINUXFS_MOUNTD_TEST_CHILD_SLEEP")));
+		answer(c, MD_USER, 0, "not yet");
+		_exit(0);
+	}
 #endif
-	answer(c, MD_USER, 0, "not yet");	/* the work comes in 16i */
-	_exit(0);
+	work(c, uid, &r);
 }
 
 /* ---- the parent ---- */
@@ -649,6 +1387,28 @@ static int check_in(void)
 }
 
 #ifdef LINUXFS_MOUNTD_TEST
+/* --describe BSD: the fields the daemon reads from DiskArbitration, as KEY=VALUE lines, read as the daemon reads them: in a
+ * child forked from a parent that has used syslog (M6, m5). 0, or 1 when DiskArbitration does not know BSD. */
+static int describe_main(const char *bsd)
+{
+	struct mountd_disk d;
+	pid_t pid;
+	int st;
+
+	say("mountd: describe %s", bsd);
+	fflush(stdout);
+	if ((pid = fork()) == 0) {
+		alarm(DA_WAIT);
+		memset(&d, 0, sizeof d);
+		st = da_describe(bsd, &d, 1);
+		fflush(stdout);
+		_exit(st == 0 ? 0 : 1);
+	}
+	if (pid < 0 || waitpid(pid, &st, 0) != pid)
+		return 1;
+	return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+}
+
 /* the test build's own socket at PATH, or -1 */
 static int bind_test(const char *path)
 {
@@ -688,6 +1448,8 @@ int main(int argc, char **argv)
 
 	openlog(IDENT, LOG_PID, FACILITY);
 #ifdef LINUXFS_MOUNTD_TEST
+	if (argc == 3 && strcmp(argv[1], "--describe") == 0)
+		return describe_main(argv[2]);
 	for (i = 1; i < argc; i++) {
 		int *to = NULL, min = 1, v;
 
@@ -717,10 +1479,14 @@ int main(int argc, char **argv)
 			to = &lim.queue, min = 0;
 		else if (strcmp(argv[i], "--queue-wait") == 0)
 			to = &lim.queue_wait;
+		else if (strcmp(argv[i], "--deadline") == 0)
+			to = &lim.deadline;
+		else if (strcmp(argv[i], "--grace") == 0)
+			to = &lim.grace;
 		if (!to || i + 1 >= argc || (v = number(argv[++i], min)) < 0) {
 			fprintf(stderr, "usage: linuxfs-mountd [--socket PATH] [--console UID | --console-file PATH] "
 					"[--foreign-pgid PGID] [--idle S] [--max-uid N] [--max N] [--queue N] [--queue-wait S] "
-					"[--status]\n");
+					"[--deadline S] [--grace S] [--status] | --describe BSD\n");
 			return 2;
 		}
 		*to = v;
