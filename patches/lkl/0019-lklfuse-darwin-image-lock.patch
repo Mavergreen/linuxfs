@@ -1,0 +1,84 @@
+lklfuse: an image file is locked exclusive, so one image is never served twice
+
+Since Task 16 every DiskArbitration mount after login is root's, served by _linuxfs, and its lock= is in _linuxfs's
+directory, while `linuxfs mount IMAGE` takes its lock in the user's: the two never met, and one image could be served by
+two lklfuse writers at once, which corrupts it (final review r0 I1). hdiutil's diskimages-helper holds a flock on each
+image it attaches (measured on 10.9: exclusive for a read-write attach, shared for -readonly), and its attach fails with
+EAGAIN ("Resource temporarily unavailable") while another process holds one exclusive. So lklfuse takes an exclusive,
+non-blocking flock on the image it serves (and on a tier2file), when it is a regular file: an image hdiutil has attached
+(whose disk root mounts) is refused, whoever runs lklfuse; so is an image another lklfuse serves; and an image lklfuse serves
+cannot be attached. A device (/dev/fd/N from linuxfs-open, a raw node) is not locked. The lock goes with the descriptor, at
+unmount (lklfuse_let_go) or exit. The refusal says "unable to exclusively lock", which linuxfs's CLI reads as "already
+mounted". tests/lklfuse-ops-test.c takes the lock twice, after let go, beside a shared lock and a device, and on an image
+lklfuse-ops-darwin.sh attached -nomount.
+
+diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
+--- a/tools/lkl/lklfuse.c
++++ b/tools/lkl/lklfuse.c
+@@ -2961,6 +2961,38 @@
+ 	return lklfuse_open_path(lklfuse.file, lklfuse.ro);
+ }
+ 
++#ifdef __APPLE__
++/*
++ * An image file (a regular file; never a device) is locked exclusive, without waiting: two writers of one image corrupt it.
++ * hdiutil's diskimages-helper holds a flock on each image it attaches (exclusive read-write, shared read-only), and its
++ * attach fails (EAGAIN) while another process holds one exclusive. So an image hdiutil has attached -- whose disk root
++ * mounts through DiskArbitration, served by _linuxfs -- is refused here, whoever runs this; so is an image another lklfuse
++ * serves; and an image served here cannot be attached. Exclusive even read-only: one image is mounted once, as hdiutil
++ * attaches an image once. The lock goes with the descriptor: let go of at unmount (lklfuse_let_go) or at exit. 0, or -1
++ * with errno (EWOULDBLOCK: another holds it).
++ */
++static int lklfuse_lock_image(int fd)
++{
++	struct stat st;
++
++	if (fstat(fd, &st) != 0)
++		return -1;
++	if (!S_ISREG(st.st_mode))
++		return 0;
++	return flock(fd, LOCK_EX | LOCK_NB);
++}
++
++/* lklfuse_lock_image, said: "unable to exclusively lock PATH", the words linuxfs's CLI reads as "already mounted". 0 or -1 */
++static int lklfuse_lock_image_said(int fd, const char *path)
++{
++	if (lklfuse_lock_image(fd) == 0)
++		return 0;
++	fprintf(stderr, "unable to exclusively lock %s: %s (attached with hdiutil, or served by another lklfuse)\n", path,
++		strerror(errno));
++	return -1;
++}
++#endif
++
+ int main(int argc, char **argv)
+ {
+ 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+@@ -3021,6 +3053,13 @@
+ 		perror(lklfuse.file);
+ 		goto out_free;
+ 	}
++#ifdef __APPLE__
++	if (lklfuse_lock_image_said(ret, lklfuse.file)) {
++		close(ret);
++		ret = -1;
++		goto out_free;
++	}
++#endif
+ 
+ 	lklfuse.disk.fd = ret;
+ 	lklfuse.disk.ro = lklfuse.ro;
+@@ -3050,6 +3089,13 @@
+ 			ret = -1;
+ 			goto out_close_disk;
+ 		}
++#ifdef __APPLE__
++		if (lklfuse_lock_image_said(lklfuse.tier2.fd, lklfuse.tier2file)) {
++			close(lklfuse.tier2.fd);
++			ret = -1;
++			goto out_close_disk;
++		}
++#endif
+ 		ret = lkl_disk_add(&lklfuse.tier2);
+ 		if (ret < 0) {
+ 			fprintf(stderr, "can't add disk %s: %s\n", lklfuse.tier2file, lkl_strerror(ret));

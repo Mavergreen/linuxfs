@@ -141,6 +141,18 @@ records() {
 # The lock name of an image file: its inode and filesystem, so every path to it agrees.
 image_lock() { printf 'image-%s-%s\n' "$(ls -i "$1" | awk '{ print $1 }')" "$(stat -f %d "$1")"; }
 
+# The whole disk (/dev/diskN) hdiutil attached the image file FILE as, if it did: matched as the same file (test -ef: device and
+# inode, through symlinks), so every path to the file agrees.
+attached_as() { # FILE
+  hdiutil info 2>/dev/null | awk '
+    /^image-path/ { sub(/^image-path[ \t]*:[ \t]*/, ""); img = $0; next }
+    /^=+$/ { img = ""; next }
+    img != "" && /^\/dev\/disk[0-9]+[ \t]/ { print img "\t" $1; img = "" }' |
+  while IFS="$tab" read -r _p _d; do
+    if [ "$_p" -ef "$1" ]; then echo "$_d"; break; fi
+  done
+}
+
 # The image file hdiutil attached as whole disk /dev/diskN, if it did.
 image_of() {
   hdiutil info 2>/dev/null | awk -v d="$1" '
@@ -327,6 +339,11 @@ cmd_mount() {
     [ -f "$target" ] || die "$target: no such image or device"
     src=$(cd "$(dirname "$target")" && pwd)/$(basename "$target")
     lockname=$(image_lock "$src")
+    # final review r0 I1: an image hdiutil attached is its disk, which root mounts (served by _linuxfs, whose locks are not this
+    # user's), so serving the file too would be a second writer. Refused here, by its disk's name; lklfuse's own lock on the image
+    # (patch 0019) refuses whatever slips between this and its start, and makes a later attach fail
+    att=$(attached_as "$src")
+    [ -z "$att" ] || die "$target is already attached as $att (hdiutil): its volume mounts from there; eject it first (diskutil eject $att), or mount the disk (linuxfs mount $att)"
   fi
   if [ -n "$open_dev" ]; then probed=$("$OPENER" --probe "$open_dev" < /dev/null); rc=$?
   else probed=$("$PROBE" "$src" < /dev/null); rc=$?; fi

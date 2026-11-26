@@ -236,6 +236,18 @@ sh "$L" unmount "$T/img" > /dev/null 2>&1
 out=$(FAKE_MODE=locked sh "$L" mount "$T/img" 2>&1); rc=$?
 [ $rc -eq 1 ] && echo "$out" | grep -q "already mounted by linuxfs" && [ ! -e "$T/Volumes/my data" ]
 ok $? "a locked source is refused as already mounted, and the made mount point is removed"
+# spec: final review r0 I1 -- an image hdiutil has attached is that disk, which root mounts (served by _linuxfs): mounting the file
+#       too would be a second writer, so it is refused before anything runs, by any path to the file, and the disk named
+: > "$T/calls"; mkdir -p "$T/other"; ln -sf "$T/img" "$T/other/link.img"
+out=$(FAKE_HDIUTIL_IMAGE="$T/img" sh "$L" mount "$T/img" 2>&1); rc=$?
+test $rc -eq 1 && echo "$out" | grep -qF "$T/img is already attached as /dev/disk7 (hdiutil)" && test ! -s "$T/calls" && test ! -e "$T/Volumes/my data"
+ok $? "an image hdiutil attached is refused, its disk named, no lklfuse run, no mount point made (rc $rc: $out)"
+out=$(FAKE_HDIUTIL_IMAGE="$T/img" sh "$L" mount "$T/other/link.img" 2>&1); rc=$?
+test $rc -eq 1 && echo "$out" | grep -q "already attached as /dev/disk7" && test ! -s "$T/calls"
+ok $? "and so it is by another path to the same file (rc $rc: $out)"
+out=$(FAKE_HDIUTIL_IMAGE="$T/img2" sh "$L" mount "$T/img" 2>&1); rc=$?
+test $rc -eq 0 && test "$(grep -c . "$T/calls")" = 1; ok $? "an image that is not attached (another is) mounts (rc $rc: $out)"
+sh "$L" unmount "$T/img" > /dev/null 2>&1; rm -rf "$T/other"
 out=$(FAKE_PROBE=none sh "$L" mount "$T/img" 2>&1); rc=$?
 [ $rc -eq 1 ] && echo "$out" | grep -q "no filesystem linuxfs knows"; ok $? "an unknown filesystem is refused"
 echo "/dev/disk3s2 on /Volumes/win (ntfs, local, read-only)" >> "$T/mtab"

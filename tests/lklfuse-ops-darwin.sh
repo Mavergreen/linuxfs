@@ -10,7 +10,8 @@
 #          xattrs (patch 0013: user.N, and netatalk's and Samba's schemes, on tests/lib/xattr-images.sh's four images,
 #          which Linux makes too, and reads back after lklfuse has written them: tests/lib/check-xattrs.sh; and on a blank
 #          NTFS image, the bare com.apple.* names linuxfs stored there before 0013), and what its init asks of macFUSE
-#          (patch 0014: case-sensitive, unless -o nocase). Needs
+#          (patch 0014: case-sensitive, unless -o nocase), and an image file's exclusive lock (patch 0019: an image
+#          hdiutil attached, here -nomount, is refused). Needs
 #          build/build-lkl-darwin.sh's output.
 set -u
 case "$(uname -s)" in Darwin) ;; *) echo "lklfuse-ops-darwin.sh: runs on a Mac" >&2; exit 77 ;; esac
@@ -20,7 +21,11 @@ OUT=${GATE0_DARWIN_OUT:-$C/darwin}
 img=$C/lklfuse-ops.img xa=$C/lklfuse-ops-xa
 rm -rf "$img" "$xa"
 sh "$ROOT/build/linux-host.sh" sh -c 'truncate -s 64M "$1" && mkfs.ext4 -q -F "$1" && sh "$3" "$2" && truncate -s 16M "$2/ntfs-xa.img" && mkntfs -q -F -Q "$2/ntfs-xa.img" >/dev/null' _ "$img" "$xa" "$ROOT/tests/lib/xattr-images.sh" || exit 1
-"$OUT/tests/lklfuse-ops" "$img" "$xa" > "$img.log" 2>&1; rc=$?
+# patch 0019: an image hdiutil has attached (read-write, nothing mounted) is one lklfuse refuses
+att=$C/lklfuse-ops-attached.img; rm -f "$att"; dd if=/dev/zero of="$att" bs=1048576 count=1 2> /dev/null
+attd=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$att" | awk 'NR == 1 { print $1 }')
+LKLFUSE_OPS_ATTACHED=$att "$OUT/tests/lklfuse-ops" "$img" "$xa" > "$img.log" 2>&1; rc=$?
+test -z "$attd" || hdiutil detach -quiet -force "$attd"; rm -f "$att"
 grep -E '^(ok|not ok|1\.\.)' "$img.log"
 # what lklfuse wrote to the xattr images, read back by Linux (debugfs), as the fsck job reads the smoke's
 sh "$ROOT/build/linux-host.sh" sh "$ROOT/tests/lib/check-xattrs.sh" "$xa" > "$img.log" 2>&1 || { rc=1; echo "not ok - check-xattrs.sh on the images lklfuse wrote:"; }

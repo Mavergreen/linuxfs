@@ -1824,6 +1824,50 @@ int main(int argc, char **argv)
 		return 1;
 
 	is(!!(fcntl(lklfuse.disk.fd, F_GETFD) & FD_CLOEXEC), 1, "the image is opened close-on-exec, so mount helpers do not inherit it");
+#ifdef __APPLE__
+	/* final review r0 I1 (patch 0019): an image file is locked exclusive, so one image is never served twice: not beside another
+	 * lklfuse, nor beside hdiutil's attach of it (whose disk root mounts), whoever runs either */
+	{
+		char path[PATH_MAX];
+		const char *tmp = getenv("TMPDIR"), *att = getenv("LKLFUSE_OPS_ATTACHED");
+		int a, b, c, d, n1, n2, e;
+
+		snprintf(path, sizeof(path), "%s/lklfuse-ops-lock.XXXXXX", tmp && *tmp ? tmp : "/tmp");
+		a = mkstemp(path);
+		b = open(path, O_RDWR);
+		is(lklfuse_lock_image(a), 0, "image lock: a regular file is locked");
+		errno = 0;
+		e = lklfuse_lock_image(b);
+		is(e == -1 && errno == EWOULDBLOCK, 1, "image lock: a second lklfuse of the same image is refused (EWOULDBLOCK)");
+		lklfuse_let_go(&a);
+		is(lklfuse_lock_image(b), 0, "image lock: let go of at unmount (lklfuse_let_go), the image is free for the next");
+		close(b);
+		c = open(path, O_RDONLY);
+		d = open(path, O_RDWR);
+		flock(c, LOCK_SH);	/* what hdiutil's read-only attach holds */
+		is(lklfuse_lock_image(d), -1, "image lock: refused while another holds a shared lock (an image hdiutil attached read-only)");
+		close(c);
+		close(d);
+		if (a >= 0)
+			close(a);
+		unlink(path);
+		n1 = open("/dev/null", O_RDWR);
+		n2 = open("/dev/null", O_RDWR);
+		is(lklfuse_lock_image(n1) == 0 && lklfuse_lock_image(n2) == 0, 1, "image lock: a device is not locked (two opens of /dev/null)");
+		close(n1);
+		close(n2);
+		if (att && *att) {
+			a = open(att, O_RDWR);
+			errno = 0;
+			e = lklfuse_lock_image(a);
+			is(a >= 0 && e == -1 && errno == EWOULDBLOCK, 1, "image lock: an image hdiutil attached (read-write, -nomount) is refused");
+			if (a >= 0)
+				close(a);
+		} else {
+			is(0, 1, "image lock: LKLFUSE_OPS_ATTACHED names an image hdiutil attached (lklfuse-ops-darwin.sh sets it)");
+		}
+	}
+#endif
 	is(lklfuse_getattr("/missing", &(struct stat){ 0 }, NULL), -ENOENT, "getattr on a missing file: ENOENT");
 	is(lklfuse_getxattr("/", "user.none", NULL, 0), -HOST_ENOATTR, "getxattr of a missing xattr: ENOATTR");
 #ifdef __APPLE__
