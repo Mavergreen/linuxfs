@@ -1787,6 +1787,20 @@ static void destroy_tests(const char *image)
 
 #endif
 
+static int count_fill(void *buf, const char *name, const struct stat *st, off_t off, enum fuse_fill_dir_flags flags)
+{
+	(*(int *)buf)++;
+	return 0;
+}
+
+/* how many entries (. and .. too) one readdir of the open handle F gives; -1 when it fails */
+static int count_readdir(const char *path, struct fuse_file_info *f)
+{
+	int n = 0;
+
+	return lklfuse_readdir(path, &n, count_fill, 0, f, 0) ? -1 : n;
+}
+
 int main(int argc, char **argv)
 {
 	char longname[NAME_MAX + 8];
@@ -1905,6 +1919,24 @@ int main(int argc, char **argv)
 		is((unsigned long long)v.f_bfree * v.f_frsize == (unsigned long long)l.f_bfree * l.f_frsize, 1,
 		   "statfs: f_bfree*f_frsize is LKL's free");
 		is(v.f_bavail < v.f_bfree, 1, "statfs: available is below free (root's reserve), not swapped with it");
+	}
+	{
+		/* Task 19b: a readdir lists the whole directory each time it is called, on a handle already read to its end:
+		 * libfuse calls again for every read at offset 0 (SUS's rewinddir), and macFUSE hands every opener of a directory
+		 * the one FUSE handle it has open, so ls beside mds (push F2) read from offset 0 on a spent handle and saw nothing */
+		struct fuse_file_info f = { 0 };
+		int first, again, third;
+
+		is(lklfuse_opendir("/", &f), 0, "readdir again: opendir /");
+		first = count_readdir("/", &f);
+		again = count_readdir("/", &f);
+		is(first > 2, 1, "readdir again: the first listing has more than . and ..");
+		is(again, first, "readdir again: a second readdir on the same handle lists them all again");
+		is(lklfuse_mkdir("/readdir-again", 0755), 0, "readdir again: a directory made between listings");
+		third = count_readdir("/", &f);
+		is(third, first + 1, "readdir again: and a third lists it too (the directory read afresh)");
+		lklfuse_releasedir("/", &f);
+		lklfuse_rmdir("/readdir-again");
 	}
 #ifdef __APPLE__
 	caller_owner_tests();

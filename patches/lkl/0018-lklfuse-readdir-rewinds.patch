@@ -1,0 +1,28 @@
+lklfuse: every readdir lists the directory from its start
+
+lklfuse's readdir ignores the offset (libfuse's mode 1: the whole directory in one call), but read on from wherever its
+LKL directory stream stood. libfuse calls readdir again on the same handle for every read at offset 0 (SUS's
+rewinddir), and macFUSE hands every opener of a directory the one FUSE handle it already has open. So once a volume's
+root is held open by another process -- mds, fseventsd or Finder, which reach a volume mounted with allow_other -- a
+second reader starts at offset 0 on a handle already read to its end, and sees an empty directory: push F2's "ls -ln"
+and "ls -a" on a root's DiskArbitration mount listed nothing a moment after a full listing. readdir now rewinds the
+stream first (lkl_rewinddir), so each call lists the whole directory as it is now. tests/lklfuse-ops-test.c reads one
+handle three times, with a directory made before the third.
+
+diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
+--- a/tools/lkl/lklfuse.c
++++ b/tools/lkl/lklfuse.c
+@@ -2387,6 +2387,13 @@
+ 	struct lkl_dir *dir = (struct lkl_dir *)(uintptr_t)fi->fh;
+ 	struct lkl_linux_dirent64 *de;
+ 
++	/*
++	 * Every call lists the whole directory from its start (the offset is ignored, mode 1 above). libfuse calls again
++	 * for each read at offset 0 (SUS's rewinddir), on the handle it already read to its end; and macFUSE gives every
++	 * opener of a directory the one FUSE handle it has open, so ls while another process (mds, fseventsd, Finder)
++	 * holds the directory open reads from offset 0 on that same handle. Without the rewind, that listing was empty.
++	 */
++	lkl_rewinddir(dir);
+ 	while ((de = lkl_readdir(dir))) {
+ 		struct stat st = { 0, };
+ 		char shown[NAME_MAX + 1];
