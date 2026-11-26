@@ -1,7 +1,8 @@
 /* platform: macOS-only -- a stand-in for a bundle's mount_macfuse_<fs>, for mountd-test.sh's LINUXFS_MOUNTD_TEST daemon only
  *   usage: mount_macfuse_<fs> -o OPTIONS /dev/BSD MNT       (copied as DIR/mount_macfuse_ext4, DIR/mount_macfuse_btrfs, ...)
  * The daemon gives it PATH alone, so what it does comes from DIR/mode (one word, or a word and a number, per line), and it
- * writes to DIR/log: its pid, argv, environment, open descriptors ("fds 0 1 2"), and what it did. With no mode, it exits 0.
+ * writes to DIR/log: its pid, argv, environment, open descriptors ("fds 0 1 2"), SIGPIPE's disposition, and what it did.
+ * With no mode, it exits 0.
  *   mount        append root's mount of /dev/BSD on MNT to DIR/mnttab (TYPE<TAB>FROM<TAB>ON<TAB>OWNER: macfuse_<fs>, owner 0)
  *   owner N      the line's owner is N            from DEV   the line's source is DEV
  *   exit N       exit N                           sleep N    sleep N s before exiting
@@ -9,6 +10,7 @@
  *   ignoreterm   SIGTERM is logged ("sigterm") and ignored     termexit   SIGTERM is logged and ends it (exit 143)
  *   child        a "mount_macfuse" child in its own group (the program's), sleeping 30 s ("child PID")
  *   cli          a "CLI" child leading a group of its own (setpgid), sleeping 30 s ("cli PID"); prints "cli-pgid PID"
+ *   pgidline N   print "cli-pgid N", starting nothing (a CLI group the test's process table stands in for)
  *   cliend       the same, but the CLI ends after 1 s and is reaped; then, 2.5 s later, a fresh group of its own
  *                ("fresh PID", sleeping 30 s) is named by a second line, "cli-pgid FRESH"
  */
@@ -73,6 +75,7 @@ static pid_t sleeper(int own_group)
 int main(int argc, char **argv)
 {
 	char path[1100], line[128], *slash;
+	long pgidline = 0;
 	int fd, exitn = 0, sleepn = 0, mount = 0, chatty = 0, ignore = 0, child = 0, cli = 0, cliend = 0, i;
 	long owner = 0;
 	char from[1024] = "";
@@ -99,6 +102,7 @@ int main(int argc, char **argv)
 			else if (!strcmp(w, "child")) child = 1;
 			else if (!strcmp(w, "cli")) cli = 1;
 			else if (!strcmp(w, "cliend")) cliend = 1;
+			else if (!strcmp(w, "pgidline")) pgidline = atol(a);
 		}
 		fclose(f);
 	}
@@ -119,6 +123,12 @@ int main(int argc, char **argv)
 		for (i = 0; environ[i]; i++)
 			fprintf(log, "env %s\n", environ[i]);
 		fprintf(log, "%s\n", fds);
+		{
+			struct sigaction old;
+
+			sigaction(SIGPIPE, NULL, &old);
+			fprintf(log, "sigpipe %s\n", old.sa_handler == SIG_DFL ? "default" : "not default");
+		}
 		fclose(log);
 	}
 	if (ignore || termexit) {
@@ -146,6 +156,10 @@ int main(int argc, char **argv)
 			return 78;
 		fprintf(f, "%s\t%s\t%s\t%ld\n", base + 6, *from ? from : argv[argc - 2], argv[argc - 1], owner);
 		fclose(f);
+	}
+	if (pgidline) {
+		printf("cli-pgid %ld\n", pgidline);
+		fflush(stdout);
 	}
 	if (child)
 		logline("child %ld", (long)sleeper(0));

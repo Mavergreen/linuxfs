@@ -40,6 +40,7 @@ REQ="mount${T}ext4${T}disk9s1${T}-${T}/Volumes/x"
 
 # The client: connects to SOCK and, by MODE:
 #   send REQ   writes REQ and a newline, then prints each line it reads, then "eof EPOCH";
+#   sendclose REQ  reads hi (prints it), writes REQ and a newline, and leaves at once;
 #   big        writes 2000 bytes and a newline, then the same;
 #   drip REQ   reads one line (prints it), then writes REQ a byte every 2 s; prints "closed SECONDS" when the daemon closes;
 #   flood N    N connections that send nothing, each read to EOF; prints each connection's lines joined by "|".
@@ -65,6 +66,7 @@ if ($mode eq 'flood') {
 	exit 0;
 }
 my $c = conn();
+if ($mode eq 'sendclose') { my $hi = <$c>; print $hi; print $c $arg, "\n"; close $c; exit 0 }
 if ($mode eq 'send' || $mode eq 'big') {
 	print $c ($mode eq 'big' ? 'x' x 2000 : $arg), "\n";
 	print "$_\n" for drain($c);
@@ -255,7 +257,7 @@ devs=""
 trap 'kill $dp 2>/dev/null; for d in $devs; do hdiutil detach -quiet -force "$d" 2>/dev/null; done' EXIT
 E=$(att ext4.img); devs="$E"; B=$(att btrfs.img); devs="$devs $B"; A=$(att enc.img); devs="$devs $A"
 E=${E#/dev/} B=${B#/dev/} A=${A#/dev/}
-P=$D/prog V=$D/vol; mkdir -p "$P" "$V"
+P=$D/prog V=$D/vol; mkdir -p "$P" "$V"; G=$(stat -f %g "$V")	# a mount point's group, as made in $V
 cc -o "$P/mount_macfuse_ext4" "$ROOT/tests/lib/mountd-program-stub.c" || exit 1
 cp "$P/mount_macfuse_ext4" "$P/mount_macfuse_btrfs"; cp "$P/mount_macfuse_ext4" "$P/mount_macfuse_apfs"
 chmod 755 "$P" "$P"/mount_macfuse_*
@@ -285,6 +287,7 @@ test "$(sed -n 's/^argv //p' "$P/log" 2>/dev/null | tr '\n' '|')" = "-o|nodev,no
 ok $? "serve_ok: argv is -o nodev,nosuid,noowners /dev/$E $V/NAME"
 test "$(grep '^env ' "$P/log" 2>/dev/null)" = "env PATH=/usr/bin:/bin:/usr/sbin:/sbin"; ok $? "serve_ok: the environment is PATH alone"
 test "$(grep '^fds' "$P/log" 2>/dev/null)" = "fds 0 1 2"; ok $? "serve_ok: descriptors 0-2 only"
+test "$(logged sigpipe)" = default; ok $? "serve_ok: SIGPIPE at its default, though the daemon's child ignores it"
 test "$(logged pid)" = "$(logged pgid)" && test -n "$(logged pid)"; ok $? "serve_ok: the program leads a process group of its own"
 grep -q "^mountd: $E on /Volumes/NAME: ok (peer $ME, DA [0-9]*ms)\$" "$D/err"; ok $? "serve_ok: one result line, with the peer and DiskArbitration's latency"
 # spec: plan 16i, serve_adopt -- a mount point of the peer's is adopted (the test build says so instead of fchown)
@@ -298,12 +301,18 @@ ok $? "serve_ro_owners: -o nodev,nosuid,owners,rdonly"
 mnt NAME; prog
 cl send "$(rq ext4 "$E" - NAME)" > "$D/sph.out"
 replies "$D/sph.out" | grep -q "^hi|begin|no${T}1${T}[^|]*|\$"; ok $? "serve_phantom: exit 0 with nothing mounted: no 1 ($(replies "$D/sph.out"))"
-mnt NAME; prog mount "owner 501"
+gb() { grep -c "^giveback $V/NAME $ME $G 755\$" "$D/err"; }
+mnt NAME; prog mount "owner 501"; g0=$(gb)
 cl send "$(rq ext4 "$E" - NAME)" > "$D/s501.out"
 replies "$D/s501.out" | grep -q "^hi|begin|no${T}1${T}"; ok $? "serve_owner_501: a mount owned by 501: no 1"
-mnt NAME; prog mount "exit 3"
+test "$(gb)" = "$g0"; ok $? "serve_owner_501 (m5): something is mounted on the mount point, so it is not given back"
+mnt NAME; prog mount "exit 3"; g0=$(gb)
 cl send "$(rq ext4 "$E" - NAME)" > "$D/src.out"
 replies "$D/src.out" | grep -q "^hi|begin|no${T}3${T}"; ok $? "serve_rc: exit 3: no 3 ($(replies "$D/src.out"))"
+mnt NAME; prog "exit 3"; g0=$(gb)
+cl send "$(rq ext4 "$E" - NAME)" > "$D/src3.out"
+replies "$D/src3.out" | grep -q "^hi|begin|no${T}3${T}" && test "$(gb)" = $((g0 + 1))
+ok $? "serve_rc (m5): exit 3 with nothing mounted: the adopted mount point is given back"
 mnt NAME; prog mount "from /dev/disk99"
 cl send "$(rq ext4 "$E" - NAME)" > "$D/src2.out"
 replies "$D/src2.out" | grep -q "^hi|begin|no${T}1${T}"; ok $? "serve_rc: exit 0, mounted from another device: no 1"
@@ -358,7 +367,7 @@ test "$(replies "$D/schat.out")" = "hi|begin|ok|" && test "$w" -le 30; ok $? "se
 mnt NAME; prog mount; chmod 777 "$P/mount_macfuse_ext4"
 cl send "$(rq ext4 "$E" - NAME)" > "$D/strust.out"
 chmod 755 "$P/mount_macfuse_ext4"
-test "$(replies "$D/strust.out")" = "hi|begin|no${T}1${T}the mount program is not root's alone|" && ! ran && grep -qx "giveback $V/NAME $ME 755" "$D/err"
+test "$(replies "$D/strust.out")" = "hi|begin|no${T}1${T}the mount program is not root's alone|" && ! ran && grep -qx "giveback $V/NAME $ME $G 755" "$D/err"
 ok $? "serve_untrusted: a program others may write is not run: no 1, the mount point given back ($(replies "$D/strust.out"))"
 # spec: plan 16i, serve_da_real (M6) -- the real DiskArbitration, in a child forked from a parent that has used syslog
 stop
@@ -385,7 +394,7 @@ da "bsd=$E"; mnt NAME; chmod 700 "$V/NAME"; prog mount
 cl send "$(rq ext4 "$E" - NAME)" > "$D/sswap.out"
 test "$(replies "$D/sswap.out")" = "hi|begin|no${T}1${T}the mount point changed|" && ! ran
 ok $? "serve_adopt_swapped: no 1 the mount point changed, the program not run ($(replies "$D/sswap.out"))"
-grep -qx "giveback $V/NAME $ME 700" "$D/err" && test "$(stat -f '%u %Lp' "$V/NAME.swapped")" = "$ME 700"
+grep -qx "giveback $V/NAME $ME $G 700" "$D/err" && test "$(stat -f '%u %Lp' "$V/NAME.swapped")" = "$ME 700"
 ok $? "serve_adopt_swapped: the moved directory is given back, 0700 ($(grep giveback "$D/err"))"
 stop
 # spec: plan 16i, serve_rdev (M8) -- /dev/BSD changed under the mount program: no
@@ -400,6 +409,44 @@ da "bsd=$E"; mnt NAME; prog mount
 t0=$(now); cl send "$(rq ext4 "$E" - NAME)" > "$D/sslow.out"; w=$(after "$t0" "$(eofat "$D/sslow.out")")
 test "$(replies "$D/sslow.out")" = "hi|user${T}the daemon was too slow: your own mount|" && test "$w" -le 170 && ! ran
 ok $? "serve_da_slow: user, too slow, within 17 s (${w} tenths), before begin"
+i=0; while ! grep -q "^mountd: child [0-9]* (uid $ME): too slow (before begin)\$" "$D/err" && test $i -lt 30; do sleep 0.1; i=$((i + 1)); done
+grep -q "^mountd: child [0-9]* (uid $ME): too slow (before begin)\$" "$D/err"; ok $? "serve_da_slow (m2): the parent logs it"
+stop
+# spec: task-16i-findings-r0.md m3 -- a peer that leaves never kills the child before its log line (SO_NOSIGPIPE)
+start $WDA LINUXFS_MOUNTD_TEST_DA_SLEEP=1 -- --console "$ME"
+da "bsd=$E"; mnt NAME; prog mount
+cl sendclose "$(rq ext4 "$E" - NAME)" > /dev/null
+i=0; while ! grep -q "the peer left before begin" "$D/err" && test $i -lt 50; do sleep 0.1; i=$((i + 1)); done
+grep -q "^mountd: $E on /Volumes/NAME: the peer left before begin\$" "$D/err" && ! ran
+ok $? "serve_peer_gone (m3): a peer gone before begin is logged, and nothing is run"
+stop
+# spec: task-16i-findings-r0.md m6 -- the console changes before the preferences are read: the user's own mount
+echo "$ME" > "$D/console"
+start $WDA LINUXFS_MOUNTD_TEST_DA_SLEEP=2 -- --console-file "$D/console"
+da "bsd=$E"; mnt NAME; prog mount
+cl send "$(rq ext4 "$E" - NAME)" > "$D/scon.out" & c1=$!
+sleep 1; echo "$OTHER" > "$D/console"; wait $c1
+test "$(replies "$D/scon.out")" = "hi|user${T}the console changed: your own mount|" && ! ran
+ok $? "serve_console_changed (m6): user, the console changed, not run ($(replies "$D/scon.out"))"
+stop
+# spec: task-16i-findings-r0.md I1, m1 -- the CLI's group kill, against a process table the test writes
+#       (LINUXFS_MOUNTD_TEST_PROCTAB: pid ppid pgid uid sec usec; the test build says "kill PID" instead of signalling)
+FN=90001; ST=$(($(date +%s) + 100))
+printf '%s\n' "$FN 1 $FN $ME $ST 1" "90002 $FN $FN $ME $ST 2" > "$D/proctab"
+start $WDA "LINUXFS_MOUNTD_TEST_RUNAS=$ME" "LINUXFS_MOUNTD_TEST_PROCTAB=$D/proctab" -- --console "$ME" --deadline 2 --grace 2
+da "bsd=$E"; mnt NAME; prog ignoreterm "pgidline $FN" "sleep 30"
+cl send "$(rq ext4 "$E" - NAME)" > "$D/spt1.out"
+test "$(replies "$D/spt1.out")" = "hi|begin|no${T}1${T}deadline|" && grep -qx "kill $FN" "$D/err" && grep -qx "kill 90002" "$D/err"
+ok $? "serve_deadline_group (I1 b): the CLI's group, alive as first seen, is killed ($(grep '^kill ' "$D/err" | tr '\n' ' '))"
+n0=$(grep -c '^kill ' "$D/err")
+printf '%s\n' "$FN 1 $FN $ME $ST 1" "90002 $FN $FN $ME $ST 2" > "$D/proctab"
+mnt NAME; prog ignoreterm "pgidline $FN" "sleep 30"
+cl send "$(rq ext4 "$E" - NAME)" > "$D/spt2.out" & c1=$!
+sleep 1.5
+printf '%s\n' "$FN 1 $FN $ME $((ST + 50)) 7" "90003 $FN $FN $ME $((ST + 50)) 8" > "$D/proctab.new"; mv "$D/proctab.new" "$D/proctab"
+wait $c1
+test "$(replies "$D/spt2.out")" = "hi|begin|no${T}1${T}deadline|" && test "$(grep -c '^kill ' "$D/err")" = "$n0"
+ok $? "serve_deadline_recycled (I1 a): the group id recycled before the last refresh: nothing of the new group is killed"
 stop
 # spec: plan 16i, serve_deadline (I4, N5) -- SIGTERM at the deadline, then SIGKILL to the program's group and the CLI's
 start $WDA "LINUXFS_MOUNTD_TEST_RUNAS=$ME" -- --console "$ME" --deadline 2 --grace 2
@@ -442,6 +489,7 @@ hooks="LINUXFS_MOUNTD_TEST_ LINUXFS_MOUNTD_TEST_CHILD_SLEEP LINUXFS_MOUNTD_TEST_
 hooks="$hooks --idle --max-uid --max --queue --queue-wait --status --foreign-pgid --deadline --grace --describe"
 hooks="$hooks LINUXFS_MOUNTD_TEST_DA LINUXFS_MOUNTD_TEST_DA_SLEEP LINUXFS_MOUNTD_TEST_PROGRAM LINUXFS_MOUNTD_TEST_VOLUMES"
 hooks="$hooks LINUXFS_MOUNTD_TEST_MNTTAB LINUXFS_MOUNTD_TEST_ADOPT_SWAP LINUXFS_MOUNTD_TEST_RUNAS LINUXFS_MOUNTD_TEST_RDEV_SHIFT"
+hooks="$hooks LINUXFS_MOUNTD_TEST_PROCTAB"
 "$CL/bin/llvm-strings" "$D/mountd" > "$D/strings"; "$CL/bin/llvm-strings" "$D/mountd-t" > "$D/strings-t"
 found=""; missing=""
 for h in $hooks; do

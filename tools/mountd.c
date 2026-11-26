@@ -29,9 +29,11 @@
  * MOUNTD_PREBEGIN. Then "begin"; a mount point of the peer's is adopted (root's, 0755, checked again, given back on any
  * doubt); the bundle's mount_macfuse_<fs>, trusted (trust_path), is spawned in a process group of its own with a fixed argv,
  * PATH alone and 0-2 only, its output drained (the first 64 KiB to syslog, and its first "cli-pgid N"). At MOUNTD_DEADLINE
- * it gets SIGTERM; MOUNTD_GRACE later, SIGKILL to its group and to the members of the CLI's group N that run as _linuxfs and
- * were in the last once-a-second snapshot with the same start time. "ok" only when it exited 0, root's mount of /dev/BSD is
- * on top of MNT and /dev/BSD is still the device judged. One result line per request goes to syslog.
+ * it gets SIGTERM; MOUNTD_GRACE later, SIGKILL to its group and to the CLI's group N as mountd_snap_refresh keeps it: the
+ * _linuxfs members first seen and their children, frozen once the group is seen empty or recycled, each still itself.
+ * "ok" only when it exited 0, root's mount of /dev/BSD is on top of MNT and /dev/BSD is still the device judged; any other
+ * reply gives an adopted mount point back when nothing is mounted on it. One result line per request goes to syslog, or,
+ * after "too slow", one from the parent.
  *
  * The test build (LINUXFS_MOUNTD_TEST, never shipped) binds its own socket and takes the console's uid (or a file to read
  * it from), the slots, the queue and the idle time as options; --foreign-pgid stands peers of one process group in for
@@ -39,7 +41,8 @@
  * Without LINUXFS_MOUNTD_TEST_PROGRAM its child is a stub that sleeps LINUXFS_MOUNTD_TEST_CHILD_SLEEP seconds and answers
  * "user not yet" (the front door's tests). With it, the child does the work with stand-ins: the program's directory
  * (trusted as the test user's), LINUXFS_MOUNTD_TEST_DA (a key=value file for DiskArbitration; _DA_SLEEP delays it),
- * _VOLUMES, _MNTTAB, _RUNAS (the group kill's _linuxfs), _ADOPT_SWAP, _RDEV_SHIFT, and --deadline and --grace. Adoption
+ * _VOLUMES, _MNTTAB, _RUNAS (the group kill's _linuxfs), _PROCTAB (a process table for the group kill, which then says
+ * "kill PID" rather than signalling), _ADOPT_SWAP, _RDEV_SHIFT, and --deadline and --grace. Adoption
  * and giving back are said ("adopt MNT", "giveback MNT UID MODE") rather than done. --describe BSD prints what the real
  * DiskArbitration says of BSD, read in a forked child as the daemon reads it.
  */
@@ -215,6 +218,104 @@ int mountd_adopted(const struct stat *after, const struct stat *entry_after, int
 	return 0;
 }
 
+int mountd_still_ours(const struct mountd_proc *was, const struct mountd_proc *now, uid_t runas)
+{
+	return now && now->pid == was->pid && now->uid == runas && now->sec == was->sec && now->usec == was->usec;
+}
+
+void mountd_snap_init(struct mountd_snap *s, pid_t pgid, uid_t runas, unsigned long long since_sec, unsigned long long since_usec)
+{
+	memset(s, 0, sizeof *s);
+	s->pgid = pgid;
+	s->runas = runas;
+	s->since_sec = since_sec;
+	s->since_usec = since_usec;
+}
+
+/* P is in S's group, run as S's uid, and started no earlier than the mount program */
+static int snap_candidate(const struct mountd_snap *s, const struct mountd_proc *p)
+{
+	return p->pgid == s->pgid && p->uid == s->runas && p->pid > 1 &&
+	       (p->sec > s->since_sec || (p->sec == s->since_sec && p->usec >= s->since_usec));
+}
+
+static int snap_holds(const struct mountd_snap *s, pid_t pid)
+{
+	int i;
+
+	for (i = 0; i < s->n; i++)
+		if (s->m[i].pid == pid)
+			return 1;
+	return 0;
+}
+
+static const struct mountd_proc *snap_find(const struct mountd_proc *now, int n, pid_t pid)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		if (now[i].pid == pid)
+			return &now[i];
+	return NULL;
+}
+
+void mountd_snap_refresh(struct mountd_snap *s, const struct mountd_proc *now, int n)
+{
+	const struct mountd_proc *leader;
+	int i, k, grew, members = 0;
+
+	if (s->frozen)
+		return;
+	for (i = 0; i < n; i++)
+		members += now[i].pgid == s->pgid;
+	leader = snap_find(now, n, s->pgid);
+	if (leader && leader->pgid != s->pgid)
+		leader = NULL;
+	/* a group seen empty has ended, and its id may be anyone's next: nothing more is ever admitted */
+	if (members == 0) {
+		s->frozen = 1;
+		return;
+	}
+	if (!s->seen) {
+		s->seen = 1;
+		/* a leader older than the program: a group that was never this mount's */
+		if (leader && !snap_candidate(s, leader)) {
+			s->frozen = 1;
+			s->n = 0;
+			return;
+		}
+		if (leader) {
+			s->leader_known = 1;
+			s->leader_sec = leader->sec;
+			s->leader_usec = leader->usec;
+		}
+		for (i = 0; i < n && s->n < MOUNTD_SNAP_MAX; i++)
+			if (snap_candidate(s, &now[i]))
+				s->m[s->n++] = now[i];
+		return;
+	}
+	/* keep the members still themselves */
+	for (i = k = 0; i < s->n; i++)
+		if (mountd_still_ours(&s->m[i], snap_find(now, n, s->m[i].pid), s->runas) &&
+		    snap_find(now, n, s->m[i].pid)->pgid == s->pgid)
+			s->m[k++] = s->m[i];
+	s->n = k;
+	/* the leader's pid with another start: the group id was recycled */
+	if (s->leader_known && leader && (leader->sec != s->leader_sec || leader->usec != s->leader_usec)) {
+		s->frozen = 1;
+		return;
+	}
+	/* admit a newcomer only as a member's child, until no more are */
+	do {
+		grew = 0;
+		for (i = 0; i < n && s->n < MOUNTD_SNAP_MAX; i++)
+			if (snap_candidate(s, &now[i]) && !snap_holds(s, now[i].pid) && snap_holds(s, now[i].ppid)) {
+				s->m[s->n++] = now[i];
+				grew = 1;
+			}
+	} while (grew);
+}
+
 int mountd_rc(long rc)
 {
 	return rc >= 1 && rc <= 255 ? (int)rc : 1;
@@ -268,6 +369,7 @@ size_t mountd_reply(char *buf, size_t len, enum mountd_verdict v, int rc, const 
 #include <sys/mount.h>
 #include <sys/param.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/ucred.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -289,7 +391,7 @@ size_t mountd_reply(char *buf, size_t len, enum mountd_verdict v, int rc, const 
 #define PROGRAM_FMT "/System/Library/Filesystems/macfuse_%s.fs/Contents/Resources/mount_macfuse_%s"
 #define PROGRAM_PATH "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
 #define OUTPUT_LOGGED (64 * 1024)	/* the program's output to syslog; the rest is drained unread (M5) */
-#define SNAPSHOT_MAX 256	/* members of the CLI's group remembered (R1) */
+#define TOO_SLOW_EXIT 3	/* the child's status when it answered "too slow" from its SIGALRM handler (m2) */
 
 struct limits { int slots_uid, slots, queue, queue_wait, idle, status; uid_t console; int console_given; int deadline, grace; };
 static struct limits lim = { MOUNTD_SLOTS_UID, MOUNTD_SLOTS, MOUNTD_QUEUE, MOUNTD_QUEUE_WAIT, MOUNTD_IDLE, 0, 0, 0,
@@ -376,8 +478,8 @@ static void status(void)
 		fprintf(stderr, "mountd: status slots %d queued %d\n", nkids, nqueued);
 }
 
-/* the reply V (mountd_reply) to C, never waiting: C is non-blocking in the parent, and a peer that left is no harm (SIGPIPE
- * is ignored) */
+/* the reply V (mountd_reply) to C: never waiting in the parent (C is non-blocking there), and a peer that left is no harm
+ * (SIGPIPE is ignored in the parent and the child) */
 static void answer(int c, enum mountd_verdict v, int rc, const char *why)
 {
 	char buf[256];
@@ -498,10 +600,16 @@ static ssize_t read_request(int c, char *buf, size_t len)
 /* ---- the child's work (16i): describe, judge, adopt, spawn, reply ---- */
 
 static int conn = -1;	/* the request's connection, for the pre-begin alarm */
-static struct { const char *bsd, *mnt; uid_t peer; long long da_ms; } job;
+static struct {
+	const char *bsd, *mnt, *real;	/* the request's disk and mount point, and the mount point's path here */
+	uid_t peer;
+	long long da_ms;
+	int adopted, mfd;	/* the mount point, adopted, on mfd */
+	struct stat was;	/* its fstat before adoption */
+} job;
 
 /* Before begin (N2): nothing has been changed, so the mount program's own path is safe. A handler, since a blocked mach_msg
- * (DiskArbitration) is not reliably interrupted: the reply, then out. */
+ * (DiskArbitration) is not reliably interrupted: the reply, then out, with a status the parent logs. */
 static void too_slow(int sig)
 {
 	static const char r[] = "user\tthe daemon was too slow: your own mount\n";
@@ -510,12 +618,19 @@ static void too_slow(int sig)
 	if (write(conn, r, sizeof r - 1) < 0) {
 		/* the peer is gone: nothing to do */
 	}
-	_exit(0);
+	_exit(TOO_SLOW_EXIT);	/* syslog is not safe here: the parent logs it (m2) */
 }
 
-/* The reply V/RC/WHY, the one result line to syslog, and the end of the child (the mount point's lock with it). */
+static void give_back(int fd, const char *mnt, uid_t peer, const struct stat *was);
+static int anything_on(const char *mnt);
+
+/* The reply V/RC/WHY, the one result line to syslog, and the end of the child (the mount point's lock with it). A refused
+ * request whose mount point was adopted gives it back when nothing is mounted on it (m5): the root path failed, the user's
+ * path will not run, and the user must be able to reuse or remove it. */
 static void __attribute__((noreturn)) finish(enum mountd_verdict v, int rc, const char *why)
 {
+	if (v != MD_MOUNT && job.adopted && anything_on(job.real) == 0)
+		give_back(job.mfd, job.real, job.peer, &job.was);
 	answer(conn, v, rc, why);
 	if (v == MD_MOUNT)
 		say("mountd: %s on %s: ok (peer %u, DA %lldms)", job.bsd, job.mnt, (unsigned)job.peer, job.da_ms);
@@ -743,6 +858,20 @@ static int topmost_is_roots(const char *fs, const char *bsd, const char *mnt)
 	return 0;
 }
 
+/* Whether anything is mounted on MNT: 1, 0, or -1 when the table cannot be read */
+static int anything_on(const char *mnt)
+{
+	struct statfs *m;
+	int n = mnt_table(&m), i;
+
+	if (n < 0)
+		return -1;
+	for (i = 0; i < n; i++)
+		if (strcmp(m[i].f_mntonname, mnt) == 0)
+			return 1;
+	return 0;
+}
+
 /* Whether the directory open on FD is empty (1), not (0), or cannot be read (-1). 10.9 has no fdopendir: the child stands in
  * the directory itself (fchdir, so a rename of MNT changes nothing) and reads ".", then goes back to /. */
 static int dir_empty(int fd)
@@ -765,14 +894,15 @@ static int dir_empty(int fd)
 	return n;
 }
 
-/* MNT, open on FD and adopted, back to PEER with its mode before (WAS) (N9); the test build says "giveback MNT UID MODE" */
+/* MNT, open on FD and adopted, back to PEER with its group and mode before (WAS) (N9, m4); the test build says
+ * "giveback MNT UID GID MODE" */
 static void give_back(int fd, const char *mnt, uid_t peer, const struct stat *was)
 {
 #ifdef LINUXFS_MOUNTD_TEST
 	(void)fd;
-	fprintf(stderr, "giveback %s %u %o\n", mnt, (unsigned)peer, (unsigned)(was->st_mode & 07777));
+	fprintf(stderr, "giveback %s %u %u %o\n", mnt, (unsigned)peer, (unsigned)was->st_gid, (unsigned)(was->st_mode & 07777));
 #else
-	if (fchown(fd, peer, (gid_t)-1) != 0 || fchmod(fd, was->st_mode & 07777) != 0)
+	if (fchown(fd, peer, was->st_gid) != 0 || fchmod(fd, was->st_mode & 07777) != 0)
 		say("mountd: %s: the mount point cannot be given back: %s", mnt, strerror(errno));
 #endif
 }
@@ -818,7 +948,7 @@ static int adopt(int fd, const char *mnt, uid_t peer, const struct stat *was, co
 /* The bundle's mount program for R, on MNT, trusted (trust_path) and spawned in a process group of its own, with default
  * signals, no mask, 0-2 only (stdin /dev/null, stdout and stderr *OUT's pipe), PATH alone and the fixed argv. Its pid; -1
  * with *why. The test build runs LINUXFS_MOUNTD_TEST_PROGRAM's mount_macfuse_<fs>, trusted as the test user's. */
-static pid_t spawn_program(const struct mountd_req *r, const char *mnt, int *out, const char **why)
+static pid_t spawn_program(const struct mountd_req *r, const char *mnt, int *out, struct timeval *since, const char **why)
 {
 	char prog[PATH_MAX], resolved[PATH_MAX], opts[64], dev[64];
 	char *argv[6], *envp[] = { PROGRAM_PATH, NULL };
@@ -869,6 +999,7 @@ static pid_t spawn_program(const struct mountd_req *r, const char *mnt, int *out
 	posix_spawnattr_setsigdefault(&at, &def);
 	sigemptyset(&none);
 	posix_spawnattr_setsigmask(&at, &none);
+	gettimeofday(since, NULL);	/* the CLI's group starts after this (I1) */
 	e = posix_spawn(&pid, resolved, &fa, &at, argv, envp);
 	posix_spawn_file_actions_destroy(&fa);
 	posix_spawnattr_destroy(&at);
@@ -895,43 +1026,88 @@ static uid_t run_as(void)
 	return pw ? pw->pw_uid : 0;
 }
 
-/* One member of the CLI's group, as it was seen (R1): its pid and when it started */
-struct member { pid_t pid; uint64_t sec, usec; };
-
-/* PID's start time and effective uid; 0, or -1 when it is gone */
-static int proc_facts(pid_t pid, struct proc_bsdinfo *bi)
+/* PID as the group kill sees it, into P: 0, or -1 when it is gone. The test build reads LINUXFS_MOUNTD_TEST_PROCTAB's
+ * "pid ppid pgid uid sec usec" lines instead, at each look. */
+#ifdef LINUXFS_MOUNTD_TEST
+static int proctab(struct mountd_proc *p, int max, pid_t pid, pid_t pgid)
 {
-	return proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, bi, sizeof *bi) == (int)sizeof *bi ? 0 : -1;
+	FILE *f = fopen(getenv("LINUXFS_MOUNTD_TEST_PROCTAB"), "r");
+	struct mountd_proc x;
+	long a, b, c;
+	unsigned long u;
+	int k = 0;
+
+	if (!f)
+		return 0;
+	while (k < max && fscanf(f, "%ld %ld %ld %lu %llu %llu", &a, &b, &c, &u, &x.sec, &x.usec) == 6) {
+		x.pid = (pid_t)a;
+		x.ppid = (pid_t)b;
+		x.pgid = (pid_t)c;
+		x.uid = (uid_t)u;
+		if ((pid && x.pid == pid) || (pgid && x.pgid == pgid))
+			p[k++] = x;
+	}
+	fclose(f);
+	return k;
+}
+#endif
+
+static int proc_facts(pid_t pid, struct mountd_proc *p)
+{
+	struct proc_bsdinfo bi;
+
+#ifdef LINUXFS_MOUNTD_TEST
+	if (getenv("LINUXFS_MOUNTD_TEST_PROCTAB"))
+		return proctab(p, 1, pid, 0) == 1 ? 0 : -1;
+#endif
+	if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof bi) != (int)sizeof bi)
+		return -1;
+	p->pid = pid;
+	p->ppid = (pid_t)bi.pbi_ppid;
+	p->pgid = (pid_t)bi.pbi_pgid;
+	p->uid = bi.pbi_uid;
+	p->sec = bi.pbi_start_tvsec;
+	p->usec = bi.pbi_start_tvusec;
+	return 0;
 }
 
-/* The members of process group PGID that run as RUNAS, into M (at most MAX): how many */
-static int snapshot(pid_t pgid, uid_t runas, struct member *m, int max)
+/* Process group PGID's members as they are now, into P (at most MAX): how many */
+static int list_group(pid_t pgid, struct mountd_proc *p, int max)
 {
 	static pid_t pids[1024];
-	struct proc_bsdinfo bi;
-	int n = proc_listpids(PROC_PGRP_ONLY, (uint32_t)pgid, pids, sizeof pids), i, k = 0;
+	int n, i, k = 0;
 
+#ifdef LINUXFS_MOUNTD_TEST
+	if (getenv("LINUXFS_MOUNTD_TEST_PROCTAB"))
+		return proctab(p, max, 0, pgid);
+#endif
+	n = proc_listpids(PROC_PGRP_ONLY, (uint32_t)pgid, pids, sizeof pids);
 	for (i = 0; n > 0 && i < n / (int)sizeof(pid_t) && k < max; i++)
-		if (pids[i] > 1 && proc_facts(pids[i], &bi) == 0 && bi.pbi_uid == runas && (pid_t)bi.pbi_pgid == pgid) {
-			m[k].pid = pids[i];
-			m[k].sec = bi.pbi_start_tvsec;
-			m[k].usec = bi.pbi_start_tvusec;
+		if (pids[i] > 0 && proc_facts(pids[i], &p[k]) == 0)
 			k++;
-		}
 	return k;
 }
 
-/* SIGKILL to each member of the last snapshot still alive, still RUNAS's, and started when it was seen: never a pid reused
- * since (a recycled group id may be another mount's CLI, started after the snapshot). How many. */
-static int kill_snapshot(const struct member *m, int n, uid_t runas)
+/* SIGKILL to each member of the snapshot still itself (mountd_still_ours); the test build with a process table says
+ * "kill PID" instead. How many. */
+static int kill_snapshot(const struct mountd_snap *s)
 {
-	struct proc_bsdinfo bi;
+	struct mountd_proc now;
 	int i, k = 0;
 
-	for (i = 0; i < n; i++)
-		if (proc_facts(m[i].pid, &bi) == 0 && bi.pbi_uid == runas && bi.pbi_start_tvsec == m[i].sec &&
-		    bi.pbi_start_tvusec == m[i].usec && kill(m[i].pid, SIGKILL) == 0)
+	for (i = 0; i < s->n; i++) {
+		if (proc_facts(s->m[i].pid, &now) != 0 || !mountd_still_ours(&s->m[i], &now, s->runas))
+			continue;
+#ifdef LINUXFS_MOUNTD_TEST
+		if (getenv("LINUXFS_MOUNTD_TEST_PROCTAB")) {
+			fprintf(stderr, "kill %d\n", (int)s->m[i].pid);
 			k++;
+			continue;
+		}
+#endif
+		if (kill(s->m[i].pid, SIGKILL) == 0)
+			k++;
+	}
 	return k;
 }
 
@@ -974,16 +1150,18 @@ static void output_take(struct output *o, const char *buf, size_t n)
 
 /* The mount program PID, its output on OUT, to the end or the deadline (I4): a timed loop of poll and waitpid. At
  * lim.deadline, SIGTERM to the program (the root path cleans up); lim.grace later, SIGKILL to its process group and to the
- * last snapshot of the CLI's group (N5, R1), refreshed once a second, and "deadline". Then the reply. */
-static void await(const struct mountd_req *r, const char *mnt, pid_t pid, int out, dev_t rdev)
+ * snapshot of the CLI's group (N5, R1, I1: mountd_snap_refresh, once a second, members since SINCE), and "deadline". Then the
+ * reply. */
+static void await(const struct mountd_req *r, const char *mnt, pid_t pid, int out, dev_t rdev, const struct timeval *since)
 {
+	static struct mountd_snap snap;
+	static struct mountd_proc now[MOUNTD_SNAP_MAX];
 	struct output o;
-	struct member snap[SNAPSHOT_MAX];
 	struct stat node;
 	char buf[16384], path[64];
 	long long start = now_ms(), t, next_snap = 0, term_at = -1, next, wait;
 	uid_t runas = run_as();
-	int st = 0, nsnap = 0, killed;
+	int st = 0, killed;
 	ssize_t n;
 	int i;
 
@@ -994,7 +1172,10 @@ static void await(const struct mountd_req *r, const char *mnt, pid_t pid, int ou
 			break;
 		t = now_ms();
 		if (o.cli && runas != 0 && t >= next_snap) {
-			nsnap = snapshot(o.cli, runas, snap, SNAPSHOT_MAX);
+			if (!next_snap)
+				mountd_snap_init(&snap, o.cli, runas, (unsigned long long)since->tv_sec,
+						 (unsigned long long)since->tv_usec);
+			mountd_snap_refresh(&snap, now, list_group(o.cli, now, MOUNTD_SNAP_MAX));
 			next_snap = t + 1000;
 		}
 		if (term_at < 0 && t - start >= lim.deadline * 1000LL) {
@@ -1004,7 +1185,7 @@ static void await(const struct mountd_req *r, const char *mnt, pid_t pid, int ou
 		}
 		if (term_at >= 0 && t - term_at >= lim.grace * 1000LL) {
 			kill(-pid, SIGKILL);
-			killed = o.cli ? kill_snapshot(snap, nsnap, runas) : 0;
+			killed = o.cli && next_snap ? kill_snapshot(&snap) : 0;
 			shout("mountd: %s on %s: still running %d s later: SIGKILL to its group %d and to %d of the CLI's group %d",
 			      r->bsd, r->mnt, lim.grace, (int)pid, killed, (int)o.cli);
 			for (i = 0; i < 10 && waitpid(pid, &st, WNOHANG) == 0; i++)
@@ -1079,6 +1260,7 @@ static void work(int c, uid_t peer, const struct mountd_req *r)
 	int fd, mfd, rc, err = 0, from_disk = 0, on_mnt = 0, adopting = 0, empty, out = -1;
 	unsigned flags = 0;
 	enum mountd_verdict v;
+	struct timeval since;
 	pid_t pid;
 
 	conn = c;
@@ -1086,6 +1268,7 @@ static void work(int c, uid_t peer, const struct mountd_req *r)
 	job.mnt = r->mnt;
 	job.peer = peer;
 	job.da_ms = -1;
+	job.mfd = -1;
 	while ((fd = open("/dev/null", O_RDWR)) >= 0 && fd < 3)
 		;	/* 0-2 open, so no pipe or descriptor below takes their place */
 	if (fd >= 3)
@@ -1128,6 +1311,9 @@ static void work(int c, uid_t peer, const struct mountd_req *r)
 		close(fd);
 	}
 	prefs_read(&p);
+	/* m6: the preferences are the console user's now; they must be the peer's */
+	if (console_uid() != peer)
+		finish(MD_USER, 0, "the console changed: your own mount");
 	v = mountd_judge(r, &d, peer, type, flags, &p, from_disk, on_mnt, &rc, &why);
 	if (v != MD_MOUNT)
 		finish(v, rc, why);
@@ -1153,19 +1339,20 @@ static void work(int c, uid_t peer, const struct mountd_req *r)
 		_exit(0);
 	}
 
-	/* 6. adoption, when the mount point is the peer's */
+	/* 6. adoption, when the mount point is the peer's (given back on any refusal from here with nothing on it: finish) */
 	if (adopting && adopt(mfd, mnt, peer, &opened, &why) != 0)
 		finish(MD_REFUSE, 1, why);
+	job.real = mnt;
+	job.mfd = mfd;
+	job.was = opened;
+	job.adopted = adopting;
 
-	/* 7. the bundle's mount program; not run, nothing was mounted, so an adopted mount point goes back */
-	if ((pid = spawn_program(r, mnt, &out, &why)) < 0) {
-		if (adopting)
-			give_back(mfd, mnt, peer, &opened);
+	/* 7. the bundle's mount program */
+	if ((pid = spawn_program(r, mnt, &out, &since, &why)) < 0)
 		finish(MD_REFUSE, 1, why);
-	}
 
 	/* 8, 9. the deadline, and the reply */
-	await(r, mnt, pid, out, node.st_rdev);
+	await(r, mnt, pid, out, node.st_rdev, &since);
 }
 
 /* One request from the console user UID on C, in a forked child. */
@@ -1186,7 +1373,10 @@ static void serve(int c, uid_t uid)
 			close(fd);
 	openlog(IDENT, LOG_PID, FACILITY);	/* m4: the parent's ident and facility, not libc's defaults */
 	signal(SIGCHLD, SIG_DFL);
-	signal(SIGPIPE, SIG_DFL);
+	/* m3: a peer that left is EPIPE, never a death before the result line. Ignored rather than SO_NOSIGPIPE alone: XNU
+	 * refuses socket options (EINVAL) once the peer has shut the socket both ways, which is just when it matters. The
+	 * mount program still gets SIGPIPE's default (posix_spawn's SETSIGDEF). */
+	signal(SIGPIPE, SIG_IGN);
 	signal(SIGTERM, SIG_DFL);
 	sigemptyset(&none);
 	sigprocmask(SIG_SETMASK, &none, NULL);
@@ -1245,6 +1435,9 @@ static void reap(void)
 	while ((pid = waitpid(-1, &st, WNOHANG)) > 0)
 		for (i = 0; i < nkids; i++)
 			if (kids[i].pid == pid) {
+				/* m2: its SIGALRM handler could not log; its request line (LOG_PID) names the disk */
+				if (WIFEXITED(st) && WEXITSTATUS(st) == TOO_SLOW_EXIT)
+					say("mountd: child %d (uid %u): too slow (before begin)", (int)pid, (unsigned)kids[i].uid);
 				kids[i] = kids[--nkids];
 				break;
 			}
@@ -1327,6 +1520,11 @@ static void arrive(int c)
 	int i;
 
 	fcntl(c, F_SETFL, fcntl(c, F_GETFL) | O_NONBLOCK);
+	{
+		int one = 1;	/* the socket's own guard as well (m3); it fails only on a peer already gone */
+
+		setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+	}
 	if ((why = peer_cred(c, &xu)) != NULL) {
 		/* no reply: no hi, so the mount program takes its own path */
 		close(c);

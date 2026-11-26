@@ -123,6 +123,33 @@ static struct stat dir(dev_t dev, ino_t ino, uid_t uid, mode_t mode)
 	return st;
 }
 
+/* a process for the group kill's rules: PID, its parent, its group, uid U, started at SEC.USEC */
+static struct mountd_proc pr(pid_t pid, pid_t ppid, pid_t pgid, uid_t u, unsigned long long sec, unsigned long long usec)
+{
+	struct mountd_proc x;
+
+	x.pid = pid;
+	x.ppid = ppid;
+	x.pgid = pgid;
+	x.uid = u;
+	x.sec = sec;
+	x.usec = usec;
+	return x;
+}
+
+/* whether S holds PID */
+static int holds(const struct mountd_snap *s, pid_t pid)
+{
+	int i;
+
+	for (i = 0; i < s->n; i++)
+		if (s->m[i].pid == pid)
+			return 1;
+	return 0;
+}
+
+static struct mountd_snap snap;
+
 int main(void)
 {
 	struct fsprefs p, take;
@@ -362,6 +389,74 @@ int main(void)
 	is(MOUNTD_SLOTS, 8, "limits: 8 children in all");
 	is(MOUNTD_QUEUE, 16, "limits: 16 queued per user");
 	is(MOUNTD_IDLE, 60, "limits: the daemon leaves after 60 s idle");
+
+	/* spec: task-16i-findings-r0.md I1, m1 -- the CLI's group kill (R1): who stays ours, and a snapshot a recycled group id can
+	 * never enter. The CLI's group is 900, run as 77, its program spawned at 1000.0 */
+	{
+		struct mountd_proc a = pr(900, 50, 900, 77, 1001, 5), now, t[4];
+
+		now = a;
+		is(mountd_still_ours(&a, &now, 77), 1, "still_ours: the same pid, uid and start");
+		now.usec = 6;
+		is(mountd_still_ours(&a, &now, 77), 0, "still_ours: the same pid, started a microsecond later: a reused pid");
+		now = a;
+		now.sec = 1002;
+		is(mountd_still_ours(&a, &now, 77), 0, "still_ours: started a second later");
+		now = a;
+		now.uid = 78;
+		is(mountd_still_ours(&a, &now, 77), 0, "still_ours: the same start under another uid");
+		is(mountd_still_ours(&a, NULL, 77), 0, "still_ours: gone");
+
+		/* the first look admits the group's members of the run-as uid started since the spawn */
+		mountd_snap_init(&snap, 900, 77, 1000, 0);
+		t[0] = a;
+		t[1] = pr(901, 900, 900, 77, 1001, 9);
+		t[2] = pr(902, 900, 900, 78, 1001, 9);	/* another uid */
+		t[3] = pr(903, 1, 900, 77, 999, 0);	/* started before the program */
+		mountd_snap_refresh(&snap, t, 4);
+		is(snap.n == 2 && holds(&snap, 900) && holds(&snap, 901), 1, "snapshot: the first look takes the run-as members started since the spawn");
+		is(holds(&snap, 902) || holds(&snap, 903), 0, "snapshot: never another uid's, nor one older than the program");
+		/* a newcomer is admitted only as a child of a member */
+		t[2] = pr(904, 901, 900, 77, 1003, 0);	/* lklfuse, the CLI's child */
+		t[3] = pr(905, 1, 900, 77, 1003, 0);	/* joined the group, no member's child */
+		mountd_snap_refresh(&snap, t, 4);
+		is(holds(&snap, 904), 1, "snapshot: a member's child is admitted");
+		is(holds(&snap, 905), 0, "snapshot: a newcomer that is no member's child is not");
+		/* a member that ended is dropped, and its reused pid never comes back in */
+		t[0] = a;
+		t[1] = pr(901, 1, 900, 77, 1050, 0);	/* 901 reused, by no member's child */
+		mountd_snap_refresh(&snap, t, 2);
+		is(holds(&snap, 901), 0, "snapshot: a member's pid reused is dropped");
+		is(snap.frozen, 0, "snapshot: (control) not frozen while the leader is the same");
+
+		/* I1 (a): the group ends; pid 900 then comes back as another mount's CLI, with its own child */
+		mountd_snap_init(&snap, 900, 77, 1000, 0);
+		t[0] = a;
+		t[1] = pr(901, 900, 900, 77, 1001, 9);
+		mountd_snap_refresh(&snap, t, 2);
+		mountd_snap_refresh(&snap, t, 0);
+		is(snap.frozen, 1, "snapshot: frozen once the group is seen empty");
+		t[0] = pr(900, 60, 900, 77, 1100, 0);
+		t[1] = pr(906, 900, 900, 77, 1100, 1);
+		mountd_snap_refresh(&snap, t, 2);
+		is(holds(&snap, 906), 0, "snapshot: frozen, a recycled group's members never enter");
+		/* (b): pid 900 alive with a new start, the group never seen empty */
+		mountd_snap_init(&snap, 900, 77, 1000, 0);
+		t[0] = a;
+		t[1] = pr(901, 900, 900, 77, 1001, 9);
+		mountd_snap_refresh(&snap, t, 2);
+		t[0] = pr(900, 60, 900, 77, 1100, 0);
+		t[1] = pr(906, 900, 900, 77, 1100, 1);
+		mountd_snap_refresh(&snap, t, 2);
+		is(snap.frozen, 1, "snapshot: frozen once the leader's pid shows a new start");
+		is(holds(&snap, 906) || holds(&snap, 900), 0, "snapshot: and neither the new leader nor its child is taken");
+		/* (c): the leader seen first already older than the program: a stale group, never ours */
+		mountd_snap_init(&snap, 900, 77, 1000, 0);
+		t[0] = pr(900, 60, 900, 77, 900, 0);
+		t[1] = pr(907, 900, 900, 77, 1001, 0);
+		mountd_snap_refresh(&snap, t, 2);
+		is(snap.frozen == 1 && snap.n == 0, 1, "snapshot: a leader older than the program: frozen, empty");
+	}
 
 	printf("1..%d\n", tapno);
 	return failures != 0;

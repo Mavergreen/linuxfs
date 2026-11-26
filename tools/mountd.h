@@ -92,6 +92,33 @@ int mountd_mnt_facts(const struct stat *opened, const struct stat *entry, const 
  * before the fchown, and cannot after it). 0, or -1 with *why, and then the caller gives the directory back to PEER. */
 int mountd_adopted(const struct stat *after, const struct stat *entry_after, int empty_after, uid_t peer, const char **why);
 
+/* The CLI's group kill (N5, R1). A process as the daemon sees it (proc_pidinfo PROC_PIDTBSDINFO): pid, parent, group, effective
+ * uid and start time. */
+struct mountd_proc { pid_t pid, ppid, pgid; uid_t uid; unsigned long long sec, usec; };
+
+/* Whether NOW (NULL: gone) is still WAS: the same pid, run as RUNAS, started at the same time to the microsecond. */
+int mountd_still_ours(const struct mountd_proc *was, const struct mountd_proc *now, uid_t runas);
+
+/* What the deadline may SIGKILL of the CLI's group PGID: its members that run as RUNAS, started since the mount program
+ * (SINCE), refreshed once a second. A group id is recycled only after the group has ended, so (I1):
+ * - the first look takes every such member; a leader (pid PGID) older than the program means the group is not ours: frozen,
+ *   empty;
+ * - each later look keeps the members still themselves (mountd_still_ours) and admits a newcomer only as a child of one;
+ * - it freezes, admitting nothing more, once it sees the group empty, or pid PGID with another start time than the leader's.
+ * So a recycled group's processes, which descend from no member, never enter it. */
+#define MOUNTD_SNAP_MAX 256
+struct mountd_snap {
+	pid_t pgid;
+	uid_t runas;
+	unsigned long long since_sec, since_usec, leader_sec, leader_usec;
+	int seen, frozen, leader_known, n;
+	struct mountd_proc m[MOUNTD_SNAP_MAX];
+};
+void mountd_snap_init(struct mountd_snap *s, pid_t pgid, uid_t runas, unsigned long long since_sec,
+		      unsigned long long since_usec);
+/* One look: NOW is the group's processes as listed now (N of them, any uid; others are ignored). */
+void mountd_snap_refresh(struct mountd_snap *s, const struct mountd_proc *now, int n);
+
 /* A status for the reply: 1..255 as it is, anything else (0 included) 1. */
 int mountd_rc(long rc);
 
