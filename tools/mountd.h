@@ -11,6 +11,30 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+/* The bounds, in seconds (N6, R2, R3). What the daemon may take for one request, end to end:
+ * - MOUNTD_QUEUE_WAIT: waiting for a slot (then "user busy": nothing was touched);
+ * - MOUNTD_REQUEST: reading the request line, one total bound (M4);
+ * - MOUNTD_PREBEGIN: before begin (DiskArbitration's 15, then the probe and the mount point);
+ * - MOUNTD_DEADLINE: the mount program, then SIGTERM; MOUNTD_GRACE: then its groups' SIGKILL.
+ * Their sum, 285, plus 5 s of margin is MOUNTD_CLIENT_WAIT, what the mount program waits in all. MOUNTD_CLIENT_PREBEGIN is
+ * what it waits from hi to begin: the daemon's pre-begin alarm cannot fire while its child is blocked in an uninterruptible
+ * read (a wedged image's probe), so the client keeps its own bound. The smoke's 300 s bound on hdiutil attach caps the
+ * whole mount. tests/mountd-policy-test.c (limits_fit) adds them up. */
+#define MOUNTD_REQUEST 5
+#define MOUNTD_QUEUE_WAIT 60
+#define MOUNTD_PREBEGIN 30
+#define MOUNTD_DEADLINE 170
+#define MOUNTD_GRACE 20
+#define MOUNTD_CLIENT_WAIT 290
+#define MOUNTD_CLIENT_PREBEGIN (MOUNTD_QUEUE_WAIT + MOUNTD_REQUEST + MOUNTD_PREBEGIN + 5)
+
+/* The slots (I3): children per uid and in all, requests queued per uid beyond them (first in, first out), and how long
+ * the daemon stays with no child and nothing queued. */
+#define MOUNTD_SLOTS_UID 4
+#define MOUNTD_SLOTS 8
+#define MOUNTD_QUEUE 16
+#define MOUNTD_IDLE 60
+
 /* One request: FS one of the six, BSD diskN or diskNsM, MNT /Volumes/<one name>; ro and owners from FLAGS. */
 struct mountd_req { char fs[8], bsd[40], mnt[1024]; int ro, owners; };
 

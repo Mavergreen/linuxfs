@@ -346,6 +346,23 @@ int main(void)
 	n = mountd_reply(buf, 8, MD_USER, 0, "a long reason");
 	is(n < 8 && buf[n - 1] == '\n' && buf[n] == '\0', 1, "reply: cut to fit, still one line");
 
+	/* ---- the bounds (N6, R2): what the daemon may take, against what the mount program waits ---- */
+	is(MOUNTD_REQUEST, 5, "limits: the request is read within 5 s");
+	is(MOUNTD_QUEUE_WAIT, 60, "limits: a queued request waits at most 60 s");
+	is(MOUNTD_PREBEGIN, 30, "limits: 30 s before begin");
+	is(MOUNTD_DEADLINE, 170, "limits: the program's deadline is 170 s");
+	is(MOUNTD_GRACE, 20, "limits: its grace is 20 s");
+	is(MOUNTD_QUEUE_WAIT + MOUNTD_REQUEST + MOUNTD_PREBEGIN + MOUNTD_DEADLINE + MOUNTD_GRACE <= MOUNTD_CLIENT_WAIT - 5, 1,
+	   "limits_fit: the five bounds add up to at most the client's wait less 5 s");
+	is(MOUNTD_CLIENT_WAIT <= 290, 1, "limits_fit: the client waits at most 290 s, under the smoke's 300 s attach bound");
+	is(MOUNTD_CLIENT_PREBEGIN, MOUNTD_QUEUE_WAIT + MOUNTD_REQUEST + MOUNTD_PREBEGIN + 5,
+	   "limits_fit: from hi to begin, the client waits the queue, the request and the pre-begin bounds, plus 5 s");
+	is(MOUNTD_CLIENT_PREBEGIN < MOUNTD_CLIENT_WAIT, 1, "limits_fit: and less than its whole wait");
+	is(MOUNTD_SLOTS_UID, 4, "limits: 4 children per user");
+	is(MOUNTD_SLOTS, 8, "limits: 8 children in all");
+	is(MOUNTD_QUEUE, 16, "limits: 16 queued per user");
+	is(MOUNTD_IDLE, 60, "limits: the daemon leaves after 60 s idle");
+
 	printf("1..%d\n", tapno);
 	return failures != 0;
 }
