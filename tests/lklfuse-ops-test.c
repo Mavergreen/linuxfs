@@ -1927,16 +1927,20 @@ int main(int argc, char **argv)
 		struct fuse_file_info f = { 0 };
 		int first, again, third;
 
-		is(lklfuse_opendir("/", &f), 0, "readdir again: opendir /");
-		first = count_readdir("/", &f);
-		again = count_readdir("/", &f);
+		/* (fix round 1) with no handle, the reads would crash the run (lkl_rewinddir of NULL): each is said not ok instead */
+		int opened = lklfuse_opendir("/", &f) == 0;
+
+		is(opened, 1, "readdir again: opendir /");
+		first = opened ? count_readdir("/", &f) : -1;
+		again = opened ? count_readdir("/", &f) : -2;
 		is(first > 2, 1, "readdir again: the first listing has more than . and ..");
 		is(again, first, "readdir again: a second readdir on the same handle lists them all again");
 		is(lklfuse_mkdir("/readdir-again", 0755), 0, "readdir again: a directory made between listings");
-		third = count_readdir("/", &f);
+		third = opened ? count_readdir("/", &f) : -1;
 		is(third, first + 1, "readdir again: and a third lists it too (the directory read afresh)");
-		lklfuse_releasedir("/", &f);
-		lklfuse_rmdir("/readdir-again");
+		if (opened)
+			lklfuse_releasedir("/", &f);
+		is(lklfuse_rmdir("/readdir-again"), 0, "readdir again: the directory removed, so later tests see the root as before");
 	}
 #ifdef __APPLE__
 	caller_owner_tests();
