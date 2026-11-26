@@ -52,7 +52,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  #endif
  "    -o opts=options        mount options (use \\ to escape , and =)\n"
  );
-@@ -1460,6 +1465,152 @@
+@@ -1471,6 +1476,152 @@
  	st->st_ctim.tv_nsec = in->st_ctime_nsec;
  }
  
@@ -205,7 +205,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  static int lklfuse_getattr(const char *path, struct stat *st,
  			   struct fuse_file_info *fi)
  {
-@@ -1472,6 +1623,8 @@
+@@ -1483,6 +1634,8 @@
  	 */
  	char pbuf[LKLFUSE_PATH_MAX];
  
@@ -214,7 +214,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if (fi)
  		ret = lkl_sys_fstat(fi->fh, &lkl_stat);
  	else if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
-@@ -1489,6 +1642,8 @@
+@@ -1500,6 +1653,8 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	long ret;
  
@@ -223,7 +223,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
  		return ret;
  	ret = lkl_sys_readlink(path, buf, len);
-@@ -1631,16 +1786,23 @@
+@@ -1642,16 +1797,23 @@
  static int lklfuse_unlink(const char *path)
  {
  	char pbuf[LKLFUSE_PATH_MAX];
@@ -249,7 +249,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	return ret ? ret : lklfuse_err(lkl_sys_rmdir(path));
  }
  
-@@ -1659,7 +1821,11 @@
+@@ -1670,7 +1832,11 @@
  			  unsigned int flags)
  {
  	char obuf[LKLFUSE_PATH_MAX], nbuf[LKLFUSE_PATH_MAX];
@@ -262,7 +262,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  
  	if (!ret)
  		ret = lklfuse_resolve(newname, nbuf, sizeof(nbuf), 1, &newname);
-@@ -1673,7 +1839,11 @@
+@@ -1684,7 +1850,11 @@
  static int lklfuse_link(const char *oldname, const char *newname)
  {
  	char obuf[LKLFUSE_PATH_MAX], nbuf[LKLFUSE_PATH_MAX];
@@ -275,7 +275,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  
  	if (!ret)
  		ret = lklfuse_resolve(newname, nbuf, sizeof(nbuf), 1, &newname);
-@@ -1686,6 +1856,8 @@
+@@ -1697,6 +1867,8 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	int ret;
  
@@ -284,7 +284,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if (fi)
  		ret = lkl_sys_fchmod(fi->fh, mode);
  	else if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
-@@ -1702,6 +1874,8 @@
+@@ -1713,6 +1885,8 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	int ret;
  
@@ -293,7 +293,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if (fi)
  		ret = lkl_sys_fchown(fi->fh, uid, gid);
  	else if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
-@@ -1718,6 +1892,11 @@
+@@ -1729,6 +1903,11 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	int ret;
  
@@ -305,7 +305,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if (fi)
  		ret = lkl_sys_ftruncate(fi->fh, off);
  	else if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
-@@ -1842,11 +2021,59 @@
+@@ -1853,11 +2032,59 @@
  	return 0;
  }
  
@@ -366,7 +366,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	return ret ? ret : lklfuse_open3(path, false, 0, fi);
  }
  
-@@ -1856,6 +2083,8 @@
+@@ -1867,6 +2094,8 @@
  	long ret;
  	ssize_t orig_size = size;
  
@@ -375,7 +375,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	do {
  		ret = lkl_sys_pread64(fi->fh, buf, size, offset);
  		if (ret <= 0)
-@@ -1875,6 +2104,8 @@
+@@ -1886,6 +2115,8 @@
  	long ret;
  	ssize_t orig_size = size;
  
@@ -384,7 +384,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	do {
  		ret = lkl_sys_pwrite64(fi->fh, buf, size, offset);
  		if (ret <= 0)
-@@ -1894,6 +2125,8 @@
+@@ -1905,6 +2136,8 @@
  	struct lkl_statfs lkl_statfs;
  	char pbuf[LKLFUSE_PATH_MAX];
  
@@ -393,7 +393,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
  		return ret;
  	ret = lkl_sys_statfs(path, &lkl_statfs);
-@@ -1922,12 +2155,16 @@
+@@ -1933,12 +2166,16 @@
  
  static int lklfuse_release(const char *path, struct fuse_file_info *fi)
  {
@@ -410,7 +410,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if (datasync)
  		return lklfuse_err(lkl_sys_fdatasync(fi->fh));
  	else
-@@ -1938,8 +2175,11 @@
+@@ -1949,8 +2186,11 @@
  		   size_t size, int flags)
  {
  	char pbuf[LKLFUSE_PATH_MAX];
@@ -423,7 +423,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	return ret ? ret : lklfuse_xset(path, name, val, size, lklfuse_xattr_flags(flags));
  }
  
-@@ -1947,24 +2187,37 @@
+@@ -1958,24 +2198,37 @@
  			  size_t size)
  {
  	char pbuf[LKLFUSE_PATH_MAX];
@@ -464,7 +464,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	return ret ? ret : lklfuse_xremove(path, name);
  }
  
-@@ -1974,6 +2227,8 @@
+@@ -1985,6 +2238,8 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	int err;
  
@@ -473,7 +473,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if ((err = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
  		return err;
  	dir = lkl_opendir(path, &err);
-@@ -2053,8 +2308,11 @@
+@@ -2064,8 +2319,11 @@
  static int lklfuse_access(const char *path, int mode)
  {
  	char pbuf[LKLFUSE_PATH_MAX];
@@ -486,7 +486,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	return ret ? ret : lklfuse_err(lkl_sys_access(path, mode));
  }
  
-@@ -2068,6 +2326,8 @@
+@@ -2079,6 +2337,8 @@
  		{ .tv_sec = tv[1].tv_sec, .tv_nsec = tv[1].tv_nsec },
  	};
  
@@ -495,7 +495,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	if (fi)
  		ret = lkl_sys_utimensat(fi->fh, NULL, ts, 0);
  	else if ((ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path)))
-@@ -2081,6 +2341,8 @@
+@@ -2092,6 +2352,8 @@
  static int lklfuse_fallocate(const char *path, int mode, off_t offset,
  			     off_t len, struct fuse_file_info *fi)
  {
@@ -504,7 +504,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	return lklfuse_err(lkl_sys_fallocate(fi->fh, mode, offset, len));
  }
  
-@@ -2092,6 +2354,10 @@
+@@ -2103,6 +2365,10 @@
  {
  	lkl_loff_t loff_in = off_in, loff_out = off_out;
  
@@ -515,7 +515,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	return lklfuse_err(lkl_sys_copy_file_range(fi_in->fh, &loff_in, fi_out->fh,
  				       &loff_out, len, flags));
  }
-@@ -2099,6 +2365,8 @@
+@@ -2110,6 +2376,8 @@
  static off_t lklfuse_lseek(const char *path, off_t off, int whence,
  			   struct fuse_file_info *fi)
  {
@@ -524,7 +524,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	return lklfuse_err(lkl_sys_lseek(fi->fh, off, whence));
  }
  
-@@ -2594,6 +2862,8 @@
+@@ -2605,6 +2873,8 @@
  	if (fuse_parse_cmdline(&args, &cli_opts))
  		return 1;
  

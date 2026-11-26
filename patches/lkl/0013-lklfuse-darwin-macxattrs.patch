@@ -8,6 +8,11 @@ user.X is shown to the Mac as X; Linux's other namespaces (security, trusted, sy
 writable, so nothing can clash. On apfs the prefix is osx., the namespace the Linux driver puts every name macOS wrote
 in, so a Mac reads macOS's own names there.
 
+One legacy scheme: before this, linuxfs passed Mac names through, and on NTFS (ntfs3 takes any name) they were kept
+bare; the census saw Finder tags round-trip there. A bare com.apple.* name is shown under its own name, and read and
+changed where it is; a new name still goes to user.N; a name there both ways is listed once, and is its user.N copy.
+Every other name outside user. (WSL's $LXUID and the like among them) stays hidden.
+
 Volumes that netatalk or Samba (vfs_fruit) have served keep a Mac file's metadata their own ways (netatalk 4.6.1's and
 Samba 4.25.1's sources, recorded in the item's findings):
 - netatalk, and Samba's fruit:metadata=netatalk: the Finder Info is 32 bytes of an AppleDouble blob,
@@ -27,8 +32,8 @@ an all-zero Finder Info in a blob or an AfpInfo is no Finder Info (removing it z
 netatalk's other data, and removes the AfpInfo, as Samba does); a Finder Info is 32 bytes (ERANGE otherwise); and a value
 the filesystem cannot hold is refused with ENOSPC, the only refusal HFS+ gave (it took 64 MiB + 1; linuxfs gave E2BIG
 at 128 KiB). tests/lklfuse-ops-test.c checks the name table, the choice of scheme, and each scheme's round trip, on four
-images tests/lib/xattr-images.sh makes, one per scheme and one mixing them, with the raw names and bytes as Linux sees
-them.
+images tests/lib/xattr-images.sh makes, one per scheme and one mixing them, and the legacy scheme on a blank NTFS
+image, with the raw names and bytes as Linux sees them.
 
 Darwin only: on Linux the names are passed as given, as before.
 
@@ -44,7 +49,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  
  #ifdef __APPLE__
  #include <sys/xattr.h>
-@@ -773,9 +775,644 @@
+@@ -773,9 +775,655 @@
  {
  	return fuse_new(args, ops, size, data);
  }
@@ -52,7 +57,10 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +/*
 + * Mac xattrs (spec: item 7). Linux takes only namespaced names, so a Mac name N is stored as the Linux name user.N,
 + * always (on apfs, osx.N: macOS's own names, as the Linux driver shows them). Linux user.X is shown to the Mac as X;
-+ * Linux's other namespaces (security, trusted, system) are neither shown nor writable, so nothing can clash. Volumes
++ * Linux's other namespaces (security, trusted, system) are neither shown nor writable, so nothing can clash. One legacy
++ * scheme: before this, linuxfs passed Mac names through, and NTFS (whose ntfs3 takes any name) kept them bare. A bare
++ * com.apple.* name is shown as itself and read and changed where it is; a new one is still user.N, and a name there
++ * both ways is its user.N. Every other name outside user. (WSL's $LX* among them) stays hidden. Volumes
 + * netatalk or Samba (vfs_fruit) have served keep a Mac file's metadata their own ways (item-7-findings.md has the
 + * encodings, from their sources):
 + * - netatalk, and fruit:metadata=netatalk: the Finder Info is 32 bytes of an AppleDouble blob, user.org.netatalk.Metadata
@@ -78,6 +86,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +#define LKLFUSE_XNAME_MAX 512	/* a Linux xattr name lklfuse builds (Linux's own limit is 255) */
 +#define LKLFUSE_XVAL_MAX 65536	/* Linux's XATTR_SIZE_MAX: no carrier is larger */
 +#define LKLFUSE_RESOURCEFORK "com.apple.ResourceFork"
++#define LKLFUSE_XLEGACY "com.apple."	/* the bare names linuxfs kept on NTFS before user.N */
 +#define LKLFUSE_XMETA "org.netatalk.Metadata"
 +#define LKLFUSE_XRSRC "org.netatalk.ResourceFork"
 +#define LKLFUSE_XSTREAM "DosStream."
@@ -145,12 +154,14 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +	return n < 0 || (size_t)n >= len ? -ENAMETOOLONG : 0;
 +}
 +
-+/* Linux name user.X: X (0); 1 for every other namespace and every carrier, hidden from the Mac */
++/* Linux name user.X: X (0), and a legacy bare com.apple.X itself; 1 for every other name and every carrier, hidden */
 +static int lklfuse_xname_to_mac(const char *lname, char *out, size_t len)
 +{
 +	size_t n = strlen(lklfuse_xpre);
 +
-+	if (strncmp(lname, lklfuse_xpre, n) || !lname[n] || lklfuse_xcarrier(lname + n))
++	if (strncmp(lname, LKLFUSE_XLEGACY, sizeof(LKLFUSE_XLEGACY) - 1) == 0 && lname[sizeof(LKLFUSE_XLEGACY) - 1])
++		n = 0;
++	else if (strncmp(lname, lklfuse_xpre, n) || !lname[n] || lklfuse_xcarrier(lname + n))
 +		return 1;
 +	if (strlen(lname + n) >= len)
 +		return -ERANGE;
@@ -276,7 +287,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +}
 +
 +/* where a Mac attribute is now: the Linux xattr NAME, and for the carriers inside one, its value and the bytes the Mac sees */
-+enum lklfuse_xloc { XL_NONE, XL_USER, XL_RSRC, XL_BLOB, XL_AFPINFO, XL_STREAM };
++enum lklfuse_xloc { XL_NONE, XL_USER, XL_RSRC, XL_BLOB, XL_AFPINFO, XL_STREAM };	/* XL_USER: user.N, or legacy bare N */
 +struct lklfuse_xat {
 +	enum lklfuse_xloc loc;
 +	char name[LKLFUSE_XNAME_MAX];
@@ -327,6 +338,11 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 +		at->loc = XL_USER;
 +	if (n != -LKL_ENODATA)
 +		return n >= 0 ? 0 : n;
++	if (strncmp(mac, LKLFUSE_XLEGACY, sizeof(LKLFUSE_XLEGACY) - 1) == 0 && lkl_sys_getxattr(path, mac, NULL, 0) >= 0) {
++		at->loc = XL_USER;	/* legacy bare N; refused (EOPNOTSUPP) where the filesystem takes only namespaces */
++		snprintf(at->name, sizeof(at->name), "%s", mac);
++		return 0;
++	}
 +	if (fi) {
 +		snprintf(name, sizeof(name), "%s%s", lklfuse_xpre, LKLFUSE_XMETA);
 +		if ((n = lklfuse_xtry(path, name, XL_BLOB, at)))
@@ -689,7 +705,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  #define lklfuse_rename_flags(flags) (flags)
  
  static inline int lklfuse_resolve(const char *path, char *buf, size_t len, int create, const char **out)
-@@ -1229,7 +1866,7 @@
+@@ -1229,7 +1877,7 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
  
@@ -698,7 +714,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  }
  
  static int lklfuse_getxattr(const char *path, const char *name, char *val,
-@@ -1238,7 +1875,7 @@
+@@ -1238,7 +1886,7 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
  
@@ -707,7 +723,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  }
  
  static int lklfuse_listxattr(const char *path, char *list, size_t size)
-@@ -1246,7 +1883,7 @@
+@@ -1246,7 +1894,7 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
  
@@ -716,7 +732,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  }
  
  static int lklfuse_removexattr(const char *path, const char *name)
-@@ -1254,7 +1891,7 @@
+@@ -1254,7 +1902,7 @@
  	char pbuf[LKLFUSE_PATH_MAX];
  	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
  
@@ -725,7 +741,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  }
  
  static int lklfuse_opendir(const char *path, struct fuse_file_info *fi)
-@@ -1711,6 +2348,8 @@
+@@ -1711,6 +2359,8 @@
  
  #ifdef __APPLE__
  	lklfuse_nf = lklfuse_nfmode_for(lklfuse.type);

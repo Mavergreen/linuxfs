@@ -1077,20 +1077,24 @@ static void volicon_tests(void)
 #define XMETA "user.org.netatalk.Metadata"
 #define XAFPI "user.DosStream.AFP_AfpInfo:$DATA"
 #define XTAGS_STREAM "user.DosStream.com.apple.metadata\xef\x80\xa2_kMDItemUserTags:$DATA"
-static const char *const xa_name[] = { "ours", "netatalk", "fruit", "mixed" };
-static struct lkl_disk xa_disk[4];
-static int xa_id[4] = { -1, -1, -1, -1 };
+static const char *const xa_file[] = { "ext4-xa-ours.img", "ext4-xa-netatalk.img", "ext4-xa-fruit.img",
+				       "ext4-xa-mixed.img", "ntfs-xa.img" };
+static const char *const xa_type[] = { "ext4", "ext4", "ext4", "ext4", "ntfs3" };
+#define XA_N (sizeof(xa_file) / sizeof(xa_file[0]))
+static struct lkl_disk xa_disk[XA_N];
+static int xa_id[XA_N] = { -1, -1, -1, -1, -1 };
 static long xa_oldroot = -1;
 static char fi_planted[32] = "TEXTttxt", fi_new[32] = "TEXTttxt\x00\x0c";
 
-/* before start_lkl: DIR's four images, as LKL disks */
+/* before start_lkl: DIR's images (xattr-images.sh's four, and a blank NTFS one), as LKL disks */
 static void xa_add(const char *dir)
 {
 	char path[PATH_MAX];
-	int i, fd;
+	size_t i;
+	int fd;
 
-	for (i = 0; i < 4; i++) {
-		snprintf(path, sizeof(path), "%s/ext4-xa-%s.img", dir, xa_name[i]);
+	for (i = 0; i < XA_N; i++) {
+		snprintf(path, sizeof(path), "%s/%s", dir, xa_file[i]);
 		fd = open(path, O_RDWR | O_CLOEXEC);
 		if (fd < 0)
 			continue;
@@ -1104,7 +1108,7 @@ static int xa_enter(int i)
 {
 	char mp[32];
 
-	if (xa_id[i] < 0 || lkl_mount_dev(xa_id[i], 0, "ext4", 0, NULL, mp, sizeof(mp)))
+	if (xa_id[i] < 0 || lkl_mount_dev(xa_id[i], 0, xa_type[i], 0, NULL, mp, sizeof(mp)))
 		return -1;
 	xa_oldroot = lkl_sys_open("/", LKL_O_RDONLY | LKL_O_DIRECTORY, 0);
 	if (xa_oldroot < 0 || lkl_sys_chroot(mp) || lkl_sys_chdir("/"))
@@ -1160,9 +1164,12 @@ static void xname_tests(void)
 		{ "k", "user.k" }, { "user.k", "user.user.k" }, { "security.foo", "user.security.foo" },
 		{ XFI, "user.com.apple.FinderInfo" },
 	};
+	/* the legacy scheme (NTFS, from before patch 0013): a bare com.apple.* name is the Mac's own */
+	static const char *const bare[] = { XTAGS, XFI, "com.apple.k" };
 	static const char *const hidden[] = {
 		"security.selinux", "trusted.x", "system.posix_acl_access", "osx.k", "user.", XMETA,
 		"user.org.netatalk.ResourceFork", XAFPI, "user.DosStream.k:$DATA", "user.DosStreamExt.1.k:$DATA",
+		"$LXUID", "$LXMOD", "k", "com.apple", "com.applex.k",
 	};
 	char b[300], what[160], longname[300];
 	size_t i;
@@ -1172,6 +1179,10 @@ static void xname_tests(void)
 		is_str(lklfuse_xname_to_linux(pair[i][0], b, sizeof(b)) == 0 ? b : NULL, pair[i][1], what);
 		snprintf(what, sizeof(what), "xname_table: %s -> %s", pair[i][1], pair[i][0]);
 		is_str(lklfuse_xname_to_mac(pair[i][1], b, sizeof(b)) == 0 ? b : NULL, pair[i][0], what);
+	}
+	for (i = 0; i < sizeof(bare) / sizeof(bare[0]); i++) {
+		snprintf(what, sizeof(what), "xname_table: bare %s -> %s, the legacy scheme", bare[i], bare[i]);
+		is_str(lklfuse_xname_to_mac(bare[i], b, sizeof(b)) == 0 ? b : NULL, bare[i], what);
 	}
 	for (i = 0; i < sizeof(hidden) / sizeof(hidden[0]); i++) {
 		snprintf(what, sizeof(what), "xname_table: %s is hidden from the Mac", hidden[i]);
@@ -1377,6 +1388,55 @@ static void xa_mixed_tests(void)
 	xa_leave(3);
 }
 
+/* lklfuse's xattr NAME of PATH is exactly LEN bytes VAL */
+static int mac_is(const char *path, const char *name, const void *val, int len)
+{
+	char b[4096];
+
+	return lklfuse_getxattr(path, name, b, sizeof(b)) == len && memcmp(b, val, len) == 0;
+}
+
+/*
+ * NTFS, the legacy scheme: before patch 0013 linuxfs passed Mac names through, and ntfs3 stored them bare (the census
+ * saw them round-trip). Those are read and changed where they are; a new one goes to user.N; if a name is there both
+ * ways, user.N is the one. WSL's $LX* and other non-Mac names stay hidden. Planted here as that linuxfs wrote them.
+ */
+static void xa_ntfs_tests(void)
+{
+	is(xa_enter(4), 0, "ntfs image: mounted");
+	if (xa_oldroot < 0)
+		return;
+	plant("/f", "f");
+	is(lkl_sys_setxattr("/f", XTAGS, "old", 3, 0) == 0 && lkl_sys_setxattr("/f", "$LXUID", "\0\0\0\0", 4, 0) == 0 &&
+	   lkl_sys_setxattr("/f", "foo.bar", "x", 1, 0) == 0, 1, "ntfs: planted a bare tag, $LXUID and foo.bar, as before 0013");
+	is(listed("/f", XTAGS, 0), 1, "ntfs legacy: listxattr shows the bare tag under its own name");
+	is(listed("/f", "$LX", 1) + listed("/f", "foo.", 1), 0, "ntfs legacy: and hides $LXUID and foo.bar");
+	is(mac_is("/f", XTAGS, "old", 3), 1, "ntfs legacy: getxattr reads the bare tag");
+	is(lklfuse_getxattr("/f", "$LXUID", NULL, 0), -HOST_ENOATTR, "ntfs legacy: getxattr $LXUID: ENOATTR");
+	is(lklfuse_setxattr("/f", XTAGS, "new", 3, XATTR_CREATE), -EEXIST, "ntfs legacy: XATTR_CREATE on the bare tag: EEXIST");
+	is(lklfuse_setxattr("/f", XTAGS, "newer", 5, XATTR_REPLACE), 0, "ntfs legacy round trip: set the tag");
+	is(raw_is("/f", XTAGS, "newer", 5), 1, "ntfs legacy round trip: changed in place, bare");
+	is(raw_has("/f", "user." XTAGS), 0, "ntfs legacy round trip: no user. copy made");
+	is(mac_is("/f", XTAGS, "newer", 5), 1, "ntfs legacy round trip: get it back");
+	is(lklfuse_removexattr("/f", XTAGS), 0, "ntfs legacy: removexattr the bare tag");
+	is(raw_has("/f", XTAGS), 0, "ntfs legacy: the bare tag is gone");
+	is(raw_has("/f", "$LXUID") + raw_has("/f", "foo.bar"), 2, "ntfs legacy: $LXUID and foo.bar untouched");
+	plant("/g", "g");
+	is(lklfuse_setxattr("/g", XTAGS, "tag", 3, 0), 0, "ntfs: a new tag");
+	is(raw_is("/g", "user." XTAGS, "tag", 3) && !raw_has("/g", XTAGS), 1, "ntfs: goes to user.N, not bare");
+	plant("/h", "h");
+	lkl_sys_setxattr("/h", XTAGS, "bare", 4, 0);
+	lkl_sys_setxattr("/h", "user." XTAGS, "user", 4, 0);
+	is(listed("/h", XTAGS, 0), 1, "ntfs both ways: listed once");
+	is(mac_is("/h", XTAGS, "user", 4), 1, "ntfs both ways: getxattr reads user.N");
+	is(lklfuse_setxattr("/h", XTAGS, "set", 3, 0), 0, "ntfs both ways: set");
+	is(raw_is("/h", "user." XTAGS, "set", 3) && raw_is("/h", XTAGS, "bare", 4), 1, "ntfs both ways: changes user.N, not the bare one");
+	lkl_sys_unlink("/f");
+	lkl_sys_unlink("/g");
+	lkl_sys_unlink("/h");
+	xa_leave(4);
+}
+
 static void xattr_tests(const char *dir)
 {
 	char *big;
@@ -1394,6 +1454,7 @@ static void xattr_tests(const char *dir)
 	xa_netatalk_tests();
 	xa_fruit_tests();
 	xa_mixed_tests();
+	xa_ntfs_tests();
 }
 
 /*
