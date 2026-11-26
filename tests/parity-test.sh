@@ -1679,6 +1679,14 @@ r=$(rb '2|head line')
 expect census_refusals_bar_rotated has "$r" "^not ok - spotlight: no refusals for linuxfs volumes (2 lines, 1 linuxfs mount points searched"
 r=$( (PARITY_SYSLOG=$T/rb.log; census_log_pos) )
 expect census_log_pos test "$r" = "5|new head"
+# (Task 19b) a first line with a backslash (sudo's COMMAND= lines carry printf "%s\n") is kept as it is: 10.9's /bin/sh is
+#   bash 3.2 in POSIX mode with xpg_echo, whose echo turns \n into a newline, so a position echo made never matched again
+printf '%s\n' 'Nov 26 sudo[1]: COMMAND=/bin/sh -c printf "%s\n" "$2" >> "$1"' 'one' > "$T/bs.log"
+r=$( (PARITY_SYSLOG=$T/bs.log; census_log_pos) )
+expect census_log_pos_backslash test "$r" = "2|$(head -n 1 "$T/bs.log")"
+r=$( (PARITY_SYSLOG=$T/bs.log; p=$(census_log_pos); echo two >> "$T/bs.log"; census_log_since "$p") )
+expect census_log_since_backslash test "$r" = two
+rm -f "$T/bs.log"
 rm -f "$T/rb.log.0.gz"
 # (fix round 1, m3) only fseventsd's, mds's and mdworker's access refusals count; mds_stores's, mdflagwriter's and any
 #   tagging one (item 7's) are recorded in refusals-linuxfs-other.txt, not counted
@@ -2031,6 +2039,15 @@ rm -f "$T/sl" "$T/sl.0.bz2"
 expect smoke_syslog_not_tail test -z "$(grep -n 'tail -n 3000' "$sm")"
 expect smoke_syslog_mark ascending "$(first_line '^PARITY_T0=')" "$(first_line '^LOG0=')" "$(first_line '^installed=')"
 expect smoke_syslog_in_finish test -n "$(smoke_fn finish | grep 'syslog_since "$LOG0" "$LOGHEAD"')"
+# (Task 19b) the smoke's log_pos keeps a first line's backslashes, as census_log_pos does: read back through log_since,
+#   only what came after
+lp_l=$T/lp.log
+printf '%s\n' 'Nov 26 sudo[1]: COMMAND=/bin/sh -c printf "%s\n" "$2" >> "$1"' 'one' > "$lp_l"
+lpfn() { (eval "$(smoke_fn log_pos | sed "s|/var/log/system.log|$lp_l|g")"; eval "$(smoke_fn log_since)"; "$@"); }
+expect smoke_log_pos_backslash test "$(lpfn log_pos)" = "2|$(head -n 1 "$lp_l")"
+r=$( (PARITY_SYSLOG=$lp_l; lpfn eval 'p=$(log_pos); echo two >> "$PARITY_SYSLOG"; log_since "$p"') )
+expect smoke_log_since_backslash test "$r" = two
+rm -f "$lp_l"
 
 # da_unmount and da_eject (item 4, Step 2): who holds the volume is sudo -n lsof on its mount point (every user's files,
 #   root's too), never lsof +D as the user; an eject's failure also says DiskArbitration's view, mount's line and who has

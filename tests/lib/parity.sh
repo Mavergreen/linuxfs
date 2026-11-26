@@ -1482,7 +1482,8 @@ syslog_since() {  # LINES FIRST [LOG]
 }
 census_log_lines() { wc -l <"$PARITY_SYSLOG" 2>/dev/null | tr -d ' '; }
 # census_log_pos: system.log's position now, "LINES|FIRST" (its length and its first line), for census_log_since
-census_log_pos() { echo "$(census_log_lines)|$(head -n 1 "$PARITY_SYSLOG" 2>/dev/null)"; }
+#   (Task 19b: printf, never echo, whose xpg_echo on 10.9's /bin/sh rewrites a backslash in that first line)
+census_log_pos() { printf '%s|%s\n' "$(census_log_lines)" "$(head -n 1 "$PARITY_SYSLOG" 2>/dev/null)"; }
 # census_log_since POS: system.log after POS (census_log_pos's), read through any turnover since by syslog_since; a bare
 #   line count (no |) is read in the current file alone
 census_log_since() {

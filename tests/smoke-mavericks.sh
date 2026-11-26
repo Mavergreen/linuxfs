@@ -441,7 +441,9 @@ da_mount_true() {  # DEV MP FS
   test "$dmt_m" = Yes && test -n "$dmt_l"
 }
 # system.log's position (LINES|FIRST-LINE), for syslog_since
-log_pos() { echo "$(wc -l < /var/log/system.log 2> /dev/null | tr -d ' ')|$(head -n 1 /var/log/system.log 2> /dev/null)"; }
+# Task 19b: printf, not echo: 10.9's /bin/sh (bash 3.2, POSIX mode, xpg_echo) would turn a backslash in the first line (sudo's
+#   COMMAND= lines carry printf "%s\n") into something else, and the position would never match system.log again
+log_pos() { printf '%s|%s\n' "$(wc -l < /var/log/system.log 2> /dev/null | tr -d ' ')" "$(head -n 1 /var/log/system.log 2> /dev/null)"; }
 # system.log since POS (log_pos's, or the census's census_log_pos: the same form), PARITY_SYSLOG's when the census library set it
 log_since() { syslog_since "${1%%|*}" "${1#*|}" "${PARITY_SYSLOG:-/var/log/system.log}" 2> /dev/null; }
 no_mount_failed() {  # POS: system.log since POS has no mount_macfuse or libfuse mount failure; prints any it has
