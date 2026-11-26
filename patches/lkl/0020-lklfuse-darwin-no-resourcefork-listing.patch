@@ -1,0 +1,23 @@
+lklfuse: com.apple.ResourceFork is not listed on Darwin, since a Mac can never read it
+
+macFUSE's libfuse, which lklfuse runs without the darwin extensions (FUSE_DARWIN_ENABLE_EXTENSIONS 0, patch 0004), replies
+ENOTSUP to every getxattr and setxattr of com.apple.ResourceFork before lklfuse is called (lib/fuse_lowlevel.c at the
+pinned library3 85f89460), but passes listxattr's names through. Patch 0013 lists the name for netatalk's
+user.org.netatalk.ResourceFork, Samba fruit's AFP_Resource stream and a bare user.com.apple.ResourceFork (rsync -X from a
+Mac), so `xattr -l` and `rsync -aX` from the volume failed on a name they were told was there (final review r1 N2).
+lklfuse_xlist leaves it out; the fork stays on disk, untouched, for Linux. tests/lklfuse-ops-test.c lists each of the
+three and finds no com.apple.ResourceFork, the rest still listed.
+
+diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
+--- a/tools/lkl/lklfuse.c
++++ b/tools/lkl/lklfuse.c
+@@ -1481,6 +1481,9 @@
+ 			continue;
+ 		if (r == 0 && strcmp(mac, LKLFUSE_FINDERINFO) == 0 && lklfuse_xuser_zero(path, raw + off))
+ 			continue;	/* an all-zero Finder Info is none */
++		if (strcmp(mac, LKLFUSE_RESOURCEFORK) == 0)
++			continue;	/* macFUSE's libfuse, without the darwin extensions, refuses every get of it (ENOTSUP):
++					 * not listed, so listxattr names only what a Mac can read (final review r1 N2) */
+ 		for (m = 0; m < o && strcmp(out + m, mac); m += strlen(out + m) + 1)
+ 			;
+ 		if (m < o || o + (long)strlen(mac) + 1 > n)

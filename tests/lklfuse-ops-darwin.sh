@@ -11,7 +11,8 @@
 #          which Linux makes too, and reads back after lklfuse has written them: tests/lib/check-xattrs.sh; and on a blank
 #          NTFS image, the bare com.apple.* names linuxfs stored there before 0013), and what its init asks of macFUSE
 #          (patch 0014: case-sensitive, unless -o nocase), and an image file's exclusive lock (patch 0019: an image
-#          hdiutil attached, here -nomount, is refused). Needs
+#          hdiutil attached, here -nomount, is refused; a file system that cannot flock is not), and no
+#          com.apple.ResourceFork listed (patch 0020: libfuse never serves it). Needs
 #          build/build-lkl-darwin.sh's output.
 set -u
 case "$(uname -s)" in Darwin) ;; *) echo "lklfuse-ops-darwin.sh: runs on a Mac" >&2; exit 77 ;; esac

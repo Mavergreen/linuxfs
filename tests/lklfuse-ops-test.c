@@ -860,6 +860,19 @@ static int lists(const char *path, const char *name)
 }
 
 /* how many times listxattr of PATH has NAME; or, with PREFIX set, names starting with NAME */
+#ifdef __APPLE__
+/* final review r1 N1: flock as a file system that cannot lock answers (stub_flock_err) */
+static int stub_flock_err;
+
+static int stub_flock(int fd, int op)
+{
+	(void)fd;
+	(void)op;
+	errno = stub_flock_err;
+	return -1;
+}
+#endif
+
 static int listed(const char *path, const char *name, int prefix)
 {
 	char b[4096];
@@ -1290,6 +1303,11 @@ static void xa_ours_tests(void)
 	is(fi_is("/f", fi_planted), 1, "ours: getxattr FinderInfo reads user.com.apple.FinderInfo");
 	is(listed("/f", XFI, 0) + listed("/f", XTAGS, 0), 2, "ours: listxattr shows FinderInfo and the tag");
 	is(listed("/f", "user.", 1), 0, "ours: and no user. name");
+	/* final review r1 N2: a resource fork rsync -X brought from a Mac (user.com.apple.ResourceFork) is not listed either */
+	lkl_sys_setxattr("/f", "user.com.apple.ResourceFork", "rsrc", 4, 0);
+	is(listed("/f", "com.apple.ResourceFork", 0), 0, "ours: user.com.apple.ResourceFork lists no com.apple.ResourceFork");
+	is(listed("/f", XFI, 0) + listed("/f", XTAGS, 0), 2, "ours: beside it, the rest are still listed");
+	lkl_sys_removexattr("/f", "user.com.apple.ResourceFork");
 	is(lklfuse_setxattr("/f", XFI, fi_new, 32, 0), 0, "ours round trip: set FinderInfo");
 	is(fi_is("/f", fi_new), 1, "ours round trip: get it back");
 	is(raw_is("/f", "user.com.apple.FinderInfo", fi_new, 32), 1, "ours round trip: stored as user.com.apple.FinderInfo");
@@ -1328,6 +1346,11 @@ static void xa_netatalk_tests(void)
 	is(listed("/f", XFI, 0), 1, "listxattr_hides: the netatalk file shows com.apple.FinderInfo");
 	is(listed("/f", "org.netatalk.Metadata", 0) + listed("/f", XMETA, 0), 0, "listxattr_hides: never org.netatalk.Metadata");
 	is(listed("/f", XTAGS, 0), 1, "netatalk: and its tag (user.N, as netatalk stores other xattrs)");
+	/* final review r1 N2: netatalk's resource fork is never listed: libfuse refuses every get of com.apple.ResourceFork */
+	lkl_sys_setxattr("/f", "user.org.netatalk.ResourceFork", "rsrc", 4, 0);
+	is(listed("/f", "com.apple.ResourceFork", 0), 0, "netatalk: user.org.netatalk.ResourceFork lists no com.apple.ResourceFork");
+	is(listed("/f", XFI, 0) + listed("/f", XTAGS, 0), 2, "netatalk: beside it, the rest are still listed");
+	lkl_sys_removexattr("/f", "user.org.netatalk.ResourceFork");
 	is(fi_is("/f", fi_planted), 1, "netatalk: getxattr FinderInfo reads the blob's (offset 122)");
 	n = lkl_sys_getxattr("/f", XMETA, before, sizeof(before));
 	is((int)n, 402, "netatalk: the blob is 402 bytes");
@@ -1442,8 +1465,9 @@ static void carrier_tests(void)
 	lkl_sys_setxattr("/g", "user.DosStream.com.apple.FinderInfo:$DATA", afp, 61, 0);
 	is(listed("/g", XFI, 0), 0, "carriers: a stream named com.apple.FinderInfo, AfpInfo-shaped, is not listed");
 	is(lklfuse_getxattr("/g", XFI, b, sizeof(b)), -HOST_ENOATTR, "carriers: (getxattr does not read it)");
-	is(listed("/f", "com.apple.ResourceFork", 0) + listed("/f", "k", 0) + listed("/f", "a:b", 0), 3,
-	   "carriers: and lists the rest by their Mac names");
+	is(listed("/f", "k", 0) + listed("/f", "a:b", 0), 2, "carriers: and lists the rest by their Mac names");
+	/* final review r1 N2: but not com.apple.ResourceFork, which macFUSE's libfuse never gets for lklfuse (ENOTSUP) */
+	is(listed("/f", "com.apple.ResourceFork", 0), 0, "carriers: the AFP_Resource stream is not listed (libfuse cannot serve it)");
 	lkl_sys_removexattr("/f", "user.DosStream.DosStream.x:$DATA");
 	lkl_sys_removexattr("/f", "user.DosStream.org.netatalk.Metadata:$DATA");
 	lkl_sys_removexattr("/f", "user.DosStream.y:$DATA:$DATA");
@@ -1856,6 +1880,60 @@ int main(int argc, char **argv)
 		is(lklfuse_lock_image(n1) == 0 && lklfuse_lock_image(n2) == 0, 1, "image lock: a device is not locked (two opens of /dev/null)");
 		close(n1);
 		close(n2);
+		/* final review r1 N1: only another holder (EWOULDBLOCK) refuses; a file system that cannot flock (an NFS share with
+		 * no lockd: ENOLCK; a FUSE volume: ENOTSUP) serves the image unlocked, with a note that is not the CLI's
+		 * "already mounted" ("unable to exclusively lock") */
+		{
+			static const int errs[] = { ENOTSUP, ENOLCK, EOPNOTSUPP, EINVAL };
+			char what[160], note[512];
+			size_t k;
+			int saved = dup(2), lf;
+			FILE *nf;
+
+			snprintf(path, sizeof(path), "%s/lklfuse-ops-lock.XXXXXX", tmp && *tmp ? tmp : "/tmp");
+			a = mkstemp(path);
+			for (k = 0; k < sizeof(errs) / sizeof(errs[0]); k++) {
+				stub_flock_err = errs[k], lklfuse_image_flock = stub_flock;
+				snprintf(what, sizeof(what), "image lock: flock failing with %s is not a refusal", strerror(errs[k]));
+				is(lklfuse_lock_image(a), 1, what);
+			}
+			stub_flock_err = EWOULDBLOCK, lklfuse_image_flock = stub_flock;
+			errno = 0;
+			e = lklfuse_lock_image(a);
+			is(e == -1 && errno == EWOULDBLOCK, 1, "image lock: a stubbed EWOULDBLOCK still refuses");
+			stub_flock_err = ENOTSUP, lklfuse_image_flock = stub_flock;
+			lf = open(path, O_RDWR | O_TRUNC);
+			fflush(stderr);
+			dup2(lf, 2);
+			e = lklfuse_lock_image_said(a, "/nfs/data.img");
+			fflush(stderr);
+			dup2(saved, 2);
+			close(saved);
+			close(lf);
+			is(e, 0, "image lock: so lklfuse goes on (lklfuse_lock_image_said 0)");
+			note[0] = 0;
+			if ((nf = fopen(path, "r"))) {
+				size_t got = fread(note, 1, sizeof(note) - 1, nf);
+
+				note[got] = 0;
+				fclose(nf);
+			}
+			is(strstr(note, "/nfs/data.img") != NULL && strstr(note, "unable to exclusively lock") == NULL, 1,
+			   "image lock: and says so, in words the CLI does not read as already mounted");
+			stub_flock_err = EWOULDBLOCK, lklfuse_image_flock = stub_flock;
+			fflush(stderr);
+			lf = open("/dev/null", O_WRONLY);
+			saved = dup(2);
+			dup2(lf, 2);
+			e = lklfuse_lock_image_said(a, "/x.img");
+			dup2(saved, 2);
+			close(saved);
+			close(lf);
+			is(e, -1, "image lock: lklfuse_lock_image_said refuses another holder");
+			lklfuse_image_flock = flock;
+			close(a);
+			unlink(path);
+		}
 		if (att && *att) {
 			a = open(att, O_RDWR);
 			errno = 0;

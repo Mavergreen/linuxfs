@@ -56,8 +56,9 @@ A disk the Mac mounts after login (when it is connected, by `diskutil mount`, or
 by root, as one mounted before login is: linuxfs's mount daemon, which launchd starts when it is asked, mounts it for
 the user at the console. Like an HFS+ disk, it is shared with every user, root's processes included, so Spotlight and
 fsevents work on it. Since root mounted it, it should stay mounted when you log out, as an HFS+ disk does, open to
-whoever logs in next (with `owners`, Linux's ids decide what they can reach); that has not yet been checked on a real
-Mac. Eject it before logging out if it should go with you.
+whoever logs in next (with `owners`, Linux's ids decide what they can reach); that has not yet been checked through
+a logout (CI's 10.9 VM tests disk images with one user who stays logged in). Eject it before logging out if it should go
+with you.
 
 Some disks fall back to a mount of your own, which is yours alone, with no Spotlight or fsevents: an encrypted APFS
 volume (it needs your password), and any disk while the mount daemon is missing or busy. The Mac runs linuxfs's mount
@@ -192,3 +193,8 @@ lock held in it. If the directory is not root's own, mode 0700, the uninstaller 
   ext4 image and 100 of an HFS+ one, it happened twice, both times to the HFS+ image (2 of 50 in one loop), and never
   to ext4. The log shows `hdiutil`'s `diskimages-helper` claiming, unmounting and ejecting the disk before any mount,
   on Apple's own HFS+ as on linuxfs: an `hdiutil` problem on 10.9, not linuxfs's. If it happens, attach again.
+- **Resource forks on Linux volumes cannot be read through macFUSE.** A resource fork stored by netatalk or Samba, or
+  brought from a Mac by `rsync -X`, stays on the disk, but the Mac cannot read or write it through linuxfs: macFUSE's
+  library refuses every request for `com.apple.ResourceFork` from a file system that, like linuxfs, does not use
+  macFUSE's Mac extensions. linuxfs does not list the attribute, so `xattr -l` and `rsync -aX` from the volume work, and
+  copies to a Mac disk arrive without the fork.
