@@ -350,6 +350,10 @@ int main(int argc, char **argv)
 		served(open_rw, getuid(), "0", "ok ext4\thelped", 1, "owner: open of a disk whose node is root's: ok, with the descriptor");
 		served(uuid, getuid(), "0", "ok ", 0, "owner: uuid of a disk whose node is root's: ok");
 		served(open_rw, getuid(), NULL, "ok ext4\thelped", 1, "owner: with no stand-in, the file's own owner (the caller): ok");
+		/* final review r0 m1: root may open anything, so sudo linuxfs ignore of an image the console user attached works */
+		served(open_rw, 0, "502", "ok ext4\thelped", 1, "owner (m1): root (peer 0) opens a disk whose node is another user's");
+		served(probe, 0, "502", "ok ext4\thelped", 0, "owner (m1): and probes it");
+		served(uuid, 0, "502", "ok ", 0, "owner (m1): and reads its uuid");
 		/* m2: the descriptor handed out is checked itself, so a node reused between the stat and the open is refused */
 		fd_node = "502";
 		served(open_rw, getuid(), me, "no another user's disk", 0, "owner (m2): the opened node another user's: refused, no descriptor");
@@ -375,6 +379,9 @@ int main(int argc, char **argv)
 			setenv("LINUXFS_HELPER_TEST_NODE_UID", me, 1);
 			answers("noauto-remove LABEL=helped\n", getuid(), getuid(), "ok", "owner (m5): (its entry removed)");
 			answers("noauto-add LABEL=helped macfuse_ext4\n", getuid(), getuid(), "ok", "owner (m5): and so is the caller's own");
+			answers("noauto-remove LABEL=helped\n", getuid(), getuid(), "ok", "owner (m5): (its entry removed)");
+			setenv("LINUXFS_HELPER_TEST_NODE_UID", "502", 1);
+			answers("noauto-add LABEL=helped macfuse_ext4\n", 0, getuid(), "ok", "owner (m1): root's noauto-add sees another user's disk");
 			unsetenv("LINUXFS_HELPER_TEST_NODE_UID");
 			unsetenv("LINUXFS_FSTAB");
 			unlink(f);

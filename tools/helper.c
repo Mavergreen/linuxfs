@@ -323,7 +323,9 @@ done:
 #define TEST_ENV(name) NULL
 #endif
 
-/* "another user's disk" when a node owned by UID is not PEER's to have (fsrules_node_owner_ok), else NULL */
+/* "another user's disk" when a node owned by UID is not PEER's to have (fsrules_node_owner_ok), else NULL. Root (PEER 0) may have
+ * any (final review r0 m1): it could open the node itself, and sudo linuxfs ignore of an image the console user attached must
+ * find it */
 static const char *owner_refusal(uid_t uid, const char *test, uid_t peer)
 {
 #ifdef LINUXFS_HELPER_TEST
@@ -334,7 +336,7 @@ static const char *owner_refusal(uid_t uid, const char *test, uid_t peer)
 #else
 	(void)test;
 #endif
-	return fsrules_node_owner_ok(uid, peer) ? NULL : "another user's disk";
+	return peer == 0 || fsrules_node_owner_ok(uid, peer) ? NULL : "another user's disk";
 }
 
 /* Why DEV's node may not be handed to PEER, or NULL: checked before anything else is done with it */
