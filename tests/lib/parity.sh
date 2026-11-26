@@ -1,6 +1,8 @@
 # platform: host-agnostic
 #   Parity library, sourced by tests/smoke-mavericks.sh, which provides ok, notok, bounded, OUT and W
-#   (bounded takes tenths of a second, and on a timeout prints a "hung:" line and returns 124).
+#   (bounded takes tenths of a second, and on a timeout prints a "hung:" line and returns 124), and the checks of a
+#   DiskArbitration mount census_da_root runs (da_mount_true, no_mount_failed, da_root_mount, no_owner_pseudo, with
+#   info, mounted_by_root and log_since).
 #   Runs one step on an HFS+ control volume and on the filesystem under test, then records or
 #   compares what each did. POSIX sh, sed and diff only.
 #
@@ -38,7 +40,7 @@
 #                                         (diskutil unmount force on both, checked; Force Eject on HFS+ alone
 #                                         unless PARITY_BUSY_FORCE=1, recorded either way); a linuxfs disk that will not eject is recorded
 #                                         (eject-failed.txt) and left, the steps going on with a fresh copy
-#   census_spotlight FS                   item 5 (.fseventsd by PARITY_MODE_FSEVENTS_DA; the indexing steps only when indexing is on
+#   census_spotlight FS                   item 5 (.fseventsd by PARITY_MODE_FSEVENTS_DA, checked; the indexing steps only when indexing is on
 #                                         for the HFS+ control, census_index_mode): read-write HFS+ against FS, then
 #                                         attach -readonly HFS+ against FS with ReadOnly on: mdutil -i on (HFS+ alone),
 #                                         mdutil -s, an mdfind find (120 s), .Spotlight-V100 and .fseventsd,
@@ -59,7 +61,8 @@
 #                                         after each step, the disks it left are freed (census_sweep, census-sweep.txt)
 #                                         and Finder's dialogs dismissed (census_finder_dialogs, dialogs.txt); every
 #                                         linuxfs mount's names mode (names-mode.txt) barred by census_names_bar; and
-#                                         census_refusals_bar (PARITY_MODE_FSEVENTS_DA): no fseventsd, mds or mdworker refused on any of those
+#                                         census_refusals_bar (PARITY_MODE_FSEVENTS_DA): no fseventsd, mds or mdworker refused on any of those;
+#                                         each pair's linuxfs volume root's mount, true to DiskArbitration (census_pair_up's census_da_root)
 #   Each records sysctl vfs.generic.macfuse once, as $OUT/parity/<census>.sysctl.txt. Every console step goes through
 #   $AQUA (guest-macosx-aqua by its path), and every screenshot follows census_dismiss (a dialog's or an offer's, from
 #   before the dialog or the attach). WHAT
@@ -94,13 +97,14 @@ PARITY_MODE_SPOTLIGHT=${PARITY_MODE_SPOTLIGHT:-check}
 #   remount's mdutil -s) failed on item 6's f_mntfromname ("could not resolve path"), not on item 5: they take
 #   PARITY_MODE_SPOTLIGHT_DA, checked since Task 16's fsname=/dev/<bsd>, which mds resolves as it does HFS+'s.
 PARITY_MODE_SPOTLIGHT_DA=${PARITY_MODE_SPOTLIGHT_DA:-check}
-# spec: .superpowers/sdd/2026-11-25-hfs-parity/push-d-debug.md and the root-daemon design's amendment (review I2) -- Task 16e takes
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/push-d-debug.md and the root-daemon design's amendment (review I2) -- Task 16e took
 #   allow_root off every logged-in DiskArbitration mount (the mount program's process has diskarbitrationd's groups, so macFUSE
-#   refused it: push D), so root's fseventsd and mds are refused there again, as in push C, until the mount daemon (Task 16l) lets
-#   them in. The three steps that need that, all on the census's DiskArbitration pairs, take PARITY_MODE_FSEVENTS_DA while
-#   PARITY_MODE_SPOTLIGHT is check: census_spotlight's .fseventsd, census_refusals_bar and census_busy_fsevents. Record until Task
-#   16l flips it to check. Root's mds is refused there too, so census_index_mode records the indexing steps while it is record.
-PARITY_MODE_FSEVENTS_DA=${PARITY_MODE_FSEVENTS_DA:-record}
+#   refused it: push D), so root's fseventsd and mds were refused there again in push E, as in push C. The three steps that need
+#   them let in, all on the census's DiskArbitration pairs, take PARITY_MODE_FSEVENTS_DA while PARITY_MODE_SPOTLIGHT is check:
+#   census_spotlight's .fseventsd, census_refusals_bar and census_busy_fsevents; census_index_mode records the indexing steps while
+#   it is record (root's mds). Task 16l: those mounts are root's now (the mount daemon, on demand: allow_other is root's to give,
+#   and census_da_root checks each pair's is), so it is check again, the index steps with it. record stays a mode it takes.
+PARITY_MODE_FSEVENTS_DA=${PARITY_MODE_FSEVENTS_DA:-check}
 # census_fsevents_mode: for a step that needs root's processes let in on a DiskArbitration volume, CFM, the mode it takes
 #   (PARITY_MODE_FSEVENTS_DA while PARITY_MODE_SPOTLIGHT is check, else PARITY_MODE_SPOTLIGHT's), and CFM_VAR, whose it is
 census_fsevents_mode() {
@@ -294,8 +298,14 @@ census_attach() {
 # spec: .superpowers/sdd/2026-11-25-hfs-parity/task-13b-brief.md item 1 -- lklfuse says how it finds names in its own log
 #   (patches/lkl/0012: "lklfuse: names: exact" or "scanning"), which the CLI writes afresh for each mount as
 #   ~/Library/Logs/linuxfs/<basename of the raw device>.log (cli/linuxfs: log=$LOGS/$(basename "$src").log, src=/dev/rdiskN),
-#   the mounting user's: for a DiskArbitration mount the console user's, who runs the smoke
+#   the mounting user's: the console user's, who runs the smoke, for a mount of its own; _linuxfs's (its home,
+#   PARITY_ROOT_HOME), read through sudo, for root's (Task 16l: DiskArbitration's mounts, through the mount daemon)
 PARITY_LKLOGS=${PARITY_LKLOGS:-$HOME/Library/Logs/linuxfs}
+PARITY_ROOT_HOME=${PARITY_ROOT_HOME:-/private/var/db/linuxfs}
+PARITY_ROOT_LKLOGS=${PARITY_ROOT_LKLOGS:-$PARITY_ROOT_HOME/Library/Logs/linuxfs}
+# root's records: the CLI's (cli/linuxfs STATE) as _linuxfs, one file per running lklfuse named by its pid: source, mount point,
+#   type, mode
+PARITY_ROOT_STATE=${PARITY_ROOT_STATE:-$PARITY_ROOT_HOME/Library/Caches/dev.mavergreen.linuxfs/mounts}
 # census_fs_mp NODE [slices]: from mount's lines on stdin, the mount point of a linuxfs mount of /dev/NODE (with slices, or
 #   of one of its slices, /dev/NODEsN): one whose type is one of the six macfuse_<fs> exactly. DiskArbitration's linuxfs
 #   mounts are named /dev/<bsd> as the Mac's are (item 6), so the type tells them apart, never the name.
@@ -310,13 +320,16 @@ census_fs_mp() {
 }
 # census_names_mode NODE MP: for a linuxfs mount (census_fs_mp: /dev/NODE on MP, one of the six types), its names line, read
 #   at once (the next mount of NODE writes the log afresh), appended to names-mode.txt as "NODE MP: MODE ...", or "NODE MP:
-#   none (...)" when the log has none; nothing for any other mount (HFS+, FAT32)
+#   none (...)" when the log has none; nothing for any other mount (HFS+, FAT32). The user's log first; when it has no names
+#   line, _linuxfs's (root's mount), through sudo
 census_names_mode() {
   _cnm_n=${1#/dev/}
   test "$(bounded 100 mount 2>/dev/null </dev/null | census_fs_mp "$_cnm_n")" = "$2" || return 0
   _cnm_l=$(sed -n 's/^lklfuse: names: //p' "$PARITY_LKLOGS/r$_cnm_n.log" 2>/dev/null | tail -n 1)
+  test -n "$_cnm_l" ||
+    _cnm_l=$(bounded 100 sudo -n cat "$PARITY_ROOT_LKLOGS/r$_cnm_n.log" 2>/dev/null </dev/null | sed -n 's/^lklfuse: names: //p' | tail -n 1)
   mkdir -p "$OUT/parity"
-  echo "$_cnm_n $2: ${_cnm_l:-none (no names line in $PARITY_LKLOGS/r$_cnm_n.log)}" >>"$OUT/parity/names-mode.txt"
+  echo "$_cnm_n $2: ${_cnm_l:-none (no names line in $PARITY_LKLOGS/r$_cnm_n.log or $PARITY_ROOT_LKLOGS/r$_cnm_n.log)}" >>"$OUT/parity/names-mode.txt"
 }
 # census_names_bar: names-mode.txt counted. With PARITY_NAMES_WANT (the smoke's: exact with macFUSE 5.5.0-mavericks.5 or
 #   later, else scanning), ok when no mount ran the other mode and one at least ran the wanted one (none would prove
@@ -1067,8 +1080,19 @@ census_busy_ejects() {
   echo "$be_busy $be_k"
 }
 
-# census_lklfuse_gone MP: returns once no lklfuse serves MP (its command's last argument); run it under bounded
+# census_root_live: root's records (PARITY_ROOT_STATE, read through sudo) whose pid still runs an lklfuse (one ps), as
+#   "PID<TAB>SOURCE<TAB>MP<TAB>TYPE<TAB>MODE" lines (a record outlives its lklfuse until the CLI next reads them); each read
+#   bounded at 10 s, nothing when either fails
+census_root_live() {
+  _crl_r=$(bounded 100 sudo -n sh -c 'for f in "$1"/*; do test -f "$f" || continue; printf "%s\t" "${f##*/}"; head -n 1 "$f"; done' _ "$PARITY_ROOT_STATE" 2>/dev/null </dev/null) || return 0
+  test -n "$_crl_r" || return 0
+  _crl_p=$(bounded 100 ps -axww -o pid=,command= 2>/dev/null </dev/null) || return 0
+  printf '%s\n' "$_crl_r" | CRL_PS=$_crl_p awk -F'\t' 'BEGIN { n = split(ENVIRON["CRL_PS"], l, "\n"); for (i = 1; i <= n; i++) if (l[i] ~ /lklfuse/) { split(l[i], w, " "); live[w[1]] = 1 } } $1 in live'
+}
+# census_lklfuse_gone MP: returns once no lklfuse serves MP: root's records first (a root mount's lklfuse serves /dev/fd/N, so
+#   its pid is waited for), then any whose command's last argument is MP (the user's own); run it under bounded
 census_lklfuse_gone() {
+  for _clg_p in $(census_root_live | awk -F'\t' -v m="$1" '$3 == m { print $1 }'); do census_pid_gone "$_clg_p"; done
   while ps -axww -o command= 2>/dev/null </dev/null | awk -v m=" $1" '/lklfuse/ && !/awk/ && length($0) > length(m) && substr($0, length($0) - length(m) + 1) == m { f = 1 } END { exit !f }'; do
     sleep 0.2
   done
@@ -1314,12 +1338,18 @@ PARITY_SPOT_SECS=${PARITY_SPOT_SECS:-120}   # census_mdfind: once a second; the 
 PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/AlertStopIcon.icns}
 # The guest job has 180 min. Before the smoke: the VM's boot and the installs, about 5. The census begins nothing after
 #   PARITY_CENSUS_MIN = 132 min from the smoke's start (PARITY_T0, which the smoke sets first), and begins a step only if
-#   at its worst (census_worst_min: the console hung; since Task 15 spotlight 32, busy 32 since Task 16e-fix, census_finder 30, the sweep
-#   and dismissal after each counted in) it ends by 132 + 11 = 143: spotlight begins by 111, busy by 111, census_finder
-#   by 113, trash/tags/case by 122, unicode by 126, a stall iteration by 80. Task 15 adds after the census
+#   at its worst (census_worst_min: the console hung; spotlight 33 and census_finder 31 since Task 16l, busy 32 since Task 16e-fix,
+#   the sweep and dismissal after each counted in) it ends by 132 + 11 = 143: spotlight begins by 110, busy by 111, census_finder
+#   by 112, trash/tags/case by 121, unicode by 126, a stall iteration by 80. Task 15 adds after the census
 #   census_refusals_bar (its system.log read bounded at 60 s: 1 min) and the smoke's non-admin mount (290 s at its
 #   bounds since fix round 1: 5 min), so PARITY_CENSUS_MIN went from 135 to 132. Then before login (about 5) and the copyback and uploads
-#   (about 5) remain: 5 + 143 + 1 + 5 + 5 + 5 = 164 of 180, under the 165 allowed. Typical
+#   (about 5) remain: 5 + 143 + 1 + 5 + 5 + 5 = 164 of 180, under the 165 allowed. Task 16l adds after the census one step, in
+#   the before-login section and within its 5: "the mount daemon was not asked", one read of system.log bounded at 10 s.
+#   The worst case rests on the 300 s bound (bounded 3000) on each hdiutil attach, which caps everything inside it:
+#   DiskArbitration's probe, the mount program, the mount daemon (at most 290 s: root-daemon design N6), and a user path after
+#   a late "user" (up to 100 s, then the user path's own bounds, a dialog's wait among them). Those parts are not summed to fit
+#   under 300 s, and need not be (R3): a total past 300 s ends at the attach's bound, as any hung attach does; it does not move
+#   the worst case. Typical
 #   steps are shorter: spotlight about 11 (its 120 s mdfind waits, remounts, Finder's refresh, the Privacy shots); a
 #   busy census about 7, or about 11 with a stuck disk at each of its six re-attaches; one trash/tags/case census about
 #   3; one stall iteration under 1. Push A's census, its Finder steps not
@@ -1329,18 +1359,29 @@ PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Content
 #   census_finder's 24 at worst). A stall iteration's worst is 60 min (census_worst_min), and census_stall asks census_due
 #   "stall ..." before each of its 200 iterations, so none begins after minute 80 (63 since Task 13b, the sweep after
 #   it counted) and every one ends by 143 like every other step (164 of 180 in all, as above). A step's larger worst
-#   case (Task 13b's 31, Task 15's 32) moves only when it may begin, never that end.
+#   case (Task 13b's 31, Task 15's 32, Task 16l's 33) moves only when it may begin, never that end.
 PARITY_CENSUS_MIN=${PARITY_CENSUS_MIN:-132}
 
 # census_pair_up CTL-IMAGE FS-IMAGE FS [readonly]: attaches both (the control -readonly when readonly) and makes them
-#   the pair (PARITY_CTL_DEV and PARITY_FS_DEV the mounted nodes); 1 when either fails, with what did attach ejected
+#   the pair (PARITY_CTL_DEV and PARITY_FS_DEV the mounted nodes); 1 when either fails, with what did attach ejected;
+#   (Task 16l) and checks the linuxfs volume as the smoke's da_cycle does: census_da_root, since its attach
 census_pair_up() {
   census_attach "$1" ${4:-} || return 1
-  _cp_hd=$CA_DISK _cp_hm=$CA_MP _cp_hv=$CA_VOL _cp_hdev=$CA_DEV
+  _cp_hd=$CA_DISK _cp_hm=$CA_MP _cp_hv=$CA_VOL _cp_hdev=$CA_DEV _cp_pos=$(census_log_pos)
   census_attach "$2" || { census_detach "$_cp_hd" apple; return 1; }
   parity_pair "$_cp_hd" "$_cp_hm" "$_cp_hv" "$3" "$CA_DISK" "$CA_MP" "$CA_VOL"
   PARITY_CTL_DEV=$_cp_hdev PARITY_FS_DEV=$CA_DEV
+  census_da_root "$CA_DEV" "$CA_MP" "$3" "$_cp_pos"
+  return 0
 }
+# census_da_root DEV MP FS POS: a DiskArbitration mount of FS at MP from DEV, attached since POS (census_log_pos), is root's and
+#   true to DiskArbitration: the smoke's da_mount_true, no_mount_failed, da_root_mount and no_owner_pseudo, together one check
+#   bounded at 10 s, said ok, or not ok with what they printed (the first to fail last)
+census_da_root() {
+  if _cdr_o=$(bounded 100 census_da_root_checks "$@" 2>&1 </dev/null); then ok "census $3: $1 on $2 is root's mount, true to DiskArbitration"
+  else notok "census $3: $1 on $2 is root's mount, true to DiskArbitration"; printf '%s\n' "$_cdr_o" | sed 's/^/# /'; fi
+}
+census_da_root_checks() { da_mount_true "$1" "$2" "$3" && no_mount_failed "$4" && da_root_mount "$2" "$1" "$3" "$4" && no_owner_pseudo "$2" "$4"; }
 # census_pair_down: the pair ejected (the control as Apple's, the other as linuxfs's); 1 when the latter is left attached
 census_pair_down() {
   census_detach "$PARITY_FS_DISK" fs "$PARITY_FS_MP"; _cpd_rc=$?
@@ -2001,15 +2042,22 @@ census_later() {
 #   after each side's Finder query, beside each side's Get Info), one sudo of df and du bounded at 5 s: 29.2 + 30 / 60 =
 #   29.7, still 30;
 #   census_trash_tags_case 13 + (3 census_finder_ask 3 x (68 + 13) = 243 + 205) / 60 = 20.5, 21;
+#   Task 16l adds census_da_root (bounded at 10 s) to each census_pair_up whose linuxfs attach mounts: spotlight's five
+#   (each pass's pair and remount, and the ro pass's first pair, which makes the file), 31.8 + 50 / 60 = 32.6, 33;
+#   census_finder's one, 29.7 + 10 / 60 = 29.9, 31 (29.8 was too thin a margin under 30 in fix round 3 above); trash/tags/
+#   case's two (its pair, then the remount's or the recovery's pair_up, never both), 20.5 + 20 / 60 = 20.8, 22 (as thin);
+#   busy, unicode, later and the stall make no pair (census_attach alone) and do not move. census_lklfuse_gone's and
+#   census_lklfuse_on's read of root's records (sudo and ps, 10 s each) is inside census_lklfuse_gone's 30 s bound, and
+#   adds 20 s to census_sweep_disk's path with no mount line (64 s, under the 137 counted);
 #   census_later 5 + 205 / 60 = 8.4, 9;
 #   a stall iteration 60 + 137 / 60 = 62.3, 63 (counted on each, though only the last is followed by the sweep);
 #   anything else 11
 census_worst_min() {
   case $1 in
-  census_spotlight) echo 32 ;;
+  census_spotlight) echo 33 ;;
   census_busy) echo 32 ;;
-  census_finder) echo 30 ;;
-  census_trash_tags_case) echo 21 ;;
+  census_finder) echo 31 ;;
+  census_trash_tags_case) echo 22 ;;
   census_unicode) echo 17 ;;
   census_later) echo 9 ;;
   stall | census_stall) echo 63 ;;
@@ -2123,9 +2171,10 @@ census_apple_image() {
   case ${1##*/} in ctl-fat32.img | *-hfs.img | *-hfs-*.img | *-hfsx-*.img | *-exfat.img) return 0 ;; esac
   return 1
 }
-# census_lklfuse_on DISK: an lklfuse's command names DISK's raw device (/dev/rDISK, or a slice /dev/rDISKsN): 0 when one
-#   does, 1 when none does, 2 when ps cannot say
+# census_lklfuse_on DISK: a live lklfuse's root record (census_root_live) names DISK's raw device as its source, or an
+#   lklfuse's command does (/dev/rDISK, or a slice /dev/rDISKsN): 0 when one does, 1 when none does, 2 when ps cannot say
 census_lklfuse_on() {
+  census_root_live | awk -F'\t' -v r="/dev/r${1#/dev/}" '$2 == r || (index($2, r "s") == 1 && substr($2, length(r) + 2) ~ /^[0-9]+$/) { f = 1 } END { exit !f }' && return 0
   _clo_p=$(bounded 100 ps -axww -o command= 2>/dev/null </dev/null) || return 2
   test -n "$_clo_p" || return 2
   printf '%s\n' "$_clo_p" | awk -v r="/dev/r${1#/dev/}" '/lklfuse/ && !/awk/ { for (i = 1; i <= NF; i++) if ($i == r || index($i, r "s") == 1) f = 1 } END { exit !f }'

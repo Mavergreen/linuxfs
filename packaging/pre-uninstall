@@ -9,11 +9,11 @@
 #          directories), and removes the _linuxfs account and its home when nothing runs as it. An lklfuse under the .d directory counts as mounted too.
 #          The mount daemon is unloaded first, so no root mount can start during the check; then it waits, polling each second
 #          for up to 30 s, while a request already runs (spec §6: its processes are abandoned process groups, which unloading
-#          does not stop): a root mountd process (by its full path), a root mount_macfuse_<fs> (one of the six; root: effective and real uid 0), or a disk's
-#          lock held. If one still runs ("a mount is under way"), or a volume is mounted, it loads mountd again (saying so if
-#          that fails) and exits 1. A check that cannot run (ps, awk or perl failing), or a lock directory that is not root's
-#          own 0700 one, is said and fails open. Once no lock is held it removes the lock directory too; the daemon's log,
-#          /var/log/dev.mavergreen.linuxfs.mountd.log, stays.
+#          does not stop): a mountd process (by its full path) or a mount_macfuse_<fs> (one of the six), either of them
+#          root's (effective and real uid 0), or a disk's lock held. If one still runs ("a mount is under way"), or a volume
+#          is mounted, it loads mountd again (saying so if that fails) and exits 1. A check that cannot run (ps, awk or perl
+#          failing), or a lock directory that is not root's own 0700 one, is said and fails open. Once no lock is held it
+#          removes the lock directory too; the daemon's log, /var/log/dev.mavergreen.linuxfs.mountd.log, stays.
 [ "${MAVERGREEN_ROOT:-/}" = / ] || exit 0
 prefix=/usr/local/mavergreen/linuxfs
 priv=/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d

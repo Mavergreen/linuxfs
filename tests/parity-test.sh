@@ -21,10 +21,18 @@ bounded() {
   done
   wait "$bp"
 }
+# the same, kept under its own name: the census_dry section below swaps bounded for a stand-in that only marks what it runs, and
+#   the cases that need a real bound (a wait that must time out) put this one back in a subshell
+bounded_real() {
+  t=$1; shift
+  "$@" & bp=$!
+  i=0; while kill -0 "$bp" 2>/dev/null; do
+    i=$((i + 1)); test $i -le "$t" || { kill -9 "$bp" 2>/dev/null; echo "hung: $*"; return 124; }
+    sleep 0.1
+  done
+  wait "$bp"
+}
 . "$here/lib/parity.sh"
-# spec: tests/lib/parity.sh PARITY_MODE_FSEVENTS_DA -- record by default until Task 16l flips it; the cases below test its check, as
-#   before Task 16e (fsevents_da_record, at the end, tests the default)
-PARITY_MODE_FSEVENTS_DA=check
 
 fails=0
 expect() { # NAME CONDITION-COMMAND...
@@ -324,6 +332,12 @@ S=$T/stub; mkdir -p "$S/nodes" "$T/vols" "$T/in"
 PARITY_FSTAB=$S/fstab PARITY_DALOG=$S/dalog PARITY_DAPL=$S/da.plist STUB=$S PARITY_POLLS=3
 PARITY_SYSLOG=$S/syslog PARITY_ICNS=$S/icon.icns PARITY_SPOT_SECS=3
 PARITY_VOLICON_OF=$S/volicon.icns   # census_busy's linuxfs.icns (the smoke names each bundle's, %s for the fs; here one for all)
+# Task 16l: root's records and _linuxfs's lklfuse logs (its home's), which the stand-in sudo serves (its cat and sh)
+PARITY_ROOT_STATE=$S/rootstate PARITY_ROOT_LKLOGS=$S/rootlogs
+# census_da_root runs the smoke's own checks of a DiskArbitration mount, which the smoke defines before the census (Task 16l)
+for f in info mounted_by_root log_since da_mount_true no_mount_failed da_root_mount no_owner_pseudo; do
+  eval "$(awk -v n="$f() " 'index($0, n) == 1 { p = 1; print; if ($0 !~ /[{] *(#.*)?$/) exit; next } p { print } p && /^}/ { exit }' "$here/smoke-mavericks.sh")"
+done
 export PARITY_FSTAB PARITY_DALOG PARITY_SYSLOG STUB
 : > "$PARITY_FSTAB"; : > "$PARITY_DALOG"; : > "$PARITY_DAPL"; : > "$S/calls"; : > "$PARITY_SYSLOG"; echo icns > "$PARITY_ICNS"
 echo "linuxfs icns" > "$PARITY_VOLICON_OF"
@@ -357,15 +371,24 @@ node_of() { # a disk node, or a mount point: its node
   done
 }
 log() { echo "$(date +%H:%M:%S)   $*" >> "$PARITY_DALOG"; }
-# a linuxfs node's mount: lklfuse's own log, $STUB/lklogs/rNODE.log (the CLI's ~/Library/Logs/linuxfs/<basename of the raw
-#   device>.log, written afresh by each mount), with its names line: exact, or scanning with $STUB/names-scanning
+# a linuxfs node's fs: the bundle's, from its volume's name (unicode-btrfs, finder-xfs-1, ...); ext4 when it names none
+fs_of() { f=ext4; for b in btrfs xfs f2fs ntfs apfs; do case -$(field "$1" vol)- in *-$b-*) f=$b ;; esac; done; echo "$f"; }
+# a linuxfs node's mount, root's since Task 16l (the mount daemon's): lklfuse's own log, $STUB/rootlogs/rNODE.log (_linuxfs's
+#   ~/Library/Logs/linuxfs/<basename of the raw device>.log, written afresh by each mount), with its names line: exact, or
+#   scanning with $STUB/names-scanning; and the mount program's lines in system.log (root's mount_macfuse -o, mounted by root).
+#   With $STUB/da-macfuse-failed, macFUSE's refusal follows; with $STUB/da-owner-pseudo, DiskArbitration's ?owner= entry
 names_log() {
   # every mount feeds the stub fs_usage Finder's open of the volume's .VolumeIcon.icns
   printf '%s\n' "$(date +%H:%M:%S).000002  open  F=5  (R_____)  $(field "$1" mp)/.VolumeIcon.icns  0.000120   Finder.79271" >> "$STUB/fsu-feed"
   test "$(field "$1" disk)" = "$1" || return 0
-  mkdir -p "$STUB/lklogs"
+  mkdir -p "$STUB/rootlogs"
   if test -f "$STUB/names-scanning"; then m=scanning; else m=exact; fi
-  printf '%s\n' "lklfuse: mounting" "lklfuse: names: $m (stub)" > "$STUB/lklogs/r$1.log"
+  printf '%s\n' "lklfuse: mounting" "lklfuse: names: $m (stub)" > "$STUB/rootlogs/r$1.log"
+  f=$(fs_of "$1") mp=$(field "$1" mp)
+  { echo "Nov 25 10:00:00 stubhost linuxfs-mount[9]: mount_$f: $1 on $mp: mount_macfuse -o allow_other,nosuid,nodev,local,volname=$(field "$1" vol),fsname=/dev/$1,noappledouble,fstypename=$f (pid 99)"
+    test ! -f "$STUB/da-macfuse-failed" || echo "Nov 25 10:00:00 stubhost mount_macfuse[99]: mount_macfuse: failed to mount $mp@/dev/macfuse0: Operation not permitted"
+    test ! -f "$STUB/da-owner-pseudo" || echo "Nov 25 10:00:00 stubhost diskarbitrationd[8]: created disk, id = $mp?owner=0"
+    echo "Nov 25 10:00:00 stubhost linuxfs-mount[9]: mount_$f: $1 mounted on $mp by root, served by _linuxfs"; } >> "$PARITY_SYSLOG"
 }
 # with $STUB/da-forgets, DiskArbitration as push A saw it (item 4), when a linuxfs volume's mount was named linuxfs@rdiskN: a
 #   mount or an unmount of any other volume leaves its disk untied (.u): DiskArbitration says it is not mounted, its eject
@@ -466,12 +489,18 @@ diskutil)
     rm -f "$N/$d" "$N/$d.m" "$N/$d.u" "$N/${d}s1" "$N/${d}s1.m"; echo "Disk $d ejected" ;;
   esac ;;
 mount)
+  # a linuxfs volume is root's mount (no "mounted by"), of its fs's type, nodev and nosuid; with $STUB/da-user-mount the user's own
+  #   (a fallback), with $STUB/da-no-nodev no nodev, and with $STUB/da-phantom not there at all (DiskArbitration's Mounted: Yes stays)
   test ! -f "$STUB/mount-fail" || exit 1
   echo "/dev/disk0s2 on / (hfs, local, journaled)"
   for f in "$N"/*.m; do
     test -f "$f" || continue
     nd=${f##*/}; nd=${nd%.m}
-    if test "$(field "$nd" disk)" = "$nd"; then echo "/dev/$nd on $(field "$nd" mp) (macfuse_ext4, local, nodev, nosuid, synchronous, mounted by stub)"
+    if test "$(field "$nd" disk)" = "$nd"; then
+      test ! -f "$STUB/da-phantom" || continue
+      o="local, nodev, nosuid, synchronous"; test ! -f "$STUB/da-no-nodev" || o="local, nosuid, synchronous"
+      test ! -f "$STUB/da-user-mount" || o="$o, mounted by vagrant"
+      echo "/dev/$nd on $(field "$nd" mp) (macfuse_$(fs_of "$nd"), $o)"
     else echo "/dev/$nd on $(field "$nd" mp) (hfs, local, nodev, nosuid, journaled, noowners, mounted by stub)"; fi
   done ;;
 linuxfs)
@@ -1566,14 +1595,15 @@ expect census_all_cleans test ! -e "$W/census/old.img" -a -e "$W/census/left-stu
 # a step begins only when, at its worst (the console hung: every AppleScript at its bound), it ends by
 #   PARITY_CENSUS_MIN + 11; a step whose worst is 11 or less keeps the plain cutoff
 expect census_worst_default test "$(census_worst_min zzz)" -eq 11
-expect census_worst_table test "$(for c in census_unicode census_busy census_spotlight census_finder census_trash_tags_case census_later census_stall stall; do census_worst_min "$c"; done | tr '\n' ' ')" = '17 32 32 30 21 9 63 63 '
+# Task 16l: census_pair_up's census_da_root (bounded at 10 s) on each pair it makes: spotlight 33, census_finder 31, trash/tags/case 22
+expect census_worst_table test "$(for c in census_unicode census_busy census_spotlight census_finder census_trash_tags_case census_later census_stall stall; do census_worst_min "$c"; done | tr '\n' ' ')" = '17 32 33 31 22 9 63 63 '
 # Task 15: the census begins nothing past 132 min (it was 135), for the refusals bar and the non-admin mount after it
 r=$(unset PARITY_CENSUS_MIN; . "$here/lib/parity.sh"; echo "$PARITY_CENSUS_MIN")
 expect census_min_default test "$r" -eq 132
 r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=20; census_due census_finder ext4 2>&1); rc=$?
 expect census_due_worst_skips test "$rc" -ne 0
-expect census_due_worst_said has "$r" "^# census: census_finder may take 30 min, past the census's end (31 min), skipped: census_finder ext4$"
-r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=29; census_due census_finder ext4 2>&1)
+expect census_due_worst_said has "$r" "^# census: census_finder may take 31 min, past the census's end (31 min), skipped: census_finder ext4$"
+r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=30; census_due census_finder ext4 2>&1)
 expect census_due_worst_fits test -z "$r"
 r=$(CA_T0=$(($(date +%s) - 600)); PARITY_CENSUS_MIN=11; census_due census_later 2>&1)
 expect census_due_plain_cutoff test -z "$r"
@@ -1989,18 +2019,20 @@ expect owners_fstab_gone_tmp_fails_intact test "$(printf '%s\n' "$r" | grep -c '
 expect owners_fstab_in_smoke grep -q '^\. "$tests_dir/lib/owners-fstab.sh"' "$here/smoke-mavericks.sh"
 rm -f "$OF"
 
-# spec: .superpowers/sdd/2026-11-25-hfs-parity/push-d-debug.md -- push E (Task 16e): DiskArbitration's mounts pass no allow_root (the
-#   mount program's process has not the user's groups), so root's fseventsd and mds stay refused on them, as in push C. The three
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/push-d-debug.md -- push E (Task 16e): DiskArbitration's mounts passed no allow_root (the
+#   mount program's process has not the user's groups), so root's fseventsd and mds were refused on them, as in push C. The three
 #   steps that need them let in on a DiskArbitration volume (.fseventsd's parity, the refusals bar, busy-fsevents) take
-#   PARITY_MODE_FSEVENTS_DA, record until Task 16l; the other item 5, item 4 and item 6 gates stay check
-r=$(unset PARITY_MODE_SPOTLIGHT PARITY_MODE_SPOTLIGHT_DA PARITY_MODE_BUSY_DA PARITY_MODE_FSEVENTS_DA; . "$here/lib/parity.sh"
-  echo "$PARITY_MODE_SPOTLIGHT $PARITY_MODE_SPOTLIGHT_DA $PARITY_MODE_BUSY_DA $PARITY_MODE_FSEVENTS_DA")
-expect modes_e test "$r" = "check check check record"
-expect modes_e_spec has "$(sed -n '/^# spec: .*push-d-debug.md/,/^PARITY_MODE_FSEVENTS_DA=/p' "$here/lib/parity.sh")" 'Task 16l'
-expect modes_e_spec_default grep -qx 'PARITY_MODE_FSEVENTS_DA=${PARITY_MODE_FSEVENTS_DA:-record}' "$here/lib/parity.sh"
+#   PARITY_MODE_FSEVENTS_DA, record in push E; Task 16l (the mount daemon: root mounts them) puts it back to check (modes_f), with
+#   the other item 5, item 4 and item 6 gates, and the census's 132 minutes unchanged
+r=$(unset PARITY_MODE_SPOTLIGHT PARITY_MODE_SPOTLIGHT_DA PARITY_MODE_BUSY_DA PARITY_MODE_FSEVENTS_DA PARITY_CENSUS_MIN; . "$here/lib/parity.sh"
+  echo "$PARITY_MODE_FSEVENTS_DA $PARITY_MODE_SPOTLIGHT $PARITY_MODE_SPOTLIGHT_DA $PARITY_MODE_BUSY_DA $PARITY_CENSUS_MIN")
+expect modes_f test "$r" = "check check check check 132"
+expect modes_f_spec has "$(sed -n '/^# spec: .*push-d-debug.md/,/^PARITY_MODE_FSEVENTS_DA=/p' "$here/lib/parity.sh")" 'Task 16l'
+expect modes_f_spec_default grep -qx 'PARITY_MODE_FSEVENTS_DA=${PARITY_MODE_FSEVENTS_DA:-check}' "$here/lib/parity.sh"
+# record is still a mode it takes (a slack push may need it): the three steps recorded, said so
 rm -f "$OUT"/*-refresh.png "$OUT"/*-privacy.png "$OUT"/*-privacy-ro.png
 : > "$S/calls"; : > "$S/fsevents-refused"
-r=$(unset PARITY_MODE_FSEVENTS_DA; . "$here/lib/parity.sh"; census_spotlight ext4 2>&1
+r=$(PARITY_MODE_FSEVENTS_DA=record; census_spotlight ext4 2>&1
   census_refusals_bar 0 2>&1
   printf '%s\n' 'hfs: fsevents: .fseventsd yes' 'ext4: fsevents: .fseventsd no' > "$T/bf.log"
   census_busy_fsevents spotlight.ext4.busy-fsevents ext4 "$T/bf.log" 2>&1)
@@ -2009,9 +2041,10 @@ for p in rw ro; do expect "fsevents_da_record_${p}_fseventsd" has "$r" "^# recor
 expect fsevents_da_record_refusals has "$r" "^# recorded spotlight: no refusals for linuxfs volumes ([1-9][0-9]* lines"
 expect fsevents_da_record_busy has "$r" "^# recorded spotlight.ext4.busy-fsevents: .*ext4 no\$"
 expect fsevents_da_record_quiet hasnt "$r" "not ok"
+# under the defaults (Task 16l), the three are checked: not ok, root's fseventsd refused
 rm -f "$OUT"/*-refresh.png "$OUT"/*-privacy.png "$OUT"/*-privacy-ro.png
 : > "$S/calls"; : > "$S/fsevents-refused"
-r=$(PARITY_MODE_FSEVENTS_DA=check; census_spotlight ext4 2>&1
+r=$(unset PARITY_MODE_FSEVENTS_DA; . "$here/lib/parity.sh"; census_spotlight ext4 2>&1
   census_refusals_bar 0 2>&1
   census_busy_fsevents spotlight.ext4.busy-fsevents ext4 "$T/bf.log" 2>&1)
 rm -f "$S/fsevents-refused" "$T/bf.log"
@@ -2019,10 +2052,11 @@ for p in rw ro; do expect "fsevents_da_check_${p}_fseventsd" has "$r" "^not ok -
 expect fsevents_da_check_refusals has "$r" "^not ok - spotlight: no refusals for linuxfs volumes ([1-9][0-9]* lines"
 expect fsevents_da_check_busy has "$r" "^not ok - parity spotlight.ext4.busy-fsevents "
 # (r0 M3) root's mds is refused on DiskArbitration volumes as root's fseventsd is: with indexing on for the HFS+ control, the indexing
-#   steps (index and da) are recorded too while PARITY_MODE_FSEVENTS_DA is record, said why; under check (Task 16l) they are checked
+#   steps (index and da) are recorded too while PARITY_MODE_FSEVENTS_DA is record, said why; under check (the default since Task 16l)
+#   they are checked
 rm -f "$OUT"/*-refresh.png "$OUT"/*-privacy.png "$OUT"/*-privacy-ro.png
 : > "$S/calls"
-r=$(unset PARITY_MODE_FSEVENTS_DA; . "$here/lib/parity.sh"; census_spotlight ext4 2>&1)
+r=$(PARITY_MODE_FSEVENTS_DA=record; census_spotlight ext4 2>&1)
 for p in rw ro; do
   for s in mdutil mdfind store privacy-off privacy-remount; do expect "fsevents_da_index_record_${p}_$s" has "$r" "^# recorded spotlight.ext4.$p.$s\$"; done
   expect "fsevents_da_index_record_${p}_said" has "$r" "^# spotlight.ext4.$p: the indexing steps are recorded: indexing is on for the HFS+ control, but root's mds is not let into a DiskArbitration volume until the mount daemon (PARITY_MODE_FSEVENTS_DA is record)\$"
@@ -2030,7 +2064,7 @@ done
 expect fsevents_da_index_record_refresh has "$r" "^# recorded spotlight.ext4.rw.refresh$"
 expect fsevents_da_index_record_quiet hasnt "$r" "not ok"
 rm -f "$OUT"/*-refresh.png "$OUT"/*-privacy.png "$OUT"/*-privacy-ro.png
-r=$(PARITY_MODE_FSEVENTS_DA=check; census_spotlight ext4 2>&1)
+r=$(unset PARITY_MODE_FSEVENTS_DA; . "$here/lib/parity.sh"; census_spotlight ext4 2>&1)
 for s in mdfind store mdutil; do expect "fsevents_da_index_check_$s" has "$r" "^ok - parity spotlight.ext4.rw.$s\$"; done
 # PARITY_MODE_SPOTLIGHT record still records them; a mode that is neither is not ok, named
 r=$(PARITY_MODE_SPOTLIGHT=record PARITY_MODE_FSEVENTS_DA=check; printf 'xfs: fsevents: .fseventsd no\n' > "$T/bf.log"; census_busy_fsevents spotlight.xfs.busy-fsevents xfs "$T/bf.log" 2>&1)
@@ -2049,7 +2083,6 @@ expect da_cycle_checks_first has "$(printf '%s\n' "$dc" | grep -A 2 'mounted at 
 expect da_cycle_checks_first_log has "$(printf '%s\n' "$dc" | grep -A 2 'mounted at $mp within 30 s"')" 'no_mount_failed "$pos"'
 expect da_cycle_checks_again has "$(printf '%s\n' "$dc" | grep -A 2 'mounted again at $mp"')" 'da_mount_true "$dev" "$mp" "$nm"'
 expect da_cycle_checks_again_log has "$(printf '%s\n' "$dc" | grep -A 2 'mounted again at $mp"')" 'no_mount_failed "$pos"'
-expect da_cycle_unshared has "$(printf '%s\n' "$dc" | grep -A 3 'mounted at $mp within 30 s"')" 'da_unshared "$mp"'
 expect da_cycle_pos_attach has "$(printf '%s\n' "$dc" | grep -B 1 'da_attach "$img"')" 'pos=$(log_pos)'
 expect da_cycle_pos_mount has "$(printf '%s\n' "$dc" | grep -B 1 'diskutil mount" bounded')" 'pos=$(log_pos)'
 eval "$(sed -n '/^da_mount_true()/,/^}/p; /^no_mount_failed()/,/^}/p' "$sm")"
@@ -2070,5 +2103,199 @@ r=$(syslog_since() { echo "$1|$2" > "$T/nmf.args"; echo 'Nov 25 linuxfs-mount[9]
 expect no_mount_failed_clean has "$r" "^rc 0$"
 expect no_mount_failed_pos test "$(cat "$T/nmf.args")" = "5|head line"
 rm -f "$T/nmf.args"
+
+# ---- Task 16l: root's automounts (the mount daemon), in the census and the smoke ----
+# census_da_root DEV MP FS POS: the smoke's checks of a DiskArbitration mount (da_mount_true, no_mount_failed, da_root_mount,
+#   no_owner_pseudo) as one check, bounded at 10 s: ok on the stand-in (root's mount, nodev and nosuid, root's mount_macfuse -o
+#   allow_other with fsname=/dev/DEV, mounted by root and served by _linuxfs); not ok, said why, for a fallback user mount, no
+#   nodev, macFUSE's refusal, DiskArbitration's ?owner= entry, and a phantom (Mounted: Yes, nothing in mount)
+dr() { # FLAG: a fresh stand-in linuxfs disk attached with $S/FLAG, census_da_root on it, then ejected
+  : > "${S:?}/$1"; echo dr > "${W:?}/census/daroot-$1.img"
+  dr_pos=$(census_log_pos); census_attach "$W/census/daroot-$1.img" > /dev/null 2>&1
+  census_da_root "$CA_DEV" "$CA_MP" ext4 "$dr_pos" 2>&1
+  rm -f "${S:?}/${1:?}"; census_detach "$CA_DISK" fs "$CA_MP" > /dev/null 2>&1; rm -f "${W:?}/census/daroot-${1:?}.img"
+}
+r=$(dr da-none)
+expect census_da_root_ok has "$r" "^ok - census ext4: /dev/disk[0-9]* on .*/vols/daroot-da-none is root's mount, true to DiskArbitration$"
+r=$(dr da-user-mount)
+expect census_da_root_user_mount has "$r" "^not ok - census ext4: /dev/disk[0-9]* on .*/vols/daroot-da-user-mount is root's mount"
+expect census_da_root_user_mount_named has "$r" "^# .*not root's mount: mounted by vagrant"
+r=$(dr da-no-nodev)
+expect census_da_root_no_nodev has "$r" "^not ok - census ext4: "
+expect census_da_root_no_nodev_said has "$r" "^# .*has no nodev"
+r=$(dr da-macfuse-failed)
+expect census_da_root_macfuse_failed has "$r" "^not ok - census ext4: "
+expect census_da_root_macfuse_failed_said has "$r" "^# .*mount_macfuse: failed to mount"
+r=$(dr da-owner-pseudo)
+expect census_da_root_owner_pseudo has "$r" "^not ok - census ext4: "
+expect census_da_root_owner_pseudo_said has "$r" "^# .*id = .*/vols/daroot-da-owner-pseudo?owner=0"
+r=$(dr da-phantom)
+expect census_da_root_phantom has "$r" "^not ok - census ext4: "
+expect census_da_root_phantom_said has "$r" "^# DiskArbitration: Mounted: Yes; mount: nothing from /dev/disk"
+expect census_da_root_bounded test -n "$(sed -n '/^census_da_root()/,/^}/p' "$here/lib/parity.sh" | grep 'bounded 100 census_da_root_checks "\$@"')"
+expect census_da_root_checks test -n "$(sed -n '/^census_da_root_checks()/,/^}/p' "$here/lib/parity.sh" | grep 'da_mount_true .*no_mount_failed .*da_root_mount .*no_owner_pseudo')"
+# census_pair_up runs it on the pair's linuxfs side, once (the HFS+ control is Apple's)
+echo h > "$W/census/pu-hfs.img"; echo f > "$W/census/pu-xfs.img"; pu_before=$(attached)
+r=$(census_pair_up "$W/census/pu-hfs.img" "$W/census/pu-xfs.img" xfs 2>&1; census_pair_down > /dev/null 2>&1)
+rm -f "${W:?}/census/pu-hfs.img" "${W:?}/census/pu-xfs.img"
+expect census_pair_up_da_root test "$(printf '%s\n' "$r" | grep -c "^ok - census xfs: /dev/disk[0-9]* on .*/vols/pu-xfs is root's mount")" -eq 1
+expect census_pair_up_da_root_once test "$(printf '%s\n' "$r" | grep -c "root's mount")" -eq 1
+expect census_pair_up_detached test "$(attached)" = "$pu_before"
+
+# census_lklfuse_gone MP by root's records (_linuxfs's, through sudo): it waits while a record's pid naming MP still runs lklfuse
+#   (a root mount's lklfuse serves /dev/fd/N, which no command line ends in MP), and returns once that pid is gone
+mkdir -p "$S/rootstate"; printf '/dev/rdisk7\t/Volumes/r\text4\trw\n' > "$S/rootstate/4321"; : > "$T/lgr.alive"
+lgr() { # CMD...: CMD with the real bounded, the real sleep, and a ps where pid 4321 is an lklfuse while $T/lgr.alive is there
+  ( unset -f sleep; bounded() { bounded_real "$@"; }
+    ps() {
+      case "$*" in
+      *pid=,command=*) echo "  99 /p/other"; test ! -f "$T/lgr.alive" || echo " 4321 /p/lklfuse -f -o x /dev/fd/3 /dev/fd/4" ;;
+      *"-p 4321"*) test -f "$T/lgr.alive" || return 1; echo S ;;
+      *-p*) return 1 ;;
+      *) echo "u /p/other" ;;
+      esac
+    }
+    "$@" ) > /dev/null 2>&1
+}
+lgr bounded 20 census_lklfuse_gone /Volumes/r; rc=$?
+expect census_lklfuse_gone_record_waits test "$rc" -eq 124
+lgr bounded 20 census_lklfuse_gone /Volumes/elsewhere; rc=$?
+expect census_lklfuse_gone_record_other_mp test "$rc" -eq 0
+( /bin/sleep 1; rm -f "${T:?}/lgr.alive" ) &
+lgr bounded 100 census_lklfuse_gone /Volumes/r; rc=$?
+expect census_lklfuse_gone_record_returns test "$rc" -eq 0 -a ! -f "$T/lgr.alive"
+wait
+# census_lklfuse_on DISK by root's records too: a live lklfuse's record names /dev/rDISK (or a slice); a dead one's does not count
+: > "$T/lgr.alive"
+lgr census_lklfuse_on /dev/disk7; rc=$?
+expect census_lklfuse_on_record test "$rc" -eq 0
+rm -f "${T:?}/lgr.alive"
+lgr census_lklfuse_on /dev/disk7; rc=$?
+expect census_lklfuse_on_record_dead test "$rc" -eq 1
+rm -rf "${S:?}/rootstate"
+
+# census_names_mode reads _linuxfs's lklfuse log (through sudo) when the user's has none: a root mount's lklfuse runs as _linuxfs
+rm -f "$P/names-mode.txt"; mkdir -p "$S/rootlogs" "$S/lklogs"; printf '%s\n' 'lklfuse: names: exact (root)' > "$S/rootlogs/rdisk77.log"
+r=$(mount() { echo "/dev/disk77 on /Volumes/n (macfuse_ext4, local, nodev, nosuid)"; }; census_names_mode disk77 /Volumes/n; cat "$P/names-mode.txt")
+expect census_names_mode_root test "$r" = "disk77 /Volumes/n: exact (root)"
+expect census_names_mode_root_sudo grep -q "^sudo -n cat $S/rootlogs/rdisk77.log$" "$S/calls.all"
+rm -f "$P/names-mode.txt"; printf '%s\n' 'lklfuse: names: scanning (user)' > "$S/lklogs/rdisk77.log"
+r=$(mount() { echo "/dev/disk77 on /Volumes/n (macfuse_ext4, local, nodev, nosuid, mounted by u)"; }; census_names_mode disk77 /Volumes/n; cat "$P/names-mode.txt")
+expect census_names_mode_user_first test "$r" = "disk77 /Volumes/n: scanning (user)"
+rm -f "$P/names-mode.txt" "${S:?}/rootlogs/rdisk77.log" "${S:?}/lklogs/rdisk77.log"
+
+# the smoke's checks of root's automounts
+expect smoke_mountd_ready_first ascending "$(first_line '^check "the mount daemon is loaded.*" mountd_ready$')" "$(first_line 'then da_cycle "\$fs"')"
+mr() { (eval "$(smoke_fn mountd_ready)"; MOUNTD=dev.mavergreen.linuxfs.mountd MOUNTD_SOCK=/var/run/dev.mavergreen.linuxfs.mountd.sock
+  sudo() { echo "sudo $*" >> "$T/mr.calls"; test -z "$mr_unloaded"; }; stat() { echo "$mr_stat"; }; mountd_ready) > /dev/null 2>&1; }
+: > "$T/mr.calls"
+mr_unloaded= mr_stat="root srw-rw-rw-"; expect smoke_mountd_ready mr
+expect smoke_mountd_ready_launchctl grep -qx 'sudo -n launchctl list dev.mavergreen.linuxfs.mountd' "$T/mr.calls"
+mr_unloaded=1; expect smoke_mountd_ready_unloaded not mr
+mr_unloaded= mr_stat="root srwxr-xr-x"; expect smoke_mountd_ready_mode not mr
+mr_stat="daemon srw-rw-rw-"; expect smoke_mountd_ready_owner not mr
+mr_stat=""; expect smoke_mountd_ready_no_socket not mr
+expect smoke_mountd_ready_bounded test -n "$(smoke_fn mountd_ready | grep 'bounded 100 sudo -n launchctl list')"
+# root_lklfuse_of MP: from root's records (_linuxfs's, read through sudo), the pid whose mount point is MP, of a live lklfuse
+mkdir -p "$T/rs"; printf '/dev/rdisk5\t/Volumes/my data\text4\trw\n' > "$T/rs/4321"; printf '/dev/rdisk4\t/Volumes/my data\text4\trw\n' > "$T/rs/4322"
+printf '/dev/rdisk6\t/Volumes/other\text4\trw\n' > "$T/rs/4323"
+rl() { # CMD...: the smoke's root_lklfuse_of, da_served and lklfuses, sudo serving $T/rs, ps as $T/rl.ps and $T/rl.ax say, syslog_since $T/rl.log
+  (eval "$(smoke_fn root_lklfuse_of)"; eval "$(smoke_fn da_served)"; eval "$(smoke_fn lklfuses)"; eval "$(smoke_fn no_root_lklfuse)"
+   LINUXFS_ROOT_STATE=$T/rs tab=$(printf '\t')
+   sudo() { test "$1" != -n || shift; "$@"; }
+   ps() {
+     case "$*" in
+     *-axww*) cat "$T/rl.ax" 2> /dev/null ;;
+     *"-p 4322"*) return 1 ;;
+     *user=*) sed -n 1p "$T/rl.ps" ;;
+     *-p*) sed -n 1p "$T/rl.ps" | cut -d ' ' -f 2- ;;
+     esac
+   }
+   syslog_since() { cat "$T/rl.log"; }
+   "$@")
+}
+echo "_linuxfs /p/lklfuse -f -o type=ext4,lock=/dev/fd/7,volname=my data,fsname=/dev/disk5,uid=99,gid=99 /dev/fd/3 /dev/fd/4" > "$T/rl.ps"
+: > "$T/rl.ax"; : > "$T/rl.log"
+r=$(rl root_lklfuse_of '/Volumes/my data' 2>&1)
+expect smoke_root_lklfuse_of test "$r" = 4321
+expect smoke_root_lklfuse_of_bounded test -n "$(smoke_fn root_lklfuse_of | grep 'bounded 100 sudo -n ')"
+# da_served MP [owners POS]: that pid runs lklfuse as _linuxfs, its -o holds uid=99,gid=99 (owners: no uid=, and root's mount_macfuse
+#   -o line in system.log has default_permissions), and no lklfuse runs as root
+r=$(rl da_served '/Volumes/my data' 2>&1); rc=$?
+expect smoke_da_served test "$rc" -eq 0
+echo "vagrant /p/lklfuse -f -o type=ext4,volname=my data,uid=99,gid=99 /dev/fd/3 /dev/fd/4" > "$T/rl.ps"
+r=$(rl da_served '/Volumes/my data' 2>&1); rc=$?
+expect smoke_da_served_user test "$rc" -ne 0
+echo "_linuxfs /p/lklfuse -f -o type=ext4,volname=my data,uid=501,gid=20 /dev/fd/3 /dev/fd/4" > "$T/rl.ps"
+r=$(rl da_served '/Volumes/my data' 2>&1); rc=$?
+expect smoke_da_served_ids test "$rc" -ne 0
+echo "_linuxfs /p/lklfuse -f -o type=ext4,volname=my data,uid=99,gid=99 /dev/fd/3 /dev/fd/4" > "$T/rl.ps"
+echo "root 77 /p/lklfuse -f -o x /dev/disk9 /Volumes/z" > "$T/rl.ax"
+r=$(rl da_served '/Volumes/my data' 2>&1); rc=$?
+expect smoke_da_served_root_lklfuse test "$rc" -ne 0
+: > "$T/rl.ax"
+r=$(rl da_served '/Volumes/elsewhere' 2>&1); rc=$?
+expect smoke_da_served_no_record test "$rc" -ne 0
+echo "_linuxfs /p/lklfuse -f -o type=ext4,volname=my data /dev/fd/3 /dev/fd/4" > "$T/rl.ps"
+echo "Nov 25 linuxfs-mount[9]: mount_ext4: disk5 on /Volumes/my data: mount_macfuse -o allow_other,nosuid,nodev,default_permissions,local,fsname=/dev/disk5 (pid 9)" > "$T/rl.log"
+r=$(rl da_served '/Volumes/my data' owners '5|head' 2>&1); rc=$?
+expect smoke_da_served_owners test "$rc" -eq 0
+r=$(rl da_served '/Volumes/my data' 2>&1); rc=$?
+expect smoke_da_served_owners_unasked test "$rc" -ne 0
+echo "_linuxfs /p/lklfuse -f -o type=ext4,volname=my data,uid=99,gid=99 /dev/fd/3 /dev/fd/4" > "$T/rl.ps"
+r=$(rl da_served '/Volumes/my data' owners '5|head' 2>&1); rc=$?
+expect smoke_da_served_owners_uid test "$rc" -ne 0
+echo "_linuxfs /p/lklfuse -f -o type=ext4,volname=my data /dev/fd/3 /dev/fd/4" > "$T/rl.ps"
+echo "Nov 25 linuxfs-mount[9]: mount_ext4: disk5 on /Volumes/my data: mount_macfuse -o allow_other,nosuid,nodev,local,fsname=/dev/disk5 (pid 9)" > "$T/rl.log"
+r=$(rl da_served '/Volumes/my data' owners '5|head' 2>&1); rc=$?
+expect smoke_da_served_owners_no_dp test "$rc" -ne 0
+rm -rf "${T:?}/rs"; rm -f "${T:?}/rl.ps" "${T:?}/rl.ax" "${T:?}/rl.log"
+# da_root_mount: root's mount_macfuse line must name this disk's fsname
+r=$( (eval "$(smoke_fn da_root_mount)"; mounted_by_root() { :; }
+  mount() { echo "/dev/disk5 on /Volumes/x (macfuse_ext4, local, nodev, nosuid, synchronous)"; }
+  syslog_since() { echo "Nov 25 x[9]: mount_ext4: disk5 on /Volumes/x: mount_macfuse -o allow_other,nosuid,nodev,fsname=/dev/disk9 (pid 9)"; echo "Nov 25 x[9]: mount_ext4: disk5 mounted on /Volumes/x by root, served by _linuxfs"; }
+  da_root_mount /Volumes/x /dev/disk5 ext4 '5|head'; echo "rc $?") 2>&1)
+expect smoke_da_root_mount_fsname has "$r" "^rc 1$"
+# no_owner_pseudo MP POS: system.log since POS has no "id = MP?owner=" (DiskArbitration's entry for a mount it cannot tie to a disk)
+nop() { (eval "$(smoke_fn no_owner_pseudo)"; syslog_since() { printf '%s\n' "$nop_l"; }; no_owner_pseudo '/Volumes/my data' '5|head') > /dev/null 2>&1; }
+nop_l='Nov 25 diskarbitrationd[8]: created disk, id = /dev/disk5'; expect smoke_no_owner_pseudo nop
+nop_l='Nov 25 diskarbitrationd[8]: created disk, id = /Volumes/my data?owner=501'; expect smoke_no_owner_pseudo_seen not nop
+nop_l='Nov 25 diskarbitrationd[8]: created disk, id = /Volumes/my data 1?owner=501'; expect smoke_no_owner_pseudo_other_mp nop
+# mountd_unshared_peer DEV POS: the daemon's peer line since POS is the console user's, outside macFUSE's admin_group; its result
+#   line for DEV is ok; and .fseventsd is on the volume within 10 s of a write (root's fseventsd let in)
+mkdir -p "$T/mup/.fseventsd"
+mup() { (eval "$(smoke_fn mountd_unshared_peer)"; unset -f sleep; bounded() { bounded_real "$@"; }
+  info() { echo "$T/mup"; }; stat() { echo 501; }; sysctl() { echo 80; }; syslog_since() { printf '%s\n' "$mup_l"; }
+  mountd_unshared_peer /dev/disk5 '5|head') > /dev/null 2>&1; }
+ok_l="Nov 25 dev.mavergreen.linuxfs.mountd[7]: mountd: disk5 on $T/mup: ok (peer 501, DA 12ms)"
+mup_l="$(printf '%s\n' 'Nov 25 dev.mavergreen.linuxfs.mountd[7]: mountd: peer uid 501 groups 20,12,61' "$ok_l")"; expect smoke_mountd_unshared_peer mup
+expect smoke_mountd_unshared_peer_tidy test ! -e "$T/mup/da-fsevents"
+mup_l="$(printf '%s\n' 'Nov 25 dev.mavergreen.linuxfs.mountd[7]: mountd: peer uid 501 groups 20,80,12' "$ok_l")"; expect smoke_mountd_unshared_peer_admin not mup
+mup_l="$(printf '%s\n' 'Nov 25 dev.mavergreen.linuxfs.mountd[7]: mountd: peer uid 502 groups 20' "$ok_l")"; expect smoke_mountd_unshared_peer_not_console not mup
+mup_l="$ok_l"; expect smoke_mountd_unshared_peer_no_peer not mup
+mup_l="$(printf '%s\n' 'Nov 25 dev.mavergreen.linuxfs.mountd[7]: mountd: peer uid 501 groups 20' "Nov 25 x[7]: mountd: disk5 on $T/mup: user (peer 501, DA 12ms): busy")"
+expect smoke_mountd_unshared_peer_user not mup
+rmdir "$T/mup/.fseventsd"
+mup_l="$(printf '%s\n' 'Nov 25 dev.mavergreen.linuxfs.mountd[7]: mountd: peer uid 501 groups 20' "$ok_l")"; expect smoke_mountd_unshared_peer_no_fseventsd not mup
+rm -rf "${T:?}/mup"
+# da_cycle: after each of its mounts, root's mount (da_root_mount), served by _linuxfs (da_served) and no ?owner= (no_owner_pseudo);
+#   its unmount and eject are the user's own (no sudo); the peer proof once, in the first ext4 cycle (raw)
+dc_first=$(printf '%s\n' "$dc" | sed -n '/mounted at $mp within 30 s"/,/da_unmount/p')
+dc_again=$(printf '%s\n' "$dc" | sed -n '/mounted again at $mp"/,/da_eject/p')
+for c in 'da_root_mount "$mp" "$dev" "$nm" "$pos"' 'da_served "$mp"' 'no_owner_pseudo "$mp" "$pos"'; do
+  expect "da_cycle_first_${c%% *}" test "$(printf '%s\n' "$dc_first" | grep -cF "bounded 300 $c")" -eq 1
+  expect "da_cycle_again_${c%% *}" test "$(printf '%s\n' "$dc_again" | grep -cF "bounded 300 $c")" -eq 1
+done
+expect da_cycle_user_unmount test -z "$(printf '%s\n' "$dc" | grep 'da_unmount\|da_eject' | grep sudo)$(smoke_fn da_unmount | grep sudo)$(smoke_fn da_eject | grep 'diskutil eject' | grep sudo)"
+expect da_cycle_peer_once test "$(grep -c 'mountd_unshared_peer "' "$sm")" -eq 1
+expect da_cycle_peer_ext4_raw test -n "$(printf '%s\n' "$dc_first" | grep 'mountd_unshared_peer "$dev" "$pos"' | grep -F '"$nm.$via" = ext4.raw')"
+expect da_eject_root_first test -n "$(smoke_fn da_eject | grep 'root_lklfuse_of "$2"')" -a -n "$(smoke_fn da_eject | grep 'lklfuse_on "$2"')"
+expect smoke_owners_served test -n "$(smoke_fn owners_case | grep 'da_served "$mp" owners "$pos"')"
+# after the census, the one new step (code line) is before login's "the mount daemon was not asked": named, read once from loglog,
+#   bounded
+after=$(awk 'p && !/^ *#/ { print } /^ *parity_census_all$/ { p = 1 }' "$sm")
+expect smoke_after_census_one_mountd test "$(printf '%s\n' "$after" | grep -c 'mountd\|mount daemon')" -eq 1
+expect smoke_before_login_not_asked test -n "$(printf '%s\n' "$after" | grep '^ *check "before login: the mount daemon was not asked" bounded 100 ' | grep 'loglog')"
+expect smoke_before_login_not_asked_in_section ascending "$bl" "$(first_line 'check "before login: the mount daemon was not asked"')" "$(first_line '^  restore_login$')"
 
 test "$fails" -eq 0
