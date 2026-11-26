@@ -56,7 +56,8 @@ check() {
   if "$@" > "$W/step-$((n + 1)).log" 2>&1; then ok "$what"; return 0; fi
   notok "$what (log follows)"; sed 's/^/# /' "$W/step-$n.log"; return 1
 }
-die() { notok "$1"; finish; }
+# a die before finish can run (finish_ready: W made afresh and CRASH0 taken) only says why and exits
+die() { notok "$1"; test -n "${finish_ready:-}" || exit 1; finish; }
 # spec: tests/smoke-mavericks.sh header -- a hang fails: every wait is bounded, in tenths of a second
 bounded() {
   t=$1; shift
@@ -77,6 +78,8 @@ crashes() { ls "$HOME"/Library/Logs/DiagnosticReports/lklfuse_* /Library/Logs/Di
 mountpoint_of() { "$L" status | awk -F"$tab" -v s="$1" '$2 == s { print $3; exit }'; }
 pid_of() { "$L" status | awk -F"$tab" -v s="$1" '$2 == s { print $1; exit }'; }
 finish() {
+  # a signal during finish does not start it again
+  trap - INT TERM HUP
   # spec: tests/lib/parity.sh census_fsu_abort -- Task 16e-fix round 1: a census_busy_cycles fs_usage (root's) left by a signal
   #       or a die is stopped first
   test -z "${parity_lib:-}" || census_fsu_abort
@@ -96,11 +99,13 @@ finish() {
   echo "1..$n"
   exit "$bad"
 }
-# a signalled smoke (the job cancelled or timed out, ssh dropped) still runs finish: its cleanup, fs_usage's stop, the copyback
-trap 'trap - INT TERM HUP; notok "the smoke was signalled"; finish' INT TERM HUP
 [ "$(id -u)" != 0 ] || { echo "run this as the guest's user, not root: volumes are mounted by users" >&2; exit 1; }
 rm -rf "$W"; mkdir -p "$W/img" "$W/mnt" || exit 1
 CRASH0=$(crashes)
+# a signalled smoke (the job cancelled or timed out, ssh dropped) still runs finish: its cleanup, fs_usage's stop, the
+#   copyback; set only now, with what finish reads in place (finish takes it away first)
+finish_ready=1
+trap 'notok "the smoke was signalled"; finish' INT TERM HUP
 
 installed=$(awk '/<key>version<\/key>/ { getline; gsub(/.*<string>|<\/string>.*/, ""); print; exit }' "$P/mavergreen.plist")
 [ "$installed" = "$VERSION" ] && ok "the installed manifest is $VERSION" || die "the installed manifest is '$installed', not $VERSION"

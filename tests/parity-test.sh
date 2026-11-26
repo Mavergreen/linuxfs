@@ -947,6 +947,12 @@ expect census_fsu_abort_pidfile_gone test ! -e "$W/census/fs_usage.pid"
 r=$(census_fsu_abort 2>&1); expect census_fsu_abort_idle test -z "$r"
 expect smoke_finish_stops_fs_usage test -n "$(awk '/^finish\(\) \{/ { p = 1 } p && /census_fsu_abort/ { print; exit } p && /^}/ { exit }' "$here/smoke-mavericks.sh")"
 expect smoke_traps_signals grep -q "^trap '.*finish' INT TERM HUP$" "$here/smoke-mavericks.sh"
+# fix round 2: finish takes the trap away first (a signal during a normal finish does not start it again); the trap is set
+#   only once what finish reads is (W made afresh, CRASH0), and a die before then exits without finish
+expect smoke_finish_untraps_first test "$(awk '/^finish\(\) \{/ { p = 1; next } p && !/^ *#/ { print; exit }' "$here/smoke-mavericks.sh")" = "  trap - INT TERM HUP"
+expect smoke_trap_after_setup awk '/^CRASH0=/ { c = NR } /^trap .* INT TERM HUP$/ { t = NR } END { exit !(c && t > c) }' "$here/smoke-mavericks.sh"
+expect smoke_finish_ready_with_trap awk '/^CRASH0=/ { c = 1 } c && /^finish_ready=1/ { r = NR } /^trap .* INT TERM HUP$/ { t = NR } END { exit !(r && t == r + 1) }' "$here/smoke-mavericks.sh"
+expect smoke_die_before_setup grep -q '^die() { notok "$1"; test -n "${finish_ready:-}" || exit 1; finish; }$' "$here/smoke-mavericks.sh"
 # fix round 1: sudoers refusing kill: the preflight says capture off and why; the cycles then capture nothing (no fs_usage
 #   started), say so at a refusal, and still count and bar as before
 mv "$pf" "$T/pf.keep"; : > "$S/sudo-kill-refused"; : > "$S/calls"
