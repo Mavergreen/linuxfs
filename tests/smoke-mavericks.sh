@@ -895,7 +895,7 @@ check "the keychain keeper is still running" pgrep -f "$P/libexec/linuxfs-agent"
 check "no lklfuse runs as root, after everything" no_root_lklfuse
 
 # spec: tests/lib/parity.sh parity_census_all -- the HFS+ parity census: each behaviour on an HFS+ control and on linuxfs
-#       volumes, recorded into OUT/parity (record-only until an item's task sets its PARITY_MODE_ to check: item 1's is), with its
+#       volumes, recorded into OUT/parity (items 1, 4, 5, 6 and 7 checked; item 3 and later. recorded), with its
 #       screenshots in OUT; before the before-login section, which must stay last
 if test -n "$parity_lib"; then
   # spec: .superpowers/sdd/2026-11-25-hfs-parity/task-19-brief.md Step 3 -- push G: item 3's loop is done with (push C ran it, 50

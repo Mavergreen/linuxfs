@@ -1285,7 +1285,10 @@ rm -f "$W/census/unpack-t.img"
 
 # census_finder: the screenshot pairs, Finder's properties against df -k, diskutil info's fields, a custom volume icon
 : > "$S/calls"
+# df's available pinned at 97656 KiB, 256 bytes under the stub Finder's free space (1.0E+8), so free space matches df
+echo 97656 > "$S/df-free"
 r=$(census_finder ext4 2>&1)
+rm -f "$S/df-free"
 # Task 19: the GPT-wrapped image when IN has one (the control is GPT-partitioned, so diskutil's Whole compares); else the
 #   bare image, said
 expect census_finder_gpt has "$r" "^# census_finder ext4: IN's gpt-ext4.img.gz, partitioned as the HFS+ control is$"
@@ -1294,6 +1297,12 @@ for s in properties diskutil-info diskutil-info-dev volumeicon; do expect "censu
 expect census_finder_props_no_ignore hasnt "$(cat "$P/finder.ext4.properties.ext4.txt")" "ignore privileges"
 expect census_finder_ignore_recorded has "$r" "^# recorded finder.ext4.ignore-privileges$"
 expect census_finder_ignore_value test "$(sed -n 's/^ignore privileges: //p' "$P/finder.ext4.ignore-privileges.ext4.txt")" = false
+# fix round 1 (I1, the controller's ruling): Finder's free space is the open QUEUE item ("Finder's free space on ext4 and xfs":
+#   (f_bavail - 1) x f_bsize - 20 MiB), so a record of its own, against df -k and against HFS+, never a checked property
+expect census_finder_props_no_free hasnt "$(cat "$P/finder.ext4.properties.ext4.txt")" "free space"
+expect census_finder_free_recorded has "$r" "^# recorded finder.ext4.free-space$"
+expect census_finder_free_vs_df grep -q '^free space equals df -k available (within 1 MiB): yes$' "$P/finder.ext4.free-space.ext4.txt"
+expect census_finder_free_hfs grep -q '^Finder free space minus df -k available: ' "$P/finder.ext4.free-space.hfs.txt"
 for s in properties diskutil-info diskutil-info-dev volumeicon; do expect "census_finder_$s" test -s "$P/finder.ext4.$s.hfs.txt" -a -s "$P/finder.ext4.$s.ext4.txt"; done
 # 10.9's diskutil info has no Removable Media or Device Location: its own names, by mount point and by device
 for f in Protocol Read-Only.Media Ejectable Internal; do expect "census_finder_du_$f" grep -q "^$f: " "$P/finder.ext4.diskutil-info-dev.ext4.txt"; done
@@ -1411,6 +1420,10 @@ expect census_ttc_big_copy_hfs grep -q 'duplicate (POSIX file ".*/census/big-src
 expect census_ttc_big_shot test "$(grep -Ec 'screencapture -x .*/(hfs|ext4)-oversized-finder.png$' "$S/calls")" -eq 2
 expect census_ttc_big_said grep -q '^big-src on <MP>: ' "$P/tags.ext4.oversized-finder.ext4.txt"
 expect census_ttc_xattrs_listed grep -q '^xattr .*/vols/trash-ext4/tagged$' "$S/calls"
+# fix round 1 (I2, the controller's ruling): both oversized records come after the read after the remount, so a dialog Finder
+#   leaves up over its copy can never keep the volume from its eject
+ttc_line() { printf '%s\n' "$r" | grep -n "$1" | head -n 1 | cut -d: -f1; }
+expect census_ttc_oversized_after_remount ascending "$(ttc_line '^ok - parity tags.ext4.after-remount$')" "$(ttc_line '^# recorded tags.ext4.oversized$')" "$(ttc_line '^# recorded tags.ext4.oversized-finder$')"
 for s in trash.ext4.finder-delete trash.ext4.trashes trash.ext4.after-empty tags.ext4.set tags.ext4.read tags.ext4.after-remount tags.ext4.oversized case.ext4.pathconf case.ext4.pathconf-hfsx; do
   expect "census_ttc_$s" test -s "$P/$s.hfs.txt" -a -s "$P/$s.ext4.txt"
 done
@@ -1439,11 +1452,24 @@ expect census_ttc_detached test -z "$(attached)"
 # a failed remount (the linuxfs eject fails) skips only the read after it: the control comes back for the case steps
 echo stuck4 > "$W/img/stuck4.img"
 r=$(census_trash_tags_case stuck4 2>&1)
-expect census_ttc_remount_fails has "$r" "^# census_trash_tags_case stuck4: no remount, so no tags read after one"
+expect census_ttc_remount_fails has "$r" "^not ok - parity tags.stuck4.after-remount: no remount, so no tags read after one"
 expect census_ttc_remount_fails_case test -s "$P/case.stuck4.pathconf.hfs.txt" -a -s "$P/case.stuck4.pathconf-hfsx.stuck4.txt"
 expect census_ttc_remount_fails_no_read test ! -e "$P/tags.stuck4.after-remount.stuck4.txt"
 for f in "$S"/nodes/*; do case $f in *.m | *.u) ;; *) test "$(sed -n 's/^vol=//p' "$f")" != trash-stuck4 || rm -f "$f" "$f.m" "$f.u" ;; esac; done
 rm -f "$W/img/stuck4.img"
+# an osascript left waiting by Finder's copy of big-src (its dialog up): Finder restarted after the oversized records
+: > "$T/restarts"
+r=$(census_finder_ask() { test "$1" = oversized-finder && echo "osascript still waiting after 20 s"; return 0; }; census_finder_restart() { echo restart >> "$T/restarts"; }; census_trash_tags_case xfs 2>&1)
+expect census_ttc_big_restart test "$(grep -c restart "$T/restarts")" -ge 1
+r=$(census_finder_ask() { return 0; }; census_finder_restart() { echo restart >> "$T/restarts2"; }; census_trash_tags_case btrfs 2>&1)
+expect census_ttc_big_no_restart test ! -e "$T/restarts2"
+# census_big_src: made once a census, and only when its xattr was made: a failure leaves no big-src to reuse (M1)
+rm -f "$W/census/big-src" "$W/census/big-src.ok"
+r=$(census_py_big='import sys; sys.exit(1)'; census_big_src 2>&1); rc=$?
+expect census_big_src_fails test "$rc" -ne 0 -a ! -e "$W/census/big-src"
+census_big_src > /dev/null 2>&1
+r=$(census_py_big='import sys; sys.exit(1)'; census_big_src 2>&1); rc=$?
+expect census_big_src_once test "$rc" -eq 0 -a -e "$W/census/big-src"
 # the oversized probe is bounded at 1 min a side (2 min for the step), so a trash/tags/case census stays in its envelope
 r=$(census_xattr_big() { echo "${PARITY_BOUND:-unset}" > "$T/xb-bound"; }; census_trash_tags_case btrfs 2>&1)
 expect census_ttc_oversized_bound test "$(cat "$T/xb-bound" 2>/dev/null)" = 600
@@ -1807,6 +1833,8 @@ expect workflow_guest_timeout awk '/^  guest:/ { g = 1 } /^  fsck:/ { g = 0 } g 
 # push G (Task 19): item 3's loop is done with (push C ran it, 50 iterations): PARITY_STALL_N=0 before the census
 expect smoke_stall_off ascending "$(first_line '^ *PARITY_STALL_N=0$')" "$(first_line '^ *parity_census_all$')"
 expect smoke_stall_not_50 not grep -q '^ *PARITY_STALL_N=50$' "$sm"
+# fix round 1 (M3): the census comment says which items are checked, no longer "record-only until"
+expect smoke_census_comment_current not grep -q 'record-only until an item' "$sm"
 # item 5 (Task 15): a user outside macFUSE's admin_group, lfs_nonadmin, made with dscl after the census and removed
 #   before the before-login section (and by finish), mounts an ext4 image without the CLI's SHARE_OPT, which the smoke
 #   reads from the installed CLI and never writes itself
