@@ -350,6 +350,25 @@ replies "$D/smtd.out" | grep -q "^hi|no${T}1${T}[^|]*|\$" && ! ran; ok $? "serve
 mnt NAME; touch "$V/NAME/file"; prog mount
 cl send "$(rq ext4 "$E" - NAME)" > "$D/sne.out"
 replies "$D/sne.out" | grep -q "^hi|no${T}1${T}[^|]*|\$" && ! ran; ok $? "serve_mnt_refusals: not empty: no 1, before begin"
+# spec: Push F (run 45759784594) -- 10.9's diskarbitrationd leaves a regular .autodiskmounted in each mount point it makes;
+# that one regular file alone is still empty (before begin and after adoption), any other shape of it or company is not
+mnt NAME; : > "$V/NAME/.autodiskmounted"; prog mount
+cl send "$(rq ext4 "$E" - NAME)" > "$D/sad.out"
+test "$(replies "$D/sad.out")" = "hi|begin|ok|" && grep -qx "adopt $V/NAME" "$D/err"
+ok $? "serve_autodiskmounted: only a regular .autodiskmounted: empty, adopted, ok ($(replies "$D/sad.out"))"
+mnt NAME; ln -s /etc/hosts "$V/NAME/.autodiskmounted"; prog mount
+cl send "$(rq ext4 "$E" - NAME)" > "$D/sads.out"
+replies "$D/sads.out" | grep -q "^hi|no${T}1${T}the mount point is not empty|\$" && ! ran; ok $? "serve_autodiskmounted: a symlink of that name: not empty ($(replies "$D/sads.out"))"
+mnt NAME; mkdir "$V/NAME/.autodiskmounted"; prog mount
+cl send "$(rq ext4 "$E" - NAME)" > "$D/sadd.out"
+replies "$D/sadd.out" | grep -q "^hi|no${T}1${T}the mount point is not empty|\$" && ! ran; ok $? "serve_autodiskmounted: a directory of that name: not empty ($(replies "$D/sadd.out"))"
+mnt NAME; mkfifo "$V/NAME/.autodiskmounted"; prog mount
+cl send "$(rq ext4 "$E" - NAME)" > "$D/sadf.out"
+replies "$D/sadf.out" | grep -q "^hi|no${T}1${T}the mount point is not empty|\$" && ! ran; ok $? "serve_autodiskmounted: a fifo of that name: not empty ($(replies "$D/sadf.out"))"
+mnt NAME; : > "$V/NAME/.autodiskmounted"; : > "$V/NAME/other"; prog mount
+cl send "$(rq ext4 "$E" - NAME)" > "$D/sado.out"
+replies "$D/sado.out" | grep -q "^hi|no${T}1${T}the mount point is not empty|\$" && ! ran; ok $? "serve_autodiskmounted: that file and another: not empty ($(replies "$D/sado.out"))"
+rm -rf "$V/NAME"
 rm -rf "$V/NAME"; mkdir -p "$D/elsewhere"; ln -s "$D/elsewhere" "$V/NAME"
 cl send "$(rq ext4 "$E" - NAME)" > "$D/ssym.out"
 replies "$D/ssym.out" | grep -q "^hi|no${T}1${T}[^|]*|\$" && ! ran; ok $? "serve_mnt_refusals: a symlink: no 1, before begin"

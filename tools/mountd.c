@@ -885,20 +885,27 @@ static int anything_on(const char *mnt)
 }
 
 /* Whether the directory open on FD is empty (1), not (0), or cannot be read (-1). 10.9 has no fdopendir: the child stands in
- * the directory itself (fchdir, so a rename of MNT changes nothing) and reads ".", then goes back to /. */
+ * the directory itself (fchdir, so a rename of MNT changes nothing) and reads ".", then goes back to /. One entry is
+ * forgiven: a regular file (lstat, so never a symlink) named AUTODISKMOUNTED, which 10.9's diskarbitrationd leaves in each
+ * mount point it makes (push F). Any other entry, or that name as anything but a regular file, is not empty. */
+#define AUTODISKMOUNTED ".autodiskmounted"
 static int dir_empty(int fd)
 {
 	struct dirent *e;
+	struct stat st;
 	DIR *dir;
 	int n = -1;
 
 	if (fchdir(fd) == 0 && (dir = opendir(".")) != NULL) {
 		n = 1;
-		while ((e = readdir(dir)) != NULL)
-			if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0) {
-				n = 0;
-				break;
-			}
+		while ((e = readdir(dir)) != NULL) {
+			if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+				continue;
+			if (strcmp(e->d_name, AUTODISKMOUNTED) == 0 && lstat(AUTODISKMOUNTED, &st) == 0 && S_ISREG(st.st_mode))
+				continue;
+			n = 0;
+			break;
+		}
 		closedir(dir);
 	}
 	if (chdir("/") != 0)
