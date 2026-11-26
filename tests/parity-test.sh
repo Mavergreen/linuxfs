@@ -481,9 +481,13 @@ linuxfs)
   esac ;;
 sudo)
   test "$1" != -n || shift
+  # census_fsu_start's root shell (sh -c '... exec fs_usage ...' _ PIDFILE): the stub fs_usage writes PIDFILE itself, once its
+  #   handlers are in (the real one's few ms between its pid and its handlers are a stub's Python start-up)
+  case "$*" in "sh -c "*"exec fs_usage "*) STUB_FSU_PIDFILE=$5 exec fs_usage -w -f pathname ;; esac
   case $1 in
   sh|tail|cat|wc|mdutil|tmutil) exec "$@" ;;
-  kill) shift; kill "$@"; exit $? ;;
+  # with $STUB/sudo-kill-refused, sudoers lets no kill through
+  kill) test ! -f "$STUB/sudo-kill-refused" || { echo "sudo: a password is required" >&2; exit 1; }; shift; kill "$@"; exit $? ;;
   lsof)
     case "$*" in
     # the whole table (+c0, no path): a header, a line elsewhere, and Finder holding each mounted volume's .VolumeIcon.icns
@@ -555,14 +559,36 @@ esac
 exit 0
 EOF
 chmod +x "$T/bin/stub"
-# fs_usage: says it ran and its pid; killed (TERM), prints a line elsewhere and what the mounts fed it since it began (the
-#   real one prints as it goes, and flushes at its exit), then exits
-cat > "$T/bin/fs_usage" <<'EOF'
-#!/bin/sh
-echo "fs_usage $*" >> "$STUB/calls"; echo $$ >> "$STUB/fsu-pids"
-o=$(($(wc -c < "$STUB/fsu-feed" 2> /dev/null || echo 0) + 1))
-trap 'echo "$(date +%H:%M:%S).000001  open  F=4  (R_____)  /private/var/stub-elsewhere  0.000010   launchd.1"; tail -c +$o "$STUB/fsu-feed" 2> /dev/null; exit 0' TERM
-/bin/sleep 60 & wait $!
+# fs_usage: says it ran and its pid; on INT or TERM (handled as the real one does: it sets its own handlers, so a background
+#   job's ignored INT reaches it), prints a line elsewhere and what the mounts fed it since it began (the real one prints as
+#   it goes, and flushes at its exit), then exits. In Python: a sh in a background job cannot trap the INT it inherits ignored
+printf '#!%s\n' "$(command -v "$PARITY_PYTHON")" > "$T/bin/fs_usage"
+cat >> "$T/bin/fs_usage" <<'EOF'
+import os, signal, sys, time
+stub = os.environ["STUB"]
+open(stub + "/calls", "a").write("fs_usage " + " ".join(sys.argv[1:]) + "\n")
+open(stub + "/fsu-pids", "a").write("%d\n" % os.getpid())
+feed = stub + "/fsu-feed"
+try:
+    off = os.path.getsize(feed)
+except OSError:
+    off = 0
+def leave(n, f):
+    sys.stdout.write(time.strftime("%H:%M:%S") + ".000001  open  F=4  (R_____)  /private/var/stub-elsewhere  0.000010   launchd.1\n")
+    try:
+        fh = open(feed)
+        fh.seek(off)
+        sys.stdout.write(fh.read())
+    except IOError:
+        pass
+    sys.stdout.flush()
+    os._exit(0)
+signal.signal(signal.SIGINT, leave)
+signal.signal(signal.SIGTERM, leave)
+if os.environ.get("STUB_FSU_PIDFILE"):
+    open(os.environ["STUB_FSU_PIDFILE"], "w").write("%d\n" % os.getpid())
+for i in range(600):
+    time.sleep(0.1)
 EOF
 chmod +x "$T/bin/fs_usage"
 for c in hdiutil diskutil osascript sudo sysctl mkfile linuxfs mdutil mdfind tmutil defaults xattr df ps mount; do ln -sf stub "$T/bin/$c"; done
@@ -865,9 +891,16 @@ expect "census_busy_cycles: a busy unmount records the opens on the volume since
     h && /stub-elsewhere/ { bad = 1 } END { exit !(f && !bad) }' "$bl"
 fsu_gone() { test -s "$S/fsu-pids" || return 1; for p in $(cat "$S/fsu-pids"); do ! kill -0 "$p" 2> /dev/null || return 1; done; }
 expect "census_busy_cycles: fs_usage never left running" fsu_gone
-# one fs_usage over the HFS+ side's cycles; over ext4's, one stopped at its refusal and one more after: each stopped
-expect census_busy_fs_usage_runs test "$(grep -c '^fs_usage -w -f pathname$' "$S/calls")" -eq 3
-expect census_busy_fs_usage_stopped test "$(grep -c '^sudo -n kill [0-9][0-9]*$' "$S/calls")" -eq 3
+# the preflight's fs_usage; one over the HFS+ side's cycles; over ext4's, one stopped at its refusal and one more after:
+#   each stopped by INT (fs_usage flushes at its exit), none needing TERM or KILL
+expect census_busy_fs_usage_runs test "$(grep -c '^fs_usage -w -f pathname$' "$S/calls")" -eq 4
+expect census_busy_fs_usage_stopped test "$(grep -c '^sudo -n kill -INT [0-9][0-9]*$' "$S/calls")" -eq 4
+expect census_busy_fs_usage_int_only not grep -q '^sudo -n kill -\(TERM\|9\) ' "$S/calls"
+# fix round 1: the preflight, once a smoke: sudo -n sh, sudo -n kill, and fs_usage's time column, recorded; capture on
+pf=$P/fs_usage-preflight.txt
+expect census_fsu_preflight_on test "$(tail -n 1 "$pf")" = "capture: on"
+expect census_fsu_preflight_column grep -q '^fs_usage first column: [0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]*$' "$pf"
+expect census_fsu_preflight_steps sh -c 'grep -q "^sudo -n sh -c echo ok$" "$1" && grep -q "^sudo -n kill -0 [0-9]" "$1"' _ "$S/calls"
 expect census_busy_fs_usage_raw_gone test -z "$(ls "$W/census" | grep fs_usage)"
 expect "census_busy: the HFS+ control carries the same custom volume icon as linuxfs" \
   sh -c 'cmp -s "$1/.VolumeIcon.icns" "$2" && grep -q "^xattr -wx com.apple.FinderInfo 0000000000000000040000000000000000000000000000000000000000000000 .*/vols/busy-hfs-ext4$" "$3"' _ "$T/vols/busy-hfs-ext4" "$PARITY_VOLICON_OF" "$S/calls"
@@ -888,6 +921,44 @@ mv "$T/volicon.away" "$PARITY_VOLICON_OF"; rm -f "$W/img/noicon.img"; cp "$T/cal
 expect census_busy_no_icon_said has "$r" "^# census_busy noicon: no $PARITY_VOLICON_OF, so the HFS+ control gets no custom icon$"
 expect census_busy_no_icon_notok has "$r" "^not ok - parity busy.noicon.cycles (hfs 0 of 20, noicon 0 of 20; custom icon: hfs no, noicon yes)$"
 expect census_busy_no_icon_detached test -z "$(attached)"
+expect census_fsu_preflight_once test "$(grep -c '^capture: ' "$pf")" -eq 1
+cp "$S/calls" "$T/calls.keep"   # (ext4's calls, for the cases after these)
+# fix round 1: icons never recorded on either side (both empty) prove nothing either
+r=$(census_busy_bar busy.x.cycles check x "0 20" "0 20" 20 "" "" 2>&1)
+expect census_busy_bar_icons_unrecorded test "$r" = "$(printf '%s\n' 'not ok - parity busy.x.cycles (hfs 0 of 20, x 0 of 20; custom icon: recorded on neither side)' 'parity: busy.x.cycles: neither side recorded its custom icon, so it proves nothing')"
+# fix round 1: an fs_usage deaf to INT and TERM is KILLed, and that said (its unflushed output lost)
+: > "$S/fsu-pids"
+r=$(census_pid_gone() { return 1; }; census_fsu_start "$T/deaf.txt"; census_fsu_stop 2>&1)
+expect census_fsu_stop_killed has "$r" "^-- fs_usage [0-9]* did not exit on INT or TERM: KILLed, its unflushed output lost$"
+expect census_fsu_stop_kill_order awk '/^sudo -n kill -INT / { i = NR } /^sudo -n kill -TERM / && i { t = NR } /^sudo -n kill -9 / && t { k = 1 } END { exit !k }' "$S/calls"
+fsu_dead() { test -s "$S/fsu-pids" || return 1; for p in $(cat "$S/fsu-pids"); do ! ps -o stat= -p "$p" 2> /dev/null | grep -qv '^ *Z' || return 1; done; }
+dead=; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do fsu_dead && { dead=1; break; }; /bin/sleep 0.1; done
+expect census_fsu_stop_killed_gone test -n "$dead"
+# fix round 1 (I1): the abort path: a census subshell that ends without its stop (the smoke signalled) leaves fs_usage
+#   running; census_fsu_abort, which finish runs, stops it by its pid file, then pkills any fs_usage left
+: > "$S/fsu-pids"; : > "$S/calls"
+( census_fsu_start "$T/abort.txt"; bounded 50 census_fsu_pidfile )
+r=$(census_fsu_abort 2>&1)
+dead=; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do fsu_dead && { dead=1; break; }; /bin/sleep 0.1; done
+expect "census_fsu_abort: the abort path leaves no fs_usage running" test -n "$dead"
+expect census_fsu_abort_int grep -q '^sudo -n kill -INT [0-9]' "$S/calls"
+expect census_fsu_abort_pkill grep -q '^sudo -n pkill -x fs_usage$' "$S/calls"
+expect census_fsu_abort_pidfile_gone test ! -e "$W/census/fs_usage.pid"
+r=$(census_fsu_abort 2>&1); expect census_fsu_abort_idle test -z "$r"
+expect smoke_finish_stops_fs_usage test -n "$(awk '/^finish\(\) \{/ { p = 1 } p && /census_fsu_abort/ { print; exit } p && /^}/ { exit }' "$here/smoke-mavericks.sh")"
+expect smoke_traps_signals grep -q "^trap '.*finish' INT TERM HUP$" "$here/smoke-mavericks.sh"
+# fix round 1: sudoers refusing kill: the preflight says capture off and why; the cycles then capture nothing (no fs_usage
+#   started), say so at a refusal, and still count and bar as before
+mv "$pf" "$T/pf.keep"; : > "$S/sudo-kill-refused"; : > "$S/calls"
+census_fsu_preflight > /dev/null 2>&1
+expect census_fsu_preflight_off test "$(tail -n 1 "$pf")" = "capture: off (sudo -n kill refused)"
+rm -f "$S/busy-once"; echo x > "$W/census/busy-ext4-pf.img"
+r=$(census_busy_cycles ext4 "$W/census/busy-ext4-pf.img" "$T/pf.log" 2>&1)
+expect census_fsu_off_counted test "$r" = "1 20"
+expect census_fsu_off_said grep -q '^-- fs_usage: not captured (capture: off (sudo -n kill refused))$' "$T/pf.log"
+expect census_fsu_off_lsof_kept grep -q '^-- sudo lsof -n -P +c0 (the whole table)' "$T/pf.log"
+expect census_fsu_off_no_start not grep -q '^fs_usage ' "$S/calls"
+rm -f "$S/sudo-kill-refused" "$W/census/busy-ext4-pf.img" "$T/pf.log"; mv "$T/pf.keep" "$pf"; cp "$T/calls.keep" "$S/calls"
 # census_busy_fsevents WHAT FS LOG, on its own: not ok when a side said no, or said nothing; recorded under record
 printf '%s\n' 'hfs: fsevents: .fseventsd yes' 'xfs: fsevents: .fseventsd no' > "$T/bf.log"
 r=$(census_busy_fsevents spotlight.xfs.busy-fsevents xfs "$T/bf.log" 2>&1)

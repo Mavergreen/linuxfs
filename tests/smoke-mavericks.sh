@@ -77,6 +77,9 @@ crashes() { ls "$HOME"/Library/Logs/DiagnosticReports/lklfuse_* /Library/Logs/Di
 mountpoint_of() { "$L" status | awk -F"$tab" -v s="$1" '$2 == s { print $3; exit }'; }
 pid_of() { "$L" status | awk -F"$tab" -v s="$1" '$2 == s { print $1; exit }'; }
 finish() {
+  # spec: tests/lib/parity.sh census_fsu_abort -- Task 16e-fix round 1: a census_busy_cycles fs_usage (root's) left by a signal
+  #       or a die is stopped first
+  test -z "${parity_lib:-}" || census_fsu_abort
   test -z "${na_made:-}" || nonadmin_remove > /dev/null 2>&1
   test -z "${OWNERS_TAG:-}" || owners_line_gone > /dev/null 2>&1
   for m in "$W"/mnt/*; do mount | grep -qF " on $m (" && { umount -f "$m" || diskutil unmount force "$m"; } > /dev/null 2>&1; done
@@ -93,6 +96,8 @@ finish() {
   echo "1..$n"
   exit "$bad"
 }
+# a signalled smoke (the job cancelled or timed out, ssh dropped) still runs finish: its cleanup, fs_usage's stop, the copyback
+trap 'trap - INT TERM HUP; notok "the smoke was signalled"; finish' INT TERM HUP
 [ "$(id -u)" != 0 ] || { echo "run this as the guest's user, not root: volumes are mounted by users" >&2; exit 1; }
 rm -rf "$W"; mkdir -p "$W/img" "$W/mnt" || exit 1
 CRASH0=$(crashes)
