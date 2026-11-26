@@ -130,7 +130,8 @@ jobs:
           set -eu
           b="$MAVERICKS_BUILD_ROOT/built"
           sh "$SHIPYARD_SCRIPTS/assert_binary_compatible.sh" \
-            "$b/lklfuse" "$b/linuxfs-probe" "$b/linuxfs-open" "$b/linuxfs-fs" "$b/linuxfs-helper" "$b/linuxfs-agent" "$b/linuxfs-mountd"
+            "$b/lklfuse" "$b/linuxfs-probe" "$b/linuxfs-open" "$b/linuxfs-fs" "$b/linuxfs-helper" "$b/linuxfs-agent" "$b/linuxfs-mountd" \
+            "$b/linuxfs-volicon"
 
       - name: Stage the product, build the updater, package
         env:
