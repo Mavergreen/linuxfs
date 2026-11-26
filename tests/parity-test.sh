@@ -896,10 +896,11 @@ expect census_busy_finder grep -q 'eject disk' "$S/calls"
 expect census_busy_shot test "$(grep -c 'screencapture -x .*-busy-eject.png' "$S/calls")" -eq 2
 expect census_busy_force_hfs grep -q '^diskutil unmount force .*/vols/busy-hfs-ext4$' "$S/calls"
 expect census_busy_force_unmount_fs grep -q '^diskutil unmount force .*/vols/busy-ext4$' "$S/calls"
-# (Task 19b) Finder's refused eject leaves UnmountAssistantAgent retrying it until it succeeds: it is stopped after
-#   finder-eject's step, before the holder is let go and before force-unmount (push F2: it ejected ext4's disk first)
-uaa_stopped() { awk '/osascript .*eject disk/ { e = 1 } /^guest-macosx-aqua killall UnmountAssistantAgent$/ { if (e) k = 1 }
-  /^diskutil unmount force / { f = 1; ok = k; exit } END { exit !(f && ok) }' "$S/calls"; }
+# (Task 19b) Finder's refused eject leaves UnmountAssistantAgent retrying it every ~3 s for about 30 s: it is stopped
+#   after finder-eject's step (after each side's eject), before census_busy_release lets the holder go (its TextEdit quit
+#   is the first thing release asks), and so before force-unmount (push F2: it ejected ext4's disk first)
+uaa_stopped() { awk '/osascript .*eject disk/ { e = 1; k = 0 } /^guest-macosx-aqua killall UnmountAssistantAgent$/ { if (e) k = 1 }
+  e && /TextEdit.*quit saving no/ { f = 1; ok = k; exit } END { exit !(f && ok) }' "$S/calls"; }
 expect census_busy_unmount_assistant_stopped uaa_stopped
 expect census_busy_eject_retried grep -q '^# census: retrying diskutil eject /dev/disk' "$P/busy.ext4.cycles.txt"
 expect census_busy_eject_lsof grep -q '^#   COMMAND PID USER (stub lsof lsof .*/vols/busy-ext4)' "$P/busy.ext4.cycles.txt"
@@ -2059,12 +2060,18 @@ rm -f "$lp_l"
 ll_d=/private/var/db/linuxfs/Library/Caches/dev.mavergreen.linuxfs/locks
 if test "$(uname -s)" = Darwin; then   # platform: stat -f %d is BSD stat's device number
   : > "$T/ll.img"
-  r=$( (eval "$(grep '^image_lock()' "$here/../cli/linuxfs")"; image_lock "$T/ll.img") )
+  # (fix round 1) the CLI's own lines name the expected lock: image_lock, and cmd_mount's whole-disk and -sN derivation
+  #   (cli/linuxfs: whole=${blk%s[0-9]*}, then lockname=...-s${blk##*s} for a partition), image_of standing in for hdiutil
+  cli_lock() { (blk=$1; eval "$(grep '^image_lock()' "$here/../cli/linuxfs")"; image_of() { echo "$T/ll.img"; }
+    eval "$(grep -E '^ *whole=\$\{blk%s\[0-9\]\*\}; img=\$\(image_of "\$whole"\)$' "$here/../cli/linuxfs")"
+    eval "$(grep -E '^ *lockname=\$\(image_lock "\$img"\); \[ "\$whole" = "\$blk" \] \|\| lockname=' "$here/../cli/linuxfs")"
+    echo "$lockname"); }
   ll() { (eval "$(smoke_fn login_lock)"; login_lock "$@"); }
-  expect smoke_login_lock_whole test "$(ll "$T/ll.img" /dev/disk2)" = "$ll_d/linuxfs-$r.lock"
-  expect smoke_login_lock_partition test "$(ll "$T/ll.img" /dev/disk2s1)" = "$ll_d/linuxfs-$r-s1.lock"
+  expect smoke_login_lock_cli_lines test "$(cli_lock /dev/disk2s1)" != "$(cli_lock /dev/disk2)" -a -n "$(cli_lock /dev/disk2)"
+  expect smoke_login_lock_whole test "$(ll "$T/ll.img" /dev/disk2)" = "$ll_d/linuxfs-$(cli_lock /dev/disk2).lock"
+  expect smoke_login_lock_partition test "$(ll "$T/ll.img" /dev/disk2s1)" = "$ll_d/linuxfs-$(cli_lock /dev/disk2s1).lock"
   rm -f "$T/ll.img"
-else echo "ok - smoke_login_lock_whole # SKIP not a Mac"; echo "ok - smoke_login_lock_partition # SKIP not a Mac"; fi
+else for t in smoke_login_lock_cli_lines smoke_login_lock_whole smoke_login_lock_partition; do echo "ok - $t # SKIP not a Mac"; done; fi
 expect smoke_login_lock_used test -n "$(grep 'lk=$(login_lock "$W/img/login-ext4.img" "$dev")' "$sm")"
 expect smoke_login_lock_not_first test -z "$(grep -e '/\*\.lock' "$sm")"
 

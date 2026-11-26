@@ -1355,9 +1355,11 @@ census_busy() {
     finder-eject)
       census_bound 1800 census_busy_parity "$cb_m" "busy.$cb_fs.finder-eject" census_finder_eject @MP@ @VOL@   # census_finder_ask's eject worst, 173 s (see it)
       # Task 19b: Finder's refused eject leaves UnmountAssistantAgent (the console user's, not Finder's) trying the
-      #   unmount and eject again every 3 s or so until they succeed, Finder restarted or not: push F2's took ext4's disk
-      #   away a second after census_busy_release let go, after census_busy_up had found it mounted, so force-unmount's
-      #   hold found no volume. It is stopped before the holder is let go.
+      #   unmount and eject again every ~3 s for about 30 s, Finder restarted or not (push F2: the control's from 00:35:47
+      #   to 00:36:16, ten tries, then it gave up). ext4's, begun 23 s later, was still trying when census_busy_release
+      #   let the holder go, and took ext4's disk away a second later, after census_busy_up had found it mounted, so
+      #   force-unmount's hold found no volume. The same agent on both sides; only its start differs. It is stopped
+      #   before the holder is let go, however long the step took.
       bounded 100 "$AQUA" killall UnmountAssistantAgent >/dev/null 2>&1 </dev/null
       bounded 300 "$AQUA" killall Finder >/dev/null 2>&1 </dev/null; census_pause 6 ;;
     esac
