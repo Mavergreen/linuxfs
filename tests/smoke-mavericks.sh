@@ -8,8 +8,9 @@
 #       bundles: ext4, btrfs, xfs, f2fs, NTFS (NTFSTakeover on) and APFS, raw and GPT-wrapped, are mounted by an attach within 30 s (personality, Type (Bundle) macfuse_<fs>, Name (User Visible) the FSName, mount type macfuse_<fs>, reads, writes, unmount and mount, eject
 #       leaves no lklfuse), each mount root's through the mount daemon (it is loaded, its socket root's 0666): in the table as
 #       DiskArbitration says, no mount_macfuse failure, root's mount_macfuse -o allow_other with fsname=/dev/<bsd>, nodev and
-#       nosuid, served by a _linuxfs lklfuse with uid=99,gid=99 (no lklfuse as root), no ?owner= entry, and unmounted and ejected
-#       by the user with no sudo; once, the daemon's peer (the console user, outside macFUSE's admin_group) gets .fseventsd; NTFS with NTFSTakeover off is Apple's; `linuxfs ignore` (an /etc/fstab noauto entry: ext4 by device, NTFS by
+#       nosuid, served by a _linuxfs lklfuse with uid=99,gid=99 (no lklfuse as root), no ?owner= entry and diskutil info naming
+#       the disk, and unmounted and ejected by the user with no sudo (a refusal of root's mount marked STOP-AND-ASK:); once, on a
+#       fresh image, the daemon's peer (the console user, outside macFUSE's admin_group) gets .fseventsd; NTFS with NTFSTakeover off is Apple's; `linuxfs ignore` (an /etc/fstab noauto entry: ext4 by device, NTFS by
 #       label; ext4 by a label with a space, written as LABEL=my\040data; each entry's type macfuse_<fs>) mounts nothing on a plain attach and never runs the mount program, `diskutil mount` mounts it, and after `linuxfs unignore` a plain attach does;
 #       ReadOnly in the user's plist (read by the root mount program) mounts read-only; an /etc/fstab rw,owners line shows
 #       Linux's ids, refuses the user's write to Linux root's 0644 file, and gives what the user makes to the user; a label with a slash or a control
@@ -287,8 +288,13 @@ da_wait() {
 # spec: tests/smoke-mavericks.sh header -- the lklfuse lines whose command ends in exactly MNT as its last argument (a mount point may hold spaces)
 lklfuse_on() { lklfuses | awk -v m=" $1" 'length($0) > length(m) && substr($0, length($0) - length(m) + 1) == m'; }
 lklfuses() { ps -axww -o user=,pid=,command= | awk '/lklfuse/ && !/awk/'; }
-lklfuse_user_is() { lklfuse_on "$2" | awk -v u="$1" '$1 == u { f = 1 } END { exit !f }'; }
-lklfuse_has() { lklfuse_on "$2" | grep -q "$1"; }
+# spec: cli/linuxfs records -- the "USER PID COMMAND" line of each lklfuse serving MNT: root's mount's by its record (root_lklfuse_of:
+#       its command ends in /dev/fd/N, never MNT), else the user path's (lklfuse_on)
+lklfuse_serving() {
+  ls_p=$(root_lklfuse_of "$1")
+  if test -n "$ls_p"; then for ls_x in $ls_p; do ps -ww -o user=,pid=,command= -p "$ls_x" 2> /dev/null; done; else lklfuse_on "$1"; fi
+}
+lklfuse_has() { lklfuse_serving "$2" | grep -q "$1"; }
 no_root_lklfuse() { lklfuses | awk '$1 == "root" { f = 1 } END { exit f }'; }
 # spec: tools/fs.c mount_by_root -- before login: the lklfuse lines run by _linuxfs whose mountpoint is /dev/fd/N (root's mount)
 lklfuse_fd() { lklfuses | awk '$1 == "_linuxfs" && $NF ~ /^\/dev\/fd\/[0-9]+$/'; }
@@ -348,7 +354,19 @@ retry_busy() {  # MOUNTPOINT DISK|"" CMD...
   rb_mp=$1 rb_d=$2; shift 2
   bounded 600 "$@" && return 0
   echo "# $* failed; who holds $rb_mp:"; holders "$rb_mp" $rb_d
-  sleep 2; echo "# retrying $*"; bounded 600 "$@"
+  sleep 2; echo "# retrying $*"
+  rb_o=$(bounded 600 "$@" 2>&1); rb_rc=$?; test -z "$rb_o" || printf '%s\n' "$rb_o"
+  test "$rb_rc" -eq 0 && return 0
+  stop_and_ask "$rb_mp" "$*" "$rb_o"; return "$rb_rc"
+}
+# spec: docs/superpowers/plans/2026-11-25-hfs-parity.md 16l-push Step 3 -- the user's unmount or eject of root's mount refused is
+#       the stop-and-ask (risk 1 of the amendment), not a busy volume's flake: after the retry failed, when MOUNTPOINT is still
+#       root's and nothing says busy (diskutil's busy or dissent, or a holder in sudo -n lsof), one fixed marker line
+stop_and_ask() {  # MOUNTPOINT CMD OUTPUT
+  mounted_by_root "$1" > /dev/null || return 0
+  case $3 in *[Bb]usy*|*[Dd]issent*|*"in use"*) return 0 ;; esac
+  test -z "$(bounded 300 sudo -n lsof "$1" 2> /dev/null < /dev/null | sed 1d)" || return 0
+  echo "STOP-AND-ASK: the user's $2 of root's mount at $1 was refused (risk 1 of the amendment; no holder, nothing busy): $(printf '%s' "$3" | tr '\n' ' ' | sed 's/ *$//')"
 }
 da_unmount() { retry_busy "$1" "" diskutil unmount "$1"; }  # MOUNTPOINT
 login_unmount() { bounded 600 sudo -n diskutil unmount "$1" && ! mount | grep -qF " on $1 ("; }
@@ -356,12 +374,19 @@ login_eject() {  # whole disk: ejected, and no _linuxfs lklfuse within 10 s
   bounded 600 sudo -n diskutil eject "$1" || return 1
   j=0; while [ -n "$(lklfuses | awk '$1 == "_linuxfs"')" ]; do j=$((j + 1)); [ $j -le 100 ] || { lklfuses; return 1; }; sleep 0.1; done
 }
-da_eject() {  # whole disk, mount point: leaves no lklfuse on it (root's mount's, by its record; else the user path's, by its command)
-  pids=$(root_lklfuse_of "$2"); test -n "$pids" || pids=$(lklfuse_on "$2" | awk '{ print $2 }')
-  retry_busy "$2" "$1" diskutil eject "$1" || return 1
-  for p in $pids; do bounded 300 sh -c 'while ps -p "$1" > /dev/null; do sleep 0.1; done' _ "$p" || { echo "lklfuse $p still runs"; return 1; }; done
-  j=0; while [ -n "$(lklfuse_on "$2")" ]; do
-    j=$((j + 1)); [ $j -le 10 ] || { echo "lklfuse still on $2 ten seconds after the eject:"; lklfuses; ps -axww -o user=,pid=,command= | grep -i 'fuse' | grep -v grep; return 1; }
+da_eject() {  # whole disk, mount point: the user's eject (no sudo); first, for da_lklfuse_gone, whether MP was mounted (ej_was) and the
+  #             pids of the lklfuse serving it (ej_pids: root's mount's, by its record; else the user path's, by its command)
+  ej_was=$(mount | grep -F " on $2 (")
+  ej_pids=$(root_lklfuse_of "$2"); test -n "$ej_pids" || ej_pids=$(lklfuse_on "$2" | awk '{ print $2 }')
+  retry_busy "$2" "$1" diskutil eject "$1"
+}
+pid_gone() { while ps -p "$1" > /dev/null 2>&1; do sleep 0.1; done; }  # PID
+da_lklfuse_gone() {  # MP: after da_eject, each of its ej_pids gone (30 s each), and no lklfuse whose command ends in MP within 10 s;
+  #                  a mounted MP with no pid found (no record read: sudo refused) is not ok, said, never passed at once
+  test -n "$ej_pids" || test -z "$ej_was" || { echo "no lklfuse to wait on: no record of root's names $1, and no lklfuse's command ends in it (mount had: $ej_was)"; return 1; }
+  for p in $ej_pids; do bounded 300 pid_gone "$p" || { echo "lklfuse $p still runs"; return 1; }; done
+  j=0; while [ -n "$(lklfuse_on "$1")" ]; do
+    j=$((j + 1)); [ $j -le 10 ] || { echo "lklfuse still on $1 ten seconds after the eject:"; lklfuses; ps -axww -o user=,pid=,command= | grep -i 'fuse' | grep -v grep; return 1; }
     sleep 1
   done
 }
@@ -404,6 +429,12 @@ no_mount_failed() {  # POS: system.log since POS has no mount_macfuse or libfuse
 #   made through the mount daemon (tools/mountd.c), as before login: launchd holds its socket, root's 0666 (the peer check is
 #   the gate), and starts it on demand
 MOUNTD=dev.mavergreen.linuxfs.mountd MOUNTD_SOCK=/var/run/dev.mavergreen.linuxfs.mountd.sock
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/root-daemon-design.md M11 -- system.log since POS (through any turnover) has no line
+#   of the daemon's (its ident, linuxfs-mountd) and none of a mount program's about it; prints any it has
+mountd_not_asked() {  # POS
+  mna_l=$(log_since "$1" | grep -e 'linuxfs-mountd\[' -e 'mount_[a-z0-9]*: .*mount daemon')
+  test -z "$mna_l" || { printf '%s\n' "$mna_l"; return 1; }
+}
 mountd_ready() {  # launchd has the mount daemon loaded, and its socket is root's srw-rw-rw-
   bounded 100 sudo -n launchctl list "$MOUNTD" > /dev/null 2>&1 < /dev/null || { echo "sudo -n launchctl list $MOUNTD: not loaded"; return 1; }
   mr_s=$(stat -f '%Su %Sp' "$MOUNTD_SOCK" 2> /dev/null); echo "$MOUNTD_SOCK: ${mr_s:-no socket}"
@@ -462,10 +493,17 @@ no_owner_pseudo() {  # MP POS
   nop_l=$(log_since "$2" | grep -F "id = $1?owner=")
   test -z "$nop_l" || { printf '%s\n' "$nop_l"; return 1; }
 }
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-16l-findings-r0.md, the ruling on concern 1 -- the positive side of
+#   no_owner_pseudo, in da_cycle alone (the census's pairs keep theirs): diskutil info MP names DEV's node, so DiskArbitration
+#   ties the mount point to the disk
+da_info_node() {  # MP DEV
+  din_n=$(info "$1" "Device Node"); echo "diskutil info $1: Device Node ${din_n:-none} (want /dev/${2#/dev/})"
+  test "$din_n" = "/dev/${2#/dev/}"
+}
 # spec: .superpowers/sdd/2026-11-25-hfs-parity/root-daemon-design.md revision 1, question 3 -- the non-admin proof (with kit 16d
 #   Part B): the daemon's peer, the DiskArbitration mount program's credential, is the console user and outside macFUSE's
 #   admin_group (push D: it never has the user's groups), and still its request for DEV is ok and root's fseventsd is let in:
-#   .fseventsd on the volume within 10 s of a write
+#   on a fresh image's volume, no .fseventsd before a write (one there proves nothing), and one within 10 s of it
 mountd_unshared_peer() {  # DEV POS
   mup_d=${1#/dev/} mup_mp=$(info "$1" "Mount Point") mup_cu=$(stat -f %u /dev/console 2> /dev/null)
   mup_ag=$(sysctl -n vfs.generic.macfuse.tunables.admin_group 2> /dev/null) mup_s=$(log_since "$2")
@@ -475,14 +513,16 @@ mountd_unshared_peer() {  # DEV POS
   printf '%s\n' "$mup_p" | awk -v u="$mup_cu" -v g="$mup_ag" '{ if ($1 != u) bad = 1; n = split($2, a, ","); for (i = 1; i <= n; i++) if (a[i] == g) bad = 1 } END { exit bad }' ||
     { echo "a peer is not the console user, or is in admin_group"; return 1; }
   printf '%s\n' "$mup_s" | grep -qF "mountd: $mup_d on $mup_mp: ok (peer $mup_cu," || { echo "no mountd: $mup_d on $mup_mp: ok (peer $mup_cu, ...) since"; return 1; }
+  if test -e "$mup_mp/.fseventsd"; then echo ".fseventsd is on $mup_mp before the write, so the write proves nothing: $(ls -la "$mup_mp/.fseventsd" 2>&1 | tr '\n' '|')"; return 1; fi
   echo fsevents > "$mup_mp/da-fsevents" || return 1
   bounded 100 sh -c 'while ! test -d "$1/.fseventsd"; do sleep 0.2; done' _ "$mup_mp"; mup_rc=$?
   rm -f "$mup_mp/da-fsevents"
   test "$mup_rc" -eq 0 || { echo "no .fseventsd on $mup_mp within 10 s of a write"; return 1; }
 }
 # spec: tests/smoke-mavericks.sh header -- NAME IMAGE PERSONALITY KIND(rw|ro) VIA(raw|GPT): attach, mounted within 30 s, personality, reads and writes,
-#       unmount then mount, eject leaves no lklfuse; after each mount, root's (da_root_mount, da_served, no_owner_pseudo), and the
-#       unmount and eject the user's own, with no sudo (a refusal is a stop-and-ask: risk 1 of the amendment)
+#       unmount then mount, eject, then it leaves no lklfuse; after each mount, root's (da_root_mount, da_served, no_owner_pseudo,
+#       da_info_node), and the unmount and eject the user's own, with no sudo (a refusal is a stop-and-ask, risk 1 of the
+#       amendment: retry_busy marks it STOP-AND-ASK:)
 da_cycle() {
   nm=$1 img=$2 want=$3 kind=$4 via=$5 tag="$1 ($5)"
   pos=$(log_pos)
@@ -496,6 +536,7 @@ da_cycle() {
   check "$tag: root's mount (no fallback to the user's own), nodev and nosuid; root's mount_macfuse -o allow_other with fsname=/dev/${dev#/dev/}" bounded 300 da_root_mount "$mp" "$dev" "$nm" "$pos"
   check "$tag: served by a _linuxfs lklfuse with uid=99,gid=99; none as root" bounded 300 da_served "$mp"
   check "$tag: no ?owner= entry for $mp (DiskArbitration ties it to $dev)" bounded 300 no_owner_pseudo "$mp" "$pos"
+  check "$tag: diskutil info $mp names $dev" bounded 300 da_info_node "$mp" "$dev"
   # spec: tests/smoke-mavericks.sh mountd_unshared_peer -- once a smoke: the first ext4 cycle's
   if test "$nm.$via" = ext4.raw; then check "$tag: the mount daemon's peer is the console user outside admin_group, and gets .fseventsd" bounded 300 mountd_unshared_peer "$dev" "$pos"; fi
   check "$tag: diskutil info shows the personality $want, Type (Bundle) macfuse_$nm, Name (User Visible) '$(fsname_of "$nm")' and Mounted: Yes" persona_is "$dev" "$want" "$nm"
@@ -534,9 +575,12 @@ da_cycle() {
     check "$tag: root's mount again, nodev and nosuid; root's mount_macfuse -o allow_other with fsname=/dev/${dev#/dev/}" bounded 300 da_root_mount "$mp" "$dev" "$nm" "$pos"
     check "$tag: served again by a _linuxfs lklfuse with uid=99,gid=99; none as root" bounded 300 da_served "$mp"
     check "$tag: no ?owner= entry for $mp again" bounded 300 no_owner_pseudo "$mp" "$pos"
+    check "$tag: diskutil info $mp names $dev again" bounded 300 da_info_node "$mp" "$dev"
     [ "$kind" != rw ] || check "$tag: what was written reads back after remount" rw_reads "$mp"
   else notok "$tag: mounted again within 30 s"; fi
-  check "$tag: diskutil eject leaves no lklfuse" da_eject "$disk" "$mp"
+  if check "$tag: diskutil eject (the user's, no sudo)" da_eject "$disk" "$mp"; then
+    check "$tag: the eject leaves no lklfuse" da_lklfuse_gone "$mp"
+  fi
   cleanup_disk
 }
 
@@ -565,7 +609,8 @@ for c in ext4:ext4:rw btrfs:btrfs:rw xfs:XFS:rw f2fs:F2FS:rw ntfs:NTFS-linuxfs:r
   if [ ! -f "$W/img/$fs.img" ] && ! gunzip -c "$IN/$fs.img.gz" > "$W/img/$fs.img" 2> /dev/null; then
     notok "$fs: no $IN/$fs.img.gz (a required image)"; continue
   fi
-  if cp "$W/img/$fs.img" "$W/img/da-$fs.img"; then da_cycle "$fs" "$W/img/da-$fs.img" "$pers" "$kind" raw; else notok "$fs: cannot copy $fs.img"; fi
+  # r0 I2: afresh from IN, not W/img's, which phase 1 mounted and wrote (its .fseventsd, say)
+  if gunzip -c "$IN/$fs.img.gz" > "$W/img/da-$fs.img"; then da_cycle "$fs" "$W/img/da-$fs.img" "$pers" "$kind" raw; else notok "$fs: cannot unpack $IN/$fs.img.gz"; fi
   if gunzip -c "$IN/gpt-$fs.img.gz" > "$W/gpt-$fs.img"; then da_cycle "$fs" "$W/gpt-$fs.img" "$pers" "$kind" GPT; else notok "$fs: cannot unpack $IN/gpt-$fs.img.gz"; fi
   rm -f "$W/gpt-$fs.img"
 done
@@ -841,7 +886,7 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
   if [ "$(console)" = root ]; then ok "before login: the console is root's (the login window), after about $i s"
   else notok "before login: /dev/console is still owned by $(console) after 30 s (loginwindow restarted; the checks below may not be before-login)"; fi
   bounded 600 sudo -n screencapture -x "$OUT/before-login.png" > /dev/null 2>&1 && echo "# before-login.png taken as root" || echo "# NOTE: screencapture as root over ssh failed; no before-login.png"
-  bad0=$bad; loglog=$(wc -l < /var/log/system.log 2> /dev/null | tr -d ' ')
+  bad0=$bad; loglog=$(wc -l < /var/log/system.log 2> /dev/null | tr -d ' ') loglp=$(log_pos)
   out=$(bounded 3000 sudo -n hdiutil attach -imagekey diskimage-class=CRawDiskImage "$W/img/login-ext4.img" 2>&1)
   disks=$(printf '%s\n' "$out" | awk '/^\/dev\/disk/ { print $1 }' | tr '\n' ' '); disk=${disks%% *}
   # spec: tools/fs.c macfuse_serves_fd -- the mount program logs which way it mounts: root's mount needs a macFUSE whose
@@ -919,8 +964,9 @@ f = open(sys.argv[1], "a"); fcntl.flock(f, fcntl.LOCK_EX); sys.stdout.write("hel
       else notok "before login: the ext4 image mounted within 30 s"; echo "$out" | sed 's/^/# /'; fi ;;
   esac
   # spec: .superpowers/sdd/2026-11-25-hfs-parity/root-daemon-design.md M11 -- root's mount program never asks the mount daemon: no line of
-  #       the daemon's, and none of a mount program's about it, since loglog; read once, bounded (within this section's 5 minutes)
-  check "before login: the mount daemon was not asked" bounded 100 sh -c '! tail -n +"$1" /var/log/system.log | grep -e "mountd: " -e "mount daemon"' _ "$((${loglog:-0} + 1))"
+  #       the daemon's, and none of a mount program's about it, since loglp (log_pos's, so through any turnover); read once, bounded
+  #       (within this section's 5 minutes)
+  check "before login: the mount daemon was not asked" bounded 100 mountd_not_asked "$loglp"
   if [ "$bad" != "$bad0" ]; then
     echo "# before login, what is left, to find why:"
     sudo -n ls -la /Volumes 2>&1 | sed 's/^/# /'; for m in /Volumes/*; do sudo -n ls -lad "$m" 2>&1 | sed 's/^/# /'; done

@@ -1874,6 +1874,7 @@ expect smoke_no_lsof_D test -z "$(grep -n 'lsof +D' "$sm")"
 busyfn() { # FAILS CMD...: the smoke's retry_busy (and da_unmount), diskutil failing FAILS times; calls in $T/busy.calls
   : > "$T/busy.calls"; echo "$1" > "$T/busy.left"; shift
   (eval "$(smoke_fn info)"; eval "$(smoke_fn holders)"; eval "$(smoke_fn retry_busy)"; eval "$(smoke_fn da_unmount)"
+   eval "$(smoke_fn stop_and_ask)"; eval "$(smoke_fn mounted_by_root)"
    bounded() { shift; "$@"; }; sleep() { echo "sleep $*" >> "$T/busy.calls"; }
    diskutil() {
      echo "diskutil $*" >> "$T/busy.calls"
@@ -2182,6 +2183,13 @@ expect census_names_mode_root_sudo grep -q "^sudo -n cat $S/rootlogs/rdisk77.log
 rm -f "$P/names-mode.txt"; printf '%s\n' 'lklfuse: names: scanning (user)' > "$S/lklogs/rdisk77.log"
 r=$(mount() { echo "/dev/disk77 on /Volumes/n (macfuse_ext4, local, nodev, nosuid, mounted by u)"; }; census_names_mode disk77 /Volumes/n; cat "$P/names-mode.txt")
 expect census_names_mode_user_first test "$r" = "disk77 /Volumes/n: scanning (user)"
+# r0 M4: a root mount (no "mounted by") reads _linuxfs's log first: a stale user log for the same node (phase 1's CLI) is not its
+rm -f "$P/names-mode.txt"; printf '%s\n' 'lklfuse: names: exact (root)' > "$S/rootlogs/rdisk77.log"
+r=$(mount() { echo "/dev/disk77 on /Volumes/n (macfuse_ext4, local, nodev, nosuid)"; }; census_names_mode disk77 /Volumes/n; cat "$P/names-mode.txt")
+expect census_names_mode_root_first test "$r" = "disk77 /Volumes/n: exact (root)"
+rm -f "$P/names-mode.txt"; rm -f "${S:?}/rootlogs/rdisk77.log"
+r=$(mount() { echo "/dev/disk77 on /Volumes/n (macfuse_ext4, local, nodev, nosuid)"; }; census_names_mode disk77 /Volumes/n; cat "$P/names-mode.txt")
+expect census_names_mode_root_then_user test "$r" = "disk77 /Volumes/n: scanning (user)"
 rm -f "$P/names-mode.txt" "${S:?}/rootlogs/rdisk77.log" "${S:?}/lklogs/rdisk77.log"
 
 # the smoke's checks of root's automounts
@@ -2249,6 +2257,30 @@ echo "_linuxfs /p/lklfuse -f -o type=ext4,volname=my data /dev/fd/3 /dev/fd/4" >
 echo "Nov 25 linuxfs-mount[9]: mount_ext4: disk5 on /Volumes/my data: mount_macfuse -o allow_other,nosuid,nodev,local,fsname=/dev/disk5 (pid 9)" > "$T/rl.log"
 r=$(rl da_served '/Volumes/my data' owners '5|head' 2>&1); rc=$?
 expect smoke_da_served_owners_no_dp test "$rc" -ne 0
+# r0 I1: lklfuse_has OPT MP finds root's mount's lklfuse by its record (its command ends in /dev/fd/N, never MP); with no record,
+#   the user path's, whose command ends in MP
+echo "_linuxfs /p/lklfuse -f -o type=ext4,volicon=/b/linuxfs.icns,uid=99,gid=99 /dev/fd/3 /dev/fd/4" > "$T/rl.ps"; : > "$T/rl.ax"
+lh() { (eval "$(smoke_fn root_lklfuse_of)"; eval "$(smoke_fn lklfuses)"; eval "$(smoke_fn lklfuse_on)"; eval "$(smoke_fn lklfuse_serving)"; eval "$(smoke_fn lklfuse_has)"
+   LINUXFS_ROOT_STATE=$T/rs tab=$(printf '\t')
+   sudo() { test "$1" != -n || shift; "$@"; }
+   ps() {
+     case "$*" in
+     *-axww*) cat "$T/rl.ax" 2> /dev/null ;;
+     *"-p 4322"*) return 1 ;;
+     *user=*) sed -n 1p "$T/rl.ps" ;;
+     *-p*) sed -n 1p "$T/rl.ps" | cut -d ' ' -f 2- ;;
+     esac
+   }
+   lklfuse_has "$@") > /dev/null 2>&1; }
+expect smoke_lklfuse_has_root lh volicon=/b/linuxfs.icns '/Volumes/my data'
+expect smoke_lklfuse_has_root_not not lh volicon=/c/other.icns '/Volumes/my data'
+echo "u 88 /p/lklfuse -f -o type=ext4,volicon=/b/linuxfs.icns /dev/disk9 /Volumes/user vol" > "$T/rl.ax"
+expect smoke_lklfuse_has_user lh volicon=/b/linuxfs.icns '/Volumes/user vol'
+expect smoke_lklfuse_has_none not lh volicon=/b/linuxfs.icns '/Volumes/nothing'
+: > "$T/rl.ax"
+expect smoke_lklfuse_has_by_serving test -n "$(smoke_fn lklfuse_has | grep 'lklfuse_serving "$2"')" -a -z "$(smoke_fn lklfuse_has | grep 'lklfuse_on')"
+expect smoke_lklfuse_serving_root_first test -n "$(smoke_fn lklfuse_serving | grep 'root_lklfuse_of "$1"')"
+expect smoke_no_lklfuse_user_is test -z "$(grep -n 'lklfuse_user_is' "$sm")"
 rm -rf "${T:?}/rs"; rm -f "${T:?}/rl.ps" "${T:?}/rl.ax" "${T:?}/rl.log"
 # da_root_mount: root's mount_macfuse line must name this disk's fsname
 r=$( (eval "$(smoke_fn da_root_mount)"; mounted_by_root() { :; }
@@ -2262,12 +2294,17 @@ nop_l='Nov 25 diskarbitrationd[8]: created disk, id = /dev/disk5'; expect smoke_
 nop_l='Nov 25 diskarbitrationd[8]: created disk, id = /Volumes/my data?owner=501'; expect smoke_no_owner_pseudo_seen not nop
 nop_l='Nov 25 diskarbitrationd[8]: created disk, id = /Volumes/my data 1?owner=501'; expect smoke_no_owner_pseudo_other_mp nop
 # mountd_unshared_peer DEV POS: the daemon's peer line since POS is the console user's, outside macFUSE's admin_group; its result
-#   line for DEV is ok; and .fseventsd is on the volume within 10 s of a write (root's fseventsd let in)
-mkdir -p "$T/mup/.fseventsd"
-mup() { (eval "$(smoke_fn mountd_unshared_peer)"; unset -f sleep; bounded() { bounded_real "$@"; }
+#   line for DEV is ok; the volume (a fresh image's) has no .fseventsd before the write, and has one within 10 s of it (root's
+#   fseventsd let in)
+mkdir -p "$T/mup"
+mup() { # with $mup_fe: after (fseventsd makes .fseventsd once the write lands), before (it is there already), never
+  rm -rf "${T:?}/mup/.fseventsd"; test "$mup_fe" != before || mkdir "$T/mup/.fseventsd"
+  if test "$mup_fe" = after; then ( i=0; while ! test -e "$T/mup/da-fsevents" && test $i -lt 50; do i=$((i + 1)); /bin/sleep 0.1; done; mkdir "$T/mup/.fseventsd" ) & fi
+  (eval "$(smoke_fn mountd_unshared_peer)"; unset -f sleep; bounded() { bounded_real "$@"; }
   info() { echo "$T/mup"; }; stat() { echo 501; }; sysctl() { echo 80; }; syslog_since() { printf '%s\n' "$mup_l"; }
-  mountd_unshared_peer /dev/disk5 '5|head') > /dev/null 2>&1; }
+  mountd_unshared_peer /dev/disk5 '5|head') > "$T/mup.out" 2>&1; mup_rc=$?; wait; return $mup_rc; }
 ok_l="Nov 25 dev.mavergreen.linuxfs.mountd[7]: mountd: disk5 on $T/mup: ok (peer 501, DA 12ms)"
+mup_fe=after
 mup_l="$(printf '%s\n' 'Nov 25 dev.mavergreen.linuxfs.mountd[7]: mountd: peer uid 501 groups 20,12,61' "$ok_l")"; expect smoke_mountd_unshared_peer mup
 expect smoke_mountd_unshared_peer_tidy test ! -e "$T/mup/da-fsevents"
 mup_l="$(printf '%s\n' 'Nov 25 dev.mavergreen.linuxfs.mountd[7]: mountd: peer uid 501 groups 20,80,12' "$ok_l")"; expect smoke_mountd_unshared_peer_admin not mup
@@ -2275,9 +2312,15 @@ mup_l="$(printf '%s\n' 'Nov 25 dev.mavergreen.linuxfs.mountd[7]: mountd: peer ui
 mup_l="$ok_l"; expect smoke_mountd_unshared_peer_no_peer not mup
 mup_l="$(printf '%s\n' 'Nov 25 dev.mavergreen.linuxfs.mountd[7]: mountd: peer uid 501 groups 20' "Nov 25 x[7]: mountd: disk5 on $T/mup: user (peer 501, DA 12ms): busy")"
 expect smoke_mountd_unshared_peer_user not mup
-rmdir "$T/mup/.fseventsd"
-mup_l="$(printf '%s\n' 'Nov 25 dev.mavergreen.linuxfs.mountd[7]: mountd: peer uid 501 groups 20' "$ok_l")"; expect smoke_mountd_unshared_peer_no_fseventsd not mup
-rm -rf "${T:?}/mup"
+mup_l="$(printf '%s\n' 'Nov 25 dev.mavergreen.linuxfs.mountd[7]: mountd: peer uid 501 groups 20' "$ok_l")"
+mup_fe=never; expect smoke_mountd_unshared_peer_no_fseventsd not mup
+# r0 I2: a .fseventsd there before the write proves nothing (phase 1's mounts may have left it): not ok, and what was there said
+mup_fe=before; expect smoke_mountd_unshared_peer_stale not mup
+expect smoke_mountd_unshared_peer_stale_said grep -q "before the write" "$T/mup.out"
+expect smoke_mountd_unshared_peer_stale_unwritten test ! -e "$T/mup/da-fsevents"
+rm -rf "${T:?}/mup"; rm -f "${T:?}/mup.out"
+# r0 I2: each raw cycle's image is unpacked afresh from IN (phase 1 mounted and wrote IN's copy in W/img), never copied from it
+expect da_cycle_raw_fresh test -n "$(grep -F 'gunzip -c "$IN/$fs.img.gz" > "$W/img/da-$fs.img"' "$sm")" -a -z "$(grep -F 'cp "$W/img/$fs.img" "$W/img/da-$fs.img"' "$sm")"
 # da_cycle: after each of its mounts, root's mount (da_root_mount), served by _linuxfs (da_served) and no ?owner= (no_owner_pseudo);
 #   its unmount and eject are the user's own (no sudo); the peer proof once, in the first ext4 cycle (raw)
 dc_first=$(printf '%s\n' "$dc" | sed -n '/mounted at $mp within 30 s"/,/da_unmount/p')
@@ -2286,7 +2329,7 @@ for c in 'da_root_mount "$mp" "$dev" "$nm" "$pos"' 'da_served "$mp"' 'no_owner_p
   expect "da_cycle_first_${c%% *}" test "$(printf '%s\n' "$dc_first" | grep -cF "bounded 300 $c")" -eq 1
   expect "da_cycle_again_${c%% *}" test "$(printf '%s\n' "$dc_again" | grep -cF "bounded 300 $c")" -eq 1
 done
-expect da_cycle_user_unmount test -z "$(printf '%s\n' "$dc" | grep 'da_unmount\|da_eject' | grep sudo)$(smoke_fn da_unmount | grep sudo)$(smoke_fn da_eject | grep 'diskutil eject' | grep sudo)"
+expect da_cycle_user_unmount test -z "$(printf '%s\n' "$dc" | grep 'da_unmount\|da_eject' | sed "s/(the user's, no sudo)//" | grep sudo)$(smoke_fn da_unmount | grep sudo)$(smoke_fn da_eject | grep 'diskutil eject' | grep sudo)"
 expect da_cycle_peer_once test "$(grep -c 'mountd_unshared_peer "' "$sm")" -eq 1
 expect da_cycle_peer_ext4_raw test -n "$(printf '%s\n' "$dc_first" | grep 'mountd_unshared_peer "$dev" "$pos"' | grep -F '"$nm.$via" = ext4.raw')"
 expect da_eject_root_first test -n "$(smoke_fn da_eject | grep 'root_lklfuse_of "$2"')" -a -n "$(smoke_fn da_eject | grep 'lklfuse_on "$2"')"
@@ -2295,7 +2338,89 @@ expect smoke_owners_served test -n "$(smoke_fn owners_case | grep 'da_served "$m
 #   bounded
 after=$(awk 'p && !/^ *#/ { print } /^ *parity_census_all$/ { p = 1 }' "$sm")
 expect smoke_after_census_one_mountd test "$(printf '%s\n' "$after" | grep -c 'mountd\|mount daemon')" -eq 1
-expect smoke_before_login_not_asked test -n "$(printf '%s\n' "$after" | grep '^ *check "before login: the mount daemon was not asked" bounded 100 ' | grep 'loglog')"
+expect smoke_before_login_not_asked test -n "$(printf '%s\n' "$after" | grep '^ *check "before login: the mount daemon was not asked" bounded 100 mountd_not_asked "$loglp"$')"
+expect smoke_before_login_loglp test -n "$(printf '%s\n' "$after" | grep 'loglog=.*loglp=$(log_pos)')"
 expect smoke_before_login_not_asked_in_section ascending "$bl" "$(first_line 'check "before login: the mount daemon was not asked"')" "$(first_line '^  restore_login$')"
+
+# ---- Task 16l fix round 1 ----
+# r0 I3: when the user's diskutil unmount or eject of root's mount fails twice and the volume is still root's, with nothing saying
+#   busy (diskutil's busy or dissent, or a holder in lsof), retry_busy prints the fixed STOP-AND-ASK: marker (risk 1); never for a
+#   busy volume, a user mount, or a retry that worked
+sa() { # FAILS MSG LSOF MOUNTLINE CMD...: the smoke's retry_busy, diskutil failing FAILS times saying MSG, lsof saying LSOF
+  : > "$T/sa.calls"; echo "$1" > "$T/sa.left"; sa_msg=$2 sa_lsof=$3 sa_mount=$4; shift 4
+  (eval "$(smoke_fn info)"; eval "$(smoke_fn holders)"; eval "$(smoke_fn retry_busy)"; eval "$(smoke_fn da_unmount)"; eval "$(smoke_fn mounted_by_root)"
+   eval "$(smoke_fn stop_and_ask)"
+   bounded() { shift; "$@"; }; sleep() { :; }
+   diskutil() {
+     echo "diskutil $*" >> "$T/sa.calls"
+     case $1 in info) return 0 ;; esac
+     k=$(cat "$T/sa.left"); test "$k" -gt 0 || return 0; echo $((k - 1)) > "$T/sa.left"; echo "$sa_msg"; return 1
+   }
+   sudo() { echo "sudo $*" >> "$T/sa.calls"; case $* in *lsof*) test -z "$sa_lsof" || printf '%s\n' "COMMAND PID USER" "$sa_lsof" ;; esac; }
+   mount() { echo "$sa_mount"; }
+   "$@") 2>&1
+}
+rootl="/dev/disk9 on /Volumes/x (macfuse_ext4, local, nodev, nosuid, synchronous)"
+userl="/dev/disk9 on /Volumes/x (macfuse_ext4, local, nodev, nosuid, synchronous, mounted by u)"
+r=$(sa 2 "Unmount failed for /Volumes/x" "" "$rootl" da_unmount /Volumes/x)
+expect smoke_stop_and_ask_unmount has "$r" "^STOP-AND-ASK: the user's diskutil unmount /Volumes/x of root's mount at /Volumes/x was refused"
+expect smoke_stop_and_ask_once test "$(printf '%s\n' "$r" | grep -c 'STOP-AND-ASK:')" -eq 1
+expect smoke_stop_and_ask_says_output has "$r" "^STOP-AND-ASK: .*: Unmount failed for /Volumes/x$"
+r=$(sa 2 "Volume failed to eject" "" "$rootl" retry_busy /Volumes/x /dev/disk9 diskutil eject /dev/disk9)
+expect smoke_stop_and_ask_eject has "$r" "^STOP-AND-ASK: the user's diskutil eject /dev/disk9 of root's mount at /Volumes/x was refused"
+r=$(sa 2 "Volume x on disk9 failed to unmount: dissented by PID 77" "" "$rootl" da_unmount /Volumes/x)
+expect smoke_stop_and_ask_not_dissent test -z "$(printf '%s\n' "$r" | grep 'STOP-AND-ASK')"
+r=$(sa 2 "Unmount failed: Resource busy" "" "$rootl" da_unmount /Volumes/x)
+expect smoke_stop_and_ask_not_busy test -z "$(printf '%s\n' "$r" | grep 'STOP-AND-ASK')"
+r=$(sa 2 "Unmount failed for /Volumes/x" "mdworker 77 root cwd DIR /Volumes/x" "$rootl" da_unmount /Volumes/x)
+expect smoke_stop_and_ask_not_held test -z "$(printf '%s\n' "$r" | grep 'STOP-AND-ASK')"
+r=$(sa 2 "Unmount failed for /Volumes/x" "" "$userl" da_unmount /Volumes/x)
+expect smoke_stop_and_ask_not_user_mount test -z "$(printf '%s\n' "$r" | grep 'STOP-AND-ASK')"
+r=$(sa 2 "Unmount failed for /Volumes/x" "" "" da_unmount /Volumes/x)
+expect smoke_stop_and_ask_not_unmounted test -z "$(printf '%s\n' "$r" | grep 'STOP-AND-ASK')"
+r=$(sa 1 "Unmount failed for /Volumes/x" "" "$rootl" da_unmount /Volumes/x)
+expect smoke_stop_and_ask_not_retried test -z "$(printf '%s\n' "$r" | grep 'STOP-AND-ASK')"
+rm -f "${T:?}/sa.calls" "${T:?}/sa.left"
+expect smoke_stop_and_ask_in_retry test -n "$(smoke_fn retry_busy | grep 'stop_and_ask ')"
+# r0 I3: da_cycle's eject is two checks: the user's eject (no sudo), then, only when it worked, that it leaves no lklfuse
+expect da_cycle_eject_split test -n "$(printf '%s\n' "$dc" | grep '^ *if check "$tag: diskutil eject (the user'"'"'s, no sudo)" da_eject "$disk" "$mp"; then')" \
+  -a -n "$(printf '%s\n' "$dc" | grep 'check "$tag: the eject leaves no lklfuse" da_lklfuse_gone "$mp"')"
+expect da_eject_no_wait test -z "$(smoke_fn da_eject | grep 'while\|ps -p')"
+# r0 M1: da_lklfuse_gone waits on da_eject's pids; with none found for a volume that was mounted (no record read, e.g. sudo
+#   refused), not ok, said, instead of passing at once
+lg() { (eval "$(smoke_fn lklfuses)"; eval "$(smoke_fn lklfuse_on)"; eval "$(smoke_fn da_lklfuse_gone)"; eval "$(smoke_fn pid_gone)"; unset -f sleep; bounded() { bounded_real "$@"; }
+  ps() { case "$*" in *-axww*) : ;; *) return 1 ;; esac; }; sleep() { :; }
+  ej_pids=$1 ej_was=$2; da_lklfuse_gone /Volumes/x) 2>&1; }
+r=$(lg "" "/dev/disk9 on /Volumes/x (macfuse_ext4)"); rc=$?
+expect smoke_lklfuse_gone_no_pids test "$rc" -ne 0
+expect smoke_lklfuse_gone_no_pids_said has "$r" "^no lklfuse to wait on"
+r=$(lg "" ""); rc=$?
+expect smoke_lklfuse_gone_unmounted test "$rc" -eq 0
+r=$(lg 4321 "/dev/disk9 on /Volumes/x (macfuse_ext4)"); rc=$?
+expect smoke_lklfuse_gone_pid_gone test "$rc" -eq 0
+# the ruling on r0's concern 1: in da_cycle (never the census's pairs), after each mount, diskutil info MP names DEV's node:
+#   DiskArbitration ties the mount point to the disk (bounded)
+din() { (eval "$(smoke_fn da_info_node)"; info() { test "$1" = /Volumes/x && test "$2" = "Device Node" && echo "$din_n"; }; da_info_node /Volumes/x "$1") > /dev/null 2>&1; }
+din_n=/dev/disk5s1; expect smoke_da_info_node din /dev/disk5s1
+expect smoke_da_info_node_bare din disk5s1
+expect smoke_da_info_node_other not din /dev/disk5
+din_n=; expect smoke_da_info_node_none not din /dev/disk5s1
+dc_first=$(printf '%s\n' "$dc" | sed -n '/mounted at $mp within 30 s"/,/da_unmount/p')
+dc_again=$(printf '%s\n' "$dc" | sed -n '/mounted again at $mp"/,/da_eject/p')
+expect da_cycle_first_info_node test "$(printf '%s\n' "$dc_first" | grep -cF 'bounded 300 da_info_node "$mp" "$dev"')" -eq 1
+expect da_cycle_again_info_node test "$(printf '%s\n' "$dc_again" | grep -cF 'bounded 300 da_info_node "$mp" "$dev"')" -eq 1
+expect census_no_info_node test -z "$(grep -n 'da_info_node' "$here/lib/parity.sh")"
+# r0 I1's audit: da_cycle looks up no lklfuse by its mount point but through root's records (lklfuse_serving, da_served)
+expect da_cycle_no_lklfuse_on test -z "$(printf '%s\n' "$dc" | grep 'lklfuse_on')"
+# r0 M3: no fallback to record contradicts PARITY_MODE_FSEVENTS_DA's default; and Task 16l's flip is told as done
+expect fsevents_da_no_record_fallback test -z "$(grep -n 'PARITY_MODE_FSEVENTS_DA:-record' "$here/lib/parity.sh")"
+expect fsevents_da_no_future test -z "$(grep -n 'Task 16l flips them back' "$here/lib/parity.sh")"
+# r0 M5: before login, the daemon's own lines (its ident, linuxfs-mountd) or a mount program's about it, read through any
+#   turnover (syslog_since from log_pos's); automountd's are not the daemon's
+mna() { (eval "$(smoke_fn mountd_not_asked)"; eval "$(smoke_fn log_since)"; syslog_since() { printf '%s\n' "$mna_l"; }; mountd_not_asked '5|head') > /dev/null 2>&1; }
+mna_l='Nov 25 automountd[51]: automountd: no mounts'; expect smoke_mountd_not_asked mna
+mna_l='Nov 25 linuxfs-mountd[9]: mountd: refused uid 0: not the console user'; expect smoke_mountd_not_asked_daemon not mna
+mna_l='Nov 25 linuxfs-mount[9]: mount_ext4: disk5 on /Volumes/x: the mount daemon said no (3: busy)'; expect smoke_mountd_not_asked_program not mna
+expect smoke_mountd_not_asked_since test -n "$(smoke_fn mountd_not_asked | grep 'log_since "$1"')" -a -z "$(smoke_fn mountd_not_asked | grep 'tail -n')"
 
 test "$fails" -eq 0

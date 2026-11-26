@@ -108,7 +108,7 @@ PARITY_MODE_FSEVENTS_DA=${PARITY_MODE_FSEVENTS_DA:-check}
 # census_fsevents_mode: for a step that needs root's processes let in on a DiskArbitration volume, CFM, the mode it takes
 #   (PARITY_MODE_FSEVENTS_DA while PARITY_MODE_SPOTLIGHT is check, else PARITY_MODE_SPOTLIGHT's), and CFM_VAR, whose it is
 census_fsevents_mode() {
-  if test "${PARITY_MODE_SPOTLIGHT:-record}" = check; then CFM=${PARITY_MODE_FSEVENTS_DA:-record} CFM_VAR=PARITY_MODE_FSEVENTS_DA
+  if test "${PARITY_MODE_SPOTLIGHT:-record}" = check; then CFM=$PARITY_MODE_FSEVENTS_DA CFM_VAR=PARITY_MODE_FSEVENTS_DA
   else CFM=${PARITY_MODE_SPOTLIGHT:-record} CFM_VAR=PARITY_MODE_SPOTLIGHT; fi
 }
 
@@ -320,17 +320,25 @@ census_fs_mp() {
 }
 # census_names_mode NODE MP: for a linuxfs mount (census_fs_mp: /dev/NODE on MP, one of the six types), its names line, read
 #   at once (the next mount of NODE writes the log afresh), appended to names-mode.txt as "NODE MP: MODE ...", or "NODE MP:
-#   none (...)" when the log has none; nothing for any other mount (HFS+, FAT32). The user's log first; when it has no names
-#   line, _linuxfs's (root's mount), through sudo
+#   none (...)" when the log has none; nothing for any other mount (HFS+, FAT32). The mounter's log first: for root's mount (no
+#   "mounted by"), _linuxfs's, through sudo (a stale user log for the same node, phase 1's CLI's, is not its: r0 M4), else the
+#   user's; when it has no names line, the other
 census_names_mode() {
   _cnm_n=${1#/dev/}
-  test "$(bounded 100 mount 2>/dev/null </dev/null | census_fs_mp "$_cnm_n")" = "$2" || return 0
-  _cnm_l=$(sed -n 's/^lklfuse: names: //p' "$PARITY_LKLOGS/r$_cnm_n.log" 2>/dev/null | tail -n 1)
-  test -n "$_cnm_l" ||
-    _cnm_l=$(bounded 100 sudo -n cat "$PARITY_ROOT_LKLOGS/r$_cnm_n.log" 2>/dev/null </dev/null | sed -n 's/^lklfuse: names: //p' | tail -n 1)
+  _cnm_m=$(bounded 100 mount 2>/dev/null </dev/null)
+  test "$(printf '%s\n' "$_cnm_m" | census_fs_mp "$_cnm_n")" = "$2" || return 0
+  if printf '%s\n' "$_cnm_m" | grep -F "/dev/$_cnm_n on $2 (" | grep -q 'mounted by'; then
+    _cnm_l=$(census_names_user "$_cnm_n"); test -n "$_cnm_l" || _cnm_l=$(census_names_root "$_cnm_n")
+  else
+    _cnm_l=$(census_names_root "$_cnm_n"); test -n "$_cnm_l" || _cnm_l=$(census_names_user "$_cnm_n")
+  fi
   mkdir -p "$OUT/parity"
   echo "$_cnm_n $2: ${_cnm_l:-none (no names line in $PARITY_LKLOGS/r$_cnm_n.log or $PARITY_ROOT_LKLOGS/r$_cnm_n.log)}" >>"$OUT/parity/names-mode.txt"
 }
+# census_names_user NODE / census_names_root NODE: the last names line of the user's lklfuse log for NODE, or of _linuxfs's
+#   (through sudo, bounded at 10 s)
+census_names_user() { sed -n 's/^lklfuse: names: //p' "$PARITY_LKLOGS/r$1.log" 2>/dev/null | tail -n 1; }
+census_names_root() { bounded 100 sudo -n cat "$PARITY_ROOT_LKLOGS/r$1.log" 2>/dev/null </dev/null | sed -n 's/^lklfuse: names: //p' | tail -n 1; }
 # census_names_bar: names-mode.txt counted. With PARITY_NAMES_WANT (the smoke's: exact with macFUSE 5.5.0-mavericks.5 or
 #   later, else scanning), ok when no mount ran the other mode and one at least ran the wanted one (none would prove
 #   nothing); a mount whose log had no names line is counted, not failed. Without it, recorded; anything else not ok.
@@ -1595,13 +1603,13 @@ census_spotlight_diag() {
 #   whether the indexing steps are checked: CS_INDEX_MODE check when PARITY_MODE_SPOTLIGHT is check and mdutil -s MP (the
 #   HFS+ control) says indexing is enabled, else record; CS_INDEX_WHY says why. (Task 16e fix round 1, r0 M3) Root's mds is refused
 #   on a DiskArbitration volume as root's fseventsd is, so the indexing steps are recorded too while PARITY_MODE_FSEVENTS_DA is
-#   record (Task 16l flips them back with it)
+#   record (Task 16l put them back to check with it: root mounts them now)
 census_index_mode() {
   _cim=$(bounded 300 mdutil -s "$1" 2>&1 </dev/null | parity_norm "$1" "" | tr '\n\t' '  ' | sed 's/  */ /g; s/^ //; s/ $//')
   if test "${PARITY_MODE_SPOTLIGHT:-record}" != check; then CS_INDEX_MODE=record CS_INDEX_WHY="PARITY_MODE_SPOTLIGHT is ${PARITY_MODE_SPOTLIGHT:-record}"
   elif printf '%s\n' "$_cim" | grep -q 'Indexing enabled'; then
     CS_INDEX_MODE=check CS_INDEX_WHY="indexing is on for the HFS+ control"
-    if test "${PARITY_MODE_FSEVENTS_DA:-record}" = record; then
+    if test "$PARITY_MODE_FSEVENTS_DA" = record; then
       CS_INDEX_MODE=record CS_INDEX_WHY="$CS_INDEX_WHY, but root's mds is not let into a DiskArbitration volume until the mount daemon (PARITY_MODE_FSEVENTS_DA is record)"
     fi
   else CS_INDEX_MODE=record CS_INDEX_WHY="indexing could not be turned on for the HFS+ control (mdutil -s: $_cim)"; fi
@@ -2048,7 +2056,9 @@ census_later() {
 #   case's two (its pair, then the remount's or the recovery's pair_up, never both), 20.5 + 20 / 60 = 20.8, 22 (as thin);
 #   busy, unicode, later and the stall make no pair (census_attach alone) and do not move. census_lklfuse_gone's and
 #   census_lklfuse_on's read of root's records (sudo and ps, 10 s each) is inside census_lklfuse_gone's 30 s bound, and
-#   adds 20 s to census_sweep_disk's path with no mount line (64 s, under the 137 counted);
+#   adds 20 s to census_sweep_disk's path with no mount line (64 s, under the 137 counted), and to census_detach_checked's
+#   other callers (r0 M2): census_attach's not-mounted path and the stall's setup-failure detaches, each counted aside (the
+#   stall's would fit its iteration's 63 regardless: 62.3 + 20 / 60 = 62.6);
 #   census_later 5 + 205 / 60 = 8.4, 9;
 #   a stall iteration 60 + 137 / 60 = 62.3, 63 (counted on each, though only the last is followed by the sweep);
 #   anything else 11
