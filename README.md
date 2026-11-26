@@ -55,8 +55,9 @@ macFUSE's `allow_root` option (and only that), so root's processes can reach the
 A disk the Mac mounts after login (when it is connected, by `diskutil mount`, or by `linuxfs mount DEVICE`) is mounted
 by root, as one mounted before login is: linuxfs's mount daemon, which launchd starts when it is asked, mounts it for
 the user at the console. Like an HFS+ disk, it is shared with every user, root's processes included, so Spotlight and
-fsevents work on it. It also stays mounted when you log out, as an HFS+ disk does, open to whoever logs in next
-(with `owners`, Linux's ids decide what they can reach). Eject it before logging out if it should go with you.
+fsevents work on it. Since root mounted it, it should stay mounted when you log out, as an HFS+ disk does, open to
+whoever logs in next (with `owners`, Linux's ids decide what they can reach); that has not yet been checked on a real
+Mac. Eject it before logging out if it should go with you.
 
 Some disks fall back to a mount of your own, which is yours alone, with no Spotlight or fsevents: an encrypted APFS
 volume (it needs your password), and any disk while the mount daemon is missing or busy. The Mac runs linuxfs's mount
