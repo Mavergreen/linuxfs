@@ -3,7 +3,7 @@
  * It speaks the CLI's side of root's protocol, as linuxfs-open does for the real one: after everything that could fail
  * before the mount (here, nothing but its mode) it writes "R" to fd 6 and waits (10 s at most) for the one descriptor
  * root sends, puts it on fd 4 and answers INIT by writing a byte to it. Its environment, open descriptors (with "sock" for
- * sockets, and "fdpath N PATH" for each one with a path) and pid go to ARGV0.log; ARGV0.mode, when present, changes what it does:
+ * sockets, and "fdpath N PATH" for each one with a path), pid and process group ("pgid N") go to ARGV0.log; ARGV0.mode, when present, changes what it does:
  *   exit N        exit N at once, before "R": a CLI whose preflight failed
  *   noready       neither "R" nor an exit: sleep 30 s
  *   linger        as ok, then leave a sleeper running (logs "lingerer PID") and exit 0
@@ -57,7 +57,7 @@ int main(int argc, char **argv)
 	fclose(log);
 	if (fd < 0 || (log = fdopen(fd, "a")) == NULL)
 		return 70;
-	fprintf(log, "pid %d\n", (int)getpid());
+	fprintf(log, "pid %d\npgid %d\n", (int)getpid(), (int)getpgrp());
 	for (i = 0; environ[i]; i++)
 		fprintf(log, "%s\n", environ[i]);
 	fprintf(log, "fds:");

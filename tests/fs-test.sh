@@ -17,6 +17,8 @@ SDK=$(sh "$SHIPYARD_SCRIPTS/fetch_sdk.sh" 2>/dev/null) || exit 1
 for n in macfuse_ext4.util macfuse_ntfs.util macfuse_btrfs.util fsck_macfuse_ext4 mount_macfuse_ext4 bogus.util; do cp "$D/linuxfs-fs" "$D/$n"; done
 sh "$ROOT/build/linux-host.sh" sh -c "cd '$D' && sh '$ROOT/tests/lib/probe-images.sh' '$D' && blkid -s UUID -o value ext4.img > ext4.uuid && blkid -s UUID -o value btrfs.img > btrfs.uuid" || exit 1
 n=0 bad=0
+# spec: Task 16j -- the console user's mount program asks root's daemon first; no case here meets a real one (the ask: cases name their own)
+LINUXFS_MOUNTD_SOCK=$D/no-mountd.sock; export LINUXFS_MOUNTD_SOCK
 ok() { n=$((n + 1)); if [ "$1" = 0 ]; then echo "ok $n - $2"; else echo "not ok $n - $2"; bad=1; fi; }
 att() { hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$D/$1" | awk 'NR == 1 { print $1 }'; }
 devs=
@@ -822,6 +824,158 @@ ok $? "root plan (helper stand-in): a live root mount of $E is never unmounted b
 rm -f "$D/drop/mhelper.mnttab"; : > "$D/drop/mhelper.mnttab"
 HS_ENV="LINUXFS_FS_TEST_MNTTAB=$D/drop/mhelper.mnttab"; hs "mounted 5" ok; unset HS_ENV
 test $rc != 0 && grep -qx "unmount-attempt $V/NAME" "$M/plan"; ok $? "and a request whose own mount landed before it failed unmounts that mount (rc $rc: $(grep '^unmount' "$M/plan"))"
+# spec: Task 16j (root-daemon design §1, I5, R2, M2; revision 4) -- the console user's mount program asks root's daemon first, at
+#       LINUXFS_MOUNTD_SOCK: tests/lib/mountd-stub.pl stands in for it, and LINUXFS_MOUNTD_PEER_UID names its uid in place of root's.
+#       It falls back to its own path only while nothing was touched: no daemon, no hi, user, or silence or EOF before begin
+MS=$M/mountd.sock; ML=$M/mountd.log
+md() { # STEP...: the stand-in daemon in the background ($mdpid), logging to $ML; waits, bounded, until it listens
+  rm -f "$MS" "$MS.ready" "$ML"
+  /usr/bin/perl "$ROOT/tests/lib/mountd-stub.pl" "$MS" "$ML" "$@" & mdpid=$!
+  i=0; while test ! -e "$MS.ready" && test $i -lt 50; do sleep 0.1; i=$((i + 1)); done; }
+mdstop() { kill "$mdpid" 2>/dev/null; wait "$mdpid" 2>/dev/null; }
+ask() { # ARGS...: the mount role as the console user, asking the stand-in (ASK_ROOT=1: root required, no stand-in uid; ASK_ENV adds
+        # to its environment); rc, stderr in $M/ask.err, seconds taken in $t
+  if test -n "${ASK_ROOT:-}"; then pu="-u LINUXFS_MOUNTD_PEER_UID"; else pu="LINUXFS_MOUNTD_PEER_UID=$(id -u)"; fi
+  s0=$(date +%s)
+  mt env $pu LINUXFS_MOUNTD_SOCK="$MS" LINUXFS_MNTTAB="$M/ask9.mnttab" ${ASK_ENV:-} "$MD" "$@" > /dev/null 2> "$M/ask.err"; rc=$?
+  t=$(( $(date +%s) - s0 )); }
+printf 'macfuse_ext4\t/dev/disk9\t/tmp/m\t%s\n' "$(id -u)" > "$M/ask9.mnttab"	# the stand-in CLI's own mount, for the user path's gate
+cliran() { grep -q '^args: ' "$M/log" 2>/dev/null; }
+askerr() { tr '\n' ';' < "$M/ask.err" | cut -c1-240; }
+md sleep:1 peek say:hi read 'say:user\tnot yet'
+ask -o nodev -o noowners "/dev/$E" "$V/NAME"; mdstop
+grep -qx 'early 0' "$ML" && grep -qxF "got: mount\\text4\\t$E\\t-\\t$V/NAME" "$ML"
+ok $? "ask: the line is exactly mount<TAB>ext4<TAB>$E<TAB>-<TAB>$V/NAME, sent after hi ($(tr '\n' ';' < "$ML"))"
+md say:hi read 'say:user\tnot yet'
+ask -o rdonly -o owners /dev/disk9 /tmp/m; mdstop
+grep -qxF 'got: mount\text4\tdisk9\tro,owners\t/tmp/m' "$ML"; ok $? "ask: -o rdonly -o owners gives FLAGS ro,owners ($(tr '\n' ';' < "$ML"))"
+md say:hi read 'say:user\tnot yet'
+ask -o owners /dev/disk9 /tmp/m; mdstop
+grep -qxF 'got: mount\text4\tdisk9\towners\t/tmp/m' "$ML"; ok $? "ask: -o owners alone gives FLAGS owners ($(tr '\n' ';' < "$ML"))"
+md say:hi read say:begin 'say:no\t3\tnot for the ext4 bundle'
+ask /dev/disk9 /tmp/m; mdstop
+test $rc = 3 && ! cliran; ok $? "ask: hi, begin, no 3 → exit 3, and the CLI never runs (rc $rc: $(askerr))"
+md say:hi read 'say:no\t3\tnot for the ext4 bundle'
+ask /dev/disk9 /tmp/m; mdstop
+test $rc = 3 && ! cliran; ok $? "ask: hi, no 3 (before begin) → exit 3, and the CLI never runs (rc $rc: $(askerr))"
+md say:hi read say:begin 'say:no\t0\tzero'
+ask /dev/disk9 /tmp/m; mdstop
+test $rc = 1 && ! cliran; ok $? "ask: no 0 → exit 1 (rc $rc: $(askerr))"
+md say:hi read say:begin 'say:no\t300\tbig'
+ask /dev/disk9 /tmp/m; mdstop
+test $rc = 1 && ! cliran; ok $? "ask: no 300 → exit 1 (rc $rc: $(askerr))"
+md say:hi read say:begin say:ok
+ask "/dev/$E" "$V/NAME"; mdstop
+test $rc = 1 && ! cliran && grep -q 'not on' "$M/ask.err"; ok $? "ask: hi, begin, ok with nothing in the mount table → exit 1, and the CLI never runs (rc $rc: $(askerr))"
+printf 'macfuse_ext4\t/dev/%s\t%s\t0\n' "$E" "$V/NAME" > "$M/ask.mnttab"
+md say:hi read say:begin say:ok
+ASK_ENV="LINUXFS_MNTTAB=$M/ask.mnttab"; ask "/dev/$E" "$V/NAME"; unset ASK_ENV; mdstop
+test $rc = 0 && ! cliran; ok $? "ask: hi, begin, ok with root's mount on MNT in the mount table → exit 0, and the CLI never runs (rc $rc: $(askerr))"
+printf 'macfuse_ext4\t/dev/%s\t%s\t%s\n' "$E" "$V/NAME" "$(id -u)" > "$M/ask.mnttab"
+md say:hi read say:begin say:ok
+ASK_ENV="LINUXFS_MNTTAB=$M/ask.mnttab"; ask "/dev/$E" "$V/NAME"; unset ASK_ENV; mdstop
+test $rc = 1 && ! cliran; ok $? "ask: hi, begin, ok with the user's own mount on MNT, not root's → exit 1 (rc $rc: $(askerr))"
+md say:hi read 'say:user\tnot your disk: your own mount'
+ask /dev/disk9 /tmp/m; mdstop
+test $rc = 0 && cliran && grep -q 'your own' "$M/ask.err"; ok $? "ask: user → the CLI runs (rc $rc: $(askerr))"
+md 'say:user\tnot the user at the console'
+ask /dev/disk9 /tmp/m; mdstop
+test $rc = 0 && cliran && ! grep -q '^got' "$ML"; ok $? "ask: user before hi (not the console's user) → the CLI runs, and no request was sent (rc $rc: $(askerr))"
+md say:hi read 'say:user\tbusy'
+ask /dev/disk9 /tmp/m; mdstop
+test $rc = 0 && cliran; ok $? "ask: user<TAB>busy after hi → the CLI runs (rc $rc: $(askerr))"
+rm -f "$MS"
+ask /dev/disk9 /tmp/m
+test $rc = 0 && cliran; ok $? "ask: no socket → the CLI runs (rc $rc: $(askerr))"
+# spec: Task 16j (revision 4, the controller's ruling) -- /var/run is root:daemon 0775, so the socket could be replaced: the client
+#       requires its peer to be uid 0 (getpeereid) before it sends or reads anything, and any other listener is no daemon
+md say:hi drain	# a hi first, so a client that skipped the check would send its request
+ASK_ROOT=1; ask /dev/disk9 /tmp/m; unset ASK_ROOT; mdstop
+grep -qx connected "$ML" && grep -qx 'drained 0' "$ML" && test $rc = 0 && cliran && grep -q "held by uid $(id -u), not root" "$M/ask.err"
+ok $? "ask: a non-root listener at the socket path gets nothing and the CLI runs (rc $rc: $(tr '\n' ';' < "$ML"); $(askerr))"
+md full
+ask /dev/disk9 /tmp/m; mdstop
+grep -q '^full after [1-9]' "$ML" && ! grep -qx connected "$ML" && test $rc = 0 && cliran
+ok $? "ask: a socket nobody accepts on (ECONNREFUSED, a full backlog) → the CLI runs (rc $rc: $(tr '\n' ';' < "$ML"); $(askerr))"
+md close
+ask /dev/disk9 /tmp/m; mdstop
+test $rc = 0 && cliran; ok $? "ask: accepted and closed at once → the CLI runs (rc $rc: $(askerr))"
+md sleep:6
+ask /dev/disk9 /tmp/m; mdstop
+test $rc = 0 && cliran && test $t -le 7; ok $? "ask: accepted, nothing written for 6 s → the CLI runs, within 7 s ($t s, rc $rc: $(askerr))"
+md say:hi read close
+ask /dev/disk9 /tmp/m; mdstop
+test $rc = 0 && cliran; ok $? "ask: hi then EOF before begin → the CLI runs (rc $rc: $(askerr))"
+md say:hi read say:begin sleep:10
+ASK_ENV=LINUXFS_MOUNTD_WAIT=2; ask /dev/disk9 /tmp/m; unset ASK_ENV; mdstop
+test $rc = 1 && ! cliran && test $t -le 4; ok $? "ask: hi, begin, then silence (LINUXFS_MOUNTD_WAIT=2) → exit 1 within 4 s, and the CLI never runs ($t s, rc $rc: $(askerr))"
+md say:hi read sleep:10
+ASK_ENV=LINUXFS_MOUNTD_PREBEGIN_WAIT=2; ask /dev/disk9 /tmp/m; unset ASK_ENV; mdstop
+test $rc = 0 && cliran && test $t -le 4 && grep -q 'said nothing before begin' "$M/ask.err"
+ok $? "ask: hi, then nothing (LINUXFS_MOUNTD_PREBEGIN_WAIT=2) → the CLI runs, within 4 s ($t s, rc $rc: $(askerr))"
+md say:hi read say:begin close
+ask /dev/disk9 /tmp/m; mdstop
+test $rc = 1 && ! cliran; ok $? "ask: hi, begin, then EOF → exit 1, and the CLI never runs (rc $rc: $(askerr))"
+md say:hi read say:begin say:hello
+ask /dev/disk9 /tmp/m; mdstop
+test $rc = 1 && ! cliran; ok $? "ask: hi, begin, then garbage → exit 1, and the CLI never runs (rc $rc: $(askerr))"
+md say:hello
+ask /dev/disk9 /tmp/m; mdstop
+test $rc = 0 && cliran && ! grep -q '^got' "$ML"; ok $? "ask: a garbled first line (hello) → the CLI runs (rc $rc: $(askerr))"
+md drain
+FP_ENV="LINUXFS_MOUNTD_SOCK=$MS LINUXFS_MOUNTD_PEER_UID=$(id -u)" fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
+mdstop
+test $rc = 0 && ! grep -qx connected "$ML"; ok $? "ask: the root plan (drop build) never connects (rc $rc: $(cat "$ML" 2>/dev/null | tr '\n' ';'))"
+# spec: Task 16j (root-daemon design I4, N3, N5) -- the daemon's deadline is SIGTERM: root's path then stops the CLI's group, unmounts
+#       its own mount (mounted_on = 1) and stops mount_macfuse, bounded, and exits 1. The handler only sets a flag, without SA_RESTART,
+#       so every wait sees EINTR or the flag
+grp_gone() { # PGID: no live process is left in that group (bounded, 3 s)
+  test -n "$1" || return 1
+  i=0; while ps -axo pgid=,stat= | awk -v g="$1" '$1 == g && $2 !~ /^Z/ { f = 1 } END { exit !f }' && test $i -lt 30; do sleep 0.1; i=$((i + 1)); done
+  test $i -lt 30; }
+hst() { # HELPER-MODE CLI-MODE FILE PATTERN: root's mount with both stand-ins, in the background; once FILE has a line matching
+        # PATTERN (bounded, 10 s), SIGTERM; rc, the seconds from the signal to its end in $t, output in $M/plan; HS_ENV adds to its environment
+  rm -f "$D/drop/mhelper.log" "$M/fdcli.log"
+  i=0; while ! lockfree && test $i -lt 100; do sleep 0.1; i=$((i + 1)); done	# an earlier case's heir may still hold the disk's lock
+  if test -n "$1"; then echo "$1" > "$D/drop/mhelper.mode"; else rm -f "$D/drop/mhelper.mode"; fi
+  echo "$2" > "$M/fdcli.mode"
+  env -i LINUXFS_FS_TEST_USER=daemon LINUXFS_FS_TEST_VOLUMES="$V" LINUXFS_FS_TEST_LOCKDIR="$LK" \
+    LINUXFS_FS_TEST_MOUNT_HELPER="$D/drop/mhelper" LINUXFS_FS_TEST_ROOT_CLI="$M/fdcli" LINUXFS_FS_TEST_TRUST_ROOT="$D" \
+    LINUXFS_FS_TEST_MACFUSE="$MF/5.5.0-mavericks.2.plist" LINUXFS_FS_TEST_WAIT=20 ${HS_ENV:-} \
+    "$DM" "/dev/$E" "$V/NAME" 7</dev/null > "$M/plan" 2>&1 & tp=$!
+  i=0; while ! grep -q "$4" "$3" 2>/dev/null && test $i -lt 100; do sleep 0.1; i=$((i + 1)); done
+  sleep 0.5	# into the wait
+  s0=$(date +%s); kill -TERM "$tp"
+  ( sleep 20; kill -9 "$tp" 2>/dev/null ) & wd=$!
+  wait "$tp"; rc=$?; t=$(( $(date +%s) - s0 ))
+  kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null; }
+pgid_of() { sed -n 's/^cli-pgid //p' "$M/plan" | head -n 1; }
+: > "$D/drop/mhelper.mnttab"
+HS_ENV="LINUXFS_FS_TEST_MNTTAB=$D/drop/mhelper.mnttab"; hst mountedhang linger "$M/fdcli.log" '^lingerer '; unset HS_ENV
+hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log"); lp=$(sed -n 's/^lingerer //p' "$M/fdcli.log"); cg=$(pgid_of)
+test $rc = 1 && test $t -lt 5 && grep -q 'stopped by SIGTERM' "$M/plan"
+ok $? "root plan (helper stand-in): SIGTERM while waiting for mount_macfuse's status → exit 1 within 5 s ($t s, rc $rc: $(tail -n 3 "$M/plan" | tr '\n' ';'))"
+grp_gone "$cg" && test -n "$lp" && gone "$lp"; ok $? "and the CLI stand-in's group ($cg) is gone, its lingerer ($lp) too"
+test -n "$hp" && gone "$hp"; ok $? "and the stand-in mount helper ($hp) is gone"
+grep -qx "unmount-attempt $V/NAME" "$M/plan"; ok $? "and with a mount table showing root's mount, root unmounts it ($(grep '^unmount' "$M/plan"))"
+test -z "$lp" || kill "$lp" 2>/dev/null
+: > "$D/drop/mhelper.mnttab"
+HS_ENV="LINUXFS_FS_TEST_MNTTAB=$D/drop/mhelper.mnttab"; hst nostatus linger "$M/fdcli.log" '^lingerer '; unset HS_ENV
+hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log"); lp=$(sed -n 's/^lingerer //p' "$M/fdcli.log"); cg=$(pgid_of)
+test $rc = 1 && test $t -lt 5 && grp_gone "$cg" && test -n "$hp" && gone "$hp" && ! grep -q '^unmount-attempt' "$M/plan"
+ok $? "and with none, it does not unmount (rc $rc, $t s: $(grep '^unmount' "$M/plan"))"
+test -z "$lp" || kill "$lp" 2>/dev/null
+hst "" noready "$M/fdcli.log" '^pid '
+cg=$(pgid_of)
+test $rc = 1 && test $t -lt 5 && grp_gone "$cg" && test ! -e "$D/drop/mhelper.log" && grep -q 'stopped by SIGTERM' "$M/plan"
+ok $? "root plan (helper stand-in): SIGTERM while waiting for ready → exit 1, the CLI group ($cg) is gone, and no mount helper ran ($t s, rc $rc: $(tail -n 3 "$M/plan" | tr '\n' ';'))"
+hst nofd ok "$D/drop/mhelper.log" '^pid '
+hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log"); cg=$(pgid_of)
+test $rc = 1 && test $t -lt 5 && grp_gone "$cg" && test -n "$hp" && gone "$hp" && grep -q 'stopped by SIGTERM' "$M/plan"
+ok $? "root plan (helper stand-in): SIGTERM while waiting for the device → exit 1 within 5 s, the CLI group ($cg) and the stand-in mount helper ($hp) are gone ($t s, rc $rc: $(tail -n 3 "$M/plan" | tr '\n' ';'))"
+hs "" ok
+test $rc = 0 && test "$(grep -c '^cli-pgid ' "$M/plan")" = 1 && grep -qE '^cli-pgid [0-9]+$' "$M/plan" && test "$(pgid_of)" = "$(sed -n 's/^pgid //p' "$M/fdcli.log")"
+ok $? "root plan (helper stand-in): cli-pgid: one cli-pgid N line, N the CLI stand-in's process group (rc $rc: $(grep '^cli-pgid' "$M/plan" | tr '\n' ' '); stand-in's $(grep '^pgid' "$M/fdcli.log"))"
 ! strings "$D/linuxfs-fs" | grep -qE 'LINUXFS_FS_TEST|unmount-attempt'; ok $? "the shipped build carries no LINUXFS_FS_TEST_* code and no unmount-attempt line"
 ! grep -q 'LINUXFS_FS_TEST' "$ROOT"/build/*.sh; ok $? "no build script defines LINUXFS_FS_TEST_DROP"
 echo "1..$n"; exit $bad

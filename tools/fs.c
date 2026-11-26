@@ -7,16 +7,22 @@
  * util -p BSD removable|fixed readonly|writable   recognised: the volume name on stdout, exit 255; else exit 254
  * util -k BSD                                     the filesystem's UUID on stdout (no newline), exit 253; else exit 254
  * fsck -q DEV                                     exit 0 (a quick check has nothing to do); -n or -y exit 8
- * mount [-o OPT]... DEV MNT                       as the console user: runs the CLI's da-mount and, for an encrypted volume,
+ * mount [-o OPT]... DEV MNT                       as the console user: asks root's mount daemon first (ask_mountd: the socket's
+ *                                                  peer must be root; "ok" is exit 0 only with root's mount on MNT, "no RC" is
+ *                                                  final, and only no daemon, "user", or no "begin" yet falls back, since
+ *                                                  nothing was touched); else runs the CLI's da-mount and, for an encrypted volume,
  *                                                  asks for the password (the keychain keeper first, then Apple's dialog);
- *                                                  as root: takes the whole disk's lock (one mount of a disk at a time) and refuses
+ *                                                  as root (never asking the daemon; the daemon's own child is root): takes the whole disk's lock (one mount of a disk at a time) and refuses
  *                                                  when anything is mounted on MNT or from the disk or its partitions already; opens /dev/rDEV as fd 3; then, with a macFUSE that
  *                                                  serves a /dev/fd/N mountpoint, runs the bundled CLI's da-mount as _linuxfs first,
  *                                                  until it is ready (nothing left that can fail before lklfuse starts), then runs
  *                                                  mount_macfuse itself (allow_other) and hands the device it sends to the CLI over
  *                                                  a channel (LINUXFS_FUSE_CHAN=6; fd 4 for lklfuse: LINUXFS_FUSE_FD=4), until
  *                                                  mount_macfuse reports the mount, all through paths that are root's alone
- *                                                  (path_trusted); with an older macFUSE, refuses ("too old to mount before login")
+ *                                                  (path_trusted); with an older macFUSE, refuses ("too old to mount before login").
+ *                                                  SIGTERM (the daemon's deadline) only sets a flag; every wait sees it, and root
+ *                                                  stops the CLI's group, unmounts its own mount, stops mount_macfuse (15 s at most)
+ *                                                  and exits 1. It says "cli-pgid N" on stderr once the CLI has its group.
  *
  * -DLINUXFS_FS_TEST_DROP (tests only, never in the shipped binary) takes the root path as whatever user runs it, up to the
  * drop: the privileged calls (initgroups, setgid, setuid) are replaced by printing the plan; the macFUSE manifest, the
@@ -27,9 +33,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <pwd.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,6 +53,7 @@
 #include <syslog.h>
 #include <unistd.h>
 #include "fsrules.h"
+#include "mountd.h"
 #include "plist.h"
 #include "probe.h"
 #include "trust.h"
@@ -594,6 +603,16 @@ static int refuse(const char *what, const char *reason)
 	return 1;
 }
 
+/* SIGTERM, the daemon's deadline (root-daemon design I4, N3): the handler only sets this flag, and is installed without SA_RESTART, so
+ * a poll, read, recv or sleep it lands in returns early (EINTR) and every wait checks the flag before going round. It never unmounts,
+ * opens or does anything with a path: lock_disk briefly fchdirs into the locks' directory. */
+static volatile sig_atomic_t stopping;
+static void on_sigterm(int sig)
+{
+	(void)sig;
+	stopping = 1;
+}
+
 /* a fatal early failure: syslog, then exit 1 */
 static void die(const char *what)
 {
@@ -777,8 +796,8 @@ static void print_cli_plan(const char *const *envp, char **args)
 }
 #endif
 
-/* The descriptor mount_macfuse sends over sock (SCM_RIGHTS, one byte) within secs; -1 when none; -2 when watch (the CLI's channel,
- * from which nothing more is due) hung up (POLLHUP) first, -3 when it became readable (POLLIN: unexpected data) first: a CLI
+/* The descriptor mount_macfuse sends over sock (SCM_RIGHTS, one byte) within secs; -1 when none; -4 when SIGTERM came; -2 when watch
+ * (the CLI's channel, from which nothing more is due) hung up (POLLHUP) first, -3 when it became readable (POLLIN: unexpected data) first: a CLI
  * that has gone, or gone wrong, needs no mount_macfuse waiting for it. A message with anything but one descriptor is refused,
  * and every descriptor it carried is closed. */
 static int recv_device(int sock, int secs, int watch)
@@ -795,6 +814,8 @@ static int recv_device(int sock, int secs, int watch)
 	for (;;) {
 		long left;
 
+		if (stopping)
+			return -4;
 		gettimeofday(&now, NULL);
 		left = secs * 1000L - ((long)(now.tv_sec - t0.tv_sec) * 1000 + (long)(now.tv_usec - t0.tv_usec) / 1000);
 		if (left <= 0)
@@ -1050,17 +1071,36 @@ static int lock_disk(const char *fs, const char *whole)
 	return hi;
 }
 
-/* Waits up to secs for pid; 1 with *st when it was reaped */
-static int reap(pid_t pid, int secs, int *st)
+#define CLEANUP_S 15	/* the failure path's waits in all, within the daemon's MOUNTD_GRACE */
+static time_t cleanup_end;	/* set when the failure path starts: no wait after a SIGKILL goes past it */
+
+/* Waits up to secs for pid; 1 with *st when it was reaped. A wait that may be cut short (stoppable) stops waiting once SIGTERM has
+ * come; one after a SIGKILL never does (the process has to be reaped), but still ends by cleanup_end. */
+static int reap_(pid_t pid, int secs, int *st, int stoppable)
 {
 	int i;
 
 	for (i = 0; i < secs * 10; i++) {
 		if (waitpid(pid, st, WNOHANG) == pid)
 			return 1;
+		if ((stoppable && stopping) || (cleanup_end && time(NULL) >= cleanup_end))
+			return 0;
 		usleep(100000);
 	}
-	return 0;
+	return waitpid(pid, st, WNOHANG) == pid;
+}
+
+static int reap(pid_t pid, int secs, int *st)
+{
+	return reap_(pid, secs, st, 1);
+}
+
+/* the end of a request SIGTERM stopped: said, exit 1 */
+static int stopped_by_sigterm(const char *fs)
+{
+	syslog(LOG_NOTICE, "mount_%s: stopped by SIGTERM", fs);
+	fprintf(stderr, "linuxfs-mount: stopped by SIGTERM\n");
+	return 1;
 }
 
 /* SIGTERM to process pid, then SIGKILL when it has not exited within term_s; reaped. One still there STOP_WAIT_S after the
@@ -1075,14 +1115,15 @@ static void stop(const char *fs, pid_t pid, int term_s)
 	if (reap(pid, term_s, &st))
 		return;
 	kill(pid, kill_sig());
-	if (reap(pid, STOP_WAIT_S, &st))
+	if (reap_(pid, STOP_WAIT_S, &st, 0))
 		return;
 	syslog(LOG_NOTICE, "mount_%s: mount_macfuse (pid %d) is still running after SIGKILL; left", fs, (int)pid);
 	fprintf(stderr, "linuxfs-mount: mount_macfuse (pid %d) is still running after SIGKILL; left\n", (int)pid);
 }
 
 /* "Ready" (exactly one byte, R) from the CLI on sock within secs. 1 when it came; 0 when the CLI ended first (its status, once
- * reaped, in *cli_rc and the time in *cli_end); -1 when the channel closed; -3 when it carried anything but that one byte; -2 on timeout. */
+ * reaped, in *cli_rc and the time in *cli_end); -1 when the channel closed; -3 when it carried anything but that one byte; -2 on timeout;
+ * -4 when SIGTERM came. */
 static int wait_ready(int sock, pid_t cpid, int *cli_rc, time_t *cli_end, int secs)
 {
 	struct pollfd p = { sock, POLLIN, 0 };
@@ -1093,9 +1134,14 @@ static int wait_ready(int sock, pid_t cpid, int *cli_rc, time_t *cli_end, int se
 		char b[16];
 		ssize_t r;
 
+		if (stopping)
+			return -4;
 		p.revents = 0;
-		if (poll(&p, 1, 200) < 0 && errno != EINTR)
+		if (poll(&p, 1, 200) < 0) {
+			if (errno == EINTR)
+				continue;	/* the flag, at the top */
 			return -1;
+		}
 		if (p.revents) {
 			r = recv(sock, b, sizeof b, MSG_DONTWAIT);
 			if (r == 1 && b[0] == 'R')
@@ -1152,7 +1198,7 @@ static void stop_group(pid_t pgid, int running)
 	usleep(300000);	/* a moment for the rest of it to end on its own */
 	kill(-pgid, SIGKILL);
 	if (running)
-		reap(pgid, STOP_WAIT_S, &st);
+		reap_(pgid, STOP_WAIT_S, &st, 0);
 }
 
 /* Root's mount, for a macFUSE that serves /dev/fd/N (macfuse's DETAILS.md), in this order. (1) The CLI, as _linuxfs, runs with
@@ -1269,6 +1315,7 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 	 * fails before that never has a mount_macfuse run for it: nothing is left in mount(2) waiting for lklfuse's INIT. */
 	cpid = fork();
 	if (cpid == 0) {
+		signal(SIGTERM, SIG_DFL);	/* root's flag-only handler is the mount program's: the CLI ends on SIGTERM */
 		setpgid(0, 0);	/* the CLI, its lklfuse and all: one group, for root to stop if the mount fails */
 		close(cs[0]);
 		close(cs[1]);
@@ -1290,8 +1337,12 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 		fd = root_cli(req, args, vars, CHAN_FD, name);
 		_exit(fd < 0 ? 1 : fd);
 	}
-	if (cpid > 0)
+	if (cpid > 0) {
 		setpgid(cpid, cpid);
+		/* the daemon reads this from the drained output: at its deadline's SIGKILL it also kills what is left of this group
+		 * that runs as _linuxfs (N5). Before login it goes to DiskArbitration's log, harmlessly */
+		fprintf(stderr, "cli-pgid %d\n", (int)cpid);
+	}
 	close(ch[1]);
 	close(3);	/* the disk is the CLI's now */
 	if (cpid < 0) {
@@ -1301,7 +1352,8 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 	w = wait_ready(ch[0], cpid, &cli_rc, &cli_end, wait_s(READY_WAIT_S));
 	if (w != 1) {
 		syslog(LOG_NOTICE, "mount_%s: %s: the CLI did not get ready (%s); mount_macfuse is not run", fs, bsd,
-		       w == 0 ? "it ended first" : w == -2 ? "timed out" : w == -3 ? "garbled: more than \"ready\"" : "its channel closed");
+		       w == 0 ? "it ended first" : w == -2 ? "timed out" : w == -3 ? "garbled: more than \"ready\"" :
+		       w == -4 ? "stopped by SIGTERM" : "its channel closed");
 		goto failed;
 	}
 	hpid = fork();
@@ -1329,7 +1381,9 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 	if (devfd < 0 || !send_device(ch[0], devfd)) {
 		if (devfd >= 0)
 			close(devfd);
-		if (devfd == -2 || devfd == -3) {
+		if (devfd == -4) {
+			syslog(LOG_NOTICE, "mount_%s: %s: SIGTERM while waiting for the device; stopping mount_macfuse", fs, bsd);
+		} else if (devfd == -2 || devfd == -3) {
 			syslog(LOG_NOTICE, "mount_%s: %s: the CLI's channel %s while waiting for the device; stopping mount_macfuse", fs, bsd,
 			       devfd == -2 ? "closed" : "sent unexpected data");
 			fprintf(stderr, "linuxfs-mount: the CLI's channel %s while waiting for the device\n",
@@ -1351,6 +1405,8 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 		time_t now = time(NULL);
 		ssize_t r;
 
+		if (stopping)
+			break;
 		if (got < 0 || (got > 0 && (status != 0 || cli_rc != -2)))
 			break;	/* no status coming, a failed one, or the status and the CLI's end */
 		if (!got && cli_rc != -2 && cli_rc != 0 && now >= cli_end + REFUSED_WAIT_S)
@@ -1361,8 +1417,11 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 		p[1].fd = hout[0];
 		p[0].events = p[1].events = POLLIN;
 		p[0].revents = p[1].revents = 0;
-		if (poll(p, 2, 200) < 0 && errno != EINTR)
+		if (poll(p, 2, 200) < 0) {
+			if (errno == EINTR)
+				continue;	/* the flag, at the top */
 			break;
+		}
 		if (p[1].revents) {
 			char tmp[512];
 
@@ -1392,16 +1451,24 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 		if (hpid > 0 && waitpid(hpid, &w, WNOHANG) == hpid)
 			hpid = -1;
 	}
-	ok = got > 0 && status == 0 && (cli_rc == 0 || cli_rc == -2);
+	ok = !stopping && got > 0 && status == 0 && (cli_rc == 0 || cli_rc == -2);
 	if (ok) {
 		syslog(LOG_NOTICE, "mount_%s: %s mounted on %s by root, served by %s%s", fs, bsd, req->mnt, RUN_USER,
 		       cli_rc == -2 ? " (the CLI had not finished)" : "");
 		close(cs[1]);
+		cs[1] = -1;
 		/* mount_macfuse has said all it has to: one still running STOP_WAIT_S later gets SIGTERM, then after 1 s SIGKILL,
-		 * and is reaped; no root helper outlives the mount program */
-		if (hpid > 0 && !reap(hpid, STOP_WAIT_S, &w)) {
+		 * and is reaped; no root helper outlives the mount program. SIGTERM meanwhile goes to the failure path, which stops it */
+		if (hpid > 0 && reap(hpid, STOP_WAIT_S, &w))
+			hpid = -1;
+		else if (hpid > 0 && !stopping) {
 			syslog(LOG_NOTICE, "mount_%s: %s: mount_macfuse (pid %d) is still running after the mount; stopped", fs, bsd, (int)hpid);
 			stop(fs, hpid, 1);
+			hpid = -1;
+		}
+		if (stopping) {
+			syslog(LOG_NOTICE, "mount_%s: %s: SIGTERM after the mount: undoing it", fs, bsd);
+			ok = 0;
 		}
 	} else {
 		if (got > 0)
@@ -1413,6 +1480,9 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 failed:
 	if (!ok || cpid < 0) {
 		ok = 0;
+		/* bounded in all (CLEANUP_S), so it ends within the daemon's grace after its SIGTERM: once SIGTERM has come, no wait for a
+		 * process to end on SIGTERM is made (reap), and the waits after SIGKILL end by cleanup_end; every signal is still sent */
+		cleanup_end = time(NULL) + CLEANUP_S;
 		/* the CLI may be ending on its own (the status can arrive first): a moment for its exit status, the failure's reason */
 		if (cpid > 0 && cli_rc == -2 && reap(cpid, 1, &w))
 			cli_rc = WIFEXITED(w) ? WEXITSTATUS(w) : 1;
@@ -1452,6 +1522,8 @@ failed:
 	}
 	hout_buf[hgot] = '\0';
 	log_lines("mount_macfuse", hout_buf);
+	if (stopping)
+		return stopped_by_sigterm(fs);
 	if (ok)
 		return 0;
 	return cli_rc > 0 ? cli_rc : 1;
@@ -1470,6 +1542,20 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 	int fd, mfd, n = 0, ro_fallback = 0, ro, by_root, lockfd, m;
 	uid_t uid;
 	gid_t gid;
+	struct sigaction sa;
+	sigset_t term;
+
+	/* SIGTERM (the daemon's deadline) only sets the flag, without SA_RESTART: every blocking call below then returns early, and
+	 * root undoes what it started (mount_by_root's failure path) and exits 1. Unblocked, whatever mask we were given. */
+	memset(&sa, 0, sizeof sa);
+	sa.sa_handler = on_sigterm;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	sigaction(SIGTERM, &sa, NULL);
+	sigemptyset(&term);
+	sigaddset(&term, SIGTERM);
+	sigprocmask(SIG_UNBLOCK, &term, NULL);
+	linuxfs_probe_stop = &stopping;	/* the probe's read of /dev/rBSD gives up on EINTR once it is set */
 
 	fill_std_fds();
 	bsd = strncmp(req->dev, "/dev/", 5) == 0 ? req->dev + 5 : req->dev;
@@ -1535,6 +1621,8 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 		int err = 0;
 
 		type = linuxfs_probe_fd(3, label, sizeof label, &err);
+		if (stopping)
+			return stopped_by_sigterm(fs);
 		if (!type)
 			return refuse(fs, "no filesystem linuxfs knows on the device");
 		prefs_read(&p);
@@ -1602,6 +1690,8 @@ static int mount_as_root(const char *fs, const struct mountreq *req)
 	args[n++] = (char *)req->mnt;
 	args[n] = NULL;
 
+	if (stopping)	/* nothing started yet: nothing to undo */
+		return stopped_by_sigterm(fs);
 	return mount_by_root(fs, req, bsd, ro, name, uid, gid, args, lockfd);
 }
 
@@ -1627,14 +1717,13 @@ static void log_request(const char *fs, int argc, char **argv)
 	syslog(LOG_NOTICE, "mount_%s: arguments: %s", fs, line);
 }
 
-/* Whether the topmost mount on MNT is one of FS's (its macfuse_<fs> type) from /dev/BSD, whoever owns it: the user path's exit gate,
- * so that DiskArbitration never records a mount that is not there (push D: an lklfuse ended by macFUSE's refusal of an asynchronous
- * mount could still say 0). The mount table with MNT_NOWAIT, last entry first, as mounted_on reads it; for tests (as the console
- * user only, as LINUXFS_CLI) LINUXFS_MNTTAB names a file of TYPE<TAB>FROM<TAB>ON<TAB>OWNER lines, the last on top. */
-static int user_mounted(const char *fs, const char *mnt, const char *bsd)
+/* The topmost mount on MNT, the one unmount(MNT) would hit: 1 with its type, source and owner, or 0 when nothing is on MNT. The mount
+ * table with MNT_NOWAIT, last entry first, as mounted_on reads it; for tests (as the console user only, as LINUXFS_CLI) LINUXFS_MNTTAB
+ * names a file of TYPE<TAB>FROM<TAB>ON<TAB>OWNER lines, the last on top (unreadable: nothing on MNT). */
+static int top_mount(const char *mnt, char type[MFSTYPENAMELEN], char from[MAXPATHLEN], unsigned *owner)
 {
-	const char *tab = test_env("LINUXFS_MNTTAB"), *t;
-	char line[3 * MAXPATHLEN], type[MFSTYPENAMELEN], from[MAXPATHLEN];
+	const char *tab = test_env("LINUXFS_MNTTAB");
+	char line[3 * MAXPATHLEN];
 	struct statfs *m;
 	int n, i, found = 0;
 	FILE *f;
@@ -1648,27 +1737,312 @@ static int user_mounted(const char *fs, const char *mnt, const char *bsd)
 			line[strcspn(line, "\n")] = '\0';
 			if (!(b = strchr(a, '\t')) || !(c = strchr(b + 1, '\t')) || !(d = strchr(c + 1, '\t')))
 				continue;
-			*b++ = *c++ = *d = '\0';
+			*b++ = *c++ = *d++ = '\0';
 			if (strcmp(c, mnt) != 0)
 				continue;
-			found = snprintf(type, sizeof type, "%s", a) < (int)sizeof type && snprintf(from, sizeof from, "%s", b) < (int)sizeof from;
+			found = snprintf(type, MFSTYPENAMELEN, "%s", a) < MFSTYPENAMELEN && snprintf(from, MAXPATHLEN, "%s", b) < MAXPATHLEN;
+			*owner = (unsigned)strtoul(d, NULL, 10);
 		}
 		fclose(f);
-		if (!found)
-			return 0;
-	} else {
-		n = getmntinfo(&m, MNT_NOWAIT);
-		for (i = n - 1; i >= 0 && !found; i--)
-			if (strcmp(m[i].f_mntonname, mnt) == 0) {
-				snprintf(type, sizeof type, "%s", m[i].f_fstypename);
-				snprintf(from, sizeof from, "%s", m[i].f_mntfromname);
-				found = 1;
-			}
-		if (!found)
-			return 0;
+		return found;
 	}
+	n = getmntinfo(&m, MNT_NOWAIT);
+	for (i = n - 1; i >= 0; i--)
+		if (strcmp(m[i].f_mntonname, mnt) == 0) {
+			snprintf(type, MFSTYPENAMELEN, "%s", m[i].f_fstypename);
+			snprintf(from, MAXPATHLEN, "%s", m[i].f_mntfromname);
+			*owner = (unsigned)m[i].f_owner;
+			return 1;
+		}
+	return 0;
+}
+
+/* Whether the topmost mount on MNT is one of FS's (its macfuse_<fs> type) from /dev/BSD, whoever owns it: the user path's exit gate,
+ * so that DiskArbitration never records a mount that is not there (push D: an lklfuse ended by macFUSE's refusal of an asynchronous
+ * mount could still say 0). */
+static int user_mounted(const char *fs, const char *mnt, const char *bsd)
+{
+	char type[MFSTYPENAMELEN], from[MAXPATHLEN];
+	unsigned owner;
+	const char *t;
+
+	if (!top_mount(mnt, type, from, &owner))
+		return 0;
 	t = fsrules_fs_of_type(type);
 	return t && strcmp(t, fs) == 0 && strncmp(from, "/dev/", 5) == 0 && strcmp(from + 5, bsd) == 0;
+}
+
+/* Whether the topmost mount on MNT is root's own mount of FS from /dev/BSD (mounted_on's rule, fsrules_mount_is_roots): the daemon's
+ * "ok" is exit 0 only then, so DiskArbitration never records a mount that is not there */
+static int roots_mounted(const char *fs, const char *mnt, const char *bsd)
+{
+	char type[MFSTYPENAMELEN], from[MAXPATHLEN];
+	unsigned owner;
+
+	return top_mount(mnt, type, from, &owner) && fsrules_mount_is_roots(fs, bsd, type, from, owner);
+}
+
+/* ---- asking root's mount daemon (tools/mountd.c; root-daemon design §1) --------------------------------------------------------- */
+
+#define MOUNTD_SOCK "/var/run/dev.mavergreen.linuxfs.mountd.sock"
+#define MOUNTD_HI_S 5	/* for hi (or user), which the daemon writes before it takes a slot */
+enum { MA_OK, MA_NO, MA_USER, MA_UNREACHABLE, MA_LOST };
+
+/* both to syslog and to stderr (DiskArbitration's log): which way the mount went, and why */
+static void ask_say(const char *fs, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void ask_say(const char *fs, const char *fmt, ...)
+{
+	char msg[300];
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(msg, sizeof msg, fmt, ap);
+	va_end(ap);
+	syslog(LOG_NOTICE, "mount_%s: %s", fs, msg);
+	fprintf(stderr, "linuxfs-mount: %s\n", msg);
+}
+
+/* the daemon's no<TAB>RC<TAB>WHY, said with the status it gives (RC through 1..255) */
+static void ask_why(const char *fs, const char *line, int rc)
+{
+	const char *why = strchr(line + 3, '\t');
+
+	ask_say(fs, "the mount daemon said no (%d: %s)", rc, why ? why + 1 : "no reason");
+}
+
+/* A test's bound in whole seconds (test_env NAME, 1 to MOUNTD_CLIENT_WAIT), or DFLT */
+static int ask_secs(const char *name, int dflt)
+{
+	const char *v = test_env(name);
+	char *e;
+	long n;
+
+	if (!v || !*v)
+		return dflt;
+	n = strtol(v, &e, 10);
+	return *e || n < 1 || n > MOUNTD_CLIENT_WAIT ? dflt : (int)n;
+}
+
+static long long ask_now_ms(void)
+{
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+/* the daemon's replies, read a line at a time from what has come so far */
+struct askbuf { char b[1100]; size_t have; };
+
+/* One line (without its LF) into line (LEN bytes) by END (ms): 1; 0 on EOF or an error; -1 on timeout; -2 for a line too long or
+ * holding a NUL */
+static int ask_line(int fd, struct askbuf *a, char *line, size_t len, long long end)
+{
+	for (;;) {
+		char *nl = memchr(a->b, '\n', a->have);
+		struct pollfd p = { fd, POLLIN, 0 };
+		long long left;
+		ssize_t r;
+
+		if (nl) {
+			size_t n = (size_t)(nl - a->b);
+
+			if (n >= len || memchr(a->b, '\0', n))
+				return -2;
+			memcpy(line, a->b, n);
+			line[n] = '\0';
+			memmove(a->b, nl + 1, a->have - n - 1);
+			a->have -= n + 1;
+			return 1;
+		}
+		if (a->have >= sizeof a->b)
+			return -2;
+		left = end - ask_now_ms();
+		if (left <= 0)
+			return -1;
+		r = poll(&p, 1, left > INT_MAX ? INT_MAX : (int)left);
+		if (r < 0 && errno != EINTR)
+			return 0;
+		if (r <= 0)
+			continue;
+		r = read(fd, a->b + a->have, sizeof a->b - a->have);
+		if (r > 0)
+			a->have += (size_t)r;
+		else if (r == 0 || (errno != EINTR && errno != EAGAIN))
+			return 0;
+	}
+}
+
+/* A reply line's kind: 'h' hi, 'b' begin, 'k' ok, 'u' user (with or without a reason), 'n' no (*rc its status through 1..255:
+ * anything else, 0 included, is 1, M2), or 0: anything else */
+static int ask_kind(const char *l, int *rc)
+{
+	char *e;
+	long v;
+
+	if (strcmp(l, "hi") == 0)
+		return 'h';
+	if (strcmp(l, "begin") == 0)
+		return 'b';
+	if (strcmp(l, "ok") == 0)
+		return 'k';
+	if (strcmp(l, "user") == 0 || strncmp(l, "user\t", 5) == 0)
+		return 'u';
+	if (strncmp(l, "no\t", 3) == 0) {
+		errno = 0;
+		v = strtol(l + 3, &e, 10);
+		*rc = e != l + 3 && (*e == '\0' || *e == '\t') && errno == 0 && v >= 1 && v <= 255 ? (int)v : 1;
+		return 'n';
+	}
+	return 0;
+}
+
+/* Asks root's mount daemon to mount FS's DEV on MNT, as req asks: MA_OK ("ok"), MA_NO ("no RC": *rc), MA_USER ("user": the user's own
+ * mount), MA_UNREACHABLE (no daemon, or one that went before "begin": nothing was touched, so the user's own path is safe), MA_LOST
+ * (after "begin", no answer: root may have changed something, so no fallback).
+ * - The socket is MOUNTD_SOCK (LINUXFS_MOUNTD_SOCK for tests). A refused connect (ECONNREFUSED: nothing listens, or a full backlog)
+ *   or none there is no daemon.
+ * - Its peer must be root (getpeereid; LINUXFS_MOUNTD_PEER_UID names a test's stand-in instead), checked before anything is sent or
+ *   read: /var/run is root:daemon 0775, so a process in group daemon could put its own listener at the path. Any other peer is no
+ *   daemon, and gets nothing of the request.
+ * - Before "begin": "hi" within MOUNTD_HI_S, then the request line; "user" or "no" is the answer; EOF, a garbled line, or nothing from
+ *   hi to begin for MOUNTD_CLIENT_PREBEGIN (LINUXFS_MOUNTD_PREBEGIN_WAIT) is no daemon (R2, I5).
+ * - After "begin": "ok" or "no"; anything else, EOF, or nothing by MOUNTD_CLIENT_WAIT in all (LINUXFS_MOUNTD_WAIT) is lost (N6). */
+static int ask_mountd(const char *fs, const struct mountreq *req, const char *bsd, int *rc)
+{
+	const char *path = test_env("LINUXFS_MOUNTD_SOCK"), *pu = test_env("LINUXFS_MOUNTD_PEER_UID"), *p;
+	char reqline[1100], line[1100];
+	struct sockaddr_un sa;
+	struct askbuf a;
+	long long t0, end, phase_end;
+	int fd, one = 1, n, k, phase = 0, out = MA_UNREACHABLE;
+	size_t sent = 0;
+	uid_t want = 0, peer;
+	gid_t pgid;
+
+	*rc = 1;
+	if (!path || !*path)
+		path = MOUNTD_SOCK;
+	if (pu && *pu) {
+		char *e;
+		unsigned long v = strtoul(pu, &e, 10);
+
+		if (!*e)
+			want = (uid_t)v;
+	}
+	/* the request line: nothing the daemon would read as another field or line */
+	n = snprintf(reqline, sizeof reqline, "mount\t%s\t%s\t%s\t%s\n", fs, bsd,
+		     req->ro && req->owners ? "ro,owners" : req->ro ? "ro" : req->owners ? "owners" : "-", req->mnt);
+	if (n < 0 || n > 1024) {
+		ask_say(fs, "the request is too long for the mount daemon: not asked");
+		return MA_UNREACHABLE;
+	}
+	for (p = reqline; p < reqline + n - 1; p++)
+		if ((unsigned char)*p == 0x7f || ((unsigned char)*p < 0x20 && *p != '\t')) {
+			ask_say(fs, "the request has a control character: the mount daemon is not asked");
+			return MA_UNREACHABLE;
+		}
+	memset(&sa, 0, sizeof sa);
+	sa.sun_family = AF_UNIX;
+	if (strlen(path) >= sizeof sa.sun_path)
+		return MA_UNREACHABLE;
+	strcpy(sa.sun_path, path);
+	fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0)
+		return MA_UNREACHABLE;
+	fcntl(fd, F_SETFD, FD_CLOEXEC);
+	setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+	if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
+		int e = errno;
+
+		close(fd);
+		if (e == ENOENT)
+			ask_say(fs, "no mount daemon (no socket): your own mount");
+		else
+			ask_say(fs, "the mount daemon cannot be reached (%s): your own mount", strerror(e));
+		return MA_UNREACHABLE;
+	}
+	/* root's, or no daemon at all: checked before a byte is sent or read */
+	if (getpeereid(fd, &peer, &pgid) != 0) {
+		close(fd);
+		ask_say(fs, "the mount daemon's peer cannot be read: not asked; your own mount");
+		return MA_UNREACHABLE;
+	}
+	if (peer != want) {
+		close(fd);
+		ask_say(fs, "the mount daemon's socket is held by uid %u, not root: not asked", (unsigned)peer);
+		return MA_UNREACHABLE;
+	}
+	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+	a.have = 0;
+	t0 = ask_now_ms();
+	end = t0 + 1000LL * ask_secs("LINUXFS_MOUNTD_WAIT", MOUNTD_CLIENT_WAIT);
+	phase_end = t0 + 1000LL * MOUNTD_HI_S;
+	for (;;) {
+		int got = ask_line(fd, &a, line, sizeof line, phase_end < end ? phase_end : end);
+
+		k = got == 1 ? ask_kind(line, rc) : 0;
+		if (phase == 2) {	/* after begin: root may have changed something; never the user's own path */
+			if (k == 'k')
+				out = MA_OK;
+			else if (k == 'n') {
+				out = MA_NO;
+				ask_why(fs, line, *rc);
+			} else {
+				out = MA_LOST;
+				ask_say(fs, "the mount daemon said begin, then %s: failed", got == -1 ? "nothing in time" : got == 1 ? "something garbled" :
+					"closed the connection");
+			}
+			break;
+		}
+		if (k == 'u') {
+			out = MA_USER;
+			ask_say(fs, "the mount daemon answered user (%s): your own mount", line[4] ? line + 5 : "no reason");
+			break;
+		}
+		if (k == 'n') {
+			out = MA_NO;
+			ask_why(fs, line, *rc);
+			break;
+		}
+		if (phase == 0 && k == 'h') {
+			phase = 1;
+			phase_end = ask_now_ms() + 1000LL * ask_secs("LINUXFS_MOUNTD_PREBEGIN_WAIT", MOUNTD_CLIENT_PREBEGIN);
+			while (sent < (size_t)n) {	/* the request, by the same bounds */
+				struct pollfd pw = { fd, POLLOUT, 0 };
+				long long left = (phase_end < end ? phase_end : end) - ask_now_ms();
+				ssize_t w;
+
+				if (left <= 0 || (poll(&pw, 1, (int)left) < 0 && errno != EINTR))
+					break;
+				w = write(fd, reqline + sent, (size_t)n - sent);
+				if (w > 0)
+					sent += (size_t)w;
+				else if (w < 0 && errno != EAGAIN && errno != EINTR)
+					break;
+			}
+			if (sent < (size_t)n) {
+				ask_say(fs, "the request did not reach the mount daemon: your own mount");
+				break;
+			}
+			continue;
+		}
+		if (phase == 1 && k == 'b') {
+			phase = 2;
+			phase_end = end;
+			continue;
+		}
+		/* before begin: nothing was touched, so the user's own path is safe */
+		if (got == -1)
+			ask_say(fs, phase ? "the mount daemon said nothing before begin: your own mount" :
+				"the mount daemon did not say hi in time: your own mount");
+		else
+			ask_say(fs, "the mount daemon %s before begin: your own mount", got == 1 || got == -2 ? "said something garbled" :
+				"closed the connection");
+		break;
+	}
+	close(fd);
+	return out;
 }
 
 static int mount_role(const char *fs, int argc, char **argv)
@@ -1702,6 +2076,27 @@ static int mount_role(const char *fs, int argc, char **argv)
 	if (getuid() == 0)
 #endif
 		return mount_as_root(fs, &req);
+	bsd = strncmp(req.dev, "/dev/", 5) == 0 ? req.dev + 5 : req.dev;
+	/* root's daemon first (root-daemon design §1): a mount made by root, as before login, has fsevents and Spotlight. Only "user", or
+	 * no daemon (nothing reached it, or nothing was touched before begin), takes the user's own path below */
+	switch (ask_mountd(fs, &req, bsd, &rc)) {
+	case MA_OK:
+		if (roots_mounted(fs, req.mnt, bsd)) {
+			syslog(LOG_NOTICE, "mount_%s: %s: mounted on %s by root's mount daemon: exit 0", fs, req.dev, req.mnt);
+			return 0;
+		}
+		fprintf(stderr, "mount_macfuse_%s: the mount daemon said ok but root's mount is not on %s\n", fs, req.mnt);
+		syslog(LOG_NOTICE, "mount_%s: %s: the mount daemon said ok but root's mount is not on %s: exit 1", fs, req.dev, req.mnt);
+		return 1;
+	case MA_NO:
+		syslog(LOG_NOTICE, "mount_%s: %s: the mount daemon said no: exit %d", fs, req.dev, rc);
+		return rc;
+	case MA_LOST:
+		syslog(LOG_NOTICE, "mount_%s: %s: the mount daemon's answer was lost after begin: exit 1", fs, req.dev);
+		return 1;
+	default:	/* MA_USER, MA_UNREACHABLE: said, with why, by ask_mountd */
+		break;
+	}
 	pw = getpwuid(getuid());
 	if (!pw || !pw->pw_dir || pw->pw_dir[0] != '/') {
 		syslog(LOG_NOTICE, "mount_%s: no home directory for uid %d", fs, (int)getuid());
@@ -1715,7 +2110,6 @@ static int mount_role(const char *fs, int argc, char **argv)
 	cli = test_env("LINUXFS_CLI");
 	if (!cli || !*cli)
 		cli = CLI_DEFAULT;
-	bsd = strncmp(req.dev, "/dev/", 5) == 0 ? req.dev + 5 : req.dev;
 	base = strrchr(req.mnt, '/');
 	base = base && base[1] ? base + 1 : req.mnt;
 	out = malloc(CAPTURE_MAX);

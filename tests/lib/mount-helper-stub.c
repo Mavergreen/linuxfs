@@ -16,6 +16,7 @@
  *   foreign    attach ARGV0.img (hdiutil) on MNT, then status 5: a volume on MNT that is not this mount
  *   mounted N  append root's mount of FSNAME on MNT to ARGV0.mnttab (TYPE<TAB>FROM<TAB>ON<TAB>OWNER, as macfuse_ext4, owner 0),
  *              then send the device and status N: a mount that did land, for a request that failed
+ *   mountedhang  the same line, then send the device and never a status (sleep 30 s): a mount that landed, its status awaited
  * Each open descriptor's path, where it has one, is logged too: "fdpath N PATH".
  */
 #include <errno.h>
@@ -64,7 +65,7 @@ int main(int argc, char **argv)
 		if (fd != fileno(log) && fcntl(fd, F_GETPATH, path) == 0)
 			fprintf(log, "fdpath %d %s\n", fd, path);
 	fflush(log);
-	if (strncmp(mode, "mounted ", 8) == 0) {
+	if (strncmp(mode, "mounted ", 8) == 0 || strcmp(mode, "mountedhang") == 0) {
 		const char *fsn = argc > 2 ? strstr(argv[2], "fsname=") : NULL;
 		FILE *t;
 
@@ -161,7 +162,7 @@ int main(int argc, char **argv)
 		close(dev[1]);
 	fprintf(log, "sent the device\n");
 	fflush(log);
-	if (strcmp(mode, "nostatus") == 0 || strncmp(mode, "hold", 4) == 0) {
+	if (strcmp(mode, "nostatus") == 0 || strcmp(mode, "mountedhang") == 0 || strncmp(mode, "hold", 4) == 0) {
 		for (i = 0; i < 300; i++)
 			usleep(100000);	/* sleep(30), in steps a SIGTERM that is ignored cannot cut short */
 		return 75;

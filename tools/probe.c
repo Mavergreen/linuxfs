@@ -439,6 +439,8 @@ static const char *probe(char *lab, size_t lablen)
 	return NULL;
 }
 
+volatile sig_atomic_t *linuxfs_probe_stop;
+
 const char *linuxfs_probe_fd(int fd, char *lab, size_t lablen, int *err)
 {
 	const char *type;
@@ -451,7 +453,7 @@ const char *linuxfs_probe_fd(int fd, char *lab, size_t lablen, int *err)
 	vflags[0] = '\0';
 	while (have < SPAN) {
 		r = pread(fd, buf + have, SPAN - have, have);
-		if (r < 0 && errno == EINTR)
+		if (r < 0 && errno == EINTR && !(linuxfs_probe_stop && *linuxfs_probe_stop))
 			continue;
 		if (r < 0) {
 			*err = errno;

@@ -1,6 +1,7 @@
 /* The superblock check linuxfs-probe and linuxfs-helper share. */
 #ifndef LINUXFS_PROBE_H
 #define LINUXFS_PROBE_H
+#include <signal.h>
 #include <stddef.h>
 /*
  * Reads the start of fd (at most 68 KiB, from offset 0) and returns the filesystem's name as lklfuse's
@@ -8,6 +9,9 @@
  * knows is there. Returns NULL and sets *err to an errno value when fd cannot be read; *err is 0 otherwise.
  */
 const char *linuxfs_probe_fd(int fd, char *label, size_t labellen, int *err);
+/* When set, a read of linuxfs_probe_fd's that a signal interrupts (EINTR) gives up, NULL with *err EINTR, once *linuxfs_probe_stop
+ * is nonzero, rather than reading on: the mount program's SIGTERM flag (tools/fs.c). NULL (the default): it always reads on. */
+extern volatile sig_atomic_t *linuxfs_probe_stop;
 /* After linuxfs_probe_fd: a third field, or "": "fusion-main UUID" or "fusion-tier2 UUID" for an APFS Fusion device. */
 const char *linuxfs_probe_extra(void);
 /* After linuxfs_probe_fd: a fourth field, or "": space-separated words, "encrypted" for an APFS container whose volume 0
