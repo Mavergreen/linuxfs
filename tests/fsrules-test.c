@@ -394,9 +394,16 @@ int main(int argc, char **argv)
 		is((int)fsrules_probe_flags("fusion-tier2 ab", "dirty  encrypted"), FSF_FUSION | FSF_DIRTY | FSF_ENCRYPTED,
 		   "words are separated by spaces, in any order");
 		is((int)fsrules_probe_flags("", "encryptedx xdirty other"), 0, "only whole known words count");
+		/* spec: item 7, case-sensitivity -- an APFS volume whose superblock says case-insensitive (Task 18) */
+		is((int)fsrules_probe_flags("", "nocase"), FSF_NOCASE, "nocase is FSF_NOCASE");
+		is((int)fsrules_probe_flags("fusion-main 0123", "encrypted nocase"), FSF_FUSION | FSF_ENCRYPTED | FSF_NOCASE,
+		   "nocase beside encrypted, with a Fusion role");
+		is((int)fsrules_probe_flags("", "nocasex xnocase"), 0, "only the whole word nocase counts");
 #define ACC(type, flags, asked, login, prefs, want, wwhy, what) \
 		do { why = "unset"; is(fsrules_access(type, flags, asked, login, prefs, &why), want, what); iss(why, wwhy, what ": why"); } while (0)
 		ACC("ext4", 0, 0, 0, &d, FSA_RW, "", "ext4 mounts read-write");
+		ACC("apfs", FSF_NOCASE, 0, 0, &aw, FSA_RW, "", "nocase changes nothing about access: APFS with APFSWrite, read-write");
+		ACC("apfs", FSF_NOCASE, 0, 0, &d, FSA_RO, "apfs", "and without it, read-only for APFS's own reason");
 		ACC("ext4", 0, 1, 0, &d, FSA_RO, "asked", "asked for read-only: read-only");
 		ACC("ext4", 0, 0, 1, &ro, FSA_RO, "ReadOnly", "the ReadOnly preference: read-only");
 		ACC("apfs", 0, 0, 0, &d, FSA_RO, "apfs", "APFS: read-only by default");

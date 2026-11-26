@@ -43,17 +43,26 @@ want exfat.img "exfat${T}CARD" 0
 want vfat.img "vfat${T}STICK" 0
 want fat32.img "vfat${T}BIG32" 0
 want f2fs.img "f2fs${T}flash" 0
-want apfs.img "apfs${T}Time Machine" 0
+# spec: item 7, case-sensitivity -- the fourth field says nocase for an APFS volume case-insensitive as a whole (its superblock's
+#       APFS_INCOMPAT_CASE_INSENSITIVE), mkapfs's default; never for a case-sensitive one (mkapfs -s), nor for any other filesystem
+want apfs.img "apfs${T}Time Machine${T}${T}nocase" 0
+want apfs-cs.img "apfs${T}Sensitive" 0
 n=$((n + 1)); m=$("$D/probe" "$D/fusion-ssd.img"); t=$("$D/probe" "$D/fusion-hdd.img")
-u=$(printf '%s\n' "$m" | sed -n "s/^apfs${T}Fused${T}fusion-main \([0-9a-f]\{32\}\)\$/\1/p")
+u=$(printf '%s\n' "$m" | sed -n "s/^apfs${T}Fused${T}fusion-main \([0-9a-f]\{32\}\)${T}nocase\$/\1/p")
 if [ -n "$u" ] && [ "$t" = "apfs${T}${T}fusion-tier2 $u" ]; then echo "ok $n - a Fusion container's two devices name their roles and the same container"
 else echo "not ok $n - Fusion: main '$m', second '$t'"; bad=1; fi
 # spec: tools/probe.c -- the fourth field: a dirty NTFS volume, an encrypted APFS volume (macOS made it: volume 0 encrypted)
 want ntfs-dirty.img "ntfs3${T}Windows${T}${T}dirty" 0
 gunzip -c "$ROOT/tests/fixtures/apfs/enc.img.gz" > "$D/enc.img"
 n=$((n + 1)); got=$("$D/probe" "$D/enc.img"); rc=$?
-case $got in "apfs${T}"*"${T}${T}encrypted") [ $rc -eq 0 ] ;; *) false ;; esac
-if [ $? -eq 0 ]; then echo "ok $n - enc.img: an encrypted APFS volume says so ($got)"; else echo "not ok $n - enc.img: got '$got' ($rc)"; bad=1; fi
+case $got in "apfs${T}"*"${T}${T}encrypted nocase") test $rc -eq 0 ;; *) false ;; esac
+if test $? -eq 0; then echo "ok $n - enc.img: an encrypted APFS volume says so, and that macOS made it case-insensitive ($got)"; else echo "not ok $n - enc.img: got '$got' ($rc)"; bad=1; fi
+# spec: item 7, case-sensitivity -- no other filesystem's probe says nocase (their case-folding, where there is any, is per directory)
+n=$((n + 1)); cs=
+for i in ext4 btrfs xfs ntfs ntfs-dirty f2fs exfat vfat fat32 apfs-cs fusion-hdd apfs-magic; do
+  case $("$D/probe" "$D/$i.img") in *nocase*) cs="$cs $i" ;; esac
+done
+if test -z "$cs"; then echo "ok $n - nocase_only_apfs: no case-sensitive or non-APFS volume says nocase"; else echo "not ok $n - nocase_only_apfs: said by$cs"; bad=1; fi
 want short.img unknown 1
 want ext4-cut.img unknown 1
 want zero.img unknown 1

@@ -408,6 +408,35 @@ sh "$L" prefs APFSWrite off
 LINUXFS_DA=1 LINUXFS_OPEN=$LO FAKE_PROBE=apfs sh "$L" mount disk3s1 > /dev/null 2>&1; ok $? "a device mount takes APFS"
 grep "^open " "$T/calls" | grep -v -- "--probe" | tail -n 1 | grep -q "^open --ro /dev/rdisk3s1 "; ok $? "and asks the helper for a read-only descriptor"
 LINUXFS_OPEN=$LO sh "$L" unmount disk3s1 > /dev/null 2>&1
+# spec: item 7, case-sensitivity -- an APFS volume the probe calls nocase (case-insensitive as a whole) gets lklfuse's nocase, so
+#       macFUSE reports it case-insensitive; every other volume reports case-sensitive, so it never gets it
+: > "$T/calls"
+FAKE_PROBE=apfs FAKE_FLAGS=nocase sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
+c=$(last); case $c in *" -o type=apfs,"*,nocase,*|*" -o type=apfs,"*,nocase" "*) r=0 ;; *) r=1 ;; esac
+test $rc -eq 0; ok $(( $? | r )) "nocase_image: APFS the probe calls nocase: lklfuse gets -o ...,nocase (rc $rc: $c)"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+: > "$T/calls"
+FAKE_PROBE=apfs FAKE_FLAGS="encrypted nocase" FAKE_ENCRYPTED=s3cret sh "$L" mount "$T/img" --password-stdin > /dev/null 2>&1 <<PW
+s3cret
+PW
+rc=$?; c=$(last); case $c in *,nocase,*|*,nocase" "*) r=0 ;; *) r=1 ;; esac
+test $rc -eq 0; ok $(( $? | r )) "nocase_beside_encrypted: nocase is a word among the flags (rc $rc: $c)"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+: > "$T/calls"
+FAKE_PROBE=apfs sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
+c=$(last); case $c in *nocase*) r=1 ;; *) r=0 ;; esac
+test $rc -eq 0 && test -n "$c"; ok $(( $? | r )) "nocase_not_cs_apfs: a case-sensitive APFS volume (no nocase from the probe) gets no nocase (rc $rc: $c)"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+: > "$T/calls"
+sh "$L" mount "$T/img" > /dev/null 2>&1; rc=$?
+c=$(last); case $c in *nocase*) r=1 ;; *) r=0 ;; esac
+test $rc -eq 0 && test -n "$c"; ok $(( $? | r )) "nocase_not_ext4: ext4 never gets nocase (rc $rc: $c)"
+sh "$L" unmount "$T/img" > /dev/null 2>&1
+: > "$T/calls"
+LINUXFS_DA=1 LINUXFS_OPEN=$LO FAKE_PROBE=apfs FAKE_FLAGS=nocase sh "$L" mount disk3s1 > /dev/null 2>&1; rc=$?
+c=$(grep "^open " "$T/calls" | grep -v -- "--probe" | tail -n 1); case $c in *" -o type=apfs,"*,nocase,*|*" -o type=apfs,"*,nocase" "*) r=0 ;; *) r=1 ;; esac
+test $rc -eq 0; ok $(( $? | r )) "nocase_device: a device the helper's probe calls nocase: lklfuse gets nocase through the opener (rc $rc: $c)"
+LINUXFS_OPEN=$LO sh "$L" unmount disk3s1 > /dev/null 2>&1
 # spec: cli/linuxfs --
 #       APFS Fusion: one container on two devices, mounted read-only from both
 : > "$T/ssd.img"; : > "$T/hdd.img"
@@ -644,6 +673,11 @@ c=$(grep '^open --fuse-chan' "$T/calls" | tail -n 1); case $c in *uid=*|*gid=*|*
 sh "$L" unmount "$T/dam" > /dev/null 2>&1
 chanrun FAKE_PROBE=apfs -- /dev/disk3s1 "$T/dam"
 [ $rc -eq 0 ] && grep -q "opts=readwrite" "$T/calls" && ! grep -q ",ro " "$T/calls"; ok $? "root said rw (no --ro) for APFS: the CLI mounts read-write though its own APFSWrite preference is off (rc $rc)"
+sh "$L" unmount "$T/dam" > /dev/null 2>&1
+# spec: item 7, case-sensitivity -- with root's device too: lklfuse answers macFUSE's FUSE_INIT, so nocase reaches it on this path as well
+chanrun FAKE_PROBE=apfs FAKE_FLAGS=nocase -- --ro /dev/disk3s1 "$T/dam"
+c=$(grep '^open --fuse-chan' "$T/calls" | tail -n 1); case $c in *" -o type=apfs,"*,nocase,*|*" -o type=apfs,"*,nocase" "*) r=0 ;; *) r=1 ;; esac
+test $rc -eq 0; ok $(( $? | r )) "nocase_root_device: with root's device, an APFS volume the probe calls nocase: lklfuse gets nocase (rc $rc: $c)"
 sh "$L" unmount "$T/dam" > /dev/null 2>&1
 defaults write test.linuxfs ReadOnly -bool true
 chanrun FAKE_PROBE=ext4 -- /dev/disk3s1 "$T/dam"

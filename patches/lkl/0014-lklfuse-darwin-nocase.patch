@@ -1,0 +1,63 @@
+lklfuse: on Darwin, every volume reports itself case-sensitive, and -o nocase case-insensitive
+
+macFUSE reports a volume's case-sensitivity (pathconf _PC_CASE_SENSITIVE, VOL_CAP_FMT_CASE_SENSITIVE) from
+FUSE_DARWIN_CAP_CASE_INSENSITIVE, which the file system asks for in its FUSE_INIT reply. With the Darwin extensions off
+(lklfuse keeps libfuse's portable signatures), macFUSE's libfuse asks for it by default, before init (lib/fuse_lowlevel.c
+do_init, LL_DARWIN_SET_DEFAULT): so every linuxfs volume read case-insensitive, as HFS+ does (the hfs-parity census,
+push A: pathconf 0 on ext4, btrfs, xfs, f2fs, ntfs and apfs; HFSX is 1). Linux's filesystems are case-sensitive (ext4's
+and f2fs's casefolding is per directory, never the whole volume), so lklfuse_init now drops the flag
+(fuse_darwin_unset_feature_flag, in the vanilla API too). The new -o nocase asks for it instead: linuxfs passes it for an
+APFS volume case-insensitive as a whole (its superblock's APFS_INCOMPAT_CASE_INSENSITIVE, as macOS makes APFS by
+default), which linux-apfs-rw looks names up in without regard to case. nocase is lklfuse's own option, never passed
+to macFUSE, and only Darwin takes it. tests/lklfuse-ops-test.c checks what init asks for, with and without nocase.
+
+diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
+--- a/tools/lkl/lklfuse.c
++++ b/tools/lkl/lklfuse.c
+@@ -46,6 +46,7 @@
+ 	int part;
+ 	int ro;
+ 	int mb;
++	int nocase;
+ } lklfuse = {
+ 	.mb = 64,
+ 	.passfd = -1,
+@@ -68,6 +69,9 @@
+ 	LKLFUSE_OPT("owner=%s", owner, 0),
+ 	LKLFUSE_OPT("tier2file=%s", tier2file, 0),
+ 	LKLFUSE_OPT("passfd=%d", passfd, 0),
++#ifdef __APPLE__
++	LKLFUSE_OPT("nocase", nocase, 1),
++#endif
+ 	FUSE_OPT_KEY("-h", KEY_HELP),
+ 	FUSE_OPT_KEY("--help", KEY_HELP),
+ 	FUSE_OPT_KEY("-V",             KEY_VERSION),
+@@ -95,6 +99,9 @@
+ "    -o ro                  open block-device read-only\n"
+ "    -o tier2file=PATH      second device of an APFS Fusion container (/dev/fd/N: that descriptor)\n"
+ "    -o passfd=N            read an encrypted volume's password from descriptor N\n"
++#ifdef __APPLE__
++"    -o nocase              tell macFUSE the volume is case-insensitive (else: case-sensitive)\n"
++#endif
+ "    -o lock=FILE           only mount after taking an exclusive lock on FILE\n"
+ "    -o owner=root|UID:GID  owner of new files: the filesystem root's, or these ids\n"
+ "    -o opts=options        mount options (use \\ to escape , and =)\n"
+@@ -2117,6 +2124,18 @@
+ 	cfg->negative_timeout = 0;
+ 	/* lkl provides valid st_ino values */
+ 	cfg->use_ino = 1;
++#ifdef __APPLE__
++	/*
++	 * Case-sensitivity, as macFUSE reports it (pathconf _PC_CASE_SENSITIVE, VOL_CAP_FMT_CASE_SENSITIVE): with the Darwin
++	 * extensions off, libfuse asks for FUSE_DARWIN_CAP_CASE_INSENSITIVE by default, so every volume read case-insensitive.
++	 * Linux's filesystems are case-sensitive (ext4's and f2fs's casefolding is per directory), so it is dropped; nocase,
++	 * for an APFS volume case-insensitive as a whole, asks for it.
++	 */
++	if (lklfuse.nocase)
++		fuse_darwin_set_feature_flag(conn, FUSE_DARWIN_CAP_CASE_INSENSITIVE);
++	else
++		fuse_darwin_unset_feature_flag(conn, FUSE_DARWIN_CAP_CASE_INSENSITIVE);
++#endif
+ 
+ 	return NULL;
+ }

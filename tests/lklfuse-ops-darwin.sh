@@ -9,7 +9,8 @@
 #          a read-only /.VolumeIcon.icns and the root's custom-icon flag while the volume has no icon of its own), and Mac
 #          xattrs (patch 0013: user.N, and netatalk's and Samba's schemes, on tests/lib/xattr-images.sh's four images,
 #          which Linux makes too, and reads back after lklfuse has written them: tests/lib/check-xattrs.sh; and on a blank
-#          NTFS image, the bare com.apple.* names linuxfs stored there before 0013). Needs
+#          NTFS image, the bare com.apple.* names linuxfs stored there before 0013), and what its init asks of macFUSE
+#          (patch 0014: case-sensitive, unless -o nocase). Needs
 #          build/build-lkl-darwin.sh's output.
 set -u
 case "$(uname -s)" in Darwin) ;; *) echo "lklfuse-ops-darwin.sh: runs on a Mac" >&2; exit 77 ;; esac

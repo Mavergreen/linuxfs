@@ -19,7 +19,8 @@
 #          A device is mounted by DiskArbitration (diskutil mount), which runs the linuxfs bundle's mount program,
 #          which calls back as da-mount; so a device takes no MOUNTPOINT, --linux-ids, --tier2 or -o (use linuxfs
 #          prefs), and its volume is the console user's alone (root's too only when macFUSE's allow_other tunable is 1; open to every user only when mounted before login, or by
-#          sudo diskutil mount). A dirty NTFS volume mounts read-only. A device the Mac has mounted is refused. APFS mounts read-only (APFSWrite on: read-write, but never an encrypted or Fusion
+#          sudo diskutil mount). A volume reports itself case-sensitive, except an APFS volume made case-insensitive (as
+#          macOS makes them), which reports case-insensitive. A dirty NTFS volume mounts read-only. A device the Mac has mounted is refused. APFS mounts read-only (APFSWrite on: read-write, but never an encrypted or Fusion
 #          volume); an encrypted volume's password is asked for at the terminal, or read from stdin
 #          (--password-stdin; for a device, offered to the login session's agent). ignore VOLUME (a device, or a volume's
 #          name with its disk attached) keeps that volume from mounting by itself when it is attached, as the Mac's own
@@ -231,7 +232,7 @@ run_lklfuse() { # SOURCE MOUNTPOINT OPTIONS [OPENER-DEVICE [SECOND-OPENER-DEVICE
 }
 
 # The fields of a probe's "TYPE<TAB>LABEL[<TAB>FUSION[<TAB>FLAGS]]": sets type, label, fusion (an APFS Fusion device's role
-# and container, or "") and flags (space-separated: encrypted, dirty; or "").
+# and container, or "") and flags (space-separated: encrypted, nocase, dirty; or "").
 fields() { # PROBE-LINE
   type=${1%%"$tab"*} label= fusion= flags=
   case $1 in *"$tab"*)
@@ -403,6 +404,9 @@ cmd_mount() {
   lockopt=$lockfile; [ -z "$fusechan" ] || lockopt=/dev/fd/7
   opts="type=$type,lock=$lockopt"
   vi=$(volicon_opt "$type"); [ -z "$vi" ] || opts="$opts,$vi"
+  # an APFS volume case-insensitive as a whole (the probe's nocase): lklfuse tells macFUSE so; every other volume reports
+  # case-sensitive (spec: item 7, case-sensitivity). lklfuse answers macFUSE's init, so this holds with root's device too.
+  case " $flags " in *" nocase "*) opts="$opts,nocase" ;; esac
   # the mount's own options (the kernel's): root gave them to mount_macfuse when it made the mount lklfuse serves
   if [ -z "$fusefd" ]; then
     [ -n "$fsn" ] || fsn=linuxfs@$(safe_name "$(basename "$src")")

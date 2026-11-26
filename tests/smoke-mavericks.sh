@@ -249,7 +249,8 @@ done
 gunzip -c "$IN/apfs.img.gz" > "$W/img/apfs.img" || die "cannot unpack $IN/apfs.img.gz"
 cp "$W/img/apfs.img" "$W/apfs.before"
 img=$W/img/apfs.img m=$W/mnt/apfs; mkdir -p "$m"
-check "apfs: linuxfs-probe names it, by its volume" sh -c '[ "$("$1" "$2")" = "$(printf "apfs\tTime Machine")" ]' _ "$P/libexec/linuxfs-probe" "$img"
+# (item 7: mkapfs makes it case-insensitive, so the probe's fourth field says nocase)
+check "apfs: linuxfs-probe names it, by its volume, and says nocase" sh -c 'test "$("$1" "$2")" = "$(printf "apfs\tTime Machine\t\tnocase")"' _ "$P/libexec/linuxfs-probe" "$img"
 check "apfs: linuxfs mount" bounded 600 "$L" mount "$img" "$m"
 check "apfs: mount shows it as macfuse_apfs" mount_type_is "$m" macfuse_apfs
 check "apfs: the volume lists" ls -la "$m"

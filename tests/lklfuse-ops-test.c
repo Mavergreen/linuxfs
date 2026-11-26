@@ -7,8 +7,16 @@
  */
 #define main lklfuse_main
 #define fuse_get_context test_fuse_get_context	/* the FUSE caller, which a test sets (owner=caller) */
+#ifdef __APPLE__	/* libfuse's own, which this test does not link: what lklfuse_init asks of macFUSE (nocase) */
+#define fuse_darwin_set_feature_flag test_fuse_darwin_set_feature_flag
+#define fuse_darwin_unset_feature_flag test_fuse_darwin_unset_feature_flag
+#endif
 #include "lklfuse.c"
 #undef fuse_get_context
+#ifdef __APPLE__
+#undef fuse_darwin_set_feature_flag
+#undef fuse_darwin_unset_feature_flag
+#endif
 #undef main
 #include <sys/xattr.h>
 #include <limits.h>
@@ -1667,6 +1675,63 @@ static int lock_free(const char *path)
 	return r;
 }
 
+/* As macFUSE's libfuse (lib/fuse_lowlevel.c at the pinned 5.5.0): a flag the kernel offers is wanted; any can be dropped. */
+bool test_fuse_darwin_set_feature_flag(struct fuse_conn_info *conn, uint64_t flag)
+{
+	if (conn->capable_darwin & flag) {
+		conn->want_darwin |= flag;
+		return true;
+	}
+	return false;
+}
+
+void test_fuse_darwin_unset_feature_flag(struct fuse_conn_info *conn, uint64_t flag)
+{
+	conn->want_darwin &= ~flag;
+}
+
+/*
+ * spec: item 7, case-sensitivity (patch 0014) -- macFUSE's libfuse, with the Darwin extensions off (lklfuse's portable
+ * signatures), asks for FUSE_DARWIN_CAP_CASE_INSENSITIVE by default before init (do_init), so every volume read
+ * case-insensitive (census: pathconf 0 on all six). lklfuse_init keeps it only with nocase, the CLI's for an APFS volume
+ * case-insensitive as a whole. conn starts as do_init leaves it: the kernel's flags offered, libfuse's defaults wanted.
+ */
+static void case_init(struct fuse_conn_info *conn, int nocase, uint64_t capable, uint64_t want)
+{
+	struct fuse_config cfg;
+
+	memset(conn, 0, sizeof(*conn));
+	memset(&cfg, 0, sizeof(cfg));
+	conn->capable_darwin = capable;
+	conn->want_darwin = want;
+	lklfuse.nocase = nocase;
+	lklfuse_init(conn, &cfg);
+	lklfuse.nocase = 0;
+}
+
+static void case_tests(void)
+{
+	const uint64_t ci = FUSE_DARWIN_CAP_CASE_INSENSITIVE, rb = FUSE_DARWIN_CAP_REPLY_BUF;
+	struct fuse_conn_info conn;
+	const struct fuse_opt *o;
+	int found = 0;
+
+	for (o = lklfuse_opts; o->templ; o++)
+		if (strcmp(o->templ, "nocase") == 0 && o->offset == offsetof(struct lklfuse, nocase) && o->value == 1)
+			found = 1;
+	is(found, 1, "case_opt: -o nocase is lklfuse's own option, which sets nocase (and never reaches macFUSE)");
+	case_init(&conn, 0, ci | rb, ci | rb);
+	is(!!(conn.want_darwin & ci), 0, "case_default: without nocase, init drops libfuse's case-insensitive default: case-sensitive");
+	is(!!(conn.want_darwin & rb), 1, "case_default: and leaves libfuse's other Darwin defaults as they were");
+	case_init(&conn, 1, ci | rb, ci | rb);
+	is(!!(conn.want_darwin & ci), 1, "case_nocase: with nocase, init asks for FUSE_DARWIN_CAP_CASE_INSENSITIVE");
+	is(!!(conn.want_darwin & rb), 1, "case_nocase: and leaves libfuse's other Darwin defaults as they were");
+	case_init(&conn, 1, ci | rb, rb);
+	is(!!(conn.want_darwin & ci), 1, "case_nocase: asked for even where libfuse did not ask by default");
+	case_init(&conn, 1, rb, rb);
+	is(!!(conn.want_darwin & ci), 0, "case_unoffered: not asked of a kernel that does not offer it (libfuse would refuse the init)");
+}
+
 static void destroy_tests(const char *image)
 {
 	char lockpath[PATH_MAX];
@@ -1837,6 +1902,7 @@ int main(int argc, char **argv)
 	unicode_tests();
 	volicon_tests();
 	xattr_tests(argc == 3 ? argv[2] : NULL);
+	case_tests();
 	destroy_tests(argv[1]);
 #endif
 	stop_lkl();

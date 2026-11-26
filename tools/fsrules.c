@@ -113,6 +113,8 @@ unsigned fsrules_probe_flags(const char *fusion, const char *words)
 			f |= FSF_ENCRYPTED;
 		else if (n == 5 && strncmp(words, "dirty", 5) == 0)
 			f |= FSF_DIRTY;
+		else if (n == 6 && strncmp(words, "nocase", 6) == 0)
+			f |= FSF_NOCASE;
 		words += n;
 		while (*words == ' ')
 			words++;

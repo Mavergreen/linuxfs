@@ -15,6 +15,8 @@ truncate -s 64M vfat.img; mkfs.vfat -n STICK vfat.img >/dev/null
 truncate -s 64M fat32.img; mkfs.vfat -F 32 -n BIG32 fat32.img >/dev/null
 truncate -s 128M f2fs.img; mkfs.f2fs -q -l flash f2fs.img >/dev/null
 truncate -s 64M apfs.img; mkapfs -L "Time Machine" apfs.img >/dev/null
+# spec: item 7, case-sensitivity -- mkapfs makes a case-insensitive volume unless -s asks for a case-sensitive one
+truncate -s 64M apfs-cs.img; mkapfs -s -L Sensitive apfs-cs.img >/dev/null
 # spec: tools/probe.c --
 #       review M5: a label that is not UTF-8, and a non-ASCII NTFS label (UTF-16 on disk)
 truncate -s 128M ext4-badlabel.img; mkfs.ext4 -q -F -L "$(printf 'ok\377x')" ext4-badlabel.img

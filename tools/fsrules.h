@@ -50,10 +50,13 @@ int fsrules_claims(const char *fs, const char *probed_type, int removable, const
 
 /* What linuxfs-probe says of a volume beyond its type and label (probe.h): its third field, an APFS Fusion device's role
  * ("fusion-main UUID", "fusion-tier2 UUID") or "", and its fourth, space-separated words: "encrypted" (an APFS volume 0
- * that needs its password) and "dirty" (an NTFS volume Windows left in use). Other words are ignored; NULL is "". */
+ * that needs its password), "dirty" (an NTFS volume Windows left in use) and "nocase" (an APFS volume 0 case-insensitive
+ * as a whole, which lklfuse's nocase tells macFUSE; it changes nothing in fsrules_access). Other words are ignored; NULL
+ * is "". */
 #define FSF_FUSION 1u
 #define FSF_ENCRYPTED 2u
 #define FSF_DIRTY 4u
+#define FSF_NOCASE 8u
 unsigned fsrules_probe_flags(const char *fusion, const char *words);
 
 enum fsaccess { FSA_RW, FSA_RO, FSA_REFUSE };

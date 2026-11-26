@@ -15,7 +15,8 @@ extern volatile sig_atomic_t *linuxfs_probe_stop;
 /* After linuxfs_probe_fd: a third field, or "": "fusion-main UUID" or "fusion-tier2 UUID" for an APFS Fusion device. */
 const char *linuxfs_probe_extra(void);
 /* After linuxfs_probe_fd: a fourth field, or "": space-separated words, "encrypted" for an APFS container whose volume 0
- * needs a password, "dirty" for an NTFS volume Windows left in use (fsrules.h reads them). */
+ * needs a password, "nocase" for one whose volume 0 is case-insensitive as a whole, "dirty" for an NTFS volume Windows
+ * left in use (fsrules.h reads them). */
 const char *linuxfs_probe_flags(void);
 /* After linuxfs_probe_fd: the line every prober prints (without its newline): TYPE<TAB>LABEL, then <TAB>EXTRA and
  * <TAB>FLAGS when there are any (EXTRA empty when only FLAGS are). 0, or -1 when it does not fit in len. */

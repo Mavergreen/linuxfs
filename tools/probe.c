@@ -34,7 +34,7 @@ static size_t have;
 static int probe_fd = -1;	/* for the reads beyond SPAN that an APFS volume's name needs */
 static size_t uuid_off;		/* where the 16 UUID bytes sit in buf, or 0 when the filesystem has none */
 static char extra[64];		/* a third field: an APFS Fusion device's role and container */
-static char vflags[32];		/* a fourth: "encrypted", "dirty" */
+static char vflags[32];		/* a fourth: "encrypted", "nocase", "dirty" */
 
 const char *linuxfs_probe_extra(void)
 {
@@ -308,8 +308,10 @@ static void exfat_label(char *out, size_t outlen)
  * (nx_block_size at 36, nx_omap_oid at 160, nx_fs_oid[] at 184), omap_phys_t (om_tree_oid at 48),
  * btree_node_phys_t (flags at 32, level at 34, nkeys at 36, table space at 40, entries from 56; a root node keeps a
  * 40-byte btree_info_t at its end), omap keys {oid, xid} and values {flags, size, paddr}, apfs_superblock_t ("APSB"
- * at 32, apfs_fs_flags at 264, whose APFS_FS_UNENCRYPTED (1) clear is what linux-apfs-rw asks a password for,
- * apfs_volname at 704). Leaves the label empty, and the flags, on anything unexpected.
+ * at 32, apfs_incompatible_features at 56, whose APFS_INCOMPAT_CASE_INSENSITIVE (1) set makes the whole volume
+ * case-insensitive (spec: item 7, case-sensitivity; the flag "nocase"), apfs_fs_flags at 264, whose APFS_FS_UNENCRYPTED (1)
+ * clear is what linux-apfs-rw asks a password for, apfs_volname at 704). Leaves the label empty, and the flags, on anything
+ * unexpected.
  */
 static void apfs_label(char *out, size_t outlen)
 {
@@ -357,9 +359,11 @@ static void apfs_label(char *out, size_t outlen)
 			goto done;
 		if (level == 0) {
 			if (read_block(b, bs, best) == 0 && memcmp(b + 32, "APSB", 4) == 0) {
+				int enc = !(b[264] & 1), nocase = b[56] & 1;
+
 				label_bytes(b + 704, 256, out, outlen);
-				if (!(b[264] & 1))
-					snprintf(vflags, sizeof vflags, "encrypted");
+				snprintf(vflags, sizeof vflags, "%s%s%s", enc ? "encrypted" : "", enc && nocase ? " " : "",
+					 nocase ? "nocase" : "");
 			}
 			goto done;
 		}
