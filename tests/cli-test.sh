@@ -419,7 +419,7 @@ sh "$L" unmount "$T/img" > /dev/null 2>&1
 FAKE_PROBE=apfs FAKE_FLAGS="encrypted nocase" FAKE_ENCRYPTED=s3cret sh "$L" mount "$T/img" --password-stdin > /dev/null 2>&1 <<PW
 s3cret
 PW
-rc=$?; c=$(last); case $c in *,nocase,*|*,nocase" "*) r=0 ;; *) r=1 ;; esac
+rc=$?; c=$(last); case $c in *" -o type=apfs,"*,nocase,*|*" -o type=apfs,"*,nocase" "*) r=0 ;; *) r=1 ;; esac
 test $rc -eq 0; ok $(( $? | r )) "nocase_beside_encrypted: nocase is a word among the flags (rc $rc: $c)"
 sh "$L" unmount "$T/img" > /dev/null 2>&1
 : > "$T/calls"

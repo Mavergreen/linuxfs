@@ -1675,9 +1675,13 @@ static int lock_free(const char *path)
 	return r;
 }
 
-/* As macFUSE's libfuse (lib/fuse_lowlevel.c at the pinned 5.5.0): a flag the kernel offers is wanted; any can be dropped. */
+/* As macFUSE's libfuse (lib/fuse_lowlevel.c at the pinned 5.5.0): a flag the kernel offers is wanted; any can be dropped.
+ * Each call is counted, so a test sees whether lklfuse asked through libfuse at all. */
+static int test_darwin_sets;
+
 bool test_fuse_darwin_set_feature_flag(struct fuse_conn_info *conn, uint64_t flag)
 {
+	test_darwin_sets++;
 	if (conn->capable_darwin & flag) {
 		conn->want_darwin |= flag;
 		return true;
@@ -1704,6 +1708,7 @@ static void case_init(struct fuse_conn_info *conn, int nocase, uint64_t capable,
 	memset(&cfg, 0, sizeof(cfg));
 	conn->capable_darwin = capable;
 	conn->want_darwin = want;
+	test_darwin_sets = 0;
 	lklfuse.nocase = nocase;
 	lklfuse_init(conn, &cfg);
 	lklfuse.nocase = 0;
@@ -1729,7 +1734,11 @@ static void case_tests(void)
 	case_init(&conn, 1, ci | rb, rb);
 	is(!!(conn.want_darwin & ci), 1, "case_nocase: asked for even where libfuse did not ask by default");
 	case_init(&conn, 1, rb, rb);
-	is(!!(conn.want_darwin & ci), 0, "case_unoffered: not asked of a kernel that does not offer it (libfuse would refuse the init)");
+	/* libfuse refuses an init (EPROTO) that wants what the kernel does not offer: lklfuse must ask through
+	 * fuse_darwin_set_feature_flag, which checks, and never set want_darwin itself */
+	is(test_darwin_sets, 1, "case_unoffered: with nocase, init asks through libfuse's fuse_darwin_set_feature_flag");
+	is(!!(conn.want_darwin & ~conn.capable_darwin), 0,
+	   "case_unoffered: and wants nothing the kernel does not offer, so libfuse accepts the init");
 }
 
 static void destroy_tests(const char *image)
