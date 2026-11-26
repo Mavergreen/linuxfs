@@ -693,6 +693,9 @@ if test -n "$parity_lib"; then
   PARITY_STALL_N=50
   # spec: tests/lib/parity.sh census_names_bar -- item 1: every linuxfs census mount runs the names mode this macFUSE means
   if macfuse_at_least 5 5 0 5; then PARITY_NAMES_WANT=exact; else PARITY_NAMES_WANT=scanning; fi
+  # spec: tests/lib/parity.sh census_busy -- Task 16e-fix: the HFS+ control carries the custom volume icon linuxfs serves,
+  #       each bundle's linuxfs.icns (%s standing for the fs)
+  PARITY_VOLICON_OF=$(volicon_of %s)
   parity_census_all
   check "no lklfuse runs as root, after the census" no_root_lklfuse
 else notok "no $tests_dir/lib/parity.sh: the census cannot run"; fi

@@ -323,8 +323,10 @@ unset -f mkfile hdiutil diskutil
 S=$T/stub; mkdir -p "$S/nodes" "$T/vols" "$T/in"
 PARITY_FSTAB=$S/fstab PARITY_DALOG=$S/dalog PARITY_DAPL=$S/da.plist STUB=$S PARITY_POLLS=3
 PARITY_SYSLOG=$S/syslog PARITY_ICNS=$S/icon.icns PARITY_SPOT_SECS=3
+PARITY_VOLICON_OF=$S/volicon.icns   # census_busy's linuxfs.icns (the smoke names each bundle's, %s for the fs; here one for all)
 export PARITY_FSTAB PARITY_DALOG PARITY_SYSLOG STUB
 : > "$PARITY_FSTAB"; : > "$PARITY_DALOG"; : > "$PARITY_DAPL"; : > "$S/calls"; : > "$PARITY_SYSLOG"; echo icns > "$PARITY_ICNS"
+echo "linuxfs icns" > "$PARITY_VOLICON_OF"
 for py in python3 /usr/bin/python; do command -v "$py" > /dev/null 2>&1 && PARITY_PYTHON=$py; done
 cat > "$T/bin/stub" <<'EOF'
 #!/bin/sh
@@ -358,6 +360,8 @@ log() { echo "$(date +%H:%M:%S)   $*" >> "$PARITY_DALOG"; }
 # a linuxfs node's mount: lklfuse's own log, $STUB/lklogs/rNODE.log (the CLI's ~/Library/Logs/linuxfs/<basename of the raw
 #   device>.log, written afresh by each mount), with its names line: exact, or scanning with $STUB/names-scanning
 names_log() {
+  # every mount feeds the stub fs_usage Finder's open of the volume's .VolumeIcon.icns
+  printf '%s\n' "$(date +%H:%M:%S).000002  open  F=5  (R_____)  $(field "$1" mp)/.VolumeIcon.icns  0.000120   Finder.79271" >> "$STUB/fsu-feed"
   test "$(field "$1" disk)" = "$1" || return 0
   mkdir -p "$STUB/lklogs"
   if test -f "$STUB/names-scanning"; then m=scanning; else m=exact; fi
@@ -477,7 +481,17 @@ linuxfs)
   esac ;;
 sudo)
   test "$1" != -n || shift
-  case $1 in sh|tail|cat|wc|mdutil|tmutil) exec "$@" ;; lsof) echo "COMMAND PID USER (stub lsof $*)" ;; esac ;;
+  case $1 in
+  sh|tail|cat|wc|mdutil|tmutil) exec "$@" ;;
+  kill) shift; kill "$@"; exit $? ;;
+  lsof)
+    case "$*" in
+    # the whole table (+c0, no path): a header, a line elsewhere, and Finder holding each mounted volume's .VolumeIcon.icns
+    *+c0*) echo "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME"; echo "launchd 1 root 3r REG 1,2 0 1 /private/var/stub-elsewhere"
+      for f in "$N"/*.m; do test -f "$f" || continue; nd=${f##*/}; nd=${nd%.m}; echo "Finder 79271 stubuser 12r REG 1,2 0 1 $(field "$nd" mp)/.VolumeIcon.icns"; done ;;
+    *) echo "COMMAND PID USER (stub lsof $*)" ;;
+    esac ;;
+  esac ;;
 mkfile) : > "$2" ;;
 sysctl) echo "$1.version.number: stub" ;;
 mdutil)
@@ -504,7 +518,18 @@ df)
     echo "Filesystem 1024-blocks Used Available Capacity Mounted on"; echo "stub 99999999999 0 $v 0% /"
   else exec /bin/df "$@"; fi ;;
 xattr)
-  case $1 in -l) echo "com.apple.FinderInfo: stub" ;; -px) echo "00 00 04 00" ;; esac ;;
+  # -wx keeps the value per path; -px gives it back, else a mounted linuxfs volume's root serves kHasCustomIcon (patch 0017's
+  #   volicon), else a short record with no flag
+  case $1 in
+  -l) echo "com.apple.FinderInfo: stub" ;;
+  -wx) mkdir -p "$STUB/xattrs"; echo "$3" > "$STUB/xattrs/$(printf '%s' "$4" | tr / _).$2" ;;
+  -px)
+    k=$STUB/xattrs/$(printf '%s' "$3" | tr / _).$2; nd=$(node_of "$3")
+    if test -f "$k"; then sed 's/../& /g; s/ $//' "$k"
+    elif test -n "$nd" && test "$(field "$nd" disk)" = "$nd" && test "$(field "$nd" mp)" = "$3"; then
+      echo "00 00 00 00 00 00 00 00 04 00 00 00 00 00 00 00"; echo "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
+    else echo "00 00 04 00"; fi ;;
+  esac ;;
 guest-macosx-aqua)
   case $1 in
   screencapture) if test -f "$STUB/same-shots"; then echo same > "$3"; else echo "$3" > "$3"; fi ;;
@@ -530,6 +555,16 @@ esac
 exit 0
 EOF
 chmod +x "$T/bin/stub"
+# fs_usage: says it ran and its pid; killed (TERM), prints a line elsewhere and what the mounts fed it since it began (the
+#   real one prints as it goes, and flushes at its exit), then exits
+cat > "$T/bin/fs_usage" <<'EOF'
+#!/bin/sh
+echo "fs_usage $*" >> "$STUB/calls"; echo $$ >> "$STUB/fsu-pids"
+o=$(($(wc -c < "$STUB/fsu-feed" 2> /dev/null || echo 0) + 1))
+trap 'echo "$(date +%H:%M:%S).000001  open  F=4  (R_____)  /private/var/stub-elsewhere  0.000010   launchd.1"; tail -c +$o "$STUB/fsu-feed" 2> /dev/null; exit 0' TERM
+/bin/sleep 60 & wait $!
+EOF
+chmod +x "$T/bin/fs_usage"
 for c in hdiutil diskutil osascript sudo sysctl mkfile linuxfs mdutil mdfind tmutil defaults xattr df ps mount; do ln -sf stub "$T/bin/$c"; done
 rm -f "$T/aqua/guest-macosx-aqua"; ln -sf ../bin/stub "$T/aqua/guest-macosx-aqua"
 expect census_aqua_off_path not command -v guest-macosx-aqua
@@ -819,6 +854,40 @@ for s in shell-unmount textedit-unmount textedit-eject finder-eject; do expect "
 expect census_busy_sysctl test -s "$P/busy-ext4.sysctl.txt"
 # every mount is said, census_busy_cycles' remounts too (20 of them, and the attach)
 expect census_names_busy_remounts test "$(grep -c '/vols/busy-ext4: exact' "$P/names-mode.txt")" -ge 21
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-16e-fix-brief.md -- push E's busy.ext4.cycles red: a busy unmount records
+#       who held the volume at once (before the pause), and the HFS+ control carries linuxfs's custom volume icon
+bl=$P/busy.ext4.cycles.txt
+expect "census_busy_cycles: a busy unmount records the whole lsof table matched on the mount point, taken before the pause" \
+  awk '/^-- sudo lsof -n -P \+c0 \(the whole table\), the lines naming / { h = NR } h && /^Finder 79271 stubuser .*\/vols\/busy-ext4\/.VolumeIcon.icns$/ { f = NR }
+    h && !o && /stub-elsewhere/ { bad = 1 } f && /^-- once more: / { o = NR } END { exit !(f && o && !bad) }' "$bl"
+expect "census_busy_cycles: a busy unmount records the opens on the volume since its mount (fs_usage)" \
+  awk '/^-- fs_usage -w -f pathname: opens naming / { h = 1; next } /^-- / { h = 0 } h && /\/vols\/busy-ext4\/.VolumeIcon.icns .*Finder.79271$/ { f = 1 }
+    h && /stub-elsewhere/ { bad = 1 } END { exit !(f && !bad) }' "$bl"
+fsu_gone() { test -s "$S/fsu-pids" || return 1; for p in $(cat "$S/fsu-pids"); do ! kill -0 "$p" 2> /dev/null || return 1; done; }
+expect "census_busy_cycles: fs_usage never left running" fsu_gone
+# one fs_usage over the HFS+ side's cycles; over ext4's, one stopped at its refusal and one more after: each stopped
+expect census_busy_fs_usage_runs test "$(grep -c '^fs_usage -w -f pathname$' "$S/calls")" -eq 3
+expect census_busy_fs_usage_stopped test "$(grep -c '^sudo -n kill [0-9][0-9]*$' "$S/calls")" -eq 3
+expect census_busy_fs_usage_raw_gone test -z "$(ls "$W/census" | grep fs_usage)"
+expect "census_busy: the HFS+ control carries the same custom volume icon as linuxfs" \
+  sh -c 'cmp -s "$1/.VolumeIcon.icns" "$2" && grep -q "^xattr -wx com.apple.FinderInfo 0000000000000000040000000000000000000000000000000000000000000000 .*/vols/busy-hfs-ext4$" "$3"' _ "$T/vols/busy-hfs-ext4" "$PARITY_VOLICON_OF" "$S/calls"
+# each side's custom icon said before its cycles; the HFS+ control's set, then mounted again, so each counted cycle mounts with it
+expect census_busy_icon_said awk '/^hfs: custom icon: yes$/ && !c { h = 1 } /^ext4: custom icon: yes$/ && c == 20 { f = 1 } /^cycle [0-9]*: / { c++ } END { exit !(h && f) }' "$bl"
+expect census_busy_icon_remounted awk '/^xattr -wx .*\/vols\/busy-hfs-ext4$/ { x = 1 } x && /^diskutil unmount .*\/vols\/busy-hfs-ext4$/ { u = 1 } u && /^diskutil mount / { m = 1; exit } END { exit !m }' "$S/calls"
+# census_busy_bar's icons (its 7th and 8th arguments): sides that differ prove nothing; alike, the bar as before
+r=$(census_busy_bar busy.x.cycles check x "0 20" "0 20" 20 no yes 2>&1)
+expect "census_busy_bar: sides that differ in custom icon prove nothing" test "$r" = "$(printf '%s\n' 'not ok - parity busy.x.cycles (hfs 0 of 20, x 0 of 20; custom icon: hfs no, x yes)' 'parity: busy.x.cycles: the sides differ in custom icon (hfs no, x yes), so it proves nothing')"
+r=$(census_busy_bar busy.x.cycles check x "0 20" "0 20" 20 yes yes 2>&1)
+expect census_busy_bar_same_icon test "$r" = "ok - parity busy.x.cycles (hfs 0 of 20, x 0 of 20)"
+r=$(census_busy_bar busy.x.cycles record x "0 20" "0 20" 20 "" yes 2>&1)
+expect census_busy_bar_icon_recorded test "$r" = "# recorded busy.x.cycles: hfs 0 of 20, x 0 of 20; custom icon: hfs unknown, x yes"
+# no linuxfs.icns to give the control (the postinstall could not make it): said, and the bar, seeing the sides differ, not ok
+mv "$PARITY_VOLICON_OF" "$T/volicon.away"; echo noicon > "$W/img/noicon.img"; cp "$S/calls" "$T/calls.keep"   # (ext4's calls, for the cases below)
+r=$(census_busy noicon 2>&1)
+mv "$T/volicon.away" "$PARITY_VOLICON_OF"; rm -f "$W/img/noicon.img"; cp "$T/calls.keep" "$S/calls"
+expect census_busy_no_icon_said has "$r" "^# census_busy noicon: no $PARITY_VOLICON_OF, so the HFS+ control gets no custom icon$"
+expect census_busy_no_icon_notok has "$r" "^not ok - parity busy.noicon.cycles (hfs 0 of 20, noicon 0 of 20; custom icon: hfs no, noicon yes)$"
+expect census_busy_no_icon_detached test -z "$(attached)"
 # census_busy_fsevents WHAT FS LOG, on its own: not ok when a side said no, or said nothing; recorded under record
 printf '%s\n' 'hfs: fsevents: .fseventsd yes' 'xfs: fsevents: .fseventsd no' > "$T/bf.log"
 r=$(census_busy_fsevents spotlight.xfs.busy-fsevents xfs "$T/bf.log" 2>&1)
@@ -1420,7 +1489,7 @@ expect census_all_cleans test ! -e "$W/census/old.img" -a -e "$W/census/left-stu
 # a step begins only when, at its worst (the console hung: every AppleScript at its bound), it ends by
 #   PARITY_CENSUS_MIN + 11; a step whose worst is 11 or less keeps the plain cutoff
 expect census_worst_default test "$(census_worst_min zzz)" -eq 11
-expect census_worst_table test "$(for c in census_unicode census_busy census_spotlight census_finder census_trash_tags_case census_later census_stall stall; do census_worst_min "$c"; done | tr '\n' ' ')" = '17 31 32 30 21 9 63 63 '
+expect census_worst_table test "$(for c in census_unicode census_busy census_spotlight census_finder census_trash_tags_case census_later census_stall stall; do census_worst_min "$c"; done | tr '\n' ' ')" = '17 32 32 30 21 9 63 63 '
 # Task 15: the census begins nothing past 132 min (it was 135), for the refusals bar and the non-admin mount after it
 r=$(unset PARITY_CENSUS_MIN; . "$here/lib/parity.sh"; echo "$PARITY_CENSUS_MIN")
 expect census_min_default test "$r" -eq 132

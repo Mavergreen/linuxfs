@@ -879,14 +879,69 @@ census_stall() {
 }
 
 # ---- item 4: busy volumes ----
-# census_busy_cycles NAME IMAGE LOG: 20 times, a write and at once diskutil unmount; a busy unmount records who holds
-#   the volume (sudo lsof on the mount point, ps, DiskArbitration's dissent), is tried once more, and the volume is
-#   mounted again. Prints the busy count and the cycles run ("0 0" when IMAGE did not attach).
+# spec: .superpowers/sdd/2026-11-25-hfs-parity/task-16e-fix-brief.md -- push E (busy.ext4.cycles, hfs 0 of 20, ext4 2 of 20):
+#       at both refusals sudo lsof on the mount point printed nothing a second later; the holder, most likely Finder reading
+#       linuxfs's synthetic /.VolumeIcon.icns (patch 0017), was not recorded, and the HFS+ control had no custom icon
+# census_fsu_start FILE: sudo -n fs_usage -w -f pathname in the background, appending to FILE; the root shell that execs it
+#   leaves its pid in $W/census/fs_usage.pid. census_fsu_stop ends it: every start is followed by a stop
+census_fsu_start() {
+  rm -f "$W/census/fs_usage.pid"
+  sudo -n sh -c 'echo $$ >"$1"; exec fs_usage -w -f pathname' _ "$W/census/fs_usage.pid" >>"$1" 2>&1 </dev/null &
+  CFSU_ON=1
+}
+# census_fsu_stop: the running fs_usage TERMed (it flushes at its exit), awaited, KILLed if still there; 4 s at most: its
+#   pid 1, the kill 1, its exit 1, the KILL 1
+census_fsu_stop() {
+  test -n "${CFSU_ON:-}" || return 0
+  CFSU_ON=
+  bounded 10 census_fsu_pidfile
+  _cfs_p=$(cat "$W/census/fs_usage.pid" 2>/dev/null); rm -f "$W/census/fs_usage.pid"
+  case $_cfs_p in '' | *[!0-9]*) echo "-- fs_usage said no pid (sudo -n refused, or it did not start)"; return 1 ;; esac
+  bounded 10 sudo -n kill "$_cfs_p" >/dev/null 2>&1 </dev/null
+  bounded 10 census_pid_gone "$_cfs_p" >/dev/null 2>&1 || bounded 10 sudo -n kill -9 "$_cfs_p" >/dev/null 2>&1 </dev/null
+}
+census_fsu_pidfile() { while ! test -s "$W/census/fs_usage.pid"; do sleep 0.1; done; }
+# census_pid_gone PID: returns once PID is gone (a zombie counts as gone); run it under bounded
+census_pid_gone() { while ps -o stat= -p "$1" 2>/dev/null </dev/null | grep -qv '^ *Z'; do sleep 0.1; done; }
+# census_fsu_cut FILE HH:MM:SS MP: fs_usage's lines in FILE from that time on (its first column) naming MP,
+#   .VolumeIcon.icns or /.vol/ (Finder opens by FSRef, so /.vol paths count)
+census_fsu_cut() {
+  awk -v t="$2" -v m="$3" '$1 >= t && (index($0, m) || index($0, ".VolumeIcon.icns") || index($0, "/.vol/"))' "$1" 2>/dev/null
+}
+# census_custom_icon MP: yes when MP's root FinderInfo has kHasCustomIcon (0x0400 in fdFlags: byte 8's 0x04), else no
+census_custom_icon() {
+  _cci=$(bounded 50 xattr -px com.apple.FinderInfo "$1" 2>/dev/null </dev/null | tr -s ' \t' '\n\n' | grep . | sed -n 9p)
+  case $_cci in
+  [0-9a-fA-F][0-9a-fA-F]) if test $((0x$_cci & 4)) -ne 0; then echo yes; else echo no; fi ;;
+  *) echo no ;;
+  esac
+}
+
+# census_busy_cycles NAME IMAGE LOG [ICON]: 20 times, a write and at once diskutil unmount; a busy unmount records who holds
+#   the volume, is tried once more, and the volume is mounted again. Who holds it: at once, before any pause, the whole of
+#   sudo lsof's table matched on the mount point (no stat of it), and fs_usage's opens on the volume since that cycle's
+#   mount (one fs_usage runs from before the attach, stopped at a refusal or the cycles' end, started again before the
+#   next mount); then sudo lsof on the mount point, ps, DiskArbitration's dissent. With ICON (an .icns), the volume is
+#   given it as its custom icon (census_volume_icon) and mounted again before the first cycle, so each counted cycle's
+#   mount has it; each side says "NAME: custom icon: yes|no" before its cycles (census_busy_bar compares them). Prints the
+#   busy count and the cycles run ("0 0" when IMAGE did not attach, or was not mounted again after its icon).
 census_busy_cycles() {
-  bc_name=$1 bc_busy=0 bc_k=0
+  bc_name=$1 bc_busy=0 bc_k=0 bc_fsu=$W/census/busy-$1.fs_usage.txt
   if test "$1" = hfs; then bc_side=apple; else bc_side=fs; fi
-  census_attach "$2" || { echo "$bc_name: not attached" >>"$3"; echo 0 0; return 1; }
+  : >"$bc_fsu"; bc_t=$(date +%H:%M:%S); census_fsu_start "$bc_fsu"
+  census_attach "$2" || { census_fsu_stop >/dev/null; rm -f "$bc_fsu"; echo "$bc_name: not attached" >>"$3"; echo 0 0; return 1; }
   bc_disk=$CA_DISK bc_dev=$CA_DEV bc_mp=$CA_MP
+  if test -n "${4:-}"; then
+    census_volume_icon "$bc_mp" "$4" 2>&1 | sed "s/^/$bc_name: custom icon given: /" >>"$3"
+    bounded 600 diskutil unmount "$bc_mp" >/dev/null 2>&1 </dev/null
+    bc_t=$(date +%H:%M:%S); bounded 600 diskutil mount "$bc_dev" >/dev/null 2>&1 </dev/null
+    if ! bc_m=$(bounded 900 census_wait_mounted "$bc_dev"); then
+      census_fsu_stop >/dev/null; rm -f "$bc_fsu"; echo "$bc_name: not mounted again after its custom icon; no cycles" >>"$3"
+      census_detach "$bc_disk" "$bc_side" "$bc_mp" >>"$3"; echo 0 0; return 1
+    fi
+    bc_mp=$(printf '%s\n' "$bc_m" | sed -n 2p); census_names_mode "$bc_dev" "$bc_mp"
+  fi
+  echo "$bc_name: custom icon: $(census_custom_icon "$bc_mp")" >>"$3"
   while test "$bc_k" -lt 20; do
     bc_k=$((bc_k + 1))
     bc_dal=$(census_dalog_size); : "${bc_dal:=0}"
@@ -897,6 +952,11 @@ census_busy_cycles() {
       bc_busy=$((bc_busy + 1))
       {
         echo "cycle $bc_k: BUSY: $bc_out"
+        echo "-- sudo lsof -n -P +c0 (the whole table), the lines naming $bc_mp"
+        bounded 100 sudo -n lsof -n -P +c0 2>&1 </dev/null | awk -v m="$bc_mp" 'NR == 1 || index($0, m)'
+        census_fsu_stop
+        echo "-- fs_usage -w -f pathname: opens naming $bc_mp, .VolumeIcon.icns or /.vol/ since this cycle's mount ($bc_t)"
+        census_fsu_cut "$bc_fsu" "$bc_t" "$bc_mp"
         echo "-- sudo lsof $bc_mp"; bounded 900 sudo -n lsof "$bc_mp" 2>&1 </dev/null
         echo "-- ps (mds, mdworker, fseventsd, Finder)"
         ps -axww -o user=,pid=,command= 2>&1 | grep '[m]ds\|[m]dworker\|[f]seventsd\|[F]inder'
@@ -905,10 +965,12 @@ census_busy_cycles() {
         echo "-- once more: $(bounded 600 diskutil unmount "$bc_mp" 2>&1 </dev/null)"
       } >>"$3" 2>&1
     fi
+    bc_t=$(date +%H:%M:%S); test -n "${CFSU_ON:-}" || census_fsu_start "$bc_fsu"
     bounded 600 diskutil mount "$bc_dev" >/dev/null 2>&1 </dev/null
     if ! bc_m=$(bounded 900 census_wait_mounted "$bc_dev"); then echo "cycle $bc_k: not mounted again; stopping" >>"$3"; break; fi
     bc_mp=$(printf '%s\n' "$bc_m" | sed -n 2p); census_names_mode "$bc_dev" "$bc_mp"
   done
+  census_fsu_stop >>"$3" 2>&1; rm -f "$bc_fsu"
   # Task 15: whether fseventsd had made .fseventsd, so whether the cycles ran with fsevents on (census_busy_fsevents)
   if bounded 100 test -e "$bc_mp/.fseventsd"; then bc_fe=yes; else bc_fe=no; fi
   echo "$bc_name: fsevents: .fseventsd $bc_fe" >>"$3"
@@ -967,20 +1029,27 @@ census_lklfuse_gone() {
   done
 }
 
-# census_busy_bar WHAT MODE FS HFS-COUNTS FS-COUNTS N: item 4(a)'s bar, from two "BUSY RUN" counts: FS busy no more often
-#   than HFS+, each side run N times. MODE check: ok, or not ok with why (a side not run N times proves nothing); record:
-#   recorded; anything else is not ok, as parity says
+# census_busy_bar WHAT MODE FS HFS-COUNTS FS-COUNTS N [HFS-ICON FS-ICON]: item 4(a)'s bar, from two "BUSY RUN" counts: FS
+#   busy no more often than HFS+, each side run N times. With each side's custom icon (yes|no; empty is unknown), sides
+#   that differ prove nothing (Task 16e-fix: Finder opens a custom icon on each mount). MODE check: ok, or not ok with why
+#   (a side not run N times, or the icons differing, proves nothing); record: recorded; anything else is not ok, as parity says
 census_busy_bar() {
+  _cbb_i=
+  if test $# -ge 8; then
+    _cbb_ih=${7:-unknown} _cbb_if=${8:-unknown}
+    test "$_cbb_ih" = "$_cbb_if" || _cbb_i="; custom icon: hfs $_cbb_ih, $3 $_cbb_if"
+  fi
   set -- "$1" "$2" "$3" ${4:-0 0} ${5:-0 0} "$6"
   for _cbb_v in "$4" "$5" "$6" "$7"; do case $_cbb_v in '' | *[!0-9]*) set -- "$1" "$2" "$3" 0 0 0 0 "$8"; break ;; esac; done
-  _cbb_s="hfs $4 of $5, $3 $6 of $7"
+  _cbb_s="hfs $4 of $5, $3 $6 of $7$_cbb_i"
   case $2 in
   record) echo "# recorded $1: $_cbb_s" ;;
   check)
-    if test "$5" -eq "$8" && test "$7" -eq "$8" && test "$6" -le "$4"; then ok "parity $1 ($_cbb_s)"; else
+    if test -z "$_cbb_i" && test "$5" -eq "$8" && test "$7" -eq "$8" && test "$6" -le "$4"; then ok "parity $1 ($_cbb_s)"; else
       notok "parity $1 ($_cbb_s)"
+      test -z "$_cbb_i" || echo "parity: $1: the sides differ in custom icon (hfs $_cbb_ih, $3 $_cbb_if), so it proves nothing"
       if test "$5" -ne "$8" || test "$7" -ne "$8"; then echo "parity: $1 did not run $8 times on each side, so it proves nothing"
-      else echo "parity: $3 was busy more often than HFS+"; fi
+      elif test "$6" -gt "$4"; then echo "parity: $3 was busy more often than HFS+"; fi
     fi ;;
   *) notok "parity $1"; echo "parity: its mode is '$2', not record or check" ;;
   esac
@@ -1144,11 +1213,16 @@ census_busy() {
   census_sysctl "busy-$cb_fs"
   cb_c=$(parity_control hfs) && cb_h=$(census_copy "$cb_c" "busy-hfs-$cb_fs") && cb_o=$(census_copy "$(parity_control hfsx)" "busy-hfsx-other-$cb_fs") &&
     cb_i=$(census_copy "$W/img/$cb_fs.img" "busy-$cb_fs") || { echo "# census_busy $cb_fs: no images"; return 1; }
+  # Task 16e-fix: the control carries the custom volume icon linuxfs serves (the bundle's linuxfs.icns, PARITY_VOLICON_OF)
+  cb_vi=
+  test -z "${PARITY_VOLICON_OF:-}" || cb_vi=$(printf -- "$PARITY_VOLICON_OF" "$cb_fs")
+  if test -z "$cb_vi" || ! test -f "$cb_vi"; then echo "# census_busy $cb_fs: no ${cb_vi:-PARITY_VOLICON_OF}, so the HFS+ control gets no custom icon"; cb_vi=; fi
   da_debug_on
   cb_log=$OUT/parity/busy.$cb_fs.cycles.txt; : >"$cb_log"
-  cb_bh=$(census_busy_cycles hfs "$cb_h" "$cb_log" | tail -n 1)
+  cb_bh=$(census_busy_cycles hfs "$cb_h" "$cb_log" "$cb_vi" | tail -n 1)
   cb_bf=$(census_busy_cycles "$cb_fs" "$cb_i" "$cb_log" | tail -n 1)
-  census_busy_bar "busy.$cb_fs.cycles" "$PARITY_MODE_BUSY" "$cb_fs" "$cb_bh" "$cb_bf" 20
+  census_busy_bar "busy.$cb_fs.cycles" "$PARITY_MODE_BUSY" "$cb_fs" "$cb_bh" "$cb_bf" 20 \
+    "$(sed -n 's/^hfs: custom icon: //p' "$cb_log" | tail -n 1)" "$(sed -n "s/^$cb_fs: custom icon: //p" "$cb_log" | tail -n 1)"
   census_busy_fsevents "spotlight.$cb_fs.busy-fsevents" "$cb_fs" "$cb_log"
   cb_eh=$(census_busy_ejects hfs "$cb_h" "$cb_o" "$cb_log" | tail -n 1)
   cb_ef=$(census_busy_ejects "$cb_fs" "$cb_i" "$cb_o" "$cb_log" | tail -n 1)
@@ -1190,8 +1264,8 @@ PARITY_SPOT_SECS=${PARITY_SPOT_SECS:-120}   # census_mdfind: once a second; the 
 PARITY_ICNS=${PARITY_ICNS:-/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/AlertStopIcon.icns}
 # The guest job has 180 min. Before the smoke: the VM's boot and the installs, about 5. The census begins nothing after
 #   PARITY_CENSUS_MIN = 132 min from the smoke's start (PARITY_T0, which the smoke sets first), and begins a step only if
-#   at its worst (census_worst_min: the console hung; since Task 15 spotlight 32, busy 31, census_finder 30, the sweep
-#   and dismissal after each counted in) it ends by 132 + 11 = 143: spotlight begins by 111, busy by 112, census_finder
+#   at its worst (census_worst_min: the console hung; since Task 15 spotlight 32, busy 32 since Task 16e-fix, census_finder 30, the sweep
+#   and dismissal after each counted in) it ends by 132 + 11 = 143: spotlight begins by 111, busy by 111, census_finder
 #   by 113, trash/tags/case by 122, unicode by 126, a stall iteration by 80. Task 15 adds after the census
 #   census_refusals_bar (its system.log read bounded at 60 s: 1 min) and the smoke's non-admin mount (290 s at its
 #   bounds since fix round 1: 5 min), so PARITY_CENSUS_MIN went from 135 to 132. Then before login (about 5) and the copyback and uploads
@@ -1594,9 +1668,10 @@ census_du_raw() {
 }
 # FinderInfo with kHasCustomIcon (0x0400) in fdFlags, bytes 8 and 9 of the 32
 census_finderinfo_icon=0000000000000000040000000000000000000000000000000000000000000000
-# census_volume_icon MP: PARITY_ICNS as MP/.VolumeIcon.icns, and the root's FinderInfo custom-icon flag set, read back
+# census_volume_icon MP [ICNS]: ICNS (default PARITY_ICNS) as MP/.VolumeIcon.icns, and the root's FinderInfo custom-icon flag
+#   set, read back
 census_volume_icon() {
-  cp "$PARITY_ICNS" "$1/.VolumeIcon.icns" && xattr -wx com.apple.FinderInfo "$census_finderinfo_icon" "$1"; _vi_rc=$?
+  cp "${2:-$PARITY_ICNS}" "$1/.VolumeIcon.icns" && xattr -wx com.apple.FinderInfo "$census_finderinfo_icon" "$1"; _vi_rc=$?
   echo "cp .VolumeIcon.icns and xattr -wx com.apple.FinderInfo: exit $_vi_rc"
   echo "FinderInfo: $(xattr -px com.apple.FinderInfo "$1" 2>&1 | tr -s ' \n' '  ')"
   return "$_vi_rc"
@@ -1862,6 +1937,11 @@ census_later() {
 #   census_busy 23 + (2 Finder ejects 2 x (68 + 31) = 198 + 205 + about 45 names-mode reads, 5) / 60 = 29.8, 31 (fix round 3:
 #   one minute over, since 29.8 leaves too thin a margin under 30); Task 15's .fseventsd test after each side's cycles,
 #   bounded at 10 s: 29.8 + 20 / 60 = 30.1, still 31;
+#   Task 16e-fix adds to census_busy, in seconds: each side's fs_usage stop at the cycles' end, 4 (census_fsu_stop's bounds;
+#   its start is a background job, 0), 8; each side's census_custom_icon, 5, 10; the control's icon and one more unmount and
+#   mount, disks as usual, about 5; at each refusal, the whole lsof table, 10, and an fs_usage stop, 4: refusals were never
+#   counted at their bounds (each already carries lsof's 90 s and the retry's 60), so at push E's rate, 2, 28: 8 + 10 + 5 +
+#   28 = 51, 30.1 + 51 / 60 = 31.0, one minute over: 32. busy begins by 111; the end (143) does not move, so 164 of 180 stays;
 #   census_spotlight 24 + (2 refresh waits 28 + 2 panes 30 + 2 x 60 + 2 x 10 + 205) / 60 = 30.7, 31; Task 15 adds
 #   census_index_mode's mdutil -s, 30 a pass (bounded 300), and nothing that waits on the console (.fseventsd's own step,
 #   a test -e); fix round 1 adds the ro pass's census_fsevents_wait, bounded at 7 s: 30.7 + (60 + 7) / 60 = 31.8, 32;
@@ -1875,7 +1955,7 @@ census_later() {
 census_worst_min() {
   case $1 in
   census_spotlight) echo 32 ;;
-  census_busy) echo 31 ;;
+  census_busy) echo 32 ;;
   census_finder) echo 30 ;;
   census_trash_tags_case) echo 21 ;;
   census_unicode) echo 17 ;;
