@@ -73,7 +73,7 @@ need(sorted(d) == ["AbandonProcessGroup", "Label", "ProgramArguments", "Sockets"
 need(d["Label"] == "dev.mavergreen.linuxfs.mountd", "Label %r" % d["Label"])
 need(d["ProgramArguments"] == ["/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.mountd"], "ProgramArguments %r" % d["ProgramArguments"])
 need(d["Sockets"] == {"Listener": {"SockPathName": "/var/run/dev.mavergreen.linuxfs.mountd.sock", "SockPathMode": 438,
-                                   "SockType": "stream", "SockListenBacklog": 128}}, "Sockets %r" % d["Sockets"])
+                                   "SockType": "stream"}}, "Sockets %r" % d["Sockets"])
 need(d["AbandonProcessGroup"] is True, "AbandonProcessGroup %r" % d["AbandonProcessGroup"])
 need(d["StandardErrorPath"] == "/var/log/dev.mavergreen.linuxfs.mountd.log", "StandardErrorPath %r" % d["StandardErrorPath"])
 need("RunAtLoad" not in d and "KeepAlive" not in d, "RunAtLoad or KeepAlive")
@@ -363,8 +363,22 @@ grep -q "launchctl bsexec 77 .*launchctl unload .*/Library/LaunchAgents/dev.mave
 #       30 s at most) while a request already runs -- a mountd process by its full path, one of the six mount_macfuse_<fs>, or a
 #       disk's lock held, probed with a shared non-blocking flock in a directory that is root's (here: this user's), 0700 and not
 #       a symlink -- then checks lklfuse; if a request still runs or the check refuses, it loads mountd again and exits 1.
-#       ps prints $T/ps.out; the lock holders are perl, each bounded by its own sleep, waited for (bounded) to hold before a run.
-printf '#!/bin/sh\ncat "%s/ps.out"\n' "$T" > "$T/bin/ps"; chmod 755 "$T/bin/ps"
+#       Only root's processes count (m3: argv[0] is anyone's to choose). ps prints $T/ps.out, UID COMMAND per line, with the
+#       UID column only when asked for uid= (the lklfuse check asks for command= alone), and fails with PS_FAIL set; the lock
+#       holders are perl, each bounded by its own sleep, waited for (bounded) to hold before a run. launchctl's load fails with
+#       LAUNCHCTL_LOAD_FAIL set.
+cat > "$T/bin/ps" <<STUB
+#!/bin/sh
+test -z "\${PS_FAIL:-}" || exit 1
+case "\$*" in *uid=*) cat "$T/ps.out" ;; *) sed 's/^[0-9]* //' "$T/ps.out" ;; esac
+STUB
+chmod 755 "$T/bin/ps"
+cat > "$T/bin/launchctl" <<STUB
+#!/bin/sh
+echo "launchctl \$*" >> "$T/launchctl.calls"
+case "\$1" in load) test -z "\${LAUNCHCTL_LOAD_FAIL:-}" || exit 1 ;; esac
+STUB
+chmod 755 "$T/bin/launchctl"
 L="$LINUXFS_PKG_TEST_LOCKDIR"
 LF="$L/dev.mavergreen.linuxfs.mount.disk9.lock"
 UNL="launchctl unload /Library/LaunchDaemons/$M.plist"
@@ -401,17 +415,17 @@ went_on() {  # CASE: uninstalled, mountd unloaded first and never reloaded
   grep -q "launchctl unload /Library/LaunchDaemons/$H.plist" "$T/launchctl.calls" || fail "pre-uninstall did not unload the helper, $1"
 }
 mkdir -m 700 "$L"; : > "$LF"; chmod 600 "$LF"
-printf '%s\n' /sbin/launchd > "$T/ps.out"
+printf '%s\n' "0 /sbin/launchd" > "$T/ps.out"
 uninst; went_on "with nothing running"
 grep -qxF "rm -rf $L" "$T/acct.calls" || fail "pre-uninstall does not remove the lock directory once no lock is held: $(tr '\n' '|' < "$T/acct.calls")"
-printf '%s\n' /sbin/launchd "$LINUXFS_PREFIX/libexec/lklfuse -f -o type=ext4 /dev/fd/3 /Volumes/data" > "$T/ps.out"
+printf '%s\n' "0 /sbin/launchd" "77 $LINUXFS_PREFIX/libexec/lklfuse -f -o type=ext4 /dev/fd/3 /Volumes/data" > "$T/ps.out"
 uninst
 test "$urc" -eq 1 || fail "pre-uninstall exits $urc with an lklfuse running, not 1"
 test "$(sed -n 1p "$T/launchctl.calls")" = "$UNL" && test "$(sed -n 2p "$T/launchctl.calls")" = "$REL" ||
   fail "pre-uninstall with an lklfuse running does not unload mountd, then load it again: $(tr '\n' '|' < "$T/launchctl.calls")"
 grep -q /Volumes/data "$T/u.out" || fail "pre-uninstall's refusal does not name the volume with mountd: $(cat "$T/u.out")"
 ! grep -qF "rm -rf $L" "$T/acct.calls" || fail "pre-uninstall removed the lock directory though it refused"
-printf '%s\n' /sbin/launchd > "$T/ps.out"
+printf '%s\n' "0 /sbin/launchd" > "$T/ps.out"
 holder LOCK_EX 3 "$LF"
 uninst
 kill -0 "$holder_pid" 2>/dev/null && fail "pre-uninstall did not wait for an exclusive lock's holder to let go"
@@ -423,18 +437,37 @@ kill -0 "$holder_pid" 2>/dev/null || fail "pre-uninstall waited for a shared loc
 went_on "with a shared lock held"
 holder_gone
 for p in /System/Library/Filesystems/macfuse_ext4.fs/Contents/Resources/mount_macfuse_ext4 "$R"; do
-  printf '%s\n' /sbin/launchd "$p -o rdonly disk9 /Volumes/x" > "$T/ps.out"
+  printf '%s\n' "0 /sbin/launchd" "0 $p -o rdonly disk9 /Volumes/x" > "$T/ps.out"
   LINUXFS_PKG_TEST_WAIT=2; export LINUXFS_PKG_TEST_WAIT
   uninst; under_way "while ${p##*/} runs"
+  # the same command line as another user's (m3) is not a request: it goes on at once
+  printf '%s\n' "0 /sbin/launchd" "501 $p -o rdonly disk9 /Volumes/x" > "$T/ps.out"
+  uninst; went_on "with ${p##*/} running as uid 501, not root"
   unset LINUXFS_PKG_TEST_WAIT
 done
+# m5: a reload of mountd that fails is said, and the refusal still exits non-zero
+printf '%s\n' "0 /sbin/launchd" "0 $R" > "$T/ps.out"
+LINUXFS_PKG_TEST_WAIT=1 LAUNCHCTL_LOAD_FAIL=1; export LINUXFS_PKG_TEST_WAIT LAUNCHCTL_LOAD_FAIL
+uninst
+test "$urc" -ne 0 || fail "pre-uninstall exits 0 though a mount is under way and mountd's reload failed"
+grep -q 'could not load the mount daemon again' "$T/u.out" || fail "pre-uninstall does not say mountd's reload failed (a mount under way): $(cat "$T/u.out")"
+printf '%s\n' "0 /sbin/launchd" "77 $LINUXFS_PREFIX/libexec/lklfuse -f -o type=ext4 /dev/fd/3 /Volumes/data" > "$T/ps.out"
+uninst
+test "$urc" -ne 0 || fail "pre-uninstall exits 0 though a volume is mounted and mountd's reload failed"
+grep -q 'could not load the mount daemon again' "$T/u.out" || fail "pre-uninstall does not say mountd's reload failed (a volume mounted): $(cat "$T/u.out")"
+unset LINUXFS_PKG_TEST_WAIT LAUNCHCTL_LOAD_FAIL
+# m4: ps failing is said, and fails open: it goes on
+PS_FAIL=1; export PS_FAIL
+uninst; went_on "with ps failing"
+grep -q 'linuxfs: could not list the processes' "$T/u.out" || fail "pre-uninstall does not say it could not list the processes: $(cat "$T/u.out")"
+unset PS_FAIL
 # controls: macFUSE's own mount_macfuse, a name outside the six, and a mountd of the same name elsewhere are not linuxfs's requests
-printf '%s\n' /sbin/launchd "/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse -o x y /Volumes/z" \
-  "/usr/local/bin/mount_macfuse_foo /Volumes/w" "$T/elsewhere/$M" > "$T/ps.out"
+printf '%s\n' "0 /sbin/launchd" "0 /Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse -o x y /Volumes/z" \
+  "0 /usr/local/bin/mount_macfuse_foo /Volumes/w" "0 $T/elsewhere/$M" > "$T/ps.out"
 LINUXFS_PKG_TEST_WAIT=2; export LINUXFS_PKG_TEST_WAIT
 uninst; went_on "with only processes that are not linuxfs's requests"
 unset LINUXFS_PKG_TEST_WAIT
-printf '%s\n' /sbin/launchd > "$T/ps.out"
+printf '%s\n' "0 /sbin/launchd" > "$T/ps.out"
 # a FIFO where a lock file goes is skipped, not opened to wait on (O_NONBLOCK, then regular files only)
 mkfifo "$L/dev.mavergreen.linuxfs.mount.disk8.lock"
 LINUXFS_PKG_TEST_WAIT=2; export LINUXFS_PKG_TEST_WAIT
@@ -446,6 +479,7 @@ holder LOCK_EX 6 "$T/locks.real/dev.mavergreen.linuxfs.mount.disk9.lock"
 uninst
 kill -0 "$holder_pid" 2>/dev/null || fail "pre-uninstall probed the locks through a symlinked lock directory"
 went_on "with the lock directory a symlink"
+grep -q "is not root's own 0700 directory; leaving it" "$T/u.out" || fail "pre-uninstall does not say it skipped a symlinked lock directory: $(cat "$T/u.out")"
 ! grep -qF "rm -rf $L" "$T/acct.calls" || fail "pre-uninstall removed a symlinked lock directory"
 holder_gone
 rm -f "$L"; mv "$T/locks.real" "$L"; chmod 755 "$L"
@@ -453,6 +487,7 @@ holder LOCK_EX 6 "$LF"
 uninst
 kill -0 "$holder_pid" 2>/dev/null || fail "pre-uninstall probed the locks in a lock directory of mode 0755"
 went_on "with the lock directory 0755"
+grep -q "is not root's own 0700 directory; leaving it" "$T/u.out" || fail "pre-uninstall does not say it skipped a lock directory of mode 0755: $(cat "$T/u.out")"
 ! grep -qF "rm -rf $L" "$T/acct.calls" || fail "pre-uninstall removed a lock directory of mode 0755"
 holder_gone
 

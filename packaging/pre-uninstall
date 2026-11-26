@@ -9,9 +9,11 @@
 #          directories), and removes the _linuxfs account and its home when nothing runs as it. An lklfuse under the .d directory counts as mounted too.
 #          The mount daemon is unloaded first, so no root mount can start during the check; then it waits, polling each second
 #          for up to 30 s, while a request already runs (spec §6: its processes are abandoned process groups, which unloading
-#          does not stop): a mountd process (by its full path), one of the six mount_macfuse_<fs>, or a disk's lock held. If one
-#          still runs ("a mount is under way"), or a volume is mounted, it loads mountd again and exits 1. Once no lock is held
-#          it removes the lock directory too; the daemon's log, /var/log/dev.mavergreen.linuxfs.mountd.log, stays.
+#          does not stop): a root mountd process (by its full path), a root mount_macfuse_<fs> (one of the six), or a disk's
+#          lock held. If one still runs ("a mount is under way"), or a volume is mounted, it loads mountd again (saying so if
+#          that fails) and exits 1. A check that cannot run (ps, awk or perl failing), or a lock directory that is not root's
+#          own 0700 one, is said and fails open. Once no lock is held it removes the lock directory too; the daemon's log,
+#          /var/log/dev.mavergreen.linuxfs.mountd.log, stays.
 [ "${MAVERGREEN_ROOT:-/}" = / ] || exit 0
 prefix=/usr/local/mavergreen/linuxfs
 priv=/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d
@@ -21,13 +23,21 @@ lock_owner=0
 wait_s=30
 mountd_plist=/Library/LaunchDaemons/dev.mavergreen.linuxfs.mountd.plist
 launchctl unload "$mountd_plist" 2>/dev/null || :
-# requests: the mount daemon's own processes (a request's child before it takes a lock) and the bundles' mount programs, each of
-# the six named exactly, as running
+# requests: root's processes of the mount daemon (a request's child before it takes a lock) and of the bundles' mount programs,
+# each of the six named exactly, as running. Only uid 0 counts: every request runs as root, and anyone can name a process so.
+# It fails (status 1, nothing printed) when ps or awk does.
 requests() {
-  ps -axww -o command= 2>/dev/null | awk -v m="$mountd" '
-    { c = $0; sub(/^[ \t]+/, "", c); n = c; sub(/[ \t].*/, "", n); sub(/.*\//, "", n) }
-    c == m || index(c, m " ") == 1 { print; next }
-    n ~ /^mount_macfuse_(ext4|ntfs|btrfs|xfs|f2fs|apfs)$/ { print }'
+  rq_ps="$(ps -axww -o uid=,command= 2>/dev/null)" && [ -n "$rq_ps" ] || return 1
+  printf '%s\n' "$rq_ps" | awk -v m="$mountd" '
+    { u = $1; c = $0; sub(/^[ \t]*[0-9]+[ \t]+/, "", c); n = c; sub(/[ \t].*/, "", n); sub(/.*\//, "", n) }
+    u != "0" { next }
+    c == m || index(c, m " ") == 1 { print c; next }
+    n ~ /^mount_macfuse_(ext4|ntfs|btrfs|xfs|f2fs|apfs)$/ { print c }'
+}
+# reload: mountd back after a refusal; a failure is said (until it is loaded, or the Mac restarts, disks mount as the user's own)
+reload() {
+  launchctl load -w "$mountd_plist" 2>/dev/null ||
+    echo "linuxfs: could not load the mount daemon again; until the Mac restarts, disks mount as your own (no Spotlight or fsevents)" >&2
 }
 # locks: prints absent, skipped (the directory is not root's alone: a directory, not a symlink, 0700), held or free. Each lock
 # file is opened without following a link and without waiting (a FIFO or device is never waited on), only a regular file is
@@ -58,13 +68,20 @@ locks() {
 }
 waited=0
 while :; do
-  req="$(requests)"; lk="$(locks)"
+  rq_ok=1; req="$(requests)" || { rq_ok=0; req=; }; lk="$(locks)"
   [ -n "$req" ] || [ "$lk" = held ] || break
   [ "$waited" -lt "$wait_s" ] || break
   sleep 1; waited=$((waited + 1))
 done
+# a check that could not run fails open (a broken system perl or ps must not make linuxfs impossible to remove), and says so
+[ "$rq_ok" = 1 ] || echo "linuxfs: could not list the processes (ps or awk failed), so a mount under way may be missed; going on" >&2
+case "$lk" in
+  held|free|absent) ;;
+  skipped) echo "linuxfs: $lockdir is not root's own 0700 directory; leaving it, unprobed" >&2 ;;
+  *) echo "linuxfs: could not check the disks' locks in $lockdir (/usr/bin/perl failed), so a mount under way may be missed; going on" >&2 ;;
+esac
 if [ -n "$req" ] || [ "$lk" = held ]; then
-  launchctl load -w "$mountd_plist" 2>/dev/null || :
+  reload
   echo "linuxfs: a mount is under way; let it finish, then run: sudo mavergreen uninstall linuxfs" >&2
   [ -z "$req" ] || printf '%s\n' "$req" | awk '{ print "  " $0 }' >&2
   [ "$lk" != held ] || echo "  a disk's lock in $lockdir is held" >&2
@@ -95,7 +112,7 @@ if [ -z "$running" ]; then
   fi
   exit 0
 fi
-launchctl load -w "$mountd_plist" 2>/dev/null || :
+reload
 echo "linuxfs is in use; unmount these volumes first (linuxfs unmount MOUNTPOINT), then run: sudo mavergreen uninstall linuxfs" >&2
 printf '%s\n' "$running" | awk '{ print "  " $NF }' >&2
 exit 1

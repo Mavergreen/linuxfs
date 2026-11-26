@@ -8,6 +8,9 @@
 	<array>
 		<string>/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.mountd</string>
 	</array>
+	<!-- No SockListenBacklog: 10.9's launchctl does not read it, so the listen queue is launchctl's own default. When a
+	     flood fills it, a connect gets ECONNREFUSED, which the mount program's client counts as no daemon (the user's own
+	     mount; tools/fs.c). -->
 	<key>Sockets</key>
 	<dict>
 		<key>Listener</key>
@@ -18,8 +21,6 @@
 			<integer>438</integer>
 			<key>SockType</key>
 			<string>stream</string>
-			<key>SockListenBacklog</key>
-			<integer>128</integer>
 		</dict>
 	</dict>
 	<key>AbandonProcessGroup</key>

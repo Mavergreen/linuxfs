@@ -176,12 +176,12 @@ linuxfs prefs NTFSTakeover on
 ### Uninstalling
 
 `sudo mavergreen uninstall linuxfs` refuses while a linuxfs volume is mounted, and while a mount is under way (it
-waits up to 30 seconds for one to finish first). Two things stay behind:
+waits up to 30 seconds for one to finish first). One thing stays behind: `/var/log/dev.mavergreen.linuxfs.mountd.log`,
+the mount daemon's log of what it could not tell syslog (a failure to start). Delete it if you like.
 
-- `/var/log/dev.mavergreen.linuxfs.mountd.log`, the mount daemon's log of what it could not tell syslog (a failure
-  to start). Delete it if you like.
-- The disks' lock files in `/var/db/dev.mavergreen.linuxfs.locks`, which persist across reboots, harmlessly: a lock
-  ends with the process that held it. The uninstaller removes the directory once it has found no lock held in it.
+While linuxfs is installed, the disks' lock files in `/var/db/dev.mavergreen.linuxfs.locks` persist across reboots,
+harmlessly: a lock ends with the process that held it. The uninstaller removes that directory once it has found no
+lock held in it. If the directory is not root's own, mode 0700, the uninstaller says so and leaves it alone.
 
 ### Known issues
 
