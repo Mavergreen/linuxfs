@@ -20,7 +20,7 @@ tests/lklfuse-ops-test.c checks the descriptor, the lock, the read-only mount an
 diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
 --- a/tools/lkl/lklfuse.c
 +++ b/tools/lkl/lklfuse.c
-@@ -1404,6 +1404,10 @@
+@@ -2041,6 +2041,10 @@
  	return NULL;
  }
  
@@ -31,7 +31,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  const struct fuse_operations lklfuse_ops = {
  	.init = lklfuse_init,
  
-@@ -1447,6 +1451,9 @@
+@@ -2084,6 +2088,9 @@
  	.fallocate = lklfuse_fallocate,
  	.copy_file_range = lklfuse_copy_file_range,
  	.lseek = lklfuse_lseek,
@@ -41,7 +41,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  };
  
  static int lklfuse_parse_vfs_flags(bool ro, const char *opts, int *flags,
-@@ -1598,6 +1605,11 @@
+@@ -2235,6 +2242,11 @@
   */
  static pthread_t lklfuse_loop_thread;
  static volatile sig_atomic_t lklfuse_gone, lklfuse_io_errors;
@@ -53,7 +53,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  
  static int lklfuse_blk_get_capacity(struct lkl_disk disk, unsigned long long *res)
  {
-@@ -1608,6 +1620,10 @@
+@@ -2245,6 +2257,10 @@
  {
  	int ret, err;
  
@@ -64,7 +64,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  	errno = 0;
  	ret = lkl_dev_blk_ops.request(disk, req);
  	if (ret != LKL_DEV_BLK_STATUS_IOERR)
-@@ -1628,6 +1644,64 @@
+@@ -2265,6 +2281,64 @@
  	.request = lklfuse_blk_request,
  };
  
@@ -129,7 +129,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  static int start_lkl(void)
  {
  	long ret;
-@@ -1741,6 +1815,9 @@
+@@ -2380,6 +2454,9 @@
  		fprintf(stderr, "failed to umount disk: %d: %s\n",
  			lklfuse.disk_id, lkl_strerror(ret));
  	lkl_sys_halt();
@@ -139,7 +139,7 @@ diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
  }
  
  /*
-@@ -1796,6 +1873,9 @@
+@@ -2435,6 +2512,9 @@
  			return 2;
  		}
  		/* lock dropped when lockfd is closed on program exit */

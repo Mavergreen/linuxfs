@@ -5,11 +5,13 @@
 #          each image (as the user, -nomount), diskutil formats it, files are written, and everything is detached.
 #          Writes into one new directory, printed at the end:
 #            enc.img.gz   1200 MiB: a container with volume "Secret", encrypted with passphrase "linuxfs-test" (hint
-#                         "test"), and volume "Plain", unencrypted; the same files on both
+#                         "test"), and volume "Plain", unencrypted; the same files on both, and on Plain also
+#                         tagged, with the Finder tag Parity (red) and the red label (spec: item 7, the APFS mapping)
 #            ssd.img.gz   256 MiB \ one Fusion container (-main ssd, -secondary hdd) with volume "Fused"; its 400 MiB
 #            hdd.img.gz   1 GiB   / file cannot fit on the 256 MiB main device, so part of it lies on the secondary
 #          (APFS allows one volume per 512 MiB of container, rounded up: enc.img needs more than 512 MiB for two)
 #            expected.txt SHA-256 of every file written, per volume, as `shasum -a 256` prints them
+#            tagged.txt   Plain's tagged file's xattrs, as macOS lists them (xattr -lx)
 #            macos.txt    sw_vers, uname -m and diskutil's version
 #            log.txt      everything the tools printed
 #          Exits non-zero, naming the step, if any step fails; images still attached are detached on the way out.
@@ -50,6 +52,18 @@ fill() { # MOUNTPOINT: the same files on every volume
   cafe=$(printf 'caf\303\251')   # NFC "café": printf expands the escapes, a quoted file name would not
   echo "$cafe" > "$m/unicode-$cafe.txt"
 }
+tagged() { # MOUNTPOINT: a file with a Finder tag and a label, as xattrs, as Finder keeps them
+  echo tagged > "$1/tagged"
+  printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+    '<plist version="1.0"><array><string>Parity' '6</string></array></plist>' > tags.plist
+  plutil -convert binary1 tags.plist || return 1
+  xattr -wx com.apple.metadata:_kMDItemUserTags "$(xxd -p tags.plist | tr -d '\n')" "$1/tagged" || return 1
+  # frFlags (bytes 8-9) colour bits: label 6, red, as the tag says
+  xattr -wx com.apple.FinderInfo 0000000000000000000C00000000000000000000000000000000000000000000 "$1/tagged" || return 1
+  rm -f tags.plist
+  xattr -lx "$1/tagged" > tagged.txt
+}
 record() { # NAME MOUNTPOINT
   (cd "$2" && find . -type f | sort | while read -r f; do shasum -a 256 "$f"; done) | sed "s|^|$1 |" >> expected.txt
 }
@@ -63,7 +77,9 @@ diskutil apfs addVolume "$c" APFS Secret -passphrase linuxfs-test -passphraseHin
 diskutil apfs addVolume "$c" APFS Plain || die "addVolume Plain"
 for v in Secret Plain; do
   m=$(mounted_at "$v"); [ -n "$m" ] || die "volume $v is not mounted"
-  fill "$m" && record "$v" "$m" || die "writing to $v"
+  fill "$m" || die "writing to $v"
+  if test "$v" = Plain; then tagged "$m" || die "tagging $v/tagged"; fi
+  record "$v" "$m" || die "recording $v"
 done
 diskutil apfs list "$c" || :
 diskutil unmountDisk "$c" || die "unmountDisk $c"

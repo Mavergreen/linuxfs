@@ -7,7 +7,8 @@ name: on-mavericks
 #       image through `linuxfs mount`, checks DiskArbitration mounts attached disks (raw and GPT-wrapped) through the six
 #       bundles, the password dialog and keychain for encrypted APFS, and the before-login mount (root mounts, lklfuse as _linuxfs serves); then Linux checks every image
 #       the guest wrote with its own fsck (tests/lib/check-fs.sh), and the Unicode names it wrote (tests/lib/check-names.py:
-#       NFC on ext4 and on Apple's FAT32). Any panic, hang, skip (77), failed fsck or wrong name fails.
+#       NFC on ext4 and on Apple's FAT32), and the Mac xattrs it wrote, each in its file's scheme (tests/lib/check-xattrs.sh).
+#       Any panic, hang, skip (77), failed fsck, wrong name or misplaced xattr fails.
 #       release.yml calls it, and its publish job needs it.
 on:
   workflow_call:
@@ -36,7 +37,7 @@ jobs:
       - uses: actions/checkout@v7
         with: { persist-credentials: false }
       - uses: Mavergreen/shipyard/.github/actions/install@v1
-      - name: ext4, btrfs, xfs, f2fs, NTFS, exFAT and APFS images, labelled, and the Linux-made Unicode names, in the build container
+      - name: ext4, btrfs, xfs, f2fs, NTFS, exFAT and APFS images, labelled, the Linux-made Unicode names, and the Mac-xattr schemes, in the build container
         run: |
           set -eu
           d="$RUNNER_TEMP/images"
@@ -44,10 +45,14 @@ jobs:
           LINUX_HOST_SHARE="$HOME" sh build/linux-host.sh sh tests/lib/probe-images.sh "$d"
           LINUX_HOST_SHARE="$HOME" sh build/linux-host.sh sh tests/lib/label-images.sh "$d"
           LINUX_HOST_SHARE="$HOME" sh build/linux-host.sh sh tests/lib/unicode-images.sh "$d"
+          # spec: item 7 -- ext4-xa-{ours,netatalk,fruit,mixed}.img, a file f tagged in each scheme, for the smoke to tag
+          #       from the Mac and the fsck job's check-xattrs.sh to read back (tests/lib/xattr-images.sh)
+          LINUX_HOST_SHARE="$HOME" sh build/linux-host.sh sh tests/lib/xattr-images.sh "$d"
           mkdir -p "$RUNNER_TEMP/up"
           for fs in ext4 btrfs xfs f2fs ntfs exfat apfs; do gzip -c "$d/$fs.img" > "$RUNNER_TEMP/up/$fs.img.gz"; done
           gzip -c "$d/ext4-names.img" > "$RUNNER_TEMP/up/ext4-names.img.gz"
           for l in slash ctl; do [ ! -f "$d/ext4-$l.img" ] || gzip -c "$d/ext4-$l.img" > "$RUNNER_TEMP/up/ext4-$l.img.gz"; done
+          for s in ours netatalk fruit mixed; do gzip -c "$d/ext4-xa-$s.img" > "$RUNNER_TEMP/up/ext4-xa-$s.img.gz"; done
       # spec: tests/lib/gpt-wrap.py -- the same images in a GPT wrapper with each filesystem's own partition type (Linux data, basic data for NTFS, APFS), plus ext4 in the basic-data type,
       #       as an external disk formatted by macOS is laid out,
       #       and the encrypted APFS fixture (password linuxfs-test) in one too: its partition UUID is the keychain's account
@@ -196,7 +201,7 @@ jobs:
           for z in "$d"/*.img.gz; do gunzip "$z"; done
           LINUX_HOST_SHARE="$HOME" sh build/linux-host.sh sh -c '
             rc=0
-            for c in ext4:ext4 btrfs:btrfs xfs:xfs ntfs:ntfs exfat:exfat f2fs:f2fs ext4:da-ext4 btrfs:da-btrfs xfs:da-xfs ntfs:da-ntfs f2fs:da-f2fs ext4:da-ext4-noauto ntfs:da-ntfs-noauto ext4:da-ext4-ro ext4:login-ext4 ext4:da-ext4-names; do
+            for c in ext4:ext4 btrfs:btrfs xfs:xfs ntfs:ntfs exfat:exfat f2fs:f2fs ext4:da-ext4 btrfs:da-btrfs xfs:da-xfs ntfs:da-ntfs f2fs:da-f2fs ext4:da-ext4-noauto ntfs:da-ntfs-noauto ext4:da-ext4-ro ext4:login-ext4 ext4:da-ext4-names ext4:ext4-xa-ours ext4:ext4-xa-netatalk ext4:ext4-xa-fruit ext4:ext4-xa-mixed; do
               fs=${c%%:*} img=$1/${c#*:}.img
               if [ ! -f "$img" ]; then echo "not ok - $img: the guest returned no such image"; rc=1
               elif sh tests/lib/check-fs.sh "$fs" "$img"; then echo "ok - $img is clean ($fs)"
@@ -211,4 +216,7 @@ jobs:
               elif python3 -I tests/lib/check-names.py ext4 "$img" $(cat "$1/$c.names"); then echo "ok - $c: its names are as check-names.py ext4 wants"
               else echo "not ok - $c: a name census_unicode wrote, or a Linux-made one it read, is wrong on disk (check-names.py ext4, above; .names lists only the steps that ran)"; rc=1; fi
             done
+            # spec: item 7 -- the label and tag the smoke set from the Mac on each xattr image landed in the scheme each
+            #       file already uses (user.N, the netatalk blob, the fruit streams), or the volume scheme for a new file
+            sh tests/lib/check-xattrs.sh "$1" || rc=1
             exit $rc' _ "$d"

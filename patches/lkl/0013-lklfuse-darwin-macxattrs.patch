@@ -1,0 +1,736 @@
+lklfuse: on Darwin, Mac xattrs are user.N, or kept in netatalk's or Samba's scheme where the volume already uses one
+
+Linux takes only namespaced xattr names, so a Mac name such as com.apple.FinderInfo or
+com.apple.metadata:_kMDItemUserTags failed (EPERM through macFUSE; the census, push A, saw Finder tags and labels lost
+on ext4, btrfs, xfs and f2fs), and with noappledouble nothing caught it. On Darwin a Mac name N is now stored as the
+Linux name user.N, always: names with no dot, names already starting with user., and names like security.foo too. Linux
+user.X is shown to the Mac as X; Linux's other namespaces (security, trusted, system, POSIX ACLs) are neither shown nor
+writable, so nothing can clash. On apfs the prefix is osx., the namespace the Linux driver puts every name macOS wrote
+in, so a Mac reads macOS's own names there.
+
+Volumes that netatalk or Samba (vfs_fruit) have served keep a Mac file's metadata their own ways (netatalk 4.6.1's and
+Samba 4.25.1's sources, recorded in the item's findings):
+- netatalk, and Samba's fruit:metadata=netatalk: the Finder Info is 32 bytes of an AppleDouble blob,
+  user.org.netatalk.Metadata (402 bytes in netatalk's layout, Finder Info at 122), and other xattrs are user.N;
+- Samba's fruit:metadata=stream over streams_xattr: the Finder Info is 32 bytes at 16 of the AFP_AfpInfo stream (60
+  bytes), the resource fork the AFP_Resource stream, and every other xattr a stream named as the Mac's SMB client names
+  it (':' and the other characters NTFS refuses as U+F001-U+F027); a stream is the xattr user.DosStream.NAME:$DATA,
+  holding its data and one more byte, 0. (netatalk's resource fork xattr, user.org.netatalk.ResourceFork, is read as
+  com.apple.ResourceFork too.)
+A file's attribute is read where it is and changed there. A new one goes in the file's own scheme (the carriers it has
+already), else the volume's, chosen once at mount: netatalk's if the root has .AppleDB, .AppleDouble or .AppleDesktop or
+a netatalk blob is on the root or one of its first 32 entries, else fruit's if a stream is, else user.N. The carriers
+are never listed by their own names, only as the attributes they carry, and cannot be written by them (EPERM). Inside a
+blob or an AfpInfo only the Finder Info's 32 bytes are ever written; one that is malformed (too short, a wrong magic, a
+stream in extents) is neither read (ENOATTR) nor written (EIO), so another server's data is never damaged. As on HFS+:
+an all-zero Finder Info in a blob or an AfpInfo is no Finder Info (removing it zeroes it in the blob, which keeps
+netatalk's other data, and removes the AfpInfo, as Samba does); a Finder Info is 32 bytes (ERANGE otherwise); and a value
+the filesystem cannot hold is refused with ENOSPC, the only refusal HFS+ gave (it took 64 MiB + 1; linuxfs gave E2BIG
+at 128 KiB). tests/lklfuse-ops-test.c checks the name table, the choice of scheme, and each scheme's round trip, on four
+images tests/lib/xattr-images.sh makes, one per scheme and one mixing them, with the raw names and bytes as Linux sees
+them.
+
+Darwin only: on Linux the names are passed as given, as before.
+
+diff -ru a/tools/lkl/lklfuse.c b/tools/lkl/lklfuse.c
+--- a/tools/lkl/lklfuse.c
++++ b/tools/lkl/lklfuse.c
+@@ -139,6 +139,8 @@
+ 
+ /* LKL's PATH_MAX, for the paths lklfuse rewrites (Darwin's own PATH_MAX is 1024) */
+ #define LKLFUSE_PATH_MAX 4096
++#define LKLFUSE_FINDERINFO "com.apple.FinderInfo"
++#define LKLFUSE_FINDERINFO_LEN 32
+ 
+ #ifdef __APPLE__
+ #include <sys/xattr.h>
+@@ -773,9 +775,644 @@
+ {
+ 	return fuse_new(args, ops, size, data);
+ }
++
++/*
++ * Mac xattrs (spec: item 7). Linux takes only namespaced names, so a Mac name N is stored as the Linux name user.N,
++ * always (on apfs, osx.N: macOS's own names, as the Linux driver shows them). Linux user.X is shown to the Mac as X;
++ * Linux's other namespaces (security, trusted, system) are neither shown nor writable, so nothing can clash. Volumes
++ * netatalk or Samba (vfs_fruit) have served keep a Mac file's metadata their own ways (item-7-findings.md has the
++ * encodings, from their sources):
++ * - netatalk, and fruit:metadata=netatalk: the Finder Info is 32 bytes of an AppleDouble blob, user.org.netatalk.Metadata
++ *   (402 bytes, Finder Info at 122, in netatalk's own layout), and the file's other xattrs are user.N, as ours;
++ * - fruit:metadata=stream, over streams_xattr: the Finder Info is 32 bytes at 16 of the AFP_AfpInfo stream (60 bytes),
++ *   the resource fork the AFP_Resource stream, and every other xattr a stream named as the Mac's SMB client names it (the
++ *   characters NTFS refuses, ':' among them, in the Unicode private range); a stream is the xattr
++ *   user.DosStream.NAME:$DATA, its data and one more byte, 0 (an extent count otherwise).
++ * A file's attribute is read where it is and changed there; a new one goes in the file's own scheme (the carriers it
++ * already has), else the volume's, chosen once at mount from netatalk's root directories or the carriers on the root
++ * and its first 32 entries. Carriers are never shown by their own names, only as the attributes they carry. Inside a
++ * blob or AfpInfo only the Finder Info's 32 bytes are ever written, and one that is malformed is neither read (ENOATTR)
++ * nor written (EIO), so another server's data is never damaged. As on HFS+, an all-zero Finder Info there is none, a
++ * Finder Info is 32 bytes (ERANGE otherwise), and a value the filesystem cannot hold is refused with ENOSPC, the only
++ * refusal HFS+ gave (item-7-findings.md, push C).
++ */
++enum lklfuse_xscheme { XS_OURS, XS_NETATALK, XS_FRUIT_STREAM };
++static const char *lklfuse_xpre = "user.";	/* the Linux namespace Mac names live in */
++static enum lklfuse_xscheme lklfuse_xs_vol;	/* the volume's scheme, for new attributes */
++
++#define LKLFUSE_XCREATE 1	/* Linux's XATTR_CREATE and XATTR_REPLACE */
++#define LKLFUSE_XREPLACE 2
++#define LKLFUSE_XNAME_MAX 512	/* a Linux xattr name lklfuse builds (Linux's own limit is 255) */
++#define LKLFUSE_XVAL_MAX 65536	/* Linux's XATTR_SIZE_MAX: no carrier is larger */
++#define LKLFUSE_RESOURCEFORK "com.apple.ResourceFork"
++#define LKLFUSE_XMETA "org.netatalk.Metadata"
++#define LKLFUSE_XRSRC "org.netatalk.ResourceFork"
++#define LKLFUSE_XSTREAM "DosStream."
++#define LKLFUSE_XSTREAM_EXT "DosStreamExt."
++#define LKLFUSE_XSTREAM_TYPE ":$DATA"
++#define LKLFUSE_XAFPINFO "AFP_AfpInfo"
++#define LKLFUSE_XAFPRSRC "AFP_Resource"
++#define LKLFUSE_AD_MAGIC 0x00051607	/* AppleDouble */
++#define LKLFUSE_AD_VERSION 0x00020000
++#define LKLFUSE_AD_LEN 402	/* netatalk's AD_DATASZ_EA */
++#define LKLFUSE_AD_FINDERI 122
++#define LKLFUSE_AFPINFO_LEN 60	/* AFP_INFO_SIZE */
++#define LKLFUSE_AFPINFO_FINDERI 16
++#define LKLFUSE_AFP_SIGNATURE 0x41465000
++#define LKLFUSE_AFP_VERSION 0x00000100
++#define LKLFUSE_AD_DATE_DELTA 946684800	/* AppleDouble dates count from 2000 */
++
++/* the characters the Mac's SMB client sends as U+F001 to U+F027, in that order (Samba's macos_string_replace_map) */
++static const char lklfuse_xpriv[] = "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14"
++				    "\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\"*:<>?\\|";
++
++static const char *lklfuse_xpre_for(const char *type)
++{
++	return type && strcmp(type, "apfs") == 0 ? "osx." : "user.";
++}
++
++static unsigned int lklfuse_be32(const void *p)
++{
++	const unsigned char *u = p;
++
++	return (unsigned int)u[0] << 24 | u[1] << 16 | u[2] << 8 | u[3];
++}
++
++static void lklfuse_put_be32(void *p, unsigned int v)
++{
++	unsigned char *u = p;
++
++	u[0] = v >> 24;
++	u[1] = v >> 16;
++	u[2] = v >> 8;
++	u[3] = v;
++}
++
++static int lklfuse_xzero(const char *p, size_t n)
++{
++	while (n--)
++		if (*p++)
++			return 0;
++	return 1;
++}
++
++/* X, a name past the prefix, is another scheme's carrier */
++static int lklfuse_xcarrier(const char *x)
++{
++	return strcmp(x, LKLFUSE_XMETA) == 0 || strcmp(x, LKLFUSE_XRSRC) == 0 ||
++	       strncmp(x, LKLFUSE_XSTREAM, sizeof(LKLFUSE_XSTREAM) - 1) == 0 ||
++	       strncmp(x, LKLFUSE_XSTREAM_EXT, sizeof(LKLFUSE_XSTREAM_EXT) - 1) == 0;
++}
++
++/* Mac name N: user.N, always */
++static int lklfuse_xname_to_linux(const char *mac, char *out, size_t len)
++{
++	int n = snprintf(out, len, "%s%s", lklfuse_xpre, mac);
++
++	return n < 0 || (size_t)n >= len ? -ENAMETOOLONG : 0;
++}
++
++/* Linux name user.X: X (0); 1 for every other namespace and every carrier, hidden from the Mac */
++static int lklfuse_xname_to_mac(const char *lname, char *out, size_t len)
++{
++	size_t n = strlen(lklfuse_xpre);
++
++	if (strncmp(lname, lklfuse_xpre, n) || !lname[n] || lklfuse_xcarrier(lname + n))
++		return 1;
++	if (strlen(lname + n) >= len)
++		return -ERANGE;
++	strcpy(out, lname + n);
++	return 0;
++}
++
++/* Mac name MAC may be stored under its own name: not one that is a carrier's */
++static int lklfuse_xmac_ok(const char *mac)
++{
++	char l[LKLFUSE_XNAME_MAX], m[LKLFUSE_XNAME_MAX];
++
++	return lklfuse_xname_to_linux(mac, l, sizeof(l)) == 0 && lklfuse_xname_to_mac(l, m, sizeof(m)) == 0;
++}
++
++/* Linux xattr NAME of PATH, whole, into *val (malloc'd; the caller frees it): its length, or a negative LKL error */
++static long lklfuse_xread(const char *path, const char *name, char **val)
++{
++	long n = lkl_sys_getxattr(path, name, NULL, 0), m;
++
++	*val = NULL;
++	if (n < 0)
++		return n;
++	if (n > LKLFUSE_XVAL_MAX)
++		return -LKL_E2BIG;
++	*val = malloc(n ? n : 1);
++	if (!*val)
++		return -LKL_ENOMEM;
++	m = lkl_sys_getxattr(path, name, *val, n);
++	if (m < 0) {
++		free(*val);
++		*val = NULL;
++	}
++	return m;
++}
++
++/* netatalk's metadata blob VAL (LEN bytes): its Finder Info's 32 bytes, or NULL when it is not one */
++static char *lklfuse_ad_finderinfo(char *val, long len)
++{
++	unsigned int n, i, off, elen;
++	const char *e;
++
++	if (len < 26 || lklfuse_be32(val) != LKLFUSE_AD_MAGIC || lklfuse_be32(val + 4) != LKLFUSE_AD_VERSION)
++		return NULL;
++	n = (unsigned char)val[24] << 8 | (unsigned char)val[25];
++	if (26 + 12L * n > len)
++		return NULL;
++	for (i = 0, e = val + 26; i < n; i++, e += 12) {
++		if (lklfuse_be32(e) != 9)	/* ADEID_FINDERI */
++			continue;
++		off = lklfuse_be32(e + 4);
++		elen = lklfuse_be32(e + 8);
++		return elen >= LKLFUSE_FINDERINFO_LEN && off <= len && LKLFUSE_FINDERINFO_LEN <= len - off ? val + off : NULL;
++	}
++	return NULL;
++}
++
++/* AFP_AfpInfo's xattr VAL (LEN bytes): its Finder Info's 32 bytes, or NULL when it is not one */
++static char *lklfuse_afp_finderinfo(char *val, long len)
++{
++	if (len != LKLFUSE_AFPINFO_LEN + 1 || val[LKLFUSE_AFPINFO_LEN] || lklfuse_be32(val) != LKLFUSE_AFP_SIGNATURE ||
++	    lklfuse_be32(val + 4) != LKLFUSE_AFP_VERSION)
++		return NULL;
++	return val + LKLFUSE_AFPINFO_FINDERI;
++}
++
++/* the stream name the Mac's SMB client gives MAC, with the private-range characters (PRIV) or as it is */
++static int lklfuse_xstream_name(const char *mac, int priv, int typed, char *out, size_t len)
++{
++	size_t o = snprintf(out, len, "%s%s", lklfuse_xpre, LKLFUSE_XSTREAM);
++	const char *c;
++
++	if (o >= len)
++		return -ENAMETOOLONG;
++	for (; *mac; mac++) {
++		if (o + 4 > len)
++			return -ENAMETOOLONG;
++		c = priv ? strchr(lklfuse_xpriv, *mac) : NULL;
++		if (c) {
++			out[o++] = (char)0xef;
++			out[o++] = (char)0x80;
++			out[o++] = (char)(0x80 | (1 + (c - lklfuse_xpriv)));
++		} else {
++			out[o++] = *mac;
++		}
++	}
++	out[o] = '\0';
++	if (typed && o + sizeof(LKLFUSE_XSTREAM_TYPE) > len)
++		return -ENAMETOOLONG;
++	if (typed)
++		strcat(out, LKLFUSE_XSTREAM_TYPE);
++	return 0;
++}
++
++/* stream X (past user.DosStream.): the Mac name it carries, its private-range characters back as they were */
++static int lklfuse_xstream_mac(const char *x, char *out, size_t len)
++{
++	size_t n = strlen(x), o = 0;
++
++	if (n > sizeof(LKLFUSE_XSTREAM_TYPE) - 1 && strcmp(x + n - (sizeof(LKLFUSE_XSTREAM_TYPE) - 1), LKLFUSE_XSTREAM_TYPE) == 0)
++		n -= sizeof(LKLFUSE_XSTREAM_TYPE) - 1;
++	if (n == 0)
++		return -1;
++	while (n) {
++		if (o + 1 >= len)
++			return -1;
++		if (n >= 3 && (unsigned char)x[0] == 0xef && (unsigned char)x[1] == 0x80 && (unsigned char)x[2] >= 0x81 &&
++		    (unsigned char)x[2] < 0x81 + sizeof(lklfuse_xpriv) - 1) {
++			out[o++] = lklfuse_xpriv[(unsigned char)x[2] - 0x81];
++			x += 3;
++			n -= 3;
++		} else {
++			out[o++] = *x++;
++			n--;
++		}
++	}
++	out[o] = '\0';
++	if (strcmp(out, LKLFUSE_XAFPINFO) == 0)
++		strcpy(out, LKLFUSE_FINDERINFO);
++	else if (strcmp(out, LKLFUSE_XAFPRSRC) == 0)
++		strcpy(out, LKLFUSE_RESOURCEFORK);
++	return 0;
++}
++
++/* where a Mac attribute is now: the Linux xattr NAME, and for the carriers inside one, its value and the bytes the Mac sees */
++enum lklfuse_xloc { XL_NONE, XL_USER, XL_RSRC, XL_BLOB, XL_AFPINFO, XL_STREAM };
++struct lklfuse_xat {
++	enum lklfuse_xloc loc;
++	char name[LKLFUSE_XNAME_MAX];
++	char *val;	/* XL_BLOB, XL_AFPINFO, XL_STREAM: the xattr's whole value (malloc'd) */
++	long len;
++	char *data;	/* the Mac's bytes in val (NULL: malformed, never read nor written) */
++	long dlen;
++};
++
++/* tries carrier NAME of PATH for LOC: 1 when it is there (AT filled in), 0 when not, or a negative LKL error */
++static long lklfuse_xtry(const char *path, const char *name, enum lklfuse_xloc loc, struct lklfuse_xat *at)
++{
++	long n = lklfuse_xread(path, name, &at->val);
++
++	if (n == -LKL_ENODATA)
++		return 0;
++	if (n < 0 && n != -LKL_E2BIG)
++		return n;
++	at->loc = loc;
++	at->len = n;
++	snprintf(at->name, sizeof(at->name), "%s", name);
++	if (n < 0)
++		at->data = NULL;
++	else if (loc == XL_BLOB)
++		at->data = lklfuse_ad_finderinfo(at->val, n);
++	else if (loc == XL_AFPINFO)
++		at->data = lklfuse_afp_finderinfo(at->val, n);
++	else
++		at->data = n >= 1 && at->val[n - 1] == 0 ? at->val : NULL;	/* one xattr, no extents */
++	at->dlen = loc == XL_STREAM ? n - 1 : LKLFUSE_FINDERINFO_LEN;
++	return 1;
++}
++
++/* where Mac attribute MAC of PATH is (at->loc XL_NONE when nowhere): 0, or a negative LKL error */
++static long lklfuse_xfind(const char *path, const char *mac, struct lklfuse_xat *at)
++{
++	int fi = strcmp(mac, LKLFUSE_FINDERINFO) == 0, rf = strcmp(mac, LKLFUSE_RESOURCEFORK) == 0;
++	char name[LKLFUSE_XNAME_MAX];
++	const char *stream = fi ? LKLFUSE_XAFPINFO : rf ? LKLFUSE_XAFPRSRC : mac;
++	int priv, typed;
++	long n;
++
++	memset(at, 0, sizeof(*at));
++	if (lklfuse_xname_to_linux(mac, at->name, sizeof(at->name)))
++		return -LKL_ERANGE;
++	n = lkl_sys_getxattr(path, at->name, NULL, 0);
++	if (n >= 0)
++		at->loc = XL_USER;
++	if (n != -LKL_ENODATA)
++		return n >= 0 ? 0 : n;
++	if (fi) {
++		snprintf(name, sizeof(name), "%s%s", lklfuse_xpre, LKLFUSE_XMETA);
++		if ((n = lklfuse_xtry(path, name, XL_BLOB, at)))
++			return n < 0 ? n : 0;
++	}
++	if (rf) {
++		snprintf(name, sizeof(name), "%s%s", lklfuse_xpre, LKLFUSE_XRSRC);
++		n = lkl_sys_getxattr(path, name, NULL, 0);
++		if (n >= 0) {
++			at->loc = XL_RSRC;
++			snprintf(at->name, sizeof(at->name), "%s", name);
++		}
++		if (n != -LKL_ENODATA)
++			return n >= 0 ? 0 : n;
++	}
++	if (!fi && !rf && (strcmp(mac, LKLFUSE_XAFPINFO) == 0 || strcmp(mac, LKLFUSE_XAFPRSRC) == 0))
++		return 0;	/* names fruit keeps for itself: never a stream of their own */
++	for (priv = 1; priv >= 0; priv--) {
++		if (!priv && !strpbrk(stream, lklfuse_xpriv))
++			break;	/* nothing to send in the private range: the same names again */
++		for (typed = 1; typed >= 0; typed--) {
++			if (lklfuse_xstream_name(stream, priv, typed, name, sizeof(name)))
++				return -LKL_ERANGE;
++			if ((n = lklfuse_xtry(path, name, fi ? XL_AFPINFO : XL_STREAM, at)))
++				return n < 0 ? n : 0;
++		}
++	}
++	at->loc = XL_NONE;
++	return 0;
++}
++
++/* the carriers PATH has: XS_NETATALK (a blob, whatever else), XS_FRUIT_STREAM (streams), or -1 for none */
++static int lklfuse_xmarks(const char *path, int nofollow)
++{
++	char b[4096], *raw = b;
++	size_t p = strlen(lklfuse_xpre);
++	long n, off;
++	int s = -1;
++
++	n = nofollow ? lkl_sys_llistxattr(path, NULL, 0) : lkl_sys_listxattr(path, NULL, 0);
++	if (n <= 0)
++		return -1;
++	if (n > (long)sizeof(b) && !(raw = malloc(n)))
++		return -1;
++	n = nofollow ? lkl_sys_llistxattr(path, raw, n) : lkl_sys_listxattr(path, raw, n);
++	for (off = 0; off < n && s != XS_NETATALK; off += strlen(raw + off) + 1) {
++		if (strncmp(raw + off, lklfuse_xpre, p))
++			continue;
++		if (strcmp(raw + off + p, LKLFUSE_XMETA) == 0)
++			s = XS_NETATALK;
++		else if (lklfuse_xcarrier(raw + off + p))
++			s = XS_FRUIT_STREAM;
++	}
++	if (raw != b)
++		free(raw);
++	return s;
++}
++
++/* the scheme PATH already uses: its carriers', else the volume's */
++static enum lklfuse_xscheme lklfuse_file_xscheme(const char *path)
++{
++	int s = lklfuse_xmarks(path, 0);
++
++	return s >= 0 ? (enum lklfuse_xscheme)s : lklfuse_xs_vol;
++}
++
++/* once, at mount: netatalk's root directories, or the carriers on the root or its first 32 entries (a blob wins) */
++static enum lklfuse_xscheme lklfuse_volume_xscheme(void)
++{
++	static const char *const dirs[] = { "/.AppleDB", "/.AppleDouble", "/.AppleDesktop" };
++	unsigned long long b[512];
++	char path[LKLFUSE_PATH_MAX];
++	struct lkl_stat st;
++	long fd, n, off;
++	int i, s, seen = 0, fruit;
++
++	for (i = 0; i < 3; i++)
++		if (lkl_sys_lstat(dirs[i], &st) == 0 && LKL_S_ISDIR(st.st_mode))
++			return XS_NETATALK;
++	s = lklfuse_xmarks("/", 1);
++	if (s == XS_NETATALK)
++		return XS_NETATALK;
++	fruit = s == XS_FRUIT_STREAM;
++	fd = lkl_sys_open("/", LKL_O_RDONLY | LKL_O_DIRECTORY, 0);
++	while (fd >= 0 && seen < 32 && (n = lkl_sys_getdents64(fd, (void *)b, sizeof(b))) > 0) {
++		for (off = 0; off < n && seen < 32; ) {
++			struct lkl_linux_dirent64 *de = (void *)((char *)b + off);
++
++			off += de->d_reclen;
++			if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
++				continue;
++			seen++;
++			snprintf(path, sizeof(path), "/%s", de->d_name);
++			s = lklfuse_xmarks(path, 1);
++			if (s == XS_NETATALK) {
++				lkl_sys_close(fd);
++				return XS_NETATALK;
++			}
++			fruit |= s == XS_FRUIT_STREAM;
++		}
++	}
++	if (fd >= 0)
++		lkl_sys_close(fd);
++	return fruit ? XS_FRUIT_STREAM : XS_OURS;
++}
++
++/* a stream's data VAL, written as streams_xattr writes it: with one more byte, 0 */
++static long lklfuse_xstream_put(const char *path, const char *name, const char *val, size_t size, int flags)
++{
++	char *v = malloc(size + 1);
++	long ret;
++
++	if (!v)
++		return -LKL_ENOMEM;
++	memcpy(v, val, size);
++	v[size] = 0;
++	ret = lkl_sys_setxattr(path, name, v, size + 1, flags);
++	free(v);
++	return ret;
++}
++
++/* a new netatalk blob for PATH holding Finder Info FI, laid out as netatalk's ad_rebuild_adouble_header_ea writes it */
++static long lklfuse_ad_new(const char *path, const char *fi)
++{
++	static const unsigned int ents[8][3] = {
++		{ 4, 154, 200 }, { 8, 354, 16 }, { 9, LKLFUSE_AD_FINDERI, LKLFUSE_FINDERINFO_LEN }, { 14, 370, 4 },
++		{ 0x80444556, 374, 8 }, { 0x80494E4F, 382, 8 }, { 0x8053594E, 390, 8 }, { 0x8053567E, 398, 4 },
++	};
++	char blob[LKLFUSE_AD_LEN], name[LKLFUSE_XNAME_MAX];
++	struct lkl_stat st;
++	unsigned int t;
++	int i;
++
++	memset(blob, 0, sizeof(blob));
++	lklfuse_put_be32(blob, LKLFUSE_AD_MAGIC);
++	lklfuse_put_be32(blob + 4, LKLFUSE_AD_VERSION);
++	blob[25] = 8;
++	for (i = 0; i < 8; i++) {
++		lklfuse_put_be32(blob + 26 + 12 * i, ents[i][0]);
++		lklfuse_put_be32(blob + 30 + 12 * i, ents[i][1]);
++		lklfuse_put_be32(blob + 34 + 12 * i, ents[i][2]);
++	}
++	memcpy(blob + LKLFUSE_AD_FINDERI, fi, LKLFUSE_FINDERINFO_LEN);
++	/* the dates, as netatalk's new_ad_header puts them: created, changed and read at the file's mtime, never backed up */
++	t = lkl_sys_stat(path, &st) == 0 ? (unsigned int)(st.lkl_st_mtime - LKLFUSE_AD_DATE_DELTA) : 0;
++	lklfuse_put_be32(blob + 354, t);
++	lklfuse_put_be32(blob + 358, t);
++	lklfuse_put_be32(blob + 362, 0x80000000);
++	lklfuse_put_be32(blob + 366, t);
++	snprintf(name, sizeof(name), "%s%s", lklfuse_xpre, LKLFUSE_XMETA);
++	return lkl_sys_setxattr(path, name, blob, sizeof(blob), LKLFUSE_XCREATE);
++}
++
++/* a new AFP_AfpInfo stream for PATH holding Finder Info FI, as vfs_fruit's afpinfo_pack writes it */
++static long lklfuse_afp_new(const char *path, const char *fi)
++{
++	char afp[LKLFUSE_AFPINFO_LEN], name[LKLFUSE_XNAME_MAX];
++
++	memset(afp, 0, sizeof(afp));
++	lklfuse_put_be32(afp, LKLFUSE_AFP_SIGNATURE);
++	lklfuse_put_be32(afp + 4, LKLFUSE_AFP_VERSION);
++	lklfuse_put_be32(afp + 12, 0x80000000);	/* backup time: never */
++	memcpy(afp + LKLFUSE_AFPINFO_FINDERI, fi, LKLFUSE_FINDERINFO_LEN);
++	lklfuse_xstream_name(LKLFUSE_XAFPINFO, 0, 1, name, sizeof(name));
++	return lklfuse_xstream_put(path, name, afp, sizeof(afp), LKLFUSE_XCREATE);
++}
++
++/* Mac attribute MAC of PATH, nowhere yet: in the file's own scheme, else the volume's */
++static long lklfuse_xnew(const char *path, const char *mac, const char *val, size_t size, int flags)
++{
++	enum lklfuse_xscheme s = lklfuse_file_xscheme(path);
++	int fi = strcmp(mac, LKLFUSE_FINDERINFO) == 0, rf = strcmp(mac, LKLFUSE_RESOURCEFORK) == 0;
++	char name[LKLFUSE_XNAME_MAX];
++
++	if (fi && s != XS_OURS && lklfuse_xzero(val, LKLFUSE_FINDERINFO_LEN))
++		return 0;	/* an all-zero Finder Info is none: nothing to keep */
++	if (fi && s == XS_NETATALK)
++		return lklfuse_ad_new(path, val);
++	if (fi && s == XS_FRUIT_STREAM)
++		return lklfuse_afp_new(path, val);
++	if (s == XS_FRUIT_STREAM && strcmp(mac, LKLFUSE_XAFPINFO) && strcmp(mac, LKLFUSE_XAFPRSRC)) {
++		if (lklfuse_xstream_name(rf ? LKLFUSE_XAFPRSRC : mac, 1, 1, name, sizeof(name)))
++			return -LKL_ERANGE;
++		return lklfuse_xstream_put(path, name, val, size, LKLFUSE_XCREATE);
++	}
++	if (lklfuse_xname_to_linux(mac, name, sizeof(name)))
++		return -LKL_ERANGE;
++	return lkl_sys_setxattr(path, name, val, size, flags);
++}
++
++/* Mac attribute MAC of PATH, found at AT, set to VAL (FLAGS: Linux's) */
++static long lklfuse_xput(const char *path, const char *mac, struct lklfuse_xat *at, const char *val, size_t size, int flags)
++{
++	int has;
++
++	if (at->loc == XL_USER || at->loc == XL_RSRC)
++		return lkl_sys_setxattr(path, at->name, val, size, flags);
++	if (at->loc == XL_NONE)
++		return (flags & LKLFUSE_XREPLACE) ? -LKL_ENODATA : lklfuse_xnew(path, mac, val, size, flags);
++	if (!at->data)
++		return -LKL_EIO;
++	has = at->loc == XL_STREAM || !lklfuse_xzero(at->data, LKLFUSE_FINDERINFO_LEN);
++	if ((flags & LKLFUSE_XCREATE) && has)
++		return -LKL_EEXIST;
++	if ((flags & LKLFUSE_XREPLACE) && !has)
++		return -LKL_ENODATA;
++	if (at->loc == XL_STREAM)
++		return lklfuse_xstream_put(path, at->name, val, size, LKLFUSE_XREPLACE);
++	if (at->loc == XL_AFPINFO && lklfuse_xzero(val, LKLFUSE_FINDERINFO_LEN))
++		return lkl_sys_removexattr(path, at->name);	/* as vfs_fruit does with an all-zero AfpInfo */
++	memcpy(at->data, val, LKLFUSE_FINDERINFO_LEN);	/* only those 32 bytes change */
++	return lkl_sys_setxattr(path, at->name, at->val, at->len, LKLFUSE_XREPLACE);
++}
++
++static int lklfuse_xset(const char *path, const char *mac, const char *val, size_t size, int flags)
++{
++	struct lklfuse_xat at;
++	long ret;
++
++	if (!lklfuse_xmac_ok(mac))
++		return -EPERM;
++	if (strcmp(mac, LKLFUSE_FINDERINFO) == 0 && size != LKLFUSE_FINDERINFO_LEN)
++		return -ERANGE;
++	ret = lklfuse_xfind(path, mac, &at);
++	if (ret == 0)
++		ret = lklfuse_xput(path, mac, &at, val, size, flags);
++	free(at.val);
++	return lklfuse_err(ret == -LKL_E2BIG ? -LKL_ENOSPC : ret);
++}
++
++static int lklfuse_xget(const char *path, const char *mac, char *val, size_t size)
++{
++	struct lklfuse_xat at;
++	long ret;
++
++	if (!lklfuse_xmac_ok(mac))
++		return -ENOATTR;
++	ret = lklfuse_xfind(path, mac, &at);
++	if (ret)
++		;
++	else if (at.loc == XL_USER || at.loc == XL_RSRC)
++		ret = lkl_sys_getxattr(path, at.name, val, size);
++	else if (at.loc == XL_NONE || !at.data ||
++		 (at.loc != XL_STREAM && lklfuse_xzero(at.data, LKLFUSE_FINDERINFO_LEN)))
++		ret = -LKL_ENODATA;
++	else if (size == 0)
++		ret = at.dlen;
++	else if (size < (size_t)at.dlen)
++		ret = -LKL_ERANGE;
++	else
++		memcpy(val, at.data, (ret = at.dlen));
++	free(at.val);
++	return lklfuse_err(ret);
++}
++
++static int lklfuse_xremove(const char *path, const char *mac)
++{
++	struct lklfuse_xat at;
++	long ret;
++
++	if (!lklfuse_xmac_ok(mac))
++		return -ENOATTR;
++	ret = lklfuse_xfind(path, mac, &at);
++	if (ret)
++		;
++	else if (at.loc == XL_USER || at.loc == XL_RSRC)
++		ret = lkl_sys_removexattr(path, at.name);
++	else if (at.loc == XL_NONE)
++		ret = -LKL_ENODATA;
++	else if (!at.data)
++		ret = -LKL_EIO;
++	else if (at.loc == XL_STREAM)
++		ret = lkl_sys_removexattr(path, at.name);
++	else if (lklfuse_xzero(at.data, LKLFUSE_FINDERINFO_LEN))
++		ret = -LKL_ENODATA;
++	else if (at.loc == XL_AFPINFO)
++		ret = lkl_sys_removexattr(path, at.name);
++	else {
++		memset(at.data, 0, LKLFUSE_FINDERINFO_LEN);	/* the blob keeps netatalk's other data */
++		ret = lkl_sys_setxattr(path, at.name, at.val, at.len, LKLFUSE_XREPLACE);
++	}
++	free(at.val);
++	return lklfuse_err(ret);
++}
++
++/* carrier LNAME of PATH: the Mac name of what it carries into MAC (1), or 0 when it carries nothing readable */
++static int lklfuse_xcarried(const char *path, const char *lname, char *mac, size_t len)
++{
++	size_t p = strlen(lklfuse_xpre);
++	struct lklfuse_xat at;
++	int ok;
++
++	if (strncmp(lname, lklfuse_xpre, p) || !lklfuse_xcarrier(lname + p) ||
++	    strncmp(lname + p, LKLFUSE_XSTREAM_EXT, sizeof(LKLFUSE_XSTREAM_EXT) - 1) == 0)
++		return 0;
++	if (strcmp(lname + p, LKLFUSE_XRSRC) == 0) {
++		snprintf(mac, len, "%s", LKLFUSE_RESOURCEFORK);
++		return 1;
++	}
++	if (strcmp(lname + p, LKLFUSE_XMETA) == 0)
++		snprintf(mac, len, "%s", LKLFUSE_FINDERINFO);
++	else if (lklfuse_xstream_mac(lname + p + sizeof(LKLFUSE_XSTREAM) - 1, mac, len))
++		return 0;
++	memset(&at, 0, sizeof(at));
++	if (lklfuse_xtry(path, lname, strcmp(lname + p, LKLFUSE_XMETA) == 0 ? XL_BLOB :
++			 strcmp(mac, LKLFUSE_FINDERINFO) == 0 ? XL_AFPINFO : XL_STREAM, &at) <= 0)
++		return 0;
++	ok = at.data && (at.loc == XL_STREAM || !lklfuse_xzero(at.data, LKLFUSE_FINDERINFO_LEN));
++	free(at.val);
++	return ok;
++}
++
++static int lklfuse_xlist(const char *path, char *list, size_t size)
++{
++	char *raw, *out, mac[LKLFUSE_XNAME_MAX];
++	long n = lkl_sys_listxattr(path, NULL, 0), off, o = 0, m, r;
++	int ret;
++
++	if (n < 0)
++		return lklfuse_err(n);
++	raw = malloc(n + 1);
++	out = malloc(n + 1);	/* a Mac name is never longer than the Linux name it comes from */
++	if (!raw || !out) {
++		free(raw);
++		free(out);
++		return -ENOMEM;
++	}
++	n = lkl_sys_listxattr(path, raw, n);
++	for (off = 0; off < n; off += strlen(raw + off) + 1) {
++		r = lklfuse_xname_to_mac(raw + off, mac, sizeof(mac));
++		if (r < 0 || (r == 1 && !lklfuse_xcarried(path, raw + off, mac, sizeof(mac))))
++			continue;
++		for (m = 0; m < o && strcmp(out + m, mac); m += strlen(out + m) + 1)
++			;
++		if (m < o || o + (long)strlen(mac) + 1 > n)
++			continue;	/* listed already (a file in two schemes) */
++		strcpy(out + o, mac);
++		o += strlen(mac) + 1;
++	}
++	if (n < 0)
++		ret = lklfuse_err(n);
++	else if (size == 0)
++		ret = o;
++	else if ((size_t)o > size)
++		ret = -ERANGE;
++	else
++		memcpy(list, out, (ret = o));
++	free(raw);
++	free(out);
++	return ret;
++}
+ #else
+ #define lklfuse_err(ret) (ret)
+ #define lklfuse_xattr_flags(flags) (flags)
++/* xattr names as given */
++#define lklfuse_xset(path, name, val, size, flags) lklfuse_err(lkl_sys_setxattr(path, name, val, size, flags))
++#define lklfuse_xget(path, name, val, size) lklfuse_err(lkl_sys_getxattr(path, name, val, size))
++#define lklfuse_xlist(path, list, size) lklfuse_err(lkl_sys_listxattr(path, list, size))
++#define lklfuse_xremove(path, name) lklfuse_err(lkl_sys_removexattr(path, name))
+ #define lklfuse_rename_flags(flags) (flags)
+ 
+ static inline int lklfuse_resolve(const char *path, char *buf, size_t len, int create, const char **out)
+@@ -1229,7 +1866,7 @@
+ 	char pbuf[LKLFUSE_PATH_MAX];
+ 	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
+ 
+-	return ret ? ret : lklfuse_err(lkl_sys_setxattr(path, name, val, size, lklfuse_xattr_flags(flags)));
++	return ret ? ret : lklfuse_xset(path, name, val, size, lklfuse_xattr_flags(flags));
+ }
+ 
+ static int lklfuse_getxattr(const char *path, const char *name, char *val,
+@@ -1238,7 +1875,7 @@
+ 	char pbuf[LKLFUSE_PATH_MAX];
+ 	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
+ 
+-	return ret ? ret : lklfuse_err(lkl_sys_getxattr(path, name, val, size));
++	return ret ? ret : lklfuse_xget(path, name, val, size);
+ }
+ 
+ static int lklfuse_listxattr(const char *path, char *list, size_t size)
+@@ -1246,7 +1883,7 @@
+ 	char pbuf[LKLFUSE_PATH_MAX];
+ 	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
+ 
+-	return ret ? ret : lklfuse_err(lkl_sys_listxattr(path, list, size));
++	return ret ? ret : lklfuse_xlist(path, list, size);
+ }
+ 
+ static int lklfuse_removexattr(const char *path, const char *name)
+@@ -1254,7 +1891,7 @@
+ 	char pbuf[LKLFUSE_PATH_MAX];
+ 	int ret = lklfuse_resolve(path, pbuf, sizeof(pbuf), 0, &path);
+ 
+-	return ret ? ret : lklfuse_err(lkl_sys_removexattr(path, name));
++	return ret ? ret : lklfuse_xremove(path, name);
+ }
+ 
+ static int lklfuse_opendir(const char *path, struct fuse_file_info *fi)
+@@ -1711,6 +2348,8 @@
+ 
+ #ifdef __APPLE__
+ 	lklfuse_nf = lklfuse_nfmode_for(lklfuse.type);
++	lklfuse_xpre = lklfuse_xpre_for(lklfuse.type);
++	lklfuse_xs_vol = lklfuse_volume_xscheme();
+ #endif
+ 
+ 	ret = lklfuse_set_owner();
