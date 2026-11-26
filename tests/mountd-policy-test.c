@@ -57,6 +57,18 @@ static int parse(const char *s)
 	return mountd_parse(s, strlen(s), &req, &why);
 }
 
+static void elsewhere(const char *s, const char *what)
+{
+	const char *why = NULL;
+	int r = mountd_parse(s, strlen(s), &req, &why);
+
+	is(r, 1, what);
+	if (r == 1 && (!why || !strstr(why, "your own mount"))) {
+		printf("# no reason, or not the user's own mount: %s\n", why ? why : "(none)");
+		failures++;
+	}
+}
+
 static void refuses(const char *s, const char *what)
 {
 	const char *why = NULL;
@@ -202,12 +214,19 @@ int main(void)
 	refuses("mount\text4\tdisk3s1\tro,ro,x\t/Volumes/x\n", "parse_refuses: FLAGS ro,ro,x");
 	refuses("mount\text4\tdisk3s1\tro,ro\t/Volumes/x\n", "parse_refuses: FLAGS ro,ro");
 	refuses("mount\text4\tdisk3s1\t\t/Volumes/x\n", "parse_refuses: empty FLAGS");
-	refuses("mount\text4\tdisk3s1\t-\t/Volumes\n", "parse_refuses: MNT /Volumes");
-	refuses("mount\text4\tdisk3s1\t-\t/Volumes/\n", "parse_refuses: MNT /Volumes/");
-	refuses("mount\text4\tdisk3s1\t-\t/Volumes/a/b\n", "parse_refuses: MNT /Volumes/a/b");
-	refuses("mount\text4\tdisk3s1\t-\t/Volumes/.\n", "parse_refuses: MNT /Volumes/.");
-	refuses("mount\text4\tdisk3s1\t-\t/Volumes/..\n", "parse_refuses: MNT /Volumes/..");
-	refuses("mount\text4\tdisk3s1\t-\t/private/tmp/x\n", "parse_refuses: MNT /private/tmp/x");
+	/* a mount point not directly under /Volumes is no request root serves, but nothing is wrong with it: the user's own
+	 * mount (16j fix round 1, the controller's ruling on concern 3), 1 */
+	elsewhere("mount\text4\tdisk3s1\t-\t/Volumes\n", "parse_elsewhere: MNT /Volumes is the user's own mount");
+	elsewhere("mount\text4\tdisk3s1\t-\t/Volumes/\n", "parse_elsewhere: MNT /Volumes/");
+	elsewhere("mount\text4\tdisk3s1\t-\t/Volumes/a/b\n", "parse_elsewhere: MNT /Volumes/a/b");
+	elsewhere("mount\text4\tdisk3s1\t-\t/Volumes/.\n", "parse_elsewhere: MNT /Volumes/.");
+	elsewhere("mount\text4\tdisk3s1\t-\t/Volumes/..\n", "parse_elsewhere: MNT /Volumes/..");
+	elsewhere("mount\text4\tdisk3s1\t-\t/tmp/m\n", "parse_elsewhere: MNT /tmp/m");
+	elsewhere("mount\text4\tdisk3s1\t-\trelative\n", "parse_elsewhere: MNT relative");
+	elsewhere("mount\text4\tdisk3s1\t-\t/Volumesx/a\n", "parse_elsewhere: MNT /Volumesx/a");
+	refuses("mount\text4\tdisk3s1\t-\t/tmp/a\001b\n", "parse_refuses: MNT elsewhere with a control character is still garbled");
+	refuses("mount\thfs\tdisk3s1\t-\t/tmp/m\n", "parse_refuses: MNT elsewhere does not excuse a bad FS");
+	elsewhere("mount\text4\tdisk3s1\t-\t/private/tmp/x\n", "parse_elsewhere: MNT /private/tmp/x");
 	refuses("mount\text4\tdisk3s1\t-\t/Volumes/a\001b\n", "parse_refuses: MNT with a control character");
 	refuses("mount\text4\tdisk3s1\t-\t/Volumes/a\177b\n", "parse_refuses: MNT with DEL");
 	refuses("mount\text4\tdisk3s1\t-\t/Volumes/a\rb\n", "parse_refuses: MNT with a CR");

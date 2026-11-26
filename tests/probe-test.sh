@@ -11,6 +11,7 @@ if [ "$(uname -s)" = Linux ]; then
   D=${PROBE_TEST_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/probe-test.XXXXXX")}
   cc -O2 -Wall -Werror -o "$D/probe" "$ROOT/tools/probe.c" "$ROOT/tools/fsrules.c" || exit 1
   cc -O2 -Wall -Werror -DLINUXFS_PROBE_NO_MAIN -o "$D/probe-uuid" "$ROOT/tests/probe-uuid.c" "$ROOT/tools/probe.c" || exit 1
+  cc -O2 -U_FORTIFY_SOURCE -Wall -Werror -DLINUXFS_PROBE_NO_MAIN -Dpread=probe_test_pread -o "$D/probe-eintr" "$ROOT/tests/lib/probe-eintr.c" "$ROOT/tools/probe.c" || exit 1
 else
   . "$ROOT/build/msc.sh"
   D=$HOME/Library/Caches/mm-build/linuxfs-probe-test; rm -rf "$D"; mkdir -p "$D"
@@ -20,6 +21,8 @@ else
     -o "$D/probe" "$ROOT/tools/probe.c" "$ROOT/tools/fsrules.c" || exit 1
   "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN \
     -o "$D/probe-uuid" "$ROOT/tests/probe-uuid.c" "$ROOT/tools/probe.c" || exit 1
+  "$CL/bin/clang" --target=x86_64-apple-macos10.9 -isysroot "$SDK" -O2 -Wall -Werror -fuse-ld=lld -DLINUXFS_PROBE_NO_MAIN -Dpread=probe_test_pread \
+    -o "$D/probe-eintr" "$ROOT/tests/lib/probe-eintr.c" "$ROOT/tools/probe.c" || exit 1
 fi
 if [ "$(uname -s)" = Linux ]; then sh "$ROOT/tests/lib/probe-images.sh" "$D" || exit 1
 else sh "$ROOT/build/linux-host.sh" sh "$ROOT/tests/lib/probe-images.sh" "$D" || exit 1; fi
@@ -132,4 +135,12 @@ if [ "$(uname -s)" = Darwin ]; then
   if printf '%s\n' "$u" | grep -qx '_getgroups' && ! printf '%s\n' "$u" | grep -qF 'getgroups$DARWIN_EXTSN'; then echo "ok $n - groups_kernel: linuxfs-probe imports _getgroups, not _getgroups\$DARWIN_EXTSN"
   else echo "not ok $n - groups_kernel: nm -u: $(printf '%s\n' "$u" | grep getgroups | tr '\n' ' ')"; bad=1; fi
 fi
+# spec: tools/probe.h linuxfs_probe_stop (task-16j-findings-r0.md m5) -- a read the probe's caller's SIGTERM interrupts (EINTR) gives up only
+#       once the flag it points at is set; unset, or a flag of 0, and the probe reads on (tests/lib/probe-eintr.c injects one EINTR)
+eintr() { # MODE WANT WHAT
+  n=$((n + 1)); got=$("$D/probe-eintr" "$D/ext4.img" "$1" 2>&1 | tr '\n' ' ')
+  if test "$got" = "$2"; then echo "ok $n - probe_stop: $3"; else echo "not ok $n - probe_stop: $3: got '$got', want '$2'"; bad=1; fi; }
+eintr null "ext4 - injected 1 " "with no flag, an EINTR is read past: ext4"
+eintr zero "ext4 - injected 1 " "with a flag of 0, an EINTR is read past: ext4"
+eintr one "NULL EINTR injected 1 " "with the flag set, an EINTR gives up: NULL, EINTR"
 echo "1..$n"; exit $bad

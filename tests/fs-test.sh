@@ -22,7 +22,15 @@ LINUXFS_MOUNTD_SOCK=$D/no-mountd.sock; export LINUXFS_MOUNTD_SOCK
 ok() { n=$((n + 1)); if [ "$1" = 0 ]; then echo "ok $n - $2"; else echo "not ok $n - $2"; bad=1; fi; }
 att() { hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$D/$1" | awk 'NR == 1 { print $1 }'; }
 devs=
-trap 'for d in $devs; do hdiutil detach -quiet -force "$d" 2>/dev/null; done' EXIT
+# the end, however it comes: the stand-in daemon, a background root run and its watchdog, and the last CLI group it named go first,
+# so nothing holds a disk when it is detached (task-16j-findings-r0.md m8)
+mdpid= tp= wd= lastcg=
+cleanup() {
+  for p in $mdpid $tp $wd; do kill "$p" 2>/dev/null; done
+  test -z "$lastcg" || kill -9 -- "-$lastcg" 2>/dev/null
+  for d in $devs; do hdiutil detach -quiet -force "$d" 2>/dev/null; done; }
+trap cleanup EXIT
+trap 'exit 1' INT TERM HUP
 e=$(att ext4.img); b=$(att btrfs.img); t=$(att ntfs.img); devs="$e $b $t"
 echo "# attached $e $b $t"
 E=${e#/dev/}; B=${b#/dev/}; T=${t#/dev/}
@@ -832,12 +840,12 @@ md() { # STEP...: the stand-in daemon in the background ($mdpid), logging to $ML
   rm -f "$MS" "$MS.ready" "$ML"
   /usr/bin/perl "$ROOT/tests/lib/mountd-stub.pl" "$MS" "$ML" "$@" & mdpid=$!
   i=0; while test ! -e "$MS.ready" && test $i -lt 50; do sleep 0.1; i=$((i + 1)); done; }
-mdstop() { kill "$mdpid" 2>/dev/null; wait "$mdpid" 2>/dev/null; }
+mdstop() { kill "$mdpid" 2>/dev/null; wait "$mdpid" 2>/dev/null; mdpid=; }
 ask() { # ARGS...: the mount role as the console user, asking the stand-in (ASK_ROOT=1: root required, no stand-in uid; ASK_ENV adds
-        # to its environment); rc, stderr in $M/ask.err, seconds taken in $t
+        # to its environment; ASK_SOCK names another socket path); rc, stderr in $M/ask.err, seconds taken in $t
   if test -n "${ASK_ROOT:-}"; then pu="-u LINUXFS_MOUNTD_PEER_UID"; else pu="LINUXFS_MOUNTD_PEER_UID=$(id -u)"; fi
   s0=$(date +%s)
-  mt env $pu LINUXFS_MOUNTD_SOCK="$MS" LINUXFS_MNTTAB="$M/ask9.mnttab" ${ASK_ENV:-} "$MD" "$@" > /dev/null 2> "$M/ask.err"; rc=$?
+  mt env $pu LINUXFS_MOUNTD_SOCK="${ASK_SOCK:-$MS}" LINUXFS_MNTTAB="$M/ask9.mnttab" ${ASK_ENV:-} "$MD" "$@" > /dev/null 2> "$M/ask.err"; rc=$?
   t=$(( $(date +%s) - s0 )); }
 printf 'macfuse_ext4\t/dev/disk9\t/tmp/m\t%s\n' "$(id -u)" > "$M/ask9.mnttab"	# the stand-in CLI's own mount, for the user path's gate
 cliran() { grep -q '^args: ' "$M/log" 2>/dev/null; }
@@ -897,15 +905,30 @@ md full
 ask /dev/disk9 /tmp/m; mdstop
 grep -q '^full after [1-9]' "$ML" && ! grep -qx connected "$ML" && test $rc = 0 && cliran
 ok $? "ask: a socket nobody accepts on (ECONNREFUSED, a full backlog) → the CLI runs (rc $rc: $(tr '\n' ';' < "$ML"); $(askerr))"
+md stale
+ask /dev/disk9 /tmp/m; mdstop
+test -S "$MS" && test $rc = 0 && cliran && grep -q 'Connection refused' "$M/ask.err"
+ok $? "ask: a stale socket file (nothing listening) → the CLI runs (rc $rc: $(askerr))"
+# spec: task-16j-findings-r0.md m4 -- connect follows a symlink, so one at the socket path could lead to another root socket: the path
+#       itself must be a socket of root's (best effort: lstat before connect)
+md say:hi read 'say:no\t3\tnot this service'
+rm -f "$M/link.sock"; ln -s "$MS" "$M/link.sock"
+ASK_SOCK=$M/link.sock; ask /dev/disk9 /tmp/m; unset ASK_SOCK; mdstop
+! grep -qx connected "$ML" && test $rc = 0 && cliran && grep -q 'not a socket' "$M/ask.err"
+ok $? "ask: a symlink at the socket path (to a socket of the right uid) is not followed: the CLI runs (rc $rc: $(tr '\n' ';' < "$ML"); $(askerr))"
+# spec: task-16j-findings-r0.md m1 -- ok before begin claims a mount: never the user's own path over it
+md say:hi read say:ok
+ask /dev/disk9 /tmp/m; mdstop
+test $rc = 1 && ! cliran; ok $? "ask: hi, then ok without begin → exit 1, and the CLI never runs (rc $rc: $(askerr))"
 md close
 ask /dev/disk9 /tmp/m; mdstop
-test $rc = 0 && cliran; ok $? "ask: accepted and closed at once → the CLI runs (rc $rc: $(askerr))"
+grep -qx connected "$ML" && test $rc = 0 && cliran; ok $? "ask: accepted and closed at once → the CLI runs (rc $rc: $(askerr))"
 md sleep:6
 ask /dev/disk9 /tmp/m; mdstop
-test $rc = 0 && cliran && test $t -le 7; ok $? "ask: accepted, nothing written for 6 s → the CLI runs, within 7 s ($t s, rc $rc: $(askerr))"
+grep -qx connected "$ML" && test $rc = 0 && cliran && test $t -ge 5 && test $t -le 7; ok $? "ask: accepted, nothing written for 6 s → the CLI runs, after the 5 s hi wait, within 7 s ($t s, rc $rc: $(askerr))"
 md say:hi read close
 ask /dev/disk9 /tmp/m; mdstop
-test $rc = 0 && cliran; ok $? "ask: hi then EOF before begin → the CLI runs (rc $rc: $(askerr))"
+grep -q '^got: mount' "$ML" && test $rc = 0 && cliran; ok $? "ask: hi then EOF before begin → the CLI runs (rc $rc: $(askerr))"
 md say:hi read say:begin sleep:10
 ASK_ENV=LINUXFS_MOUNTD_WAIT=2; ask /dev/disk9 /tmp/m; unset ASK_ENV; mdstop
 test $rc = 1 && ! cliran && test $t -le 4; ok $? "ask: hi, begin, then silence (LINUXFS_MOUNTD_WAIT=2) → exit 1 within 4 s, and the CLI never runs ($t s, rc $rc: $(askerr))"
@@ -921,7 +944,7 @@ ask /dev/disk9 /tmp/m; mdstop
 test $rc = 1 && ! cliran; ok $? "ask: hi, begin, then garbage → exit 1, and the CLI never runs (rc $rc: $(askerr))"
 md say:hello
 ask /dev/disk9 /tmp/m; mdstop
-test $rc = 0 && cliran && ! grep -q '^got' "$ML"; ok $? "ask: a garbled first line (hello) → the CLI runs (rc $rc: $(askerr))"
+grep -qx connected "$ML" && test $rc = 0 && cliran && ! grep -q '^got' "$ML"; ok $? "ask: a garbled first line (hello) → the CLI runs (rc $rc: $(askerr))"
 md drain
 FP_ENV="LINUXFS_MOUNTD_SOCK=$MS LINUXFS_MOUNTD_PEER_UID=$(id -u)" fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2>&1; rc=$?
 mdstop
@@ -947,8 +970,8 @@ hst() { # HELPER-MODE CLI-MODE FILE PATTERN: root's mount with both stand-ins, i
   sleep 0.5	# into the wait
   s0=$(date +%s); kill -TERM "$tp"
   ( sleep 20; kill -9 "$tp" 2>/dev/null ) & wd=$!
-  wait "$tp"; rc=$?; t=$(( $(date +%s) - s0 ))
-  kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null; }
+  wait "$tp"; rc=$?; t=$(( $(date +%s) - s0 )); tp=
+  kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null; wd=; lastcg=$(sed -n 's/^cli-pgid //p' "$M/plan" | head -n 1); }
 pgid_of() { sed -n 's/^cli-pgid //p' "$M/plan" | head -n 1; }
 : > "$D/drop/mhelper.mnttab"
 HS_ENV="LINUXFS_FS_TEST_MNTTAB=$D/drop/mhelper.mnttab"; hst mountedhang linger "$M/fdcli.log" '^lingerer '; unset HS_ENV
@@ -973,6 +996,19 @@ hst nofd ok "$D/drop/mhelper.log" '^pid '
 hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log"); cg=$(pgid_of)
 test $rc = 1 && test $t -lt 5 && grp_gone "$cg" && test -n "$hp" && gone "$hp" && grep -q 'stopped by SIGTERM' "$M/plan"
 ok $? "root plan (helper stand-in): SIGTERM while waiting for the device → exit 1 within 5 s, the CLI group ($cg) and the stand-in mount helper ($hp) are gone ($t s, rc $rc: $(tail -n 3 "$M/plan" | tr '\n' ';'))"
+# spec: task-16j-findings-r0.md I1 -- once ok is decided root's path blocks SIGTERM: a SIGTERM after the success path's last check
+#       (LINUXFS_FS_TEST_OK_PAUSE: the drop build says "ok-pause" there and sleeps) is held to the end; the program exits 0 with
+#       its mount, never 1 with the mount left in place
+: > "$D/drop/mhelper.mnttab"
+HS_ENV="LINUXFS_FS_TEST_MNTTAB=$D/drop/mhelper.mnttab LINUXFS_FS_TEST_OK_PAUSE=2"; hst "mounted 0" ok "$M/plan" '^ok-pause'; unset HS_ENV
+test $rc = 0 && test $t -lt 5 && ! grep -q '^unmount-attempt' "$M/plan" && grep -q '^ok-pause' "$M/plan" && grep -q "^macfuse_ext4	/dev/$E	$V/NAME	0" "$D/drop/mhelper.mnttab"
+ok $? "root plan (helper stand-in): SIGTERM after ok is decided → exit 0 with the mount in place, no unmount ($t s, rc $rc: $(tail -n 3 "$M/plan" | tr '\n' ';'))"
+# spec: task-16j-findings-r0.md I2 (the controller's ruling) -- under SIGTERM the CLI's group still gets up to 5 s to end on its SIGTERM (LKL's
+#       umount and sync) before SIGKILL: a stand-in lklfuse that takes 2 s to end is never killed
+hst nostatus slowterm "$M/fdcli.log" '^lingerer '
+hp=$(sed -n 's/^pid //p' "$D/drop/mhelper.log"); lp=$(sed -n 's/^lingerer //p' "$M/fdcli.log"); cg=$(pgid_of)
+test $rc = 1 && test $t -lt 6 && grep -qx 'clean exit' "$M/fdcli.log" && grp_gone "$cg" && test -n "$hp" && gone "$hp"
+ok $? "root plan (helper stand-in): SIGTERM: a CLI group member that ends 2 s after its SIGTERM is not SIGKILLed ($t s, rc $rc, lingerer $lp: $(grep -c 'clean exit' "$M/fdcli.log") clean exit)"
 hs "" ok
 test $rc = 0 && test "$(grep -c '^cli-pgid ' "$M/plan")" = 1 && grep -qE '^cli-pgid [0-9]+$' "$M/plan" && test "$(pgid_of)" = "$(sed -n 's/^pgid //p' "$M/fdcli.log")"
 ok $? "root plan (helper stand-in): cli-pgid: one cli-pgid N line, N the CLI stand-in's process group (rc $rc: $(grep '^cli-pgid' "$M/plan" | tr '\n' ' '); stand-in's $(grep '^pgid' "$M/fdcli.log"))"

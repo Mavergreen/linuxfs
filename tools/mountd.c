@@ -107,16 +107,25 @@ int mountd_parse(const char *buf, size_t len, struct mountd_req *r, const char *
 		return -1;
 	q.ro = k == 1 || k == 3 || k == 4;
 	q.owners = k >= 2;
-	*why = "the mount point is /Volumes/ and one name, with no control characters";
-	if (!field(q.mnt, sizeof(q.mnt), f[4], n[4]) || strncmp(q.mnt, VOLUMES, strlen(VOLUMES)) != 0)
+	*why = "the mount point has no control characters";
+	if (!field(q.mnt, sizeof(q.mnt), f[4], n[4]))
 		return -1;
-	name = q.mnt + strlen(VOLUMES);
-	nlen = strlen(name);
-	if (nlen == 0 || nlen > MOUNTD_NAME_MAX || strchr(name, '/') || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
-		return -1;
-	for (i = 0; i < nlen; i++)
-		if ((unsigned char)name[i] < 0x20 || (unsigned char)name[i] == 0x7f)
+	for (i = 0; q.mnt[i]; i++)
+		if ((unsigned char)q.mnt[i] < 0x20 || (unsigned char)q.mnt[i] == 0x7f)
 			return -1;
+	/* a well-formed request for a mount point not directly under /Volumes is none root serves, and nothing is wrong with it: the
+	 * user's own mount (16j fix round 1, the controller's ruling), 1 */
+	name = q.mnt + strlen(VOLUMES);
+	if (strncmp(q.mnt, VOLUMES, strlen(VOLUMES)) != 0 || !*name || strchr(name, '/') || strcmp(name, ".") == 0 ||
+	    strcmp(name, "..") == 0) {
+		*r = q;
+		*why = "the mount point is not directly under /Volumes: your own mount";
+		return 1;
+	}
+	nlen = strlen(name);
+	*why = "the mount point's name is at most 255 bytes";
+	if (nlen > MOUNTD_NAME_MAX)
+		return -1;
 	*r = q;
 	*why = "";
 	return 0;
@@ -1148,6 +1157,30 @@ static void output_take(struct output *o, const char *buf, size_t n)
 	}
 }
 
+/* Before any no after the program ran: root's mount of the disk left on MNT (topmost, fsrules_mount_is_roots) is unmounted, so a no
+ * never stands beside an orphaned mount nobody would own (16j findings I1: a program SIGTERMed or SIGKILLed after its mount landed,
+ * or one that failed without undoing it). The disk's lock and MNT's flock keep any other request's mount off MNT. The test build
+ * says "unmount MNT" instead. */
+static void undo_orphan(const struct mountd_req *r, const char *mnt)
+{
+	if (!topmost_is_roots(r->fs, r->bsd, mnt))
+		return;
+#ifdef LINUXFS_MOUNTD_TEST
+	fprintf(stderr, "unmount %s\n", mnt);
+#else
+	if (unmount(mnt, MNT_FORCE) == 0)
+		shout("mountd: %s on %s: root's mount was left there: unmounted", r->bsd, r->mnt);
+	else
+		shout("mountd: %s on %s: root's mount was left there and cannot be unmounted: %s", r->bsd, r->mnt, strerror(errno));
+#endif
+}
+
+static void __attribute__((noreturn)) refuse_after(const struct mountd_req *r, const char *mnt, int rc, const char *why)
+{
+	undo_orphan(r, mnt);
+	finish(MD_REFUSE, rc, why);
+}
+
 /* The mount program PID, its output on OUT, to the end or the deadline (I4): a timed loop of poll and waitpid. At
  * lim.deadline, SIGTERM to the program (the root path cleans up); lim.grace later, SIGKILL to its process group and to the
  * snapshot of the CLI's group (N5, R1, I1: mountd_snap_refresh, once a second, members since SINCE), and "deadline". Then the
@@ -1190,7 +1223,7 @@ static void await(const struct mountd_req *r, const char *mnt, pid_t pid, int ou
 			      r->bsd, r->mnt, lim.grace, (int)pid, killed, (int)o.cli);
 			for (i = 0; i < 10 && waitpid(pid, &st, WNOHANG) == 0; i++)
 				usleep(100000);	/* reaped, when it goes at once; else launchd reaps it */
-			finish(MD_REFUSE, 1, "deadline");
+			refuse_after(r, mnt, 1, "deadline");
 		}
 		next = term_at < 0 ? start + lim.deadline * 1000LL : term_at + lim.grace * 1000LL;
 		if (o.cli && runas != 0 && next_snap < next)
@@ -1225,23 +1258,27 @@ static void await(const struct mountd_req *r, const char *mnt, pid_t pid, int ou
 	}
 	if (o.len)
 		output_line(&o);
+	/* after SIGTERM, an exit 0 is judged as any other (the program holds SIGTERM once its mount is decided: 16j findings I1); any
+	 * other end is the deadline's no, with root's mount, if left, unmounted first */
 	if (term_at >= 0) {
-		shout("mountd: %s on %s: the mount program ended after SIGTERM", r->bsd, r->mnt);
-		finish(MD_REFUSE, 1, "deadline");
+		shout("mountd: %s on %s: the mount program ended after SIGTERM (%s)", r->bsd, r->mnt,
+		      WIFEXITED(st) && WEXITSTATUS(st) == 0 ? "exit 0" : "failed");
+		if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+			refuse_after(r, mnt, 1, "deadline");
 	}
 	if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
-		finish(MD_REFUSE, WIFEXITED(st) ? WEXITSTATUS(st) : 1, "the mount program failed");
+		refuse_after(r, mnt, WIFEXITED(st) ? WEXITSTATUS(st) : 1, "the mount program failed");
 	if (!topmost_is_roots(r->fs, r->bsd, mnt))
 		finish(MD_REFUSE, 1, "root's mount of the disk is not on the mount point");
 	snprintf(path, sizeof path, "/dev/%s", r->bsd);
 	if (stat(path, &node) != 0)
-		finish(MD_REFUSE, 1, "the disk is gone");
+		refuse_after(r, mnt, 1, "the disk is gone");
 #ifdef LINUXFS_MOUNTD_TEST
 	if (getenv("LINUXFS_MOUNTD_TEST_RDEV_SHIFT"))
 		node.st_rdev += atoi(getenv("LINUXFS_MOUNTD_TEST_RDEV_SHIFT"));
 #endif
 	if (node.st_rdev != rdev)
-		finish(MD_REFUSE, 1, "another disk has the disk's name now");
+		refuse_after(r, mnt, 1, "another disk has the disk's name now");
 	finish(MD_MOUNT, 0, "");
 }
 
@@ -1387,7 +1424,14 @@ static void serve(int c, uid_t uid)
 		say("mountd: uid %u sent no request within %d s", (unsigned)uid, MOUNTD_REQUEST);
 		_exit(0);
 	}
-	if (mountd_parse(buf, (size_t)n, &r, &why) != 0) {
+	switch (mountd_parse(buf, (size_t)n, &r, &why)) {
+	case 0:
+		break;
+	case 1:
+		say("mountd: uid %u: %s on %s: user: %s", (unsigned)uid, r.bsd, r.mnt, why);
+		answer(c, MD_USER, 0, why);
+		_exit(0);
+	default:
 		say("mountd: uid %u: a bad request: %s", (unsigned)uid, why);
 		answer(c, MD_REFUSE, 1, why);
 		_exit(0);

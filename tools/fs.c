@@ -160,7 +160,8 @@ static int fsck(const char *fs, int argc, char **argv)
 #define DIALOG_SECONDS 120
 #define DIALOG_TRIES 3
 
-/* LINUXFS_CLI, LINUXFS_DIALOG, LINUXFS_KEYCHAIN_SOCK and LINUXFS_MNTTAB are for tests, and never obeyed by root */
+/* LINUXFS_CLI, LINUXFS_DIALOG, LINUXFS_KEYCHAIN_SOCK, LINUXFS_MNTTAB and the mount daemon's LINUXFS_MOUNTD_SOCK, LINUXFS_MOUNTD_PEER_UID,
+ * LINUXFS_MOUNTD_WAIT and LINUXFS_MOUNTD_PREBEGIN_WAIT are for tests, and never obeyed by root */
 static const char *test_env(const char *name)
 {
 	return getuid() != 0 ? getenv(name) : NULL;
@@ -821,7 +822,7 @@ static int recv_device(int sock, int secs, int watch)
 		if (left <= 0)
 			return -1;
 		p[0].revents = p[1].revents = 0;
-		r = poll(p, 2, (int)left);
+		r = poll(p, 2, left > 200 ? 200 : (int)left);	/* a SIGTERM just before the poll is seen within 200 ms */
 		if (r > 0 && p[1].revents)
 			return (p[1].revents & POLLHUP) ? -2 : -3;
 		if (r > 0)
@@ -1185,17 +1186,27 @@ static int send_device(int sock, int dev)
 	return sendmsg(sock, &msg, MSG_DONTWAIT) == 1;
 }
 
-/* SIGTERM to process group pgid, then, after its leader (reaped, when it has not been yet: running) exits or STOP_WAIT_S, SIGKILL
- * to whatever of it is left. A leader reaped already (running 0) leaves the group's pgid unusable by anyone else while any member
- * lives, so kill(-pgid) still reaches only what was the CLI's (its lklfuse, its sleepers) */
+#define GROUP_WAIT_S 5	/* for the CLI's group (lklfuse: LKL's umount and sync) to end on its SIGTERM, before SIGKILL */
+
+/* SIGTERM to process group pgid; then, once every process of it has ended (its leader reaped, when it has not been yet: running) or
+ * after GROUP_WAIT_S (and never past cleanup_end), SIGKILL to whatever of it is left. Under the daemon's SIGTERM too: lklfuse
+ * SIGKILLed before LKL's umount leaves a dirty volume (an NTFS one comes up read-only next time), and the failure path's CLEANUP_S
+ * has room for it (task-16j-findings-r0.md I2, the controller's ruling). A leader reaped already (running 0) leaves the group's pgid
+ * unusable by anyone else while any member lives, so kill(-pgid) still reaches only what was the CLI's (its lklfuse, its sleepers) */
 static void stop_group(pid_t pgid, int running)
 {
-	int st;
+	int st, i;
 
 	kill(-pgid, SIGTERM);
-	if (running)
-		reap(pgid, STOP_WAIT_S, &st);
-	usleep(300000);	/* a moment for the rest of it to end on its own */
+	for (i = 0; i < GROUP_WAIT_S * 10; i++) {
+		if (running && waitpid(pgid, &st, WNOHANG) == pgid)
+			running = 0;
+		if (!running && kill(-pgid, 0) != 0 && errno == ESRCH)
+			return;	/* all of it ended on SIGTERM */
+		if (cleanup_end && time(NULL) >= cleanup_end)
+			break;
+		usleep(100000);
+	}
 	kill(-pgid, SIGKILL);
 	if (running)
 		reap_(pgid, STOP_WAIT_S, &st, 0);
@@ -1451,6 +1462,16 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 		if (hpid > 0 && waitpid(hpid, &w, WNOHANG) == hpid)
 			hpid = -1;
 	}
+	/* SIGTERM from here on is held (blocked) to the end: once ok is decided the program exits 0 with its mount, never 1 beside it
+	 * (task-16j-findings-r0.md I1); a SIGTERM before this line is the flag, and the failure path undoes everything. The daemon
+	 * judges an exit 0 after its SIGTERM by the mount table, as any other */
+	{
+		sigset_t term;
+
+		sigemptyset(&term);
+		sigaddset(&term, SIGTERM);
+		sigprocmask(SIG_BLOCK, &term, NULL);
+	}
 	ok = !stopping && got > 0 && status == 0 && (cli_rc == 0 || cli_rc == -2);
 	if (ok) {
 		syslog(LOG_NOTICE, "mount_%s: %s mounted on %s by root, served by %s%s", fs, bsd, req->mnt, RUN_USER,
@@ -1458,18 +1479,12 @@ static int mount_by_root(const char *fs, const struct mountreq *req, const char 
 		close(cs[1]);
 		cs[1] = -1;
 		/* mount_macfuse has said all it has to: one still running STOP_WAIT_S later gets SIGTERM, then after 1 s SIGKILL,
-		 * and is reaped; no root helper outlives the mount program. SIGTERM meanwhile goes to the failure path, which stops it */
-		if (hpid > 0 && reap(hpid, STOP_WAIT_S, &w))
-			hpid = -1;
-		else if (hpid > 0 && !stopping) {
+		 * and is reaped; no root helper outlives the mount program (SIGTERM is held now, so none of this is cut short) */
+		if (hpid > 0 && !reap(hpid, STOP_WAIT_S, &w)) {
 			syslog(LOG_NOTICE, "mount_%s: %s: mount_macfuse (pid %d) is still running after the mount; stopped", fs, bsd, (int)hpid);
 			stop(fs, hpid, 1);
-			hpid = -1;
 		}
-		if (stopping) {
-			syslog(LOG_NOTICE, "mount_%s: %s: SIGTERM after the mount: undoing it", fs, bsd);
-			ok = 0;
-		}
+		hpid = -1;
 	} else {
 		if (got > 0)
 			syslog(LOG_NOTICE, "mount_%s: %s: mount_macfuse reported %d", fs, bsd, (int)status);
@@ -1512,6 +1527,13 @@ failed:
 			close(ch[0]);
 		fprintf(stderr, "linuxfs-mount: root's mount of %s failed\n", bsd);
 	}
+#ifdef LINUXFS_FS_TEST_DROP
+	if (ok && getenv("LINUXFS_FS_TEST_OK_PAUSE")) {	/* past the last check, before log_lines (which may block): a test's SIGTERM lands here, held */
+		printf("ok-pause\n");
+		fflush(stdout);
+		sleep((unsigned)atoi(getenv("LINUXFS_FS_TEST_OK_PAUSE")));
+	}
+#endif
 	if (hout[0] >= 0) {
 		ssize_t r;
 
@@ -1913,6 +1935,7 @@ static int ask_mountd(const char *fs, const struct mountreq *req, const char *bs
 	const char *path = test_env("LINUXFS_MOUNTD_SOCK"), *pu = test_env("LINUXFS_MOUNTD_PEER_UID"), *p;
 	char reqline[1100], line[1100];
 	struct sockaddr_un sa;
+	struct stat pst;
 	struct askbuf a;
 	long long t0, end, phase_end;
 	int fd, one = 1, n, k, phase = 0, out = MA_UNREACHABLE;
@@ -1947,6 +1970,17 @@ static int ask_mountd(const char *fs, const struct mountreq *req, const char *bs
 	if (strlen(path) >= sizeof sa.sun_path)
 		return MA_UNREACHABLE;
 	strcpy(sa.sun_path, path);
+	/* connect follows a symlink, which a process in group daemon could put at the path, to another root service's socket: the path
+	 * itself must be a socket, not a symlink. Best effort (the path can change before connect); whose it is, the peer check below
+	 * decides */
+	if (lstat(path, &pst) != 0) {
+		ask_say(fs, errno == ENOENT ? "no mount daemon (no socket): your own mount" : "the mount daemon's socket cannot be read: your own mount");
+		return MA_UNREACHABLE;
+	}
+	if (!S_ISSOCK(pst.st_mode)) {
+		ask_say(fs, "the mount daemon's socket path is not a socket (a symlink?): not asked");
+		return MA_UNREACHABLE;
+	}
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0)
 		return MA_UNREACHABLE;
@@ -1990,8 +2024,8 @@ static int ask_mountd(const char *fs, const struct mountreq *req, const char *bs
 				ask_why(fs, line, *rc);
 			} else {
 				out = MA_LOST;
-				ask_say(fs, "the mount daemon said begin, then %s: failed", got == -1 ? "nothing in time" : got == 1 ? "something garbled" :
-					"closed the connection");
+				ask_say(fs, "the mount daemon said begin, then %s: failed", got == -1 ? "nothing in time" :
+					got == 1 || got == -2 ? "something garbled" : "closed the connection");
 			}
 			break;
 		}
@@ -2026,6 +2060,11 @@ static int ask_mountd(const char *fs, const struct mountreq *req, const char *bs
 				break;
 			}
 			continue;
+		}
+		if (k == 'k') {	/* ok before begin claims a mount: never the user's own path over it (findings m1) */
+			out = MA_LOST;
+			ask_say(fs, "the mount daemon said ok before begin: failed");
+			break;
 		}
 		if (phase == 1 && k == 'b') {
 			phase = 2;

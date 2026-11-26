@@ -7,6 +7,7 @@
  *   exit N        exit N at once, before "R": a CLI whose preflight failed
  *   noready       neither "R" nor an exit: sleep 30 s
  *   linger        as ok, then leave a sleeper running (logs "lingerer PID") and exit 0
+ *   slowterm      as linger, but the sleeper is an lklfuse that takes 2 s to end on SIGTERM (LKL's umount), then logs "clean exit"
  *   garble        "X" instead of "R", then sleep 30 s
  *   rr            "RR" and trailing bytes in one write, then sleep 30 s: more than "ready"
  *   diesAfterR N  "R", then exit N at once, without waiting for the device
@@ -18,6 +19,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +30,8 @@
 #include <unistd.h>
 
 extern char **environ;
+static volatile sig_atomic_t term;
+static void on_term(int sig) { (void)sig; term = 1; }
 
 int main(int argc, char **argv)
 {
@@ -122,10 +126,30 @@ int main(int argc, char **argv)
 		return atoi(mode + 10);
 	if (write(4, "x", 1) != 1)
 		return 6;
-	if (strcmp(mode, "linger") == 0) {
+	if (strcmp(mode, "linger") == 0 || strcmp(mode, "slowterm") == 0) {
 		pid_t sp = fork();
 
 		if (sp == 0) {
+			if (mode[0] == 's') {
+				struct sigaction sa;
+				FILE *l;
+
+				memset(&sa, 0, sizeof sa);
+				sa.sa_handler = on_term;
+				sigaction(SIGTERM, &sa, NULL);
+				for (fd = 0; fd < 256; fd++)
+					close(fd);
+				while (!term)
+					usleep(100000);
+				for (i = 0; i < 20; i++)
+					usleep(100000);	/* 2 s, a SIGKILL meanwhile ends it before the line below */
+				snprintf(path, sizeof path, "%s.log", argv[0]);
+				if ((l = fopen(path, "a")) != NULL) {
+					fprintf(l, "clean exit\n");
+					fclose(l);
+				}
+				_exit(0);
+			}
 			for (fd = 0; fd < 256; fd++)
 				close(fd);
 			sleep(30);

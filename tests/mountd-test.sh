@@ -302,20 +302,28 @@ mnt NAME; prog
 cl send "$(rq ext4 "$E" - NAME)" > "$D/sph.out"
 replies "$D/sph.out" | grep -q "^hi|begin|no${T}1${T}[^|]*|\$"; ok $? "serve_phantom: exit 0 with nothing mounted: no 1 ($(replies "$D/sph.out"))"
 gb() { grep -c "^giveback $V/NAME $ME $G 755\$" "$D/err"; }
-mnt NAME; prog mount "owner 501"; g0=$(gb)
+um() { grep -c "^unmount $V/NAME\$" "$D/err"; }	# the test build says "unmount MNT" where it would unmount root's orphaned mount
+mnt NAME; prog mount "owner 501"; g0=$(gb); u0=$(um)
 cl send "$(rq ext4 "$E" - NAME)" > "$D/s501.out"
-replies "$D/s501.out" | grep -q "^hi|begin|no${T}1${T}"; ok $? "serve_owner_501: a mount owned by 501: no 1"
+replies "$D/s501.out" | grep -q "^hi|begin|no${T}1${T}" && test "$(um)" = "$u0"; ok $? "serve_owner_501: a mount owned by 501: no 1, and it is not unmounted (not root's)"
 test "$(gb)" = "$g0"; ok $? "serve_owner_501 (m5): something is mounted on the mount point, so it is not given back"
-mnt NAME; prog mount "exit 3"; g0=$(gb)
+mnt NAME; prog mount "exit 3"; g0=$(gb); u0=$(um)
 cl send "$(rq ext4 "$E" - NAME)" > "$D/src.out"
 replies "$D/src.out" | grep -q "^hi|begin|no${T}3${T}"; ok $? "serve_rc: exit 3: no 3 ($(replies "$D/src.out"))"
+# spec: task-16j-findings-r0.md I1 -- never a no beside an orphaned mount: root's mount of the disk left on MNT is unmounted first
+test "$(um)" = $((u0 + 1)); ok $? "serve_rc (16j I1): exit 3 with root's mount of the disk left on MNT: it is unmounted before the no"
 mnt NAME; prog "exit 3"; g0=$(gb)
 cl send "$(rq ext4 "$E" - NAME)" > "$D/src3.out"
 replies "$D/src3.out" | grep -q "^hi|begin|no${T}3${T}" && test "$(gb)" = $((g0 + 1))
 ok $? "serve_rc (m5): exit 3 with nothing mounted: the adopted mount point is given back"
-mnt NAME; prog mount "from /dev/disk99"
+mnt NAME; prog mount "from /dev/disk99"; u0=$(um)
 cl send "$(rq ext4 "$E" - NAME)" > "$D/src2.out"
-replies "$D/src2.out" | grep -q "^hi|begin|no${T}1${T}"; ok $? "serve_rc: exit 0, mounted from another device: no 1"
+replies "$D/src2.out" | grep -q "^hi|begin|no${T}1${T}" && test "$(um)" = "$u0"; ok $? "serve_rc: exit 0, mounted from another device: no 1, and that mount is not unmounted"
+# spec: 16j fix round 1 (the controller's ruling) -- a mount point not directly under /Volumes is the user's own mount, not a final no
+prog mount
+cl send "mount${T}ext4${T}$E${T}-${T}/tmp/m" > "$D/selse.out"
+test "$(replies "$D/selse.out")" = "hi|user${T}the mount point is not directly under /Volumes: your own mount|" && ! ran
+ok $? "serve_elsewhere: MNT /tmp/m: user, before anything, not run ($(replies "$D/selse.out"))"
 # spec: plan 16i, serve_encrypted -- the user's own mount, before begin, the program never run
 da "bsd=$A" kind=macfuse_apfs; mnt NAME; prog mount
 cl send "$(rq apfs "$A" - NAME)" > "$D/senc.out"
@@ -471,6 +479,24 @@ prog termexit "sleep 30"; mnt NAME
 t0=$(now); cl send "$(rq ext4 "$E" - NAME)" > "$D/sdt.out"; w=$(after "$t0" "$(eofat "$D/sdt.out")")
 test "$(replies "$D/sdt.out")" = "hi|begin|no${T}1${T}deadline|" && test "$w" -lt 40 && grep -qx sigterm "$P/log" && ! grep -q SIGKILL "$D/err"
 ok $? "serve_deadline_term: it ends on SIGTERM, within the grace (${w} tenths), with no SIGKILL"
+# spec: task-16j-findings-r0.md I1 -- after SIGTERM the program's exit 0 is judged as any other: root's mount on MNT is ok; root's mount
+#       left by a failed exit, or by SIGKILL, is unmounted before the no; nothing mounted is a no with nothing to unmount
+prog mount termzero "sleep 30"; mnt NAME; u0=$(um)
+cl send "$(rq ext4 "$E" - NAME)" > "$D/stz.out"
+test "$(replies "$D/stz.out")" = "hi|begin|ok|" && grep -qx sigterm "$P/log" && test "$(um)" = "$u0"
+ok $? "serve_term_ok (16j I1): exit 0 after SIGTERM with root's mount on MNT: ok, nothing unmounted ($(replies "$D/stz.out"))"
+prog termzero "sleep 30"; mnt NAME; u0=$(um)
+cl send "$(rq ext4 "$E" - NAME)" > "$D/stz2.out"
+replies "$D/stz2.out" | grep -q "^hi|begin|no${T}1${T}" && grep -qx sigterm "$P/log" && test "$(um)" = "$u0"
+ok $? "serve_term_nothing (16j I1): exit 0 after SIGTERM with nothing mounted: no 1, nothing to unmount ($(replies "$D/stz2.out"))"
+prog mount termexit "sleep 30"; mnt NAME; u0=$(um)
+cl send "$(rq ext4 "$E" - NAME)" > "$D/stx.out"
+test "$(replies "$D/stx.out")" = "hi|begin|no${T}1${T}deadline|" && test "$(um)" = $((u0 + 1))
+ok $? "serve_term_orphan (16j I1): ended by SIGTERM with root's mount left on MNT: unmounted, then no 1 deadline ($(replies "$D/stx.out"))"
+prog mount ignoreterm "sleep 30"; mnt NAME; u0=$(um)
+cl send "$(rq ext4 "$E" - NAME)" > "$D/skx.out"
+test "$(replies "$D/skx.out")" = "hi|begin|no${T}1${T}deadline|" && test "$(um)" = $((u0 + 1))
+ok $? "serve_kill_orphan (16j I1): SIGKILLed with root's mount left on MNT: unmounted, then no 1 deadline ($(replies "$D/skx.out"))"
 # spec: plan 16i, serve_deadline_pgid_reused (R1) -- the CLI's group ends, a fresh group is named after it: left alone
 prog ignoreterm cliend "sleep 30"; mnt NAME
 cl send "$(rq ext4 "$E" - NAME)" > "$D/sdr.out"

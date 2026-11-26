@@ -8,6 +8,7 @@
  *   exit N       exit N                           sleep N    sleep N s before exiting
  *   chatty       write 1 MiB to stdout first, in lines of 1 KiB
  *   ignoreterm   SIGTERM is logged ("sigterm") and ignored     termexit   SIGTERM is logged and ends it (exit 143)
+ *   termzero     SIGTERM is logged and ends it with exit 0 (a program whose SIGTERM came after its mount was made)
  *   child        a "mount_macfuse" child in its own group (the program's), sleeping 30 s ("child PID")
  *   cli          a "CLI" child leading a group of its own (setpgid), sleeping 30 s ("cli PID"); prints "cli-pgid PID"
  *   pgidline N   print "cli-pgid N", starting nothing (a CLI group the test's process table stands in for)
@@ -53,7 +54,7 @@ static void on_term(int sig)
 		close(fd);
 	}
 	if (termexit)
-		_exit(143);
+		_exit(termexit == 2 ? 0 : 143);
 }
 
 static pid_t sleeper(int own_group)
@@ -99,6 +100,7 @@ int main(int argc, char **argv)
 			else if (!strcmp(w, "chatty")) chatty = 1;
 			else if (!strcmp(w, "ignoreterm")) ignore = 1;
 			else if (!strcmp(w, "termexit")) termexit = 1;
+			else if (!strcmp(w, "termzero")) termexit = 2;
 			else if (!strcmp(w, "child")) child = 1;
 			else if (!strcmp(w, "cli")) cli = 1;
 			else if (!strcmp(w, "cliend")) cliend = 1;

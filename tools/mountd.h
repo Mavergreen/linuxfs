@@ -43,7 +43,9 @@ struct mountd_req { char fs[8], bsd[40], mnt[1024]; int ro, owners; };
  * - FLAGS is -, ro, owners, ro,owners or owners,ro;
  * - MNT is /Volumes/ and one component of at most 255 bytes, not . or .., with no byte below 0x20 and no 0x7f (it comes
  *   last, so it may hold spaces, but a tab makes a sixth field).
- * 0 with *r filled, or -1 with *why a fixed reason (never the caller's text). */
+ * 0 with *r filled, or -1 with *why a fixed reason (never the caller's text). A request well formed in every other way whose MNT
+ * (with no control byte) is not /Volumes/ and one component, not . or .., gives 1 with *r filled and *why "... your own mount": no
+ * request root serves, so the user's own mount (user), not a final no (16j fix round 1). */
 int mountd_parse(const char *buf, size_t len, struct mountd_req *r, const char **why);
 
 /* Who is asking. MP_SERVE: the console user (and not root). MP_ROOT: root, which mounts by itself (a final no). MP_USER: any
