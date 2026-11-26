@@ -356,6 +356,18 @@ int fsrules_from_disk(const char *f_mntfromname, const char *whole)
 	return *r == '\0';
 }
 
+int fsrules_mount_blocks(const char *f_mntfromname, const char *bsd)
+{
+	char whole[40];
+
+	if (!f_mntfromname || !fsrules_whole_disk(bsd, whole, sizeof whole))
+		return 0;
+	if (strcmp(whole, bsd) == 0)
+		return fsrules_from_disk(f_mntfromname, whole);
+	return strncmp(f_mntfromname, "/dev/", 5) == 0 &&
+	       (strcmp(f_mntfromname + 5, bsd) == 0 || strcmp(f_mntfromname + 5, whole) == 0);
+}
+
 int fsrules_node_owner_ok(uid_t node, uid_t peer)
 {
 	return node == 0 || node == peer;

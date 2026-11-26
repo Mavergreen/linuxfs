@@ -154,6 +154,20 @@ int main(int argc, char **argv)
 		is(fsrules_from_disk(NULL, "disk2"), 0, "from_disk: NULL is not");
 		is(fsrules_from_disk("/dev/disk2", NULL), 0, "from_disk: no disk is never matched");
 	}
+	/* spec: final review r0 C1 -- what a mount already there refuses: a partition only when it or its whole disk is mounted (its
+	 * siblings mount beside it, as HFS+'s do); a whole disk when it or any of its partitions is */
+	is(fsrules_mount_blocks("/dev/disk2s1", "disk2s1"), 1, "mount_blocks: disk2s1 by a mount from /dev/disk2s1");
+	is(fsrules_mount_blocks("/dev/disk2", "disk2s1"), 1, "mount_blocks: disk2s1 by a mount from its whole disk /dev/disk2");
+	is(fsrules_mount_blocks("/dev/disk2s2", "disk2s1"), 0, "mount_blocks: disk2s1 not by its sibling /dev/disk2s2");
+	is(fsrules_mount_blocks("/dev/disk2s11", "disk2s1"), 0, "mount_blocks: disk2s1 not by /dev/disk2s11");
+	is(fsrules_mount_blocks("/dev/disk22", "disk2s1"), 0, "mount_blocks: disk2s1 not by /dev/disk22, another disk");
+	is(fsrules_mount_blocks("/dev/disk2", "disk2"), 1, "mount_blocks: disk2 by a mount from /dev/disk2");
+	is(fsrules_mount_blocks("/dev/disk2s3", "disk2"), 1, "mount_blocks: disk2 by a mount from its partition /dev/disk2s3");
+	is(fsrules_mount_blocks("/dev/disk22s1", "disk2"), 0, "mount_blocks: disk2 not by /dev/disk22s1");
+	is(fsrules_mount_blocks("/dev/rdisk2s1", "disk2s1"), 0, "mount_blocks: not by a raw node");
+	is(fsrules_mount_blocks("linuxfs@disk2s1", "disk2s1"), 0, "mount_blocks: not by linuxfs@disk2s1");
+	is(fsrules_mount_blocks(NULL, "disk2s1"), 0, "mount_blocks: NULL is not");
+	is(fsrules_mount_blocks("/dev/disk2s1", "disk2s"), 0, "mount_blocks: a request that is not a BSD name is never matched");
 	/* spec: item 6 (fsname=/dev/<bsd>) -- root's force-unmount takes only a mount root made itself: one of our six, of
 	 * the bundle's own fs, from /dev/<bsd>, owned by root; anything else on that mount point is someone else's */
 	is(fsrules_mount_is_roots("ext4", "disk2s1", "macfuse_ext4", "/dev/disk2s1", 0), 1, "roots: ext4 mounted by root from /dev/disk2s1");

@@ -99,6 +99,12 @@ int fsrules_whole_disk(const char *bsd, char *out, size_t outlen);
  * /dev/WHOLEs<digits>. /dev/disk22 is not disk2's, nor is a raw node or any other name. NULL arguments give 0. */
 int fsrules_from_disk(const char *f_mntfromname, const char *whole);
 
+/* Whether a mount from F_MNTFROMNAME already there refuses a mount of BSD (final review r0 C1, as HFS+'s partitions mount side
+ * by side): for a partition diskNsM, a mount from exactly /dev/diskNsM or from its whole disk /dev/diskN; for a whole disk
+ * diskN, a mount from /dev/diskN or any of its partitions (fsrules_from_disk). A sibling partition never refuses. NULL, or a
+ * BSD that is not a BSD name, gives 0. */
+int fsrules_mount_blocks(const char *f_mntfromname, const char *bsd);
+
 /* Whose disk it is, the one rule both root processes use (the helper's open, probe and uuid; the mount daemon's judge): 1 when
  * the disk's node (/dev/BSD's st_uid) is root's, the Mac's own, or the asking user PEER's, as hdiutil makes an image's node for
  * the user who attached it; else 0. The mount daemon adds that an image's node must be the peer's. */

@@ -842,9 +842,10 @@ static int mnt_table(struct statfs **m)
 	return n > 0 ? n : -1;
 }
 
-/* Whether anything is mounted from the disk WHOLE or any of its partitions (*from_disk), and anything on MNT (*on_mnt), as
- * root's mount program checks (16f): 0, or -1 when the table cannot be read */
-static int table_facts(const char *whole, const char *mnt, int *from_disk, int *on_mnt)
+/* Whether anything mounted refuses BSD (*from_disk: fsrules_mount_blocks, BSD itself or its whole disk, and for a whole disk any of
+ * its partitions; a sibling partition never: final review r0 C1), and anything on MNT (*on_mnt), as root's mount program checks
+ * (16f): 0, or -1 when the table cannot be read */
+static int table_facts(const char *bsd, const char *mnt, int *from_disk, int *on_mnt)
 {
 	struct statfs *m;
 	int n = mnt_table(&m), i;
@@ -852,7 +853,7 @@ static int table_facts(const char *whole, const char *mnt, int *from_disk, int *
 	if (n < 0)
 		return -1;
 	for (i = 0; i < n; i++) {
-		*from_disk |= fsrules_from_disk(m[i].f_mntfromname, whole);
+		*from_disk |= fsrules_mount_blocks(m[i].f_mntfromname, bsd);
 		*on_mnt |= strcmp(m[i].f_mntonname, mnt) == 0;
 	}
 	return 0;
@@ -1344,7 +1345,7 @@ static void work(int c, uid_t peer, const struct mountd_req *r)
 	if (!fsrules_whole_disk(r->bsd, whole, sizeof whole) ||
 	    snprintf(mnt, sizeof mnt, "%s/%s", volumes_dir(), r->mnt + strlen(VOLUMES)) >= (int)sizeof mnt)
 		finish(MD_REFUSE, 1, "not a BSD disk name");
-	if (table_facts(whole, mnt, &from_disk, &on_mnt) != 0)
+	if (table_facts(r->bsd, mnt, &from_disk, &on_mnt) != 0)
 		finish(MD_REFUSE, 1, "the mount table cannot be read");
 
 	/* 3. the probe (a superblock), the console user's preferences, the verdict */

@@ -70,14 +70,15 @@ enum mountd_verdict { MD_MOUNT, MD_USER, MD_REFUSE };
 
 /* The spec's checks (§1, "Legitimacy"), in order, for request R from PEER of disk D, which the probe named TYPE (NULL: none it
  * knows) with probe FLAGS (FSF_*), under the console user's preferences P; MOUNTED_BSD and MOUNTED_MNT are whether the mount
- * table has anything from the disk (whole or any partition) and anything on MNT:
+ * table has anything that refuses BSD (fsrules_mount_blocks: BSD itself or its whole disk; for a whole disk, any of its
+ * partitions too; never a sibling partition) and anything on MNT:
  * 0. PEER 0 is refused, "root mounts by itself" (the design's final no for root; mountd_peer's MP_ROOT answers it first);
  * 1. DiskArbitration's facts: D is R's BSD, its kind exactly macfuse_<FS>, no VolumePath, a leaf;
  * 2. whose disk it is: unless fsrules_node_owner_ok(node_uid, PEER), and for an image unless node_uid is PEER, MD_USER
  *    ("not your disk: your own mount"). Root never publishes another user's disk; the user's own path still meets the
  *    helper's owner rule;
  * 3. the helper's media rule (helper_media_refusal), read-write unless R is ro;
- * 4. nothing mounted from the disk or on MNT;
+ * 4. nothing mounted that refuses BSD, and nothing on MNT;
  * 5. TYPE is fsrules_probe_type(FS), fsrules_claims(FS, TYPE, removable, P) holds (else rc 3), and an encrypted volume is
  *    MD_USER.
  * *rc is 3 for the claims refusal and 1 for every other refusal (0 otherwise); *why a fixed reason ("" for MD_MOUNT). */

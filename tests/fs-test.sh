@@ -15,7 +15,8 @@ SDK=$(sh "$SHIPYARD_SCRIPTS/fetch_sdk.sh" 2>/dev/null) || exit 1
   -o "$D/linuxfs-fs" "$ROOT/tools/fs.c" "$ROOT/tools/fsrules.c" "$ROOT/tools/plist.c" "$ROOT/tools/probe.c" "$ROOT/tools/trust.c" \
   -framework CoreFoundation -framework DiskArbitration || exit 1
 for n in macfuse_ext4.util macfuse_ntfs.util macfuse_btrfs.util fsck_macfuse_ext4 mount_macfuse_ext4 bogus.util; do cp "$D/linuxfs-fs" "$D/$n"; done
-sh "$ROOT/build/linux-host.sh" sh -c "cd '$D' && sh '$ROOT/tests/lib/probe-images.sh' '$D' && blkid -s UUID -o value ext4.img > ext4.uuid && blkid -s UUID -o value btrfs.img > btrfs.uuid" || exit 1
+# gpt2.img: two ext4 partitions on one GPT disk (tests/lib/gpt-wrap.py), for the sibling partitions (final review r0 C1)
+sh "$ROOT/build/linux-host.sh" sh -c "cd '$D' && sh '$ROOT/tests/lib/probe-images.sh' '$D' && blkid -s UUID -o value ext4.img > ext4.uuid && blkid -s UUID -o value btrfs.img > btrfs.uuid && python3 -I '$ROOT/tests/lib/gpt-wrap.py' ext4.img gpt2.img 0FC63DAF-8483-4772-8E79-3D69D8477DE4 ext4.img 0FC63DAF-8483-4772-8E79-3D69D8477DE4" || exit 1
 n=0 bad=0
 # spec: Task 16j -- the console user's mount program asks root's daemon first; no case here meets a real one (the ask: cases name their own)
 LINUXFS_MOUNTD_SOCK=$D/no-mountd.sock; export LINUXFS_MOUNTD_SOCK
@@ -31,9 +32,9 @@ cleanup() {
   for d in $devs; do hdiutil detach -quiet -force "$d" 2>/dev/null; done; }
 trap cleanup EXIT
 trap 'exit 1' INT TERM HUP
-e=$(att ext4.img); b=$(att btrfs.img); t=$(att ntfs.img); devs="$e $b $t"
-echo "# attached $e $b $t"
-E=${e#/dev/}; B=${b#/dev/}; T=${t#/dev/}
+e=$(att ext4.img); b=$(att btrfs.img); t=$(att ntfs.img); g=$(att gpt2.img); devs="$e $b $t $g"
+echo "# attached $e $b $t $g"
+E=${e#/dev/}; B=${b#/dev/}; T=${t#/dev/}; G=${g#/dev/}
 plist() { printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>%s</dict></plist>\n' "$2" > "$1"; }
 plist "$D/empty.plist" ""
 plist "$D/take.plist" "<key>NTFSTakeover</key><true/>"
@@ -517,34 +518,72 @@ tabplan() { # MNTTAB-LINE: the plan against a mount table of that line
   printf '%s\n' "$1" > "$M/mnttab"
   FP_ENV="LINUXFS_FS_TEST_MNTTAB=$M/mnttab" fplan "$F2" "/dev/$E" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc=$?; }
 tabplan "$(printf 'macfuse_ext4\t/dev/disk99\t%s\t0' "$V/NAME")"
-test $rc = 1 && grep -qx "linuxfs-mount: refused: something is mounted on the mount point or from disk $E already" "$M/plan.err" && ! grep -q '^fd3' "$M/plan"
+test $rc = 1 && grep -qx "linuxfs-mount: refused: something is mounted on the mount point or from $E or its disk already" "$M/plan.err" && ! grep -q '^fd3' "$M/plan"
 ok $? "root plan: a mount on MNT → refused (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
 tabplan "$(printf 'hfs\t/dev/%s\t/Volumes/other\t501' "$E")"
 test $rc = 1 && grep -q '^linuxfs-mount: refused: something is mounted' "$M/plan.err" && ! grep -q '^fd3' "$M/plan"
 ok $? "root plan: a mount from /dev/$E elsewhere → refused (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
 tabplan "$(printf 'hfs\t/dev/%s1\t/Volumes/other\t0\nhfs\t/dev/disk0s2\t%s/other\t0\nhfs\t/dev/r%s\t/x\t0' "$E" "$V" "$E")"
 test $rc = 0 && grep -q '^fd3' "$M/plan"; ok $? "root plan: other mounts (/dev/${E}1, another mount point, /dev/r$E) do not refuse it (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
-# spec: Task 16f fix round 1 (m4) -- a disk is locked and checked whole: the lock is the whole disk's (disk2 for disk2sN), and a mount
-#       from /dev/<whole> or any /dev/<whole>s<N> refuses; partitions of one disk mount one after another, never beside the whole disk
+# spec: Task 16f fix round 1 (m4), and final review r0 C1 -- a whole disk and its partitions exclude each other (a mount from
+#       /dev/<whole> refuses a partition; one from any /dev/<whole>s<N> refuses the whole disk), and sibling partitions do not:
+#       each is its own volume, as HFS+'s are (a disk with an HFS+ and an ext4 partition mounts both). $G is gpt2.img: two ext4
+#       partitions, ${G}s1 and ${G}s2
+test -b "/dev/${G}s1" && test -b "/dev/${G}s2"; ok $? "gpt2.img attached as $G with two partitions, ${G}s1 and ${G}s2"
 tabplan "$(printf 'hfs\t/dev/%ss1\t/Volumes/other\t501' "$E")"
-test $rc = 1 && grep -q "^linuxfs-mount: refused: something is mounted .* disk $E already" "$M/plan.err" && ! grep -q '^fd3' "$M/plan"
+test $rc = 1 && grep -q "^linuxfs-mount: refused: something is mounted .* from $E or its disk already" "$M/plan.err" && ! grep -q '^fd3' "$M/plan"
 ok $? "root plan: the whole disk $E is refused while its partition ${E}s1 is mounted (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
-printf 'hfs\t/dev/%s\t/Volumes/other\t0\n' "$E" > "$M/mnttab"
-FP_ENV="LINUXFS_FS_TEST_MNTTAB=$M/mnttab" fplan "$F2" "/dev/${E}s1" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc=$?
-test $rc = 1 && grep -q "^linuxfs-mount: refused: something is mounted .* disk $E already" "$M/plan.err" && ! grep -q '^fd3' "$M/plan"
-ok $? "root plan: a partition ${E}s1 is refused while the whole disk $E is mounted (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
-printf 'hfs\t/dev/%ss2\t/Volumes/other\t0\n' "$E" > "$M/mnttab"
-FP_ENV="LINUXFS_FS_TEST_MNTTAB=$M/mnttab" fplan "$F2" "/dev/${E}s1" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc=$?
-test $rc = 1 && grep -q "^linuxfs-mount: refused: something is mounted .* disk $E already" "$M/plan.err"
-ok $? "root plan: a partition ${E}s1 is refused while ${E}s2 is mounted (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
+gplan() { # MNTTAB-LINES DEV: the plan for DEV against a mount table of those lines
+  printf '%s\n' "$1" > "$M/mnttab"
+  FP_ENV="LINUXFS_FS_TEST_MNTTAB=$M/mnttab" fplan "$F2" "$2" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc=$?; }
+gplan "$(printf 'hfs\t/dev/%s\t/Volumes/other\t0' "$G")" "/dev/${G}s1"
+test $rc = 1 && grep -q "^linuxfs-mount: refused: something is mounted .* from ${G}s1 or its disk already" "$M/plan.err" && ! grep -q '^fd3' "$M/plan"
+ok $? "root plan: a partition ${G}s1 is refused while the whole disk $G is mounted (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
+gplan "$(printf 'macfuse_ext4\t/dev/%ss1\t/Volumes/other\t0' "$G")" "/dev/${G}s1"
+test $rc = 1 && grep -q "^linuxfs-mount: refused: something is mounted .* from ${G}s1 or its disk already" "$M/plan.err" && ! grep -q '^fd3' "$M/plan"
+ok $? "root plan: a partition ${G}s1 is refused while it is mounted elsewhere (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
+gplan "$(printf 'hfs\t/dev/%ss2\t/Volumes/other\t501' "$G")" "/dev/${G}s1"
+test $rc = 0 && grep -qx "fd3 /dev/r${G}s1 rw" "$M/plan"
+ok $? "root plan: a partition ${G}s1 mounts while its sibling ${G}s2 is mounted, an HFS+ volume (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
+gplan "$(printf 'macfuse_ext4\t/dev/%ss2\t/Volumes/other\t0' "$G")" "/dev/${G}s1"
+test $rc = 0 && grep -qx "fd3 /dev/r${G}s1 rw" "$M/plan"
+ok $? "root plan: a partition ${G}s1 mounts while its sibling ${G}s2 is root's linuxfs mount (rc $rc: $(tr '\n' ';' < "$M/plan.err"))"
+# the locks, in two levels: a partition holds its whole disk's lock shared and its own exclusive; a whole disk, its own exclusive.
+# holdn SECONDS NAME:EX|SH...: a perl that holds those locks (LK/dev.mavergreen.linuxfs.mount.NAME.lock) that long, in the
+# background ($holder); waits, bounded, until it does
+holdn() {
+  rm -f "$M/held"; hs=$1; shift
+  /usr/bin/perl -MFcntl=:flock -e 'my ($held, $secs, $dir, @l) = @ARGV; my @f; for (@l) { my ($n, $m) = split /:/; open(my $f, ">>", "$dir/dev.mavergreen.linuxfs.mount.$n.lock") or exit 1; flock($f, $m eq "SH" ? LOCK_SH : LOCK_EX) or exit 1; push @f, $f } open(my $h, ">", $held) or exit 1; close $h; sleep $secs' \
+    "$M/held" "$hs" "$LK" "$@" & holder=$!
+  i=0; while test ! -e "$M/held" && test $i -lt 50; do sleep 0.1; i=$((i + 1)); done; }
+held_plan() { # DEV OUT ERR: the plan for DEV, with an empty mount table
+  : > "$M/mnttab"; FP_ENV="LINUXFS_FS_TEST_MNTTAB=$M/mnttab" fplan "$F2" "$1" "$V/NAME" > "$2" 2> "$3"; }
+unhold() { kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null; }
+held_plan "/dev/${G}s1" "$M/plan" "$M/plan.err"; rc=$?
+GL=$LK/dev.mavergreen.linuxfs.mount.$G.lock GL1=$LK/dev.mavergreen.linuxfs.mount.${G}s1.lock
+test $rc = 0 && test -f "$GL" && test -f "$GL1" && test "$(stat -f '%Lp %l' "$GL1")" = "600 1" && /usr/bin/perl -MFcntl=:flock -e 'for (@ARGV) { open(my $f, "<", $_) or exit 1; flock($f, LOCK_EX | LOCK_NB) or exit 1 }' "$GL" "$GL1"
+ok $? "root plan: a partition's plan makes its own lock file beside its whole disk's (0600), and both are free after it (rc $rc, $(ls -l "$GL1" 2>&1))"
+held_plan "/dev/${G}s2" "$M/plan" "$M/plan.err"	# ${G}s2's lock file, made as the program makes it
+holdn 5 "$G:SH" "${G}s2:EX"	# what root's mount of ${G}s2 holds while it is under way
+held_plan "/dev/${G}s1" "$M/plan" "$M/plan.err"; rc1=$?; cp "$M/plan" "$M/plan1"; cp "$M/plan.err" "$M/plan.err1"
+held_plan "/dev/${G}s2" "$M/plan" "$M/plan.err2"; rc2=$?
+held_plan "/dev/$G" "$M/plan" "$M/plan.err3"; rc3=$?
+unhold
+test $rc1 = 0 && grep -qx "fd3 /dev/r${G}s1 rw" "$M/plan1"
+ok $? "root plan: ${G}s1 and ${G}s2 mount at once: ${G}s1 while ${G}s2's mount holds its locks (rc $rc1: $(tr '\n' ';' < "$M/plan.err1"))"
+test $rc2 = 1 && grep -qx "linuxfs-mount: refused: another mount of ${G}s2 is under way" "$M/plan.err2"
+ok $? "root plan: ${G}s2 itself is refused while its mount is under way (rc $rc2: $(tr '\n' ';' < "$M/plan.err2"))"
+test $rc3 = 1 && grep -qx "linuxfs-mount: refused: another mount of $G is under way" "$M/plan.err3"
+ok $? "root plan: the whole disk $G is refused while a partition's mount is under way (rc $rc3: $(tr '\n' ';' < "$M/plan.err3"))"
+holdn 5 "$G:EX"	# what root's mount of the whole disk holds
+held_plan "/dev/${G}s1" "$M/plan" "$M/plan.err1"; rc1=$?
+held_plan "/dev/${G}s2" "$M/plan" "$M/plan.err2"; rc2=$?
+unhold
+test $rc1 = 1 && test $rc2 = 1 && grep -qx "linuxfs-mount: refused: another mount of $G is under way" "$M/plan.err1" && grep -qx "linuxfs-mount: refused: another mount of $G is under way" "$M/plan.err2"
+ok $? "root plan: partitions ${G}s1 and ${G}s2 are refused while the whole disk's mount is under way (rc $rc1 $rc2: $(cat "$M/plan.err1" "$M/plan.err2" | tr '\n' ';'))"
 hold 5
-fplan "$F2" "/dev/${E}s1" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc1=$?
-cp "$M/plan.err" "$M/plan.err1"
-fplan "$F2" "/dev/${E}s2" "$V/NAME" > "$M/plan" 2> "$M/plan.err"; rc2=$?
 fplan "$F2" "/dev/${E}2" "$V/NAME" > "$M/plan" 2> "$M/plan.err3"; rc3=$?
-kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
-test $rc1 = 1 && test $rc2 = 1 && grep -qx "linuxfs-mount: refused: another mount of $E is under way" "$M/plan.err1" && grep -qx "linuxfs-mount: refused: another mount of $E is under way" "$M/plan.err" && test ! -e "$LK/dev.mavergreen.linuxfs.mount.${E}s1.lock"
-ok $? "root plan: partitions ${E}s1 and ${E}s2 take the whole disk's lock: refused while it is held (rc $rc1 $rc2: $(cat "$M/plan.err1" "$M/plan.err" | tr '\n' ';'))"
+unhold
 ! grep -q 'under way' "$M/plan.err3" && test -e "$LK/dev.mavergreen.linuxfs.mount.${E}2.lock"
 ok $? "root plan: ${E}2 is another disk than $E: its own lock, not refused as under way (rc $rc3: $(tr '\n' ';' < "$M/plan.err3"))"
 # spec: tools/fs.c -- test environment overrides are not honoured by the mount role's environment; the shipped build has no test code at all

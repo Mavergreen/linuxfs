@@ -249,14 +249,16 @@ stop
 
 # ---- 16i: the work (describe, judge, adopt, spawn, reply), on real -nomount images, with stand-ins for DiskArbitration
 #      (LINUXFS_MOUNTD_TEST_DA), the mount program (tests/lib/mountd-program-stub.c, in $P), /Volumes ($V) and the mount table
+# gpt2.img: two ext4 partitions on one GPT disk (tests/lib/gpt-wrap.py), for the sibling partitions (final review r0 C1)
 sh "$ROOT/build/linux-host.sh" sh -c 'truncate -s 128M "$1/ext4.img" && mkfs.ext4 -q -F -L "my data" "$1/ext4.img" &&
-  truncate -s 128M "$1/btrfs.img" && mkfs.btrfs -q -f -L backup "$1/btrfs.img" > /dev/null' _ "$D" || exit 1
+  truncate -s 128M "$1/btrfs.img" && mkfs.btrfs -q -f -L backup "$1/btrfs.img" > /dev/null &&
+  python3 -I "$2" "$1/ext4.img" "$1/gpt2.img" 0FC63DAF-8483-4772-8E79-3D69D8477DE4 "$1/ext4.img" 0FC63DAF-8483-4772-8E79-3D69D8477DE4' _ "$D" "$ROOT/tests/lib/gpt-wrap.py" || exit 1
 gunzip -c "$ROOT/tests/fixtures/apfs/enc.img.gz" > "$D/enc.img" || exit 1
 att() { hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$D/$1" | awk 'NR == 1 { print $1 }'; }
 devs=""
 trap 'kill $dp 2>/dev/null; for d in $devs; do hdiutil detach -quiet -force "$d" 2>/dev/null; done' EXIT
-E=$(att ext4.img); devs="$E"; B=$(att btrfs.img); devs="$devs $B"; A=$(att enc.img); devs="$devs $A"
-E=${E#/dev/} B=${B#/dev/} A=${A#/dev/}
+E=$(att ext4.img); devs="$E"; B=$(att btrfs.img); devs="$devs $B"; A=$(att enc.img); devs="$devs $A"; Q=$(att gpt2.img); devs="$devs $Q"
+E=${E#/dev/} B=${B#/dev/} A=${A#/dev/} Q=${Q#/dev/}
 P=$D/prog V=$D/vol; mkdir -p "$P" "$V"; G=$(stat -f %g "$V")	# a mount point's group, as made in $V
 cc -o "$P/mount_macfuse_ext4" "$ROOT/tests/lib/mountd-program-stub.c" || exit 1
 cp "$P/mount_macfuse_ext4" "$P/mount_macfuse_btrfs"; cp "$P/mount_macfuse_ext4" "$P/mount_macfuse_apfs"
@@ -346,6 +348,18 @@ test "$(replies "$D/sfn3.out")" = "hi|begin|ok|"; ok $? "serve_foreign_node: an 
 da "bsd=$E"; mnt NAME; prog mount; printf 'hfs\t/dev/%s\t/Volumes/else\t0\n' "$E" > "$P/mnttab"
 cl send "$(rq ext4 "$E" - NAME)" > "$D/smtd.out"
 replies "$D/smtd.out" | grep -q "^hi|no${T}1${T}[^|]*|\$" && ! ran; ok $? "serve_mounted: something mounted from /dev/$E: no 1, before begin"
+# spec: final review r0 C1 -- a partition is refused only when it or its whole disk is mounted; its sibling mounts beside it, as
+#       HFS+'s partitions do ($Q is gpt2.img: two ext4 partitions); a whole disk is refused when any of its partitions is mounted
+da "bsd=${Q}s1"; mnt NAME; prog mount; printf 'hfs\t/dev/%ss2\t/Volumes/else\t501\n' "$Q" > "$P/mnttab"
+cl send "$(rq ext4 "${Q}s1" - NAME)" > "$D/smsib.out"
+test "$(replies "$D/smsib.out")" = "hi|begin|ok|"; ok $? "serve_mounted: ${Q}s1 while its sibling ${Q}s2 is mounted (HFS+): ok ($(replies "$D/smsib.out"))"
+da "bsd=${Q}s1"; mnt NAME; prog mount; printf 'hfs\t/dev/%s\t/Volumes/else\t0\n' "$Q" > "$P/mnttab"
+cl send "$(rq ext4 "${Q}s1" - NAME)" > "$D/smwh.out"
+replies "$D/smwh.out" | grep -q "^hi|no${T}1${T}[^|]*|\$" && ! ran; ok $? "serve_mounted: ${Q}s1 while its whole disk $Q is mounted: no 1, before begin ($(replies "$D/smwh.out"))"
+da "bsd=$Q"; mnt NAME; prog mount; printf 'macfuse_ext4\t/dev/%ss2\t/Volumes/else\t0\n' "$Q" > "$P/mnttab"
+cl send "$(rq ext4 "$Q" - NAME)" > "$D/smpt.out"
+replies "$D/smpt.out" | grep -q "^hi|no${T}1${T}[^|]*|\$" && ! ran; ok $? "serve_mounted: the whole disk $Q while its partition ${Q}s2 is mounted: no 1, before begin ($(replies "$D/smpt.out"))"
+da "bsd=$E"
 # spec: plan 16i, serve_mnt_refusals
 mnt NAME; touch "$V/NAME/file"; prog mount
 cl send "$(rq ext4 "$E" - NAME)" > "$D/sne.out"
