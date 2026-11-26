@@ -386,6 +386,15 @@ stop_and_ask() {  # MOUNTPOINT CMD OUTPUT [WAS]
 }
 da_unmount() { retry_busy "$1" "" diskutil unmount "$1"; }  # MOUNTPOINT
 login_unmount() { bounded 600 sudo -n diskutil unmount "$1" && ! mount | grep -qF " on $1 ("; }
+# spec: cli/linuxfs image_lock -- login_lock IMG DEV: the lock file the CLI takes for DEV, a disk hdiutil attached from IMG: in
+#       _linuxfs's lock directory, named for IMG's inode and device, with -sN for a partition. (Task 19b: since Task 16 every
+#       DiskArbitration mount after login is root's and _linuxfs's too, so that directory holds many locks; the first is
+#       not DEV's)
+login_lock() {
+  ll_p=; case ${2#/dev/} in disk*s*) ll_p=-s${2##*s} ;; esac
+  printf '%s/linuxfs-image-%s-%s%s.lock\n' /private/var/db/linuxfs/Library/Caches/dev.mavergreen.linuxfs/locks \
+    "$(ls -i "$1" | awk '{ print $1 }')" "$(stat -f %d "$1")" "$ll_p"
+}
 login_eject() {  # whole disk: ejected, and no _linuxfs lklfuse within 10 s
   bounded 600 sudo -n diskutil eject "$1" || return 1
   j=0; while [ -n "$(lklfuses | awk '$1 == "_linuxfs"')" ]; do j=$((j + 1)); [ $j -le 100 ] || { lklfuses; return 1; }; sleep 0.1; done
@@ -1007,8 +1016,9 @@ if [ -n "$oldauto" ] && sudo -n true 2> /dev/null; then
             check "before login: what the user wrote reads back" rw_reads "$mp"
             # spec: tools/fs.c mount_by_root -- the CLI failing before lklfuse answers INIT (its lock held, so lklfuse exits at
             #       once): the mount fails, nothing is left mounted, and no root mount_macfuse survives (macFUSE's, if one does)
-            # spec: tools/open.c fuse_chan -- (lklfuse's own command line names /dev/fd/7, the lock the opener holds; the file is the only one in _linuxfs's lock directory)
-            lk=$(sudo -n sh -c 'ls "$1"/*.lock 2> /dev/null | head -n 1' _ /private/var/db/linuxfs/Library/Caches/dev.mavergreen.linuxfs/locks)
+            # spec: tools/open.c fuse_chan -- (lklfuse's own command line names /dev/fd/7, the lock the opener holds; the file is
+            #       login_lock's, the one the CLI named for $dev, which the mount just made)
+            lk=$(login_lock "$W/img/login-ext4.img" "$dev"); sudo -n test -f "$lk" || lk=
             if [ -n "$lk" ] && login_unmount "$mp"; then
               sudo -n -u _linuxfs /usr/bin/python -c 'import fcntl, sys, time
 f = open(sys.argv[1], "a"); fcntl.flock(f, fcntl.LOCK_EX); sys.stdout.write("held\n"); sys.stdout.flush(); time.sleep(300)' "$lk" > "$W/lockhold.out" 2>&1 &
@@ -1022,7 +1032,7 @@ f = open(sys.argv[1], "a"); fcntl.flock(f, fcntl.LOCK_EX); sys.stdout.write("hel
               sudo -n kill "$hold" 2> /dev/null; sudo -n pkill -f "fcntl.flock" 2> /dev/null; wait "$hold" 2> /dev/null
               if bounded 600 sudo -n diskutil mount "$dev" > /dev/null 2>&1 && da_wait 300; then ok "before login: with the lock free, $dev mounts again"
               else notok "before login: with the lock free, $dev mounts again"; fi
-            else notok "before login: find lklfuse's lock ($lk) and unmount $mp for the held-lock case"; fi
+            else notok "before login: find lklfuse's lock ($(login_lock "$W/img/login-ext4.img" "$dev")) and unmount $mp for the held-lock case"; fi
           else notok "before login: diskutil mount mounts $dev again"; fi
         else notok "before login: kill lklfuse ($lp)"; fi
         check "before login: eject unmounts and leaves no lklfuse" login_eject "$disk" && disk=

@@ -896,6 +896,11 @@ expect census_busy_finder grep -q 'eject disk' "$S/calls"
 expect census_busy_shot test "$(grep -c 'screencapture -x .*-busy-eject.png' "$S/calls")" -eq 2
 expect census_busy_force_hfs grep -q '^diskutil unmount force .*/vols/busy-hfs-ext4$' "$S/calls"
 expect census_busy_force_unmount_fs grep -q '^diskutil unmount force .*/vols/busy-ext4$' "$S/calls"
+# (Task 19b) Finder's refused eject leaves UnmountAssistantAgent retrying it until it succeeds: it is stopped after
+#   finder-eject's step, before the holder is let go and before force-unmount (push F2: it ejected ext4's disk first)
+uaa_stopped() { awk '/osascript .*eject disk/ { e = 1 } /^guest-macosx-aqua killall UnmountAssistantAgent$/ { if (e) k = 1 }
+  /^diskutil unmount force / { f = 1; ok = k; exit } END { exit !(f && ok) }' "$S/calls"; }
+expect census_busy_unmount_assistant_stopped uaa_stopped
 expect census_busy_eject_retried grep -q '^# census: retrying diskutil eject /dev/disk' "$P/busy.ext4.cycles.txt"
 expect census_busy_eject_lsof grep -q '^#   COMMAND PID USER (stub lsof lsof .*/vols/busy-ext4)' "$P/busy.ext4.cycles.txt"
 # (a)'s bar: ext4 busy once (the stub's busy-ext4), HFS+ never: not ok, and why; the only not ok
@@ -2048,6 +2053,20 @@ expect smoke_log_pos_backslash test "$(lpfn log_pos)" = "2|$(head -n 1 "$lp_l")"
 r=$( (PARITY_SYSLOG=$lp_l; lpfn eval 'p=$(log_pos); echo two >> "$PARITY_SYSLOG"; log_since "$p"') )
 expect smoke_log_since_backslash test "$r" = two
 rm -f "$lp_l"
+# (Task 19b) the before-login held-lock case holds the lock the CLI takes for $dev (cli/linuxfs image_lock: a disk hdiutil
+#   attached from an image takes the image file's lock, -sN for a partition), never the first file in _linuxfs's lock
+#   directory, which every root mount since login now fills
+ll_d=/private/var/db/linuxfs/Library/Caches/dev.mavergreen.linuxfs/locks
+if test "$(uname -s)" = Darwin; then   # platform: stat -f %d is BSD stat's device number
+  : > "$T/ll.img"
+  r=$( (eval "$(grep '^image_lock()' "$here/../cli/linuxfs")"; image_lock "$T/ll.img") )
+  ll() { (eval "$(smoke_fn login_lock)"; login_lock "$@"); }
+  expect smoke_login_lock_whole test "$(ll "$T/ll.img" /dev/disk2)" = "$ll_d/linuxfs-$r.lock"
+  expect smoke_login_lock_partition test "$(ll "$T/ll.img" /dev/disk2s1)" = "$ll_d/linuxfs-$r-s1.lock"
+  rm -f "$T/ll.img"
+else echo "ok - smoke_login_lock_whole # SKIP not a Mac"; echo "ok - smoke_login_lock_partition # SKIP not a Mac"; fi
+expect smoke_login_lock_used test -n "$(grep 'lk=$(login_lock "$W/img/login-ext4.img" "$dev")' "$sm")"
+expect smoke_login_lock_not_first test -z "$(grep -e '/\*\.lock' "$sm")"
 
 # da_unmount and da_eject (item 4, Step 2): who holds the volume is sudo -n lsof on its mount point (every user's files,
 #   root's too), never lsof +D as the user; an eject's failure also says DiskArbitration's view, mount's line and who has
