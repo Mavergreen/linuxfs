@@ -357,16 +357,25 @@ retry_busy() {  # MOUNTPOINT DISK|"" CMD...
   sleep 2; echo "# retrying $*"
   rb_o=$(bounded 600 "$@" 2>&1); rb_rc=$?; test -z "$rb_o" || printf '%s\n' "$rb_o"
   test "$rb_rc" -eq 0 && return 0
-  stop_and_ask "$rb_mp" "$*" "$rb_o"; return "$rb_rc"
+  stop_and_ask "$rb_mp" "$*" "$rb_o" "${rb_was:-}"; return "$rb_rc"
 }
 # spec: docs/superpowers/plans/2026-11-25-hfs-parity.md 16l-push Step 3 -- the user's unmount or eject of root's mount refused is
 #       the stop-and-ask (risk 1 of the amendment), not a busy volume's flake: after the retry failed, when MOUNTPOINT is still
-#       root's and nothing says busy (diskutil's busy or dissent, or a holder in sudo -n lsof), one fixed marker line
-stop_and_ask() {  # MOUNTPOINT CMD OUTPUT
-  mounted_by_root "$1" > /dev/null || return 0
-  case $3 in *[Bb]usy*|*[Dd]issent*|*"in use"*) return 0 ;; esac
-  test -z "$(bounded 300 sudo -n lsof "$1" 2> /dev/null < /dev/null | sed 1d)" || return 0
-  echo "STOP-AND-ASK: the user's $2 of root's mount at $1 was refused (risk 1 of the amendment; no holder, nothing busy): $(printf '%s' "$3" | tr '\n' ' ' | sed 's/ *$//')"
+#       root's, or was before CMD (WAS, mount's line then: da_eject's ej_was, so an eject that unmounted the volume and was
+#       refused the disk), one fixed marker line: always when diskutil says privilege or permitted; else when nothing says
+#       busy (diskutil's busy or in use, or a holder in sudo -n lsof). A dissent alone is not busy: DiskArbitration words
+#       its own refusals as dissents (r1 m1)
+stop_and_ask() {  # MOUNTPOINT CMD OUTPUT [WAS]
+  if mounted_by_root "$1" > /dev/null; then sa_how="was refused"
+  elif test -n "${4:-}" && ! printf '%s\n' "$4" | grep -q 'mounted by'; then sa_how=": the volume was unmounted, the eject was refused"
+  else return 0; fi
+  case $3 in
+  *[Pp]rivilege*|*[Pp]ermitted*) ;;
+  *[Bb]usy*|*"in use"*) return 0 ;;
+  *) test -z "$(bounded 300 sudo -n lsof "$1" 2> /dev/null < /dev/null | sed 1d)" || return 0 ;;
+  esac
+  case $sa_how in :*) ;; *) sa_how=" $sa_how" ;; esac
+  echo "STOP-AND-ASK: the user's $2 of root's mount at $1$sa_how (risk 1 of the amendment): $(printf '%s' "$3" | tr '\n' ' ' | sed 's/ *$//')"
 }
 da_unmount() { retry_busy "$1" "" diskutil unmount "$1"; }  # MOUNTPOINT
 login_unmount() { bounded 600 sudo -n diskutil unmount "$1" && ! mount | grep -qF " on $1 ("; }
@@ -378,7 +387,7 @@ da_eject() {  # whole disk, mount point: the user's eject (no sudo); first, for 
   #             pids of the lklfuse serving it (ej_pids: root's mount's, by its record; else the user path's, by its command)
   ej_was=$(mount | grep -F " on $2 (")
   ej_pids=$(root_lklfuse_of "$2"); test -n "$ej_pids" || ej_pids=$(lklfuse_on "$2" | awk '{ print $2 }')
-  retry_busy "$2" "$1" diskutil eject "$1"
+  rb_was=$ej_was; retry_busy "$2" "$1" diskutil eject "$1"; ej_rc=$?; rb_was=; return "$ej_rc"
 }
 pid_gone() { while ps -p "$1" > /dev/null 2>&1; do sleep 0.1; done; }  # PID
 da_lklfuse_gone() {  # MP: after da_eject, each of its ej_pids gone (30 s each), and no lklfuse whose command ends in MP within 10 s;

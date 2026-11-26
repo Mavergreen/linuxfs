@@ -2058,7 +2058,9 @@ census_later() {
 #   census_lklfuse_on's read of root's records (sudo and ps, 10 s each) is inside census_lklfuse_gone's 30 s bound, and
 #   adds 20 s to census_sweep_disk's path with no mount line (64 s, under the 137 counted), and to census_detach_checked's
 #   other callers (r0 M2): census_attach's not-mounted path and the stall's setup-failure detaches, each counted aside (the
-#   stall's would fit its iteration's 63 regardless: 62.3 + 20 / 60 = 62.6);
+#   stall's would fit its iteration's 63 regardless: 62.3 + 20 / 60 = 62.6); census_names_mode's sudo cat of _linuxfs's log
+#   after each root attach (bounded at 10 s; about 45 a busy census, one a stall iteration) is a local read, counted as
+#   typical within the names reads' 5 s, as they are, not at its bound (r1 m3);
 #   census_later 5 + 205 / 60 = 8.4, 9;
 #   a stall iteration 60 + 137 / 60 = 62.3, 63 (counted on each, though only the last is followed by the sweep);
 #   anything else 11
