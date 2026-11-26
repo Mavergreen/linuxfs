@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>dev.mavergreen.linuxfs.mountd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.mountd</string>
+	</array>
+	<key>Sockets</key>
+	<dict>
+		<key>Listener</key>
+		<dict>
+			<key>SockPathName</key>
+			<string>/var/run/dev.mavergreen.linuxfs.mountd.sock</string>
+			<key>SockPathMode</key>
+			<integer>438</integer>
+			<key>SockType</key>
+			<string>stream</string>
+			<key>SockListenBacklog</key>
+			<integer>128</integer>
+		</dict>
+	</dict>
+	<key>AbandonProcessGroup</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/var/log/dev.mavergreen.linuxfs.mountd.log</string>
+</dict>
+</plist>

@@ -7,9 +7,69 @@
 #          --noauto-remove-all), unloads the root helper and the console user's automount agent before their files go,
 #          removes the volume icons the postinstall made in the bundles (not in the receipt, so they would keep the bundles'
 #          directories), and removes the _linuxfs account and its home when nothing runs as it. An lklfuse under the .d directory counts as mounted too.
+#          The mount daemon is unloaded first, so no root mount can start during the check; then it waits, polling each second
+#          for up to 30 s, while a request already runs (spec §6: its processes are abandoned process groups, which unloading
+#          does not stop): a mountd process (by its full path), one of the six mount_macfuse_<fs>, or a disk's lock held. If one
+#          still runs ("a mount is under way"), or a volume is mounted, it loads mountd again and exits 1. Once no lock is held
+#          it removes the lock directory too; the daemon's log, /var/log/dev.mavergreen.linuxfs.mountd.log, stays.
 [ "${MAVERGREEN_ROOT:-/}" = / ] || exit 0
 prefix=/usr/local/mavergreen/linuxfs
 priv=/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d
+mountd=/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.mountd
+lockdir=/var/db/dev.mavergreen.linuxfs.locks
+lock_owner=0
+wait_s=30
+mountd_plist=/Library/LaunchDaemons/dev.mavergreen.linuxfs.mountd.plist
+launchctl unload "$mountd_plist" 2>/dev/null || :
+# requests: the mount daemon's own processes (a request's child before it takes a lock) and the bundles' mount programs, each of
+# the six named exactly, as running
+requests() {
+  ps -axww -o command= 2>/dev/null | awk -v m="$mountd" '
+    { c = $0; sub(/^[ \t]+/, "", c); n = c; sub(/[ \t].*/, "", n); sub(/.*\//, "", n) }
+    c == m || index(c, m " ") == 1 { print; next }
+    n ~ /^mount_macfuse_(ext4|ntfs|btrfs|xfs|f2fs|apfs)$/ { print }'
+}
+# locks: prints absent, skipped (the directory is not root's alone: a directory, not a symlink, 0700), held or free. Each lock
+# file is opened without following a link and without waiting (a FIFO or device is never waited on), only a regular file is
+# probed, and with a shared lock taken without waiting: an exclusive lock (a mount's) shows, and a root-path mount of that disk
+# is put off only for the probe's instant. Each file's probe is bounded at 2 s, and one that runs out counts as held.
+locks() {
+  /usr/bin/perl -MFcntl=:DEFAULT,:flock,:mode -e '
+    my ($dir, $owner) = @ARGV;
+    my @st = lstat $dir or do { print "absent\n"; exit 0 };
+    unless (S_ISDIR($st[2]) && $st[4] == $owner && ($st[2] & 07777) == 0700) { print "skipped\n"; exit 0 }
+    opendir(my $dh, $dir) or do { print "skipped\n"; exit 0 };
+    my $held = 0;
+    for my $n (readdir $dh) {
+      next unless $n =~ /\Adev\.mavergreen\.linuxfs\.mount\.[^\/]+\.lock\z/;
+      my $fh;
+      my $ok = eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm 2;
+        if (sysopen($fh, "$dir/$n", O_RDONLY|O_NONBLOCK|O_NOFOLLOW) && -f $fh) { $held = 1 unless flock($fh, LOCK_SH|LOCK_NB) }
+        alarm 0;
+        1;
+      };
+      alarm 0;
+      $held = 1 unless $ok;
+      close $fh if $fh;
+    }
+    print $held ? "held\n" : "free\n";' "$lockdir" "$lock_owner" 2>/dev/null
+}
+waited=0
+while :; do
+  req="$(requests)"; lk="$(locks)"
+  [ -n "$req" ] || [ "$lk" = held ] || break
+  [ "$waited" -lt "$wait_s" ] || break
+  sleep 1; waited=$((waited + 1))
+done
+if [ -n "$req" ] || [ "$lk" = held ]; then
+  launchctl load -w "$mountd_plist" 2>/dev/null || :
+  echo "linuxfs: a mount is under way; let it finish, then run: sudo mavergreen uninstall linuxfs" >&2
+  [ -z "$req" ] || printf '%s\n' "$req" | awk '{ print "  " $0 }' >&2
+  [ "$lk" != held ] || echo "  a disk's lock in $lockdir is held" >&2
+  exit 1
+fi
 running="$(ps -axww -o command= 2>/dev/null | awk -v p="$prefix/libexec/lklfuse" -v q="$priv/lklfuse" 'index($0, p " ") == 1 || index($0, q " ") == 1 { print }')" || running=
 [ -n "$running" ] || running="$(ps -axww -o pid,command 2>/dev/null | awk -v p="$prefix/libexec/lklfuse" -v q="$priv/lklfuse" '{ sub(/^ *[0-9]+ /, "") } index($0, p " ") == 1 || index($0, q " ") == 1 { print }')"
 if [ -z "$running" ]; then
@@ -21,6 +81,8 @@ if [ -z "$running" ]; then
   user=$(stat -f %Su /dev/console 2>/dev/null); lw=$(pgrep -x -u "$user" loginwindow 2>/dev/null | head -n 1)
   [ -z "$lw" ] || launchctl bsexec "$lw" sudo -u "$user" launchctl unload -S Aqua /Library/LaunchAgents/dev.mavergreen.linuxfs.agent.plist 2>/dev/null || :
   for fs in ext4 ntfs btrfs xfs f2fs apfs; do rm -f "/System/Library/Filesystems/macfuse_$fs.fs/Contents/Resources/linuxfs.icns"; done
+  # the disks' lock files, once the probe found none held in a directory that is root's alone (one that is not stays, as it is)
+  [ "$lk" != free ] || rm -rf "$lockdir"
   # _linuxfs and its home go once nothing runs as it. DiskArbitration is not restarted: there is no post-uninstall hook, so its
   # list of bundles stays stale, and the missing probes fail, which reads as "not recognised", until the next reboot.
   if pgrep -u _linuxfs > /dev/null 2>&1; then
@@ -33,6 +95,7 @@ if [ -z "$running" ]; then
   fi
   exit 0
 fi
+launchctl load -w "$mountd_plist" 2>/dev/null || :
 echo "linuxfs is in use; unmount these volumes first (linuxfs unmount MOUNTPOINT), then run: sudo mavergreen uninstall linuxfs" >&2
 printf '%s\n' "$running" | awk '{ print "  " $NF }' >&2
 exit 1

@@ -3,7 +3,8 @@
 #   usage: stage.sh --built DIR --out STAGE [--version V]
 #          Lays out linuxfs's install tree under STAGE (replaced): DIR/lklfuse as libexec/lklfuse, the CLI, prober and
 #          linuxfs-open when DIR has them, DIR/linuxfs-helper as /Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper
-#          with its LaunchDaemon, DIR/linuxfs-agent with its LaunchAgent, and packaging/pre-uninstall as libexec/mavergreen/pre-uninstall, all under
+#          with its LaunchDaemon, DIR/linuxfs-mountd as /Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.mountd with its
+#          LaunchDaemon, DIR/linuxfs-agent with its LaunchAgent, and packaging/pre-uninstall as libexec/mavergreen/pre-uninstall, all under
 #          LINUXFS_PREFIX (build/lib.sh), files 0644 and programs 0755. When DIR has linuxfs-fs it also lays out the six DiskArbitration
 #          bundles, version V, under System/Library/Filesystems (linuxfs-fs copied to each bundle's macfuse_<fs>.util, mount_macfuse_<fs>
 #          and fsck_macfuse_<fs>), and Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d with copies of lklfuse, the CLI, the prober
@@ -41,6 +42,12 @@ if [ -f "$built/linuxfs-helper" ]; then
   mkdir -p "$out/Library/PrivilegedHelperTools" "$out/Library/LaunchDaemons"
   put "$built/linuxfs-helper" "$out/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper" 755
   put "$REPO_ROOT/packaging/dev.mavergreen.linuxfs.helper.plist" "$out/Library/LaunchDaemons/dev.mavergreen.linuxfs.helper.plist" 644
+fi
+# spec: root-daemon-design.md, spec §6 -- the mount daemon, root's like the helper; launchd starts it when its socket is used
+if [ -f "$built/linuxfs-mountd" ]; then
+  mkdir -p "$out/Library/PrivilegedHelperTools" "$out/Library/LaunchDaemons"
+  put "$built/linuxfs-mountd" "$out/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.mountd" 755
+  put "$REPO_ROOT/packaging/dev.mavergreen.linuxfs.mountd.plist" "$out/Library/LaunchDaemons/dev.mavergreen.linuxfs.mountd.plist" 644
 fi
 if [ -f "$built/linuxfs-agent" ]; then
   put "$built/linuxfs-agent" "$t/libexec/linuxfs-agent" 755

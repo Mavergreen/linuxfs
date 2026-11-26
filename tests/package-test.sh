@@ -24,7 +24,7 @@ V="$UP-mavericks.1"
 P=".$LINUXFS_PREFIX"
 
 mkdir -p "$T/built"
-for f in lklfuse linuxfs-probe linuxfs-open linuxfs-fs linuxfs-helper linuxfs-agent linuxfs-volicon; do printf '#!/bin/sh\n' > "$T/built/$f"; chmod 775 "$T/built/$f"; done
+for f in lklfuse linuxfs-probe linuxfs-open linuxfs-fs linuxfs-helper linuxfs-agent linuxfs-volicon linuxfs-mountd; do printf '#!/bin/sh\n' > "$T/built/$f"; chmod 775 "$T/built/$f"; done
 sh "$REPO_ROOT/build/stage.sh" --built "$T/built" --out "$T/stage" --version "$V" > "$T/log" 2>&1 ||
   { cat "$T/log" >&2; echo "FAIL: stage.sh refused the fixtures" >&2; exit 1; }
 sh "$REPO_ROOT/build/package.sh" --stage "$T/stage" --version "$V" --out "$T/dist" > "$T/log" 2>&1 ||
@@ -51,11 +51,34 @@ for e in "$P/libexec/lklfuse	100755	0/0" "$P/libexec/mavergreen/pre-uninstall	10
   "$P/libexec/linuxfs-agent	100755	0/0" "./Library/LaunchAgents/dev.mavergreen.linuxfs.agent.plist	100644	0/0"; do
   grep -qxF "$e" "$T/list" || fail "the payload lacks: $e"
 done
+# spec: root-daemon-design.md, spec §6 -- the mount daemon is root-run code, so it is where root's code goes, with its LaunchDaemon
+M=dev.mavergreen.linuxfs.mountd
+for e in "./Library/PrivilegedHelperTools/$M	100755	0/0" "./Library/LaunchDaemons/$M.plist	100644	0/0"; do
+  grep -qxF "$e" "$T/list" || fail "the payload lacks: $e"
+done
+! grep -q "^$P/.*mountd" "$T/list" || fail "something named *mountd* is under the prefix (root-run code may not be under /usr/local): $(grep "^$P/.*mountd" "$T/list" | tr '\n' ' ')"
 awk -F'\t' '$3 != "0/0" || ($2 !~ /^12/ && substr($2, length($2) - 1, 2) ~ /[2367]/) { print }' "$T/list" > "$T/bad"
 [ ! -s "$T/bad" ] || { cat "$T/bad" >&2; fail "payload entries not 0/0, or writable by group or other"; }
 grep -q "$P/libexec/linuxfs-helper\|$P/libexec/[^	]*helper" "$T/list" && fail "the root helper is under the prefix (root-run code may not be under /usr/local)"
 mkdir -p "$T/plist"; (cd "$T/plist" && gzip -dc < "$comp/Payload" | cpio -id --quiet "./Library/LaunchDaemons/$H.plist" 2>/dev/null)
 pl="$T/plist/Library/LaunchDaemons/$H.plist"
+(cd "$T/plist" && gzip -dc < "$comp/Payload" | cpio -id --quiet "./Library/LaunchDaemons/$M.plist" 2>/dev/null)
+# spec: §6 -- launchd owns the socket and starts the daemon on demand: exactly these keys, no RunAtLoad and no KeepAlive
+python3 -I - "$T/plist/Library/LaunchDaemons/$M.plist" <<'PY' || fail "$M.plist is wrong"
+import plistlib, sys
+d = plistlib.load(open(sys.argv[1], "rb"))
+def need(c, m):
+    if not c: print(m, file=sys.stderr); sys.exit(1)
+need(sorted(d) == ["AbandonProcessGroup", "Label", "ProgramArguments", "Sockets", "StandardErrorPath"], "keys %r" % sorted(d))
+need(d["Label"] == "dev.mavergreen.linuxfs.mountd", "Label %r" % d["Label"])
+need(d["ProgramArguments"] == ["/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.mountd"], "ProgramArguments %r" % d["ProgramArguments"])
+need(d["Sockets"] == {"Listener": {"SockPathName": "/var/run/dev.mavergreen.linuxfs.mountd.sock", "SockPathMode": 438,
+                                   "SockType": "stream", "SockListenBacklog": 128}}, "Sockets %r" % d["Sockets"])
+need(d["AbandonProcessGroup"] is True, "AbandonProcessGroup %r" % d["AbandonProcessGroup"])
+need(d["StandardErrorPath"] == "/var/log/dev.mavergreen.linuxfs.mountd.log", "StandardErrorPath %r" % d["StandardErrorPath"])
+need("RunAtLoad" not in d and "KeepAlive" not in d, "RunAtLoad or KeepAlive")
+PY
+if command -v plutil > /dev/null 2>&1; then plutil -lint "$T/plist/Library/LaunchDaemons/$M.plist" > /dev/null || fail "plutil -lint refuses $M.plist"; fi
 grep -q "<string>$H</string>" "$pl" 2>/dev/null || fail "the daemon's Label is not $H"
 grep -q "<string>/Library/PrivilegedHelperTools/$H</string>" "$pl" 2>/dev/null || fail "the daemon does not run /Library/PrivilegedHelperTools/$H"
 A=dev.mavergreen.linuxfs.agent
@@ -213,6 +236,13 @@ want "dscl . -create /Users/_linuxfs IsHidden 1" "IsHidden"
 want "touch /private/var/db/linuxfs/.created-group" "the made group is marked"
 [ "$(tail -n 1 "$T/calls")" = "killall diskarbitrationd" ] || fail "postinstall does not restart diskarbitrationd last: $(tail -n 1 "$T/calls")"
 grep -n 'launchctl load' "$T/calls" > /dev/null || fail "postinstall did not load the helper"
+# spec: §6 -- the postinstall unloads, then load -w's the mount daemon, after the helper and before DiskArbitration restarts
+ml=$(grep -nxF "launchctl load -w /Library/LaunchDaemons/$M.plist" "$T/calls" | cut -d: -f1)
+mu=$(grep -nxF "launchctl unload /Library/LaunchDaemons/$M.plist" "$T/calls" | cut -d: -f1)
+hl=$(grep -nxF "launchctl load -w /Library/LaunchDaemons/$H.plist" "$T/calls" | cut -d: -f1)
+kl=$(grep -nxF "killall diskarbitrationd" "$T/calls" | cut -d: -f1)
+test -n "$ml" && test -n "$mu" && test -n "$hl" && test -n "$kl" && test "$hl" -lt "$mu" && test "$mu" -lt "$ml" && test "$ml" -lt "$kl" ||
+  fail "postinstall does not unload, then load -w, the mount daemon after the helper and before restarting DiskArbitration (helper $hl, unload $mu, load $ml, killall $kl)"
 run_post "root 0" "wheel 0" 250 0 || fail "postinstall failed with the group already there"
 grep -q 'create /Groups/_linuxfs' "$T/calls" && fail "postinstall remade an existing _linuxfs group"
 want "dscl . -create /Users/_linuxfs PrimaryGroupID 250" "the existing group is reused"
@@ -273,8 +303,21 @@ printf '#!/bin/sh\nprintf "%%s\\n" "  PID COMMAND" "  412 %s/libexec/lklfuse -f 
 chmod 755 "$T/bin/ps"
 # spec: packaging/pre-uninstall -- the helper's --noauto-remove-all is a stub that logs (the real one would edit this machine's /etc/fstab)
 printf '#!/bin/sh\necho "helper $*" >> "%s/launchctl.calls"\n' "$T" > "$T/bin/helper"; chmod 755 "$T/bin/helper"
-sed "s|/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper|$T/bin/helper|g" "$REPO_ROOT/packaging/pre-uninstall" > "$T/pre-uninstall"
+# spec: §6 -- pre-uninstall's lock directory is LINUXFS_PKG_TEST_LOCKDIR here (as 16f's is LINUXFS_FS_TEST_LOCKDIR), owned by this
+#       user rather than root, its wait is LINUXFS_PKG_TEST_WAIT seconds when set, and the mount daemon it looks for in ps is
+#       under the test root; the shipped script holds only the real values, which a root-run script may not take from the
+#       environment. launchctl is a stub from the first run on.
+LINUXFS_PKG_TEST_LOCKDIR="$T/locks"
+R="$T/root/Library/PrivilegedHelperTools/$M"
+sed -e "s|/Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.helper|$T/bin/helper|g" -e "s|/Library/PrivilegedHelperTools/$M|$R|g" \
+  -e "s|^lockdir=/var/db/dev.mavergreen.linuxfs.locks\$|lockdir=$LINUXFS_PKG_TEST_LOCKDIR|" -e "s|^lock_owner=0\$|lock_owner=$(id -u)|" \
+  -e 's|^wait_s=30$|wait_s=${LINUXFS_PKG_TEST_WAIT:-30}|' "$REPO_ROOT/packaging/pre-uninstall" > "$T/pre-uninstall"
 h="$T/pre-uninstall"
+for l in "lockdir=$LINUXFS_PKG_TEST_LOCKDIR" "lock_owner=$(id -u)" 'wait_s=${LINUXFS_PKG_TEST_WAIT:-30}' "mountd=$R"; do
+  grep -qxF "$l" "$h" || { echo "FAIL: pre-uninstall has no line $l to stand the test's values in for" >&2; exit 1; }
+done
+! grep -q '/var/db/dev.mavergreen.linuxfs.locks' "$h" || { echo "FAIL: the test's pre-uninstall still names the real lock directory" >&2; exit 1; }
+printf '#!/bin/sh\necho "launchctl $*" >> "%s/launchctl.calls"\n' "$T" > "$T/bin/launchctl"; chmod 755 "$T/bin/launchctl"
 if PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > "$T/u.out" 2>&1; then fail "pre-uninstall allows uninstall while lklfuse runs"
 else grep -q /Volumes/data "$T/u.out" || fail "pre-uninstall's refusal does not name the volume: $(cat "$T/u.out")"; fi
 printf '#!/bin/sh\nprintf "%%s\\n" "  PID COMMAND" "  412 /Library/PrivilegedHelperTools/dev.mavergreen.linuxfs.d/lklfuse -f -o type=ext4 /dev/fd/3 /Volumes/dd"\n' > "$T/bin/ps"
@@ -284,7 +327,6 @@ else grep -q /Volumes/dd "$T/u.out" || fail "pre-uninstall's refusal does not na
 [ ! -s "$T/acct.calls" ] || fail "pre-uninstall touched _linuxfs while a volume was mounted: $(cat "$T/acct.calls")"
 PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/Volumes/Other sh "$h" > /dev/null 2>&1 || fail "pre-uninstall refuses for another volume"
 printf '#!/bin/sh\necho "  PID COMMAND"\necho "    1 /sbin/launchd"\n' > "$T/bin/ps"
-printf '#!/bin/sh\necho "launchctl $*" >> "%s/launchctl.calls"\n' "$T" > "$T/bin/launchctl"; chmod 755 "$T/bin/launchctl"
 PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > /dev/null 2>&1 || fail "pre-uninstall refuses with nothing mounted"
 grep -q "launchctl unload.*/Library/LaunchDaemons/$H.plist" "$T/launchctl.calls" 2>/dev/null || fail "pre-uninstall does not unload the helper"
 # spec: packaging/pre-uninstall -- linuxfs's /etc/fstab noauto lines go with it (the helper's --noauto-remove-all, as root),
@@ -316,6 +358,103 @@ rm -f "$T/created-group"
 PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > /dev/null 2>&1
 grep -q "launchctl bsexec 77 .*launchctl unload .*/Library/LaunchAgents/dev.mavergreen.linuxfs.agent.plist" "$T/launchctl.calls" ||
   fail "pre-uninstall does not unload the agent in the console session"
+
+# spec: §6, root-daemon-design.md M12, N8, R4, m1' -- pre-uninstall unloads the mount daemon first, waits (polling each second,
+#       30 s at most) while a request already runs -- a mountd process by its full path, one of the six mount_macfuse_<fs>, or a
+#       disk's lock held, probed with a shared non-blocking flock in a directory that is root's (here: this user's), 0700 and not
+#       a symlink -- then checks lklfuse; if a request still runs or the check refuses, it loads mountd again and exits 1.
+#       ps prints $T/ps.out; the lock holders are perl, each bounded by its own sleep, waited for (bounded) to hold before a run.
+printf '#!/bin/sh\ncat "%s/ps.out"\n' "$T" > "$T/bin/ps"; chmod 755 "$T/bin/ps"
+L="$LINUXFS_PKG_TEST_LOCKDIR"
+LF="$L/dev.mavergreen.linuxfs.mount.disk9.lock"
+UNL="launchctl unload /Library/LaunchDaemons/$M.plist"
+REL="launchctl load -w /Library/LaunchDaemons/$M.plist"
+holder() {  # LOCK_EX|LOCK_SH SECONDS FILE: holds FILE's flock for SECONDS in the background; holder_pid is its pid
+  rm -f "$T/held"
+  perl -MFcntl=:DEFAULT,:flock -e 'sysopen(F, $ARGV[2], O_RDWR|O_CREAT, 0600) or die "open: $!"; flock(F, $ARGV[0] eq "LOCK_EX" ? LOCK_EX : LOCK_SH) or die "flock: $!";
+    open(R, ">", $ARGV[3]) and close R; sleep $ARGV[1]' "$1" "$2" "$3" "$T/held" &
+  holder_pid=$!
+  n=0; while ! test -f "$T/held" && test $n -lt 50; do sleep 0.1; n=$((n + 1)); done
+  test -f "$T/held" || fail "the test's $1 holder of $3 never held it"
+}
+holder_gone() {  # waits, bounded at 10 s, for the holder to end
+  n=0; while kill -0 "$holder_pid" 2>/dev/null && test $n -lt 100; do sleep 0.1; n=$((n + 1)); done
+  kill "$holder_pid" 2>/dev/null || :; wait "$holder_pid" 2>/dev/null || :
+}
+uninst() {  # runs pre-uninstall with fresh logs; rc in urc
+  : > "$T/launchctl.calls"; : > "$T/acct.calls"
+  PATH="$T/bin:$PATH" MAVERGREEN_ROOT=/ sh "$h" > "$T/u.out" 2>&1 && urc=0 || urc=$?
+}
+reloaded() { grep -qxF "$REL" "$T/launchctl.calls"; }
+under_way() {  # CASE: refused with a reload of mountd after the unload, exit 1, "a mount is under way", nothing removed
+  test "$urc" -eq 1 || fail "pre-uninstall exits $urc, not 1, $1"
+  test "$(sed -n 1p "$T/launchctl.calls")" = "$UNL" || fail "pre-uninstall's first call is not mountd's unload, $1: $(sed -n 1p "$T/launchctl.calls")"
+  test "$(grep -nxF "$REL" "$T/launchctl.calls" | cut -d: -f1)" = 2 || fail "pre-uninstall does not load mountd again, at once, $1: $(tr '\n' '|' < "$T/launchctl.calls")"
+  grep -q 'a mount is under way' "$T/u.out" || fail "pre-uninstall does not say a mount is under way, $1: $(cat "$T/u.out")"
+  ! grep -q "$H.plist\|noauto-remove-all" "$T/launchctl.calls" || fail "pre-uninstall went on, $1: $(tr '\n' '|' < "$T/launchctl.calls")"
+  test ! -s "$T/acct.calls" || fail "pre-uninstall removed things, $1: $(tr '\n' '|' < "$T/acct.calls")"
+}
+went_on() {  # CASE: uninstalled, mountd unloaded first and never reloaded
+  test "$urc" -eq 0 || fail "pre-uninstall refuses ($urc), $1: $(cat "$T/u.out")"
+  test "$(sed -n 1p "$T/launchctl.calls")" = "$UNL" || fail "pre-uninstall's first call is not mountd's unload, $1: $(sed -n 1p "$T/launchctl.calls")"
+  ! reloaded || fail "pre-uninstall loaded mountd again, $1"
+  grep -q "launchctl unload /Library/LaunchDaemons/$H.plist" "$T/launchctl.calls" || fail "pre-uninstall did not unload the helper, $1"
+}
+mkdir -m 700 "$L"; : > "$LF"; chmod 600 "$LF"
+printf '%s\n' /sbin/launchd > "$T/ps.out"
+uninst; went_on "with nothing running"
+grep -qxF "rm -rf $L" "$T/acct.calls" || fail "pre-uninstall does not remove the lock directory once no lock is held: $(tr '\n' '|' < "$T/acct.calls")"
+printf '%s\n' /sbin/launchd "$LINUXFS_PREFIX/libexec/lklfuse -f -o type=ext4 /dev/fd/3 /Volumes/data" > "$T/ps.out"
+uninst
+test "$urc" -eq 1 || fail "pre-uninstall exits $urc with an lklfuse running, not 1"
+test "$(sed -n 1p "$T/launchctl.calls")" = "$UNL" && test "$(sed -n 2p "$T/launchctl.calls")" = "$REL" ||
+  fail "pre-uninstall with an lklfuse running does not unload mountd, then load it again: $(tr '\n' '|' < "$T/launchctl.calls")"
+grep -q /Volumes/data "$T/u.out" || fail "pre-uninstall's refusal does not name the volume with mountd: $(cat "$T/u.out")"
+! grep -qF "rm -rf $L" "$T/acct.calls" || fail "pre-uninstall removed the lock directory though it refused"
+printf '%s\n' /sbin/launchd > "$T/ps.out"
+holder LOCK_EX 3 "$LF"
+uninst
+kill -0 "$holder_pid" 2>/dev/null && fail "pre-uninstall did not wait for an exclusive lock's holder to let go"
+went_on "once a held lock is let go"
+holder_gone
+holder LOCK_SH 6 "$LF"
+uninst
+kill -0 "$holder_pid" 2>/dev/null || fail "pre-uninstall waited for a shared lock's holder (its probe is not LOCK_SH)"
+went_on "with a shared lock held"
+holder_gone
+for p in /System/Library/Filesystems/macfuse_ext4.fs/Contents/Resources/mount_macfuse_ext4 "$R"; do
+  printf '%s\n' /sbin/launchd "$p -o rdonly disk9 /Volumes/x" > "$T/ps.out"
+  LINUXFS_PKG_TEST_WAIT=2; export LINUXFS_PKG_TEST_WAIT
+  uninst; under_way "while ${p##*/} runs"
+  unset LINUXFS_PKG_TEST_WAIT
+done
+# controls: macFUSE's own mount_macfuse, a name outside the six, and a mountd of the same name elsewhere are not linuxfs's requests
+printf '%s\n' /sbin/launchd "/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse -o x y /Volumes/z" \
+  "/usr/local/bin/mount_macfuse_foo /Volumes/w" "$T/elsewhere/$M" > "$T/ps.out"
+LINUXFS_PKG_TEST_WAIT=2; export LINUXFS_PKG_TEST_WAIT
+uninst; went_on "with only processes that are not linuxfs's requests"
+unset LINUXFS_PKG_TEST_WAIT
+printf '%s\n' /sbin/launchd > "$T/ps.out"
+# a FIFO where a lock file goes is skipped, not opened to wait on (O_NONBLOCK, then regular files only)
+mkfifo "$L/dev.mavergreen.linuxfs.mount.disk8.lock"
+LINUXFS_PKG_TEST_WAIT=2; export LINUXFS_PKG_TEST_WAIT
+uninst; went_on "with a FIFO among the lock files"
+unset LINUXFS_PKG_TEST_WAIT
+# a lock directory that is not root's alone (here: this user's) 0700, or is a symlink, is skipped, never probed, and kept
+mv "$L" "$T/locks.real"; ln -s "$T/locks.real" "$L"
+holder LOCK_EX 6 "$T/locks.real/dev.mavergreen.linuxfs.mount.disk9.lock"
+uninst
+kill -0 "$holder_pid" 2>/dev/null || fail "pre-uninstall probed the locks through a symlinked lock directory"
+went_on "with the lock directory a symlink"
+! grep -qF "rm -rf $L" "$T/acct.calls" || fail "pre-uninstall removed a symlinked lock directory"
+holder_gone
+rm -f "$L"; mv "$T/locks.real" "$L"; chmod 755 "$L"
+holder LOCK_EX 6 "$LF"
+uninst
+kill -0 "$holder_pid" 2>/dev/null || fail "pre-uninstall probed the locks in a lock directory of mode 0755"
+went_on "with the lock directory 0755"
+! grep -qF "rm -rf $L" "$T/acct.calls" || fail "pre-uninstall removed a lock directory of mode 0755"
+holder_gone
 
 [ "$fails" -eq 0 ] || { echo "package-test: $fails failure(s)" >&2; exit 1; }
 echo "package-test: ok"

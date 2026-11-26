@@ -37,6 +37,12 @@ if [ "${3:-/}" = / ]; then
   launchctl unload /Library/LaunchDaemons/dev.mavergreen.linuxfs.helper.plist 2>/dev/null || :
   launchctl load -w /Library/LaunchDaemons/dev.mavergreen.linuxfs.helper.plist
 fi
+# linuxfs: (re)load the mount daemon, which mounts the console user's disks as root when DiskArbitration asks (launchd owns its
+# socket and starts it on demand), before DiskArbitration restarts below. Only on the running system.
+if [ "${3:-/}" = / ]; then
+  launchctl unload /Library/LaunchDaemons/dev.mavergreen.linuxfs.mountd.plist 2>/dev/null || :
+  launchctl load -w /Library/LaunchDaemons/dev.mavergreen.linuxfs.mountd.plist
+fi
 # linuxfs: "do not mount by itself" is per volume now, Apple's way: an /etc/fstab noauto entry. The root helper turns each old
 # Ignore:<LABEL> = true preference (the console user's and the machine's) into one, reading both plists and writing fstab
 # itself, and prints DOMAIN<TAB>LABEL for each it converted; those keys go, and so does the global Automount, which nothing
@@ -84,7 +90,7 @@ if [ "${3:-/}" = / ]; then
       echo "linuxfs: could not make the volume icon $icon; macfuse_$fs volumes show macFUSE's icon" >&2
   done
 fi
-# linuxfs: DiskArbitration reads the bundles when it starts, so restart it last, once the helper and agent are loaded; launchd brings it back.
+# linuxfs: DiskArbitration reads the bundles when it starts, so restart it last, once the helper, the mount daemon and agent are loaded; launchd brings it back.
 if [ "${3:-/}" = / ]; then
   killall diskarbitrationd 2>/dev/null || :
 fi

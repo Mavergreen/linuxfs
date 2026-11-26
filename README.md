@@ -52,12 +52,25 @@ An image you mount with `linuxfs mount IMAGE` is open to root's fseventsd and Sp
 it: you are an admin (in macFUSE's `admin_group`, 80 by default), or its `allow_other` tunable is 1. Then linuxfs passes
 macFUSE's `allow_root` option (and only that), so root's processes can reach the volume and Spotlight and fsevents work, as on an HFS+ disk. Non-admin users mount with no Spotlight or fsevents unless the `allow_other` tunable is 1, which lets them use `allow_root` too. That tunable also lets any user mount with `allow_other`, which opens a volume to every local user, as an HFS+ disk with "Ignore ownership" does; linuxfs does that only for a disk mounted for all users (`LINUXFS_ALL_USERS`).
 
-A disk mounted after login (by the Mac when it is connected, by `diskutil mount`, or by `linuxfs mount DEVICE`) is yours
-alone, admin or not: the Mac runs linuxfs's mount program without your groups, so macFUSE would refuse `allow_root` from
-it, and linuxfs passes it only when the `allow_other` tunable is 1. Root's fseventsd and Spotlight cannot reach such a
-disk, so neither works on it. A disk mounted before login is open to every user, root's processes included.
+A disk the Mac mounts after login (when it is connected, by `diskutil mount`, or by `linuxfs mount DEVICE`) is mounted
+by root, as one mounted before login is: linuxfs's mount daemon, which launchd starts when it is asked, mounts it for
+the user at the console. Like an HFS+ disk, it is shared with every user, root's processes included, so Spotlight and
+fsevents work on it. It also stays mounted when you log out, as an HFS+ disk does, open to whoever logs in next
+(with `owners`, Linux's ids decide what they can reach). Eject it before logging out if it should go with you.
 
-`linuxfs unmount --force` unmounts your own mount with `umount -f`, and any other linuxfs mount (one made before login)
+Some disks fall back to a mount of your own, which is yours alone, with no Spotlight or fsevents: an encrypted APFS
+volume (it needs your password), and any disk while the mount daemon is missing or busy. The Mac runs linuxfs's mount
+program for that without your groups, so macFUSE would refuse `allow_root` from it, and linuxfs passes it only when
+the `allow_other` tunable is 1.
+
+A plain `umount` of a disk the Mac mounted is refused, since root mounted it: use Finder, `diskutil unmount` or
+`linuxfs unmount`.
+
+What root mounts is limited. The daemon mounts only a disk DiskArbitration offers it, of the user at the console (or a
+disk image that user attached), never a path to an image file; and the filesystem is always served by the unprivileged
+`_linuxfs` user: lklfuse never runs as root.
+
+`linuxfs unmount --force` unmounts your own mount with `umount -f`, and any other linuxfs mount (one root made, before login or after)
 with `diskutil unmount force`. `linuxfs list`, `linuxfs status` and `linuxfs unmount DEVICE` (a volume's, or a whole disk's, as `diskutil unmountDisk`) show and unmount those too.
 
 ### Ownership
@@ -159,6 +172,16 @@ To read-write mount external disks:
 ```sh
 linuxfs prefs NTFSTakeover on
 ```
+
+### Uninstalling
+
+`sudo mavergreen uninstall linuxfs` refuses while a linuxfs volume is mounted, and while a mount is under way (it
+waits up to 30 seconds for one to finish first). Two things stay behind:
+
+- `/var/log/dev.mavergreen.linuxfs.mountd.log`, the mount daemon's log of what it could not tell syslog (a failure
+  to start). Delete it if you like.
+- The disks' lock files in `/var/db/dev.mavergreen.linuxfs.locks`, which persist across reboots, harmlessly: a lock
+  ends with the process that held it. The uninstaller removes the directory once it has found no lock held in it.
 
 ### Known issues
 
