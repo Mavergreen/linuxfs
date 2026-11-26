@@ -2314,10 +2314,14 @@ mup_l="$(printf '%s\n' 'Nov 25 dev.mavergreen.linuxfs.mountd[7]: mountd: peer ui
 expect smoke_mountd_unshared_peer_user not mup
 mup_l="$(printf '%s\n' 'Nov 25 dev.mavergreen.linuxfs.mountd[7]: mountd: peer uid 501 groups 20' "$ok_l")"
 mup_fe=never; expect smoke_mountd_unshared_peer_no_fseventsd not mup
-# r0 I2: a .fseventsd there before the write proves nothing (phase 1's mounts may have left it): not ok, and what was there said
-mup_fe=before; expect smoke_mountd_unshared_peer_stale not mup
-expect smoke_mountd_unshared_peer_stale_said grep -q "before the write" "$T/mup.out"
-expect smoke_mountd_unshared_peer_stale_unwritten test ! -e "$T/mup/da-fsevents"
+# the ruling on fix round 1's risk 1: the fresh image (made on Linux, never mounted on a Mac) is what makes .fseventsd mean root's
+#   fseventsd got in, so one made at mount time, before the write, is ok; what .fseventsd holds is printed (ls -la)
+mup_fe=before; expect smoke_mountd_unshared_peer_at_mount mup
+expect smoke_mountd_unshared_peer_ls grep -q "^\.fseventsd on $T/mup: .*total" "$T/mup.out"
+expect smoke_mountd_unshared_peer_no_absence test -z "$(smoke_fn mountd_unshared_peer | grep 'before the write')"
+expect da_cycle_peer_ls_shown test -n "$(printf '%s\n' "$dc" | grep -F 'mountd_unshared_peer "$dev" "$pos"; sed -n '"'"'s/^\.fseventsd on /# .fseventsd on /p'"'"' "$W/step-$n.log"; fi')"
+# the check's image is the first ext4 raw cycle's: da-ext4.img, unpacked afresh from IN's ext4.img.gz in the cycles loop
+expect mountd_unshared_peer_fresh_image test -n "$(sed -n '/^for c in ext4:ext4:rw /,/^done/p' "$sm" | grep -F 'if gunzip -c "$IN/$fs.img.gz" > "$W/img/da-$fs.img"; then da_cycle "$fs" "$W/img/da-$fs.img" "$pers" "$kind" raw;')"
 rm -rf "${T:?}/mup"; rm -f "${T:?}/mup.out"
 # r0 I2: each raw cycle's image is unpacked afresh from IN (phase 1 mounted and wrote IN's copy in W/img), never copied from it
 expect da_cycle_raw_fresh test -n "$(grep -F 'gunzip -c "$IN/$fs.img.gz" > "$W/img/da-$fs.img"' "$sm")" -a -z "$(grep -F 'cp "$W/img/$fs.img" "$W/img/da-$fs.img"' "$sm")"

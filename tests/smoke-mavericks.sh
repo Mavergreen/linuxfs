@@ -503,7 +503,8 @@ da_info_node() {  # MP DEV
 # spec: .superpowers/sdd/2026-11-25-hfs-parity/root-daemon-design.md revision 1, question 3 -- the non-admin proof (with kit 16d
 #   Part B): the daemon's peer, the DiskArbitration mount program's credential, is the console user and outside macFUSE's
 #   admin_group (push D: it never has the user's groups), and still its request for DEV is ok and root's fseventsd is let in:
-#   on a fresh image's volume, no .fseventsd before a write (one there proves nothing), and one within 10 s of it
+#   .fseventsd on the volume within 10 s of a write (or made at mount time). The image is what makes it mean that: fresh from
+#   IN (made on Linux, never mounted on a Mac), so any .fseventsd on it is this mount's; what it holds is printed (ls -la)
 mountd_unshared_peer() {  # DEV POS
   mup_d=${1#/dev/} mup_mp=$(info "$1" "Mount Point") mup_cu=$(stat -f %u /dev/console 2> /dev/null)
   mup_ag=$(sysctl -n vfs.generic.macfuse.tunables.admin_group 2> /dev/null) mup_s=$(log_since "$2")
@@ -513,11 +514,11 @@ mountd_unshared_peer() {  # DEV POS
   printf '%s\n' "$mup_p" | awk -v u="$mup_cu" -v g="$mup_ag" '{ if ($1 != u) bad = 1; n = split($2, a, ","); for (i = 1; i <= n; i++) if (a[i] == g) bad = 1 } END { exit bad }' ||
     { echo "a peer is not the console user, or is in admin_group"; return 1; }
   printf '%s\n' "$mup_s" | grep -qF "mountd: $mup_d on $mup_mp: ok (peer $mup_cu," || { echo "no mountd: $mup_d on $mup_mp: ok (peer $mup_cu, ...) since"; return 1; }
-  if test -e "$mup_mp/.fseventsd"; then echo ".fseventsd is on $mup_mp before the write, so the write proves nothing: $(ls -la "$mup_mp/.fseventsd" 2>&1 | tr '\n' '|')"; return 1; fi
   echo fsevents > "$mup_mp/da-fsevents" || return 1
   bounded 100 sh -c 'while ! test -d "$1/.fseventsd"; do sleep 0.2; done' _ "$mup_mp"; mup_rc=$?
   rm -f "$mup_mp/da-fsevents"
   test "$mup_rc" -eq 0 || { echo "no .fseventsd on $mup_mp within 10 s of a write"; return 1; }
+  echo ".fseventsd on $mup_mp: $(ls -la "$mup_mp/.fseventsd" 2>&1 | tr '\n' '|')"
 }
 # spec: tests/smoke-mavericks.sh header -- NAME IMAGE PERSONALITY KIND(rw|ro) VIA(raw|GPT): attach, mounted within 30 s, personality, reads and writes,
 #       unmount then mount, eject, then it leaves no lklfuse; after each mount, root's (da_root_mount, da_served, no_owner_pseudo,
@@ -538,7 +539,7 @@ da_cycle() {
   check "$tag: no ?owner= entry for $mp (DiskArbitration ties it to $dev)" bounded 300 no_owner_pseudo "$mp" "$pos"
   check "$tag: diskutil info $mp names $dev" bounded 300 da_info_node "$mp" "$dev"
   # spec: tests/smoke-mavericks.sh mountd_unshared_peer -- once a smoke: the first ext4 cycle's
-  if test "$nm.$via" = ext4.raw; then check "$tag: the mount daemon's peer is the console user outside admin_group, and gets .fseventsd" bounded 300 mountd_unshared_peer "$dev" "$pos"; fi
+  if test "$nm.$via" = ext4.raw; then check "$tag: the mount daemon's peer is the console user outside admin_group, and gets .fseventsd" bounded 300 mountd_unshared_peer "$dev" "$pos"; sed -n 's/^\.fseventsd on /# .fseventsd on /p' "$W/step-$n.log"; fi
   check "$tag: diskutil info shows the personality $want, Type (Bundle) macfuse_$nm, Name (User Visible) '$(fsname_of "$nm")' and Mounted: Yes" persona_is "$dev" "$want" "$nm"
   check "$tag: mount shows it as macfuse_$nm" mount_type_is "$mp" "macfuse_$nm"
   check "$tag: no lklfuse runs as root" no_root_lklfuse
