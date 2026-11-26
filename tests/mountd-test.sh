@@ -39,13 +39,22 @@ REQ="mount${T}ext4${T}disk9s1${T}-${T}/Volumes/x"
 #   big        writes 2000 bytes and a newline, then the same;
 #   drip REQ   reads one line (prints it), then writes REQ a byte every 2 s; prints "closed SECONDS" when the daemon closes;
 #   flood N    N connections that send nothing, each read to EOF; prints each connection's lines joined by "|".
-# Every run is bounded by a 20 s alarm.
+# Every run is bounded by a 20 s alarm. A refused connect (a full backlog) is tried again for up to 5 s.
 cat > "$D/client.pl" <<'EOF'
 use strict; use IO::Socket::UNIX; use IO::Select; use Time::HiRes qw(time sleep);
 $SIG{PIPE} = 'IGNORE'; $SIG{ALRM} = sub { print "timeout\n"; exit 2 }; alarm 20;
 $| = 1;
 my ($path, $mode, $arg) = @ARGV;
-sub conn { IO::Socket::UNIX->new(Type => SOCK_STREAM(), Peer => $path) or do { print "noconnect $!\n"; exit 3 } }
+# a full backlog (a flood) refuses a connect: it is tried again for up to 5 s, as a patient client would
+sub conn {
+	my $t0 = time;
+	while (1) {
+		my $c = IO::Socket::UNIX->new(Type => SOCK_STREAM(), Peer => $path);
+		return $c if $c;
+		if (!$!{ECONNREFUSED} || time - $t0 > 5) { print "noconnect $!\n"; exit 3 }
+		sleep 0.01;
+	}
+}
 sub drain { my ($c) = @_; my @l; while (my $l = <$c>) { chomp $l; push @l, $l } return @l }
 if ($mode eq 'flood') {
 	for (1 .. $arg) { my $c = conn(); print join('|', drain($c)), "\n"; close $c }
@@ -104,7 +113,7 @@ start -- --console "$OTHER"
 cl flood 50 > "$D/flood.out"
 test "$(grep -c "^user${T}not the user at the console\$" "$D/flood.out")" = 50
 ok $? "front_flood_other_uid: each of 50 connections gets user and nothing else"
-grep '^mountd: status ' "$D/err" > "$D/flood.status"
+grep '^mountd: status slots ' "$D/err" > "$D/flood.status"
 test -s "$D/flood.status" && ! grep -v '^mountd: status slots 0 queued 0$' "$D/flood.status" > /dev/null
 ok $? "front_flood_other_uid: the slot count never rose above 0 ($(wc -l < "$D/flood.status" | tr -d ' ') status lines)"
 test "$(grep -c "^mountd: refused uid $ME" "$D/err")" = 1
@@ -164,12 +173,88 @@ i=0; while kill -0 "$dp" 2>/dev/null && test $i -lt 60; do sleep 0.1; i=$((i + 1
 wait "$dp"; rc=$?
 test $rc = 0; ok $? "front_idle: and then it exits 0"
 
+# spec: task-16h-findings-r0.md I1 -- connect-and-close flooders of another uid (the test build's --foreign-pgid takes their
+#       process group for another uid) never starve the parent's housekeeping: the console user's 5 requests, one after
+#       another, are each served (finished children are reaped), and once the flood stops the idle exit still comes
+cat > "$D/flood.pl" <<'PL'
+use strict; use IO::Socket::UNIX; use Time::HiRes qw(time sleep);
+my ($path, $pgfile, $stop, $n) = @ARGV;
+setpgrp(0, 0); $SIG{PIPE} = 'IGNORE';
+open my $f, '>', "$pgfile.new" or die; print $f getpgrp(0), "\n"; close $f; rename "$pgfile.new", $pgfile;
+my $t0 = time;
+sleep 0.05 until -S $path || time - $t0 > 5;
+for (1 .. $n) {
+	next if fork;
+	until (-e $stop || time - $t0 > 40) { my $c = IO::Socket::UNIX->new(Type => SOCK_STREAM(), Peer => $path); close $c if $c }
+	exit 0;
+}
+1 while wait > 0;
+PL
+# flood N: N flooders in a process group of their own, $fp; flood_end stops them (bounded)
+flood() { rm -f "$S" "$D/stop" "$D/pgid"; perl "$D/flood.pl" "$S" "$D/pgid" "$D/stop" "$1" & fp=$!
+  i=0; while ! test -s "$D/pgid" && test $i -lt 50; do sleep 0.1; i=$((i + 1)); done; }
+flood_end() { touch "$D/stop"; i=0; while kill -0 "$fp" 2>/dev/null && test $i -lt 100; do sleep 0.1; i=$((i + 1)); done; wait "$fp"; }
+flood 24
+start LINUXFS_MOUNTD_TEST_CHILD_SLEEP=1 -- --console "$ME" --idle 2 --foreign-pgid "$(cat "$D/pgid")"
+sleep 1
+: > "$D/flooded.out"
+for k in 1 2 3 4 5 6; do cl send "$REQ" | sed -n 2p >> "$D/flooded.out"; done
+test "$(grep -c "^user${T}not yet\$" "$D/flooded.out")" = 6
+ok $? "front_flood_reap (I1): under a flood of another uid, the console user's 6 requests are each served ($(tr '\n' '|' < "$D/flooded.out"))"
+test "$(grep -c '^mountd: refused uid ' "$D/err")" -ge 1; ok $? "front_flood_reap: (control) the flood was refused"
+most=$(sed -n 's/^mountd: status took //p' "$D/err" | sort -n | tail -1)
+test "${most:-0}" = 16; ok $? "front_flood_reap: a pass of the loop takes at most 16 connections, and the flood filled one (most: ${most:-none})"
+flood_end
+i=0; while kill -0 "$dp" 2>/dev/null && test $i -lt 60; do sleep 0.1; i=$((i + 1)); done
+if kill -0 "$dp" 2>/dev/null; then rc=alive; else wait "$dp"; rc=$?; fi
+test "$rc" = 0; ok $? "front_flood_reap: once the flood stops, it exits 0 when idle (rc $rc)"
+stop
+flood 24
+start -- --console "$ME" --foreign-pgid "$(cat "$D/pgid")"
+sleep 1
+kill -TERM "$dp"; i=0; while kill -0 "$dp" 2>/dev/null && test $i -lt 60; do sleep 0.1; i=$((i + 1)); done
+test $i -le 10; ok $? "front_flood_reap: under the flood, SIGTERM ends it within 1 s (${i} tenths)"
+stop; flood_end
+
+# spec: task-16h-findings-r0.md m2 -- a queued request is served only if its uid is still the console user's
+#       (--console-file: the test build reads the console's uid from a file at each look)
+echo "$ME" > "$D/console"
+start LINUXFS_MOUNTD_TEST_CHILD_SLEEP=2 -- --console-file "$D/console" --max-uid 1
+cl send "$REQ" > "$D/q1.out" & c1=$!
+sleep 0.3
+cl send "$REQ" > "$D/q2.out" & c2=$!
+sleep 0.5
+echo "$OTHER" > "$D/console"
+wait $c1; wait $c2
+test "$(sed -n 1,2p "$D/q2.out" | tr '\n' '|')" = "hi|user${T}not the user at the console|"
+ok $? "front_queue_console (m2): a queued request whose uid left the console gets user, not the user at the console"
+test "$(grep -c '^mountd: request from uid ' "$D/err")" = 1; ok $? "front_queue_console: and no child of its own"
+test "$(sed -n 2p "$D/q1.out")" = "user${T}not yet"; ok $? "front_queue_console: (control) the running one is answered"
+stop
+
+# spec: task-16h-findings-r0.md m3 -- an unreadable credential: closed with no reply, logged once per 10 s with its own
+#       errno (LINUXFS_MOUNTD_TEST_CRED_FAIL: the test build takes the read as failed, EINVAL)
+start LINUXFS_MOUNTD_TEST_CRED_FAIL=1 -- --console "$ME"
+cl flood 5 > "$D/nocred.out"
+test "$(grep -c '^$' "$D/nocred.out")" = 5; ok $? "front_no_cred (m3): each of 5 gets no reply"
+test "$(grep -c "^mountd: a peer's credential cannot be read: Invalid argument\$" "$D/err")" = 1
+ok $? "front_no_cred: one log line in 10 s, with the failure's own errno"
+stop
+
 # spec: plan 16h, mountd_shipped (M14) -- the shipped daemon checks in with launchd, runs no shell, carries no test hook
 u=$("$CL/bin/llvm-nm" -u "$D/mountd" 2>&1)
 printf '%s\n' "$u" | grep -qx '_launch_msg' && ! printf '%s\n' "$u" | grep -qx '_system\|_popen\|_execvp'
 ok $? "mountd_shipped: nm -u has _launch_msg, and no _system, _popen or _execvp"
-! "$CL/bin/llvm-strings" "$D/mountd" | grep -q 'LINUXFS_MOUNTD_TEST_\|--console\|--socket\|--queue-wait'
-ok $? "mountd_shipped: no LINUXFS_MOUNTD_TEST_, --console, --socket or --queue-wait string"
-"$CL/bin/llvm-strings" "$D/mountd-t" | grep -q 'LINUXFS_MOUNTD_TEST_'; ok $? "mountd_shipped: (control) the test build has them"
+# m1: every test-only option and hook; the control proves each name is found in the test build, so none is vacuous
+hooks="LINUXFS_MOUNTD_TEST_ LINUXFS_MOUNTD_TEST_CHILD_SLEEP LINUXFS_MOUNTD_TEST_CRED_FAIL --socket --console --console-file"
+hooks="$hooks --idle --max-uid --max --queue --queue-wait --status --foreign-pgid"
+"$CL/bin/llvm-strings" "$D/mountd" > "$D/strings"; "$CL/bin/llvm-strings" "$D/mountd-t" > "$D/strings-t"
+found=""; missing=""
+for h in $hooks; do
+  if grep -q -e "$h" "$D/strings"; then found="$found $h"; fi
+  if ! grep -q -e "$h" "$D/strings-t"; then missing="$missing $h"; fi
+done
+test -z "$found"; ok $? "mountd_shipped: none of the test build's options or hooks${found:+ (found:$found)}"
+test -z "$missing"; ok $? "mountd_shipped: (control) the test build has each of them${missing:+ (missing:$missing)}"
 echo "1..$n"
 exit $bad

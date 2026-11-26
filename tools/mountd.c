@@ -19,8 +19,13 @@
  * its peer is root before it sends anything. Syslog gets the peers, refusals and results; stderr (the log file) only a
  * failure to start.
  *
- * The test build (LINUXFS_MOUNTD_TEST, never shipped) binds its own socket and takes the console's uid, the slots, the queue
- * and the idle time as options, logs to stderr, and its stub child sleeps LINUXFS_MOUNTD_TEST_CHILD_SLEEP seconds.
+ * The parent takes at most ACCEPT_BATCH connections per pass, so a flood never keeps it from reaping, dispatching, SIGTERM
+ * or the idle exit (I1). A queued request is served only if its uid is still the console user's (m2).
+ *
+ * The test build (LINUXFS_MOUNTD_TEST, never shipped) binds its own socket and takes the console's uid (or a file to read
+ * it from), the slots, the queue and the idle time as options; --foreign-pgid stands peers of one process group in for
+ * another uid. It logs to stderr as well as syslog, its stub child sleeps LINUXFS_MOUNTD_TEST_CHILD_SLEEP seconds, and
+ * LINUXFS_MOUNTD_TEST_CRED_FAIL makes every credential unreadable.
  */
 #include "mountd.h"
 #include <stdio.h>
@@ -248,6 +253,7 @@ size_t mountd_reply(char *buf, size_t len, enum mountd_verdict v, int rc, const 
 #define QUEUE_MAX 64	/* room for the queue, over every uid */
 #define REFUSAL_EVERY_MS 10000	/* a refused uid is logged at most this often */
 #define REFUSALS 16	/* uids remembered for that */
+#define ACCEPT_BATCH 16	/* connections taken per pass of the loop (I1) */
 
 struct limits { int slots_uid, slots, queue, queue_wait, idle, status; uid_t console; int console_given; };
 static struct limits lim = { MOUNTD_SLOTS_UID, MOUNTD_SLOTS, MOUNTD_QUEUE, MOUNTD_QUEUE_WAIT, MOUNTD_IDLE, 0, 0, 0 };
@@ -257,6 +263,10 @@ static struct { int fd; uid_t uid; long long since; } queue[QUEUE_MAX];
 static int nqueued;
 static struct { uid_t uid; long long at; } refusals[REFUSALS];
 static volatile sig_atomic_t stopping, child_ended;
+#ifdef LINUXFS_MOUNTD_TEST
+static const char *console_file;	/* --console-file */
+static pid_t foreign_pgid;	/* --foreign-pgid: peers in this process group stand for another uid */
+#endif
 
 static void on_term(int sig) { (void)sig; stopping = 1; }	/* only a flag: the loop acts on it */
 static void on_child(int sig) { (void)sig; child_ended = 1; }	/* only a flag: it wakes the loop, which reaps */
@@ -270,18 +280,23 @@ static long long now_ms(void)
 	return (long long)((double)mach_absolute_time() * tb.numer / tb.denom / 1e6);
 }
 
-/* one line to syslog (the test build: to stderr) */
+#define IDENT "linuxfs-mountd"
+#define FACILITY LOG_DAEMON
+
+/* one line to syslog. The test build also writes it to stderr, for the tests to read; it still calls syslog, so its
+ * children are forked from a parent that has used syslog (ASL), as the shipped daemon's are (m5). */
 static void say(const char *fmt, ...)
 {
 	va_list ap;
 
-	va_start(ap, fmt);
 #ifdef LINUXFS_MOUNTD_TEST
+	va_start(ap, fmt);
 	vfprintf(stderr, fmt, ap);
 	fputc('\n', stderr);
-#else
-	vsyslog(LOG_NOTICE, fmt, ap);
+	va_end(ap);
 #endif
+	va_start(ap, fmt);
+	vsyslog(LOG_NOTICE, fmt, ap);
 	va_end(ap);
 }
 
@@ -293,10 +308,11 @@ static int start_failed(const char *what)
 	return 1;
 }
 
+/* the test build's --status: stderr only, never syslog (it comes on every pass of the loop) */
 static void status(void)
 {
 	if (lim.status)
-		say("mountd: status slots %d queued %d", nkids, nqueued);
+		fprintf(stderr, "mountd: status slots %d queued %d\n", nkids, nqueued);
 }
 
 /* the reply V (mountd_reply) to C, never waiting: C is non-blocking in the parent, and a peer that left is no harm (SIGPIPE
@@ -327,6 +343,62 @@ static int waiting(uid_t uid)
 	for (i = 0; i < nqueued; i++)
 		k += queue[i].uid == uid;
 	return k;
+}
+
+#define UNKNOWN_PEER ((uid_t)-1)	/* the refusal log's key for a peer whose credential cannot be read */
+
+/* 1 when a line about KEY (a uid, or UNKNOWN_PEER) may go to the log now: at most once per REFUSAL_EVERY_MS per key, with
+ * the last REFUSALS keys remembered */
+static int log_due(uid_t key)
+{
+	long long now = now_ms();
+	int i, oldest = 0;
+
+	for (i = 0; i < REFUSALS; i++) {
+		if (refusals[i].at && refusals[i].uid == key)
+			break;
+		if (refusals[i].at < refusals[oldest].at)
+			oldest = i;
+	}
+	if (i < REFUSALS && now - refusals[i].at < REFUSAL_EVERY_MS)
+		return 0;
+	if (i == REFUSALS)
+		i = oldest;
+	refusals[i].uid = key;
+	refusals[i].at = now ? now : 1;
+	return 1;
+}
+
+/* A refusal for a peer that is not served (UID, its reply V/RC/WHY): it takes no slot, and is logged at most once per
+ * REFUSAL_EVERY_MS per uid. */
+static void refuse(int c, uid_t uid, enum mountd_verdict v, int rc, const char *why)
+{
+	answer(c, v, rc, why);
+	close(c);
+	if (log_due(uid))
+		say("mountd: refused uid %u: %s", (unsigned)uid, why);
+}
+
+/* /dev/console's owner, looked at each time: the helper's rule, so there is one definition of the console user (the test
+ * build: --console, or --console-file read at each look) */
+static uid_t console_uid(void)
+{
+	struct stat st;
+
+#ifdef LINUXFS_MOUNTD_TEST
+	if (console_file) {
+		FILE *f = fopen(console_file, "r");
+		unsigned u;
+		int got = f && fscanf(f, "%u", &u) == 1;
+
+		if (f)
+			fclose(f);
+		return got ? (uid_t)u : (uid_t)-1;
+	}
+#endif
+	if (lim.console_given)
+		return lim.console;
+	return stat("/dev/console", &st) == 0 ? st.st_uid : (uid_t)-1;
 }
 
 /* ---- the child ---- */
@@ -374,10 +446,11 @@ static void serve(int c, uid_t uid)
 
 	/* hygiene (M5): nothing of the parent's but C and 0-2; default signals and no mask. SIGALRM is left as it is: the
 	 * work (16i) gives it a handler before begin (N2). */
-	closelog();	/* its socket is closed below; syslog reopens one when next used */
+	closelog();	/* its socket is closed below, and a descriptor the work opens must never be taken for it */
 	for (fd = 3; fd < top; fd++)
 		if (fd != c)
 			close(fd);
+	openlog(IDENT, LOG_PID, FACILITY);	/* m4: the parent's ident and facility, not libc's defaults */
 	signal(SIGCHLD, SIG_DFL);
 	signal(SIGPIPE, SIG_DFL);
 	signal(SIGTERM, SIG_DFL);
@@ -451,8 +524,17 @@ static void dispatch(void)
 	long long now = now_ms();
 	int i;
 
+	uid_t console = console_uid();
+
 	for (i = 0; i < nqueued && nkids < lim.slots;)
-		if (running(queue[i].uid) < lim.slots_uid) {
+		if (mountd_peer(queue[i].uid, console) != MP_SERVE) {
+			/* m2: the console changed while it waited (a fast user switch): its own path, and no child */
+			int c = queue[i].fd;
+			uid_t uid = queue[i].uid;
+
+			unqueue(i);
+			refuse(c, uid, MD_USER, 0, "not the user at the console");
+		} else if (running(queue[i].uid) < lim.slots_uid) {
 			int c = queue[i].fd;
 			uid_t uid = queue[i].uid;
 
@@ -472,51 +554,46 @@ static void dispatch(void)
 		}
 }
 
-/* A refusal for a peer that is not served (UID, its reply V/RC/WHY), logged at most once per REFUSAL_EVERY_MS per uid. */
-static void refuse(int c, uid_t uid, enum mountd_verdict v, int rc, const char *why)
+/* C's peer's credential into XU: NULL, or why not (errno's text, taken where it failed) */
+static const char *peer_cred(int c, struct xucred *xu)
 {
-	long long now = now_ms();
-	int i, oldest = 0;
+	socklen_t len = sizeof(*xu);
 
-	answer(c, v, rc, why);
-	close(c);
-	for (i = 0; i < REFUSALS; i++) {
-		if (refusals[i].at && refusals[i].uid == uid)
-			break;
-		if (refusals[i].at < refusals[oldest].at)
-			oldest = i;
+#ifdef LINUXFS_MOUNTD_TEST
+	if (getenv("LINUXFS_MOUNTD_TEST_CRED_FAIL"))
+		return strerror(EINVAL);
+#endif
+	if (getsockopt(c, SOL_LOCAL, LOCAL_PEERCRED, xu, &len) != 0)
+		return strerror(errno);
+	if (len != sizeof(*xu) || xu->cr_version != XUCRED_VERSION)
+		return "an unknown credential version";
+#ifdef LINUXFS_MOUNTD_TEST
+	if (foreign_pgid > 0) {
+		pid_t pid;
+
+		len = sizeof(pid);
+		if (getsockopt(c, SOL_LOCAL, LOCAL_PEERPID, &pid, &len) == 0 && getpgid(pid) == foreign_pgid)
+			xu->cr_uid = (uid_t)-2;
 	}
-	if (i < REFUSALS && now - refusals[i].at < REFUSAL_EVERY_MS)
-		return;
-	if (i == REFUSALS)
-		i = oldest;
-	refusals[i].uid = uid;
-	refusals[i].at = now ? now : 1;
-	say("mountd: refused uid %u: %s", (unsigned)uid, why);
-}
-
-static uid_t console_uid(void)
-{
-	struct stat st;
-
-	if (lim.console_given)
-		return lim.console;
-	return stat("/dev/console", &st) == 0 ? st.st_uid : (uid_t)-1;
+#endif
+	return NULL;
 }
 
 /* One accepted connection: the peer first (I3), before any slot is counted. */
 static void arrive(int c)
 {
 	struct xucred xu;
-	socklen_t len = sizeof(xu);
 	char groups[NGROUPS * 12] = "";
+	const char *why;
 	size_t at = 0;
 	int i;
 
 	fcntl(c, F_SETFL, fcntl(c, F_GETFL) | O_NONBLOCK);
-	if (getsockopt(c, SOL_LOCAL, LOCAL_PEERCRED, &xu, &len) != 0 || xu.cr_version != XUCRED_VERSION) {
-		say("mountd: a peer's credential cannot be read: %s", strerror(errno));
+	if ((why = peer_cred(c, &xu)) != NULL) {
+		/* no reply: no hi, so the mount program takes its own path */
 		close(c);
+		if (log_due(UNKNOWN_PEER))
+			say("mountd: a peer's credential cannot be read: %s", why);
 		return;
 	}
 	switch (mountd_peer(xu.cr_uid, console_uid())) {
@@ -603,12 +680,14 @@ int main(int argc, char **argv)
 	struct sigaction sa = { 0 };
 	struct pollfd p;
 	long long idle_since = now_ms(), wait, t;
-	int s, c, i;
-
+	int s, c, i, k;
 #ifdef LINUXFS_MOUNTD_TEST
 	const char *path = NULL;
-	int console = -1;
+	int console = -1, pgid = 0;
+#endif
 
+	openlog(IDENT, LOG_PID, FACILITY);
+#ifdef LINUXFS_MOUNTD_TEST
 	for (i = 1; i < argc; i++) {
 		int *to = NULL, min = 1, v;
 
@@ -620,8 +699,14 @@ int main(int argc, char **argv)
 			path = argv[++i];
 			continue;
 		}
+		if (i + 1 < argc && strcmp(argv[i], "--console-file") == 0) {
+			console_file = argv[++i];
+			continue;
+		}
 		if (strcmp(argv[i], "--console") == 0)
 			to = &console, min = 0;
+		else if (strcmp(argv[i], "--foreign-pgid") == 0)
+			to = &pgid;
 		else if (strcmp(argv[i], "--idle") == 0)
 			to = &lim.idle;
 		else if (strcmp(argv[i], "--max-uid") == 0)
@@ -633,12 +718,14 @@ int main(int argc, char **argv)
 		else if (strcmp(argv[i], "--queue-wait") == 0)
 			to = &lim.queue_wait;
 		if (!to || i + 1 >= argc || (v = number(argv[++i], min)) < 0) {
-			fprintf(stderr, "usage: linuxfs-mountd [--socket PATH] [--console UID] [--idle S] [--max-uid N] [--max N] "
-					"[--queue N] [--queue-wait S] [--status]\n");
+			fprintf(stderr, "usage: linuxfs-mountd [--socket PATH] [--console UID | --console-file PATH] "
+					"[--foreign-pgid PGID] [--idle S] [--max-uid N] [--max N] [--queue N] [--queue-wait S] "
+					"[--status]\n");
 			return 2;
 		}
 		*to = v;
 	}
+	foreign_pgid = (pid_t)pgid;
 	if (console >= 0)
 		lim.console = (uid_t)console, lim.console_given = 1;
 	if (lim.slots > CHILDREN_MAX)
@@ -650,7 +737,6 @@ int main(int argc, char **argv)
 		fprintf(stderr, "usage: linuxfs-mountd (launchd runs it, as dev.mavergreen.linuxfs.mountd)\n");
 		return 2;
 	}
-	openlog("linuxfs-mountd", LOG_PID, LOG_DAEMON);
 	s = check_in();
 #endif
 	if (s < 0)
@@ -684,9 +770,15 @@ int main(int argc, char **argv)
 		p.events = POLLIN;
 		if (poll(&p, 1, wait < 0 ? 0 : (int)wait) <= 0)
 			continue;
-		while ((c = accept(s, NULL, NULL)) >= 0)
+		/* I1: a bounded batch, then back to the top (reap, dispatch, SIGTERM, idle), so a flood of connections from
+		 * any uid cannot hold the parent here */
+		for (k = 0; k < ACCEPT_BATCH && (c = accept(s, NULL, NULL)) >= 0; k++)
 			arrive(c);
-		if (errno == EMFILE || errno == ENFILE)
+#ifdef LINUXFS_MOUNTD_TEST
+		if (lim.status && k)
+			fprintf(stderr, "mountd: status took %d\n", k);
+#endif
+		if (k < ACCEPT_BATCH && (errno == EMFILE || errno == ENFILE))
 			usleep(100000);	/* out of descriptors: let children end, rather than spin */
 	}
 	/* stopping (launchd's SIGTERM): the queue is told to take its own path; children finish their own requests */
